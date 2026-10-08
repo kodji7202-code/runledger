@@ -13,13 +13,14 @@ import subprocess
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 from urllib.parse import urlsplit
 
 from . import __version__
 from .cli import build
 from .pricing import cost_of
 from .receipt import render
+from .review import DEFAULT_REVIEW_MODEL
 
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
@@ -53,15 +54,23 @@ def build_payload(
     session_path: Union[str, Path],
     user: Optional[str] = None,
     project: Optional[str] = None,
+    *,
+    review: bool = False,
+    review_model: str = DEFAULT_REVIEW_MODEL,
+    notes: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """The JSON body for POST /api/runs: the receipt plus user, project, html."""
+    """The JSON body for POST /api/runs: the receipt plus user, project, html.
+    With review=True the Claude risk review is included as "ai_review". A review that
+    fails is left out and its one-line note is appended to `notes`."""
     path = Path(session_path)
     if not path.is_file():
         raise PushError(f"Session file not found: {path}")
     try:
-        run, score, level, risks, _note = build(str(path))
+        run, score, level, risks, note = build(str(path), review=review, review_model=review_model)
     except (OSError, ValueError) as exc:  # unreadable file, or a native file that does not validate
         raise PushError(str(exc)) from None
+    if note and notes is not None:
+        notes.append(note)
     # The JSON receipt carries "agent" (label, e.g. "Codex CLI") and "agent_id".
     payload = json.loads(render(run, score, level, risks, "json"))
     # Exact cost per model, including messages that issued no tool call
@@ -70,6 +79,8 @@ def build_payload(
     payload["user"] = (user or default_user()).strip() or "unknown"
     payload["project"] = project or _folder_name(run.cwd) or "unknown"
     payload["html"] = render(run, score, level, risks, "html")
+    if run.ai_review is not None:
+        payload["ai_review"] = run.ai_review
     return payload
 
 
@@ -94,14 +105,19 @@ def push(
     user: Optional[str] = None,
     project: Optional[str] = None,
     timeout: float = 60.0,
+    *,
+    review: bool = False,
+    review_model: str = DEFAULT_REVIEW_MODEL,
+    notes: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Build the receipt for a session and upload it. Returns the server's reply
-    ({"id", "url", "risk_score", "risk_level"})."""
+    ({"id", "url", "risk_score", "risk_level"}). See build_payload for review and notes."""
     if not server_url:
         raise PushError("No server URL. Pass --server or set RUNLEDGER_SERVER.")
     if not api_key:
         raise PushError("No API key. Pass --key or set RUNLEDGER_API_KEY.")
-    payload = build_payload(session_path, user=user, project=project)
+    payload = build_payload(session_path, user=user, project=project,
+                            review=review, review_model=review_model, notes=notes)
     endpoint = server_url.rstrip("/") + "/api/runs"
     request = urllib.request.Request(
         endpoint,

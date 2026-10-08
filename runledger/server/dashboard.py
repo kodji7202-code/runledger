@@ -6,9 +6,10 @@ per-response nonce CSP that allows only the script below. The script calls the
 API with cookie credentials; every POST or PUT sends X-Requested-With, which a
 cross-site form cannot set.
 
-Views are switched by location hash (#runs, #approvals, and for admins #keys,
+Views are switched by location hash (#runs, #insights, #approvals, and for admins #keys,
 #audit, #settings). Features whose endpoints are not on the server yet (budgets,
-exports, notification settings) hide themselves on 404 or 403.
+exports, notification settings) hide themselves on 404 or 403. The Insights view reads
+/api/insights; its trend chart is an inline SVG built with createElementNS.
 """
 
 DASHBOARD_HTML = r"""<!doctype html>
@@ -19,8 +20,8 @@ DASHBOARD_HTML = r"""<!doctype html>
 <meta name="color-scheme" content="dark light">
 <title>RunLedger Team</title>
 <style>
-:root{--bg:#0a0b0d;--panel:#111316;--line:#1f2328;--control:#6b737e;--text:#eef0f2;--muted:#9aa1ab;--accent:#4fe0b0;--amber:#f5b547;--red:#ff6b6b;--chip:#171a1e;--on-accent:#0a0b0d}
-@media (prefers-color-scheme: light){:root{--bg:#f7f8f9;--panel:#fff;--line:#e3e6ea;--control:#7b8490;--text:#121417;--muted:#5d6670;--accent:#047857;--amber:#b45309;--red:#c62828;--chip:#f0f2f4;--on-accent:#fff}}
+:root{--bg:#0a0b0d;--panel:#111316;--line:#1f2328;--control:#6b737e;--text:#eef0f2;--muted:#9aa1ab;--accent:#4fe0b0;--amber:#f5b547;--red:#ff6b6b;--chip:#171a1e;--on-accent:#0a0b0d;--ink-good:#4fe0b0;--ink-warn:#f5b547;--ink-bad:#ff6b6b}
+@media (prefers-color-scheme: light){:root{--bg:#f7f8f9;--panel:#fff;--line:#e3e6ea;--control:#7b8490;--text:#121417;--muted:#5d6670;--accent:#047857;--amber:#b45309;--red:#c62828;--chip:#f0f2f4;--on-accent:#fff;--ink-good:#065f46;--ink-warn:#92400e;--ink-bad:#991b1b}}
 *{box-sizing:border-box}
 [hidden]{display:none!important}
 html,body{margin:0;background:var(--bg);color:var(--text)}
@@ -133,6 +134,29 @@ dialog::backdrop{background:rgba(5,6,8,.6)}
 .dialog-body{padding:18px}
 .dialog-title{font-weight:650;font-size:16px;margin:0 0 8px}
 .dialog-actions{display:flex;justify-content:flex-end;gap:10px;flex-wrap:wrap;margin-top:16px}
+.insights-head{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:baseline;gap:8px;margin:26px 0 10px}
+.insights-head h2{margin:0}
+.kpi-grade{margin-left:8px;vertical-align:middle}
+.grade{display:inline-block;min-width:26px;text-align:center;font:700 12px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;padding:0 6px;border-radius:6px;background:var(--chip);color:var(--muted);white-space:nowrap}
+.grade.g-good{background:color-mix(in srgb,var(--accent) 18%,transparent);color:var(--ink-good)}
+.grade.g-warn{background:color-mix(in srgb,var(--amber) 18%,transparent);color:var(--ink-warn)}
+.grade.g-bad{background:color-mix(in srgb,var(--red) 18%,transparent);color:var(--ink-bad)}
+.quality{white-space:nowrap}
+.quality .score{margin-left:6px;font-variant-numeric:tabular-nums}
+.verdict{display:inline-flex;align-items:center;gap:6px;white-space:nowrap;font-size:12px}
+.verdict-icon{display:inline-grid;place-items:center;width:20px;height:20px;border-radius:99px;font:700 12px/1 ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--chip);color:var(--muted)}
+.verdict.v-safe .verdict-icon{background:color-mix(in srgb,var(--accent) 18%,transparent);color:var(--ink-good)}
+.verdict.v-review .verdict-icon{background:color-mix(in srgb,var(--amber) 18%,transparent);color:var(--ink-warn)}
+.verdict.v-danger .verdict-icon{background:color-mix(in srgb,var(--red) 18%,transparent);color:var(--ink-bad)}
+.share{display:grid;grid-template-columns:minmax(60px,1fr) auto;gap:8px;align-items:center;min-width:140px}
+.spark{display:block;width:100%;height:auto;max-height:150px;overflow:visible}
+.spark polyline{fill:none;stroke:var(--accent);stroke-width:2;stroke-linejoin:round;stroke-linecap:round}
+.spark circle{fill:var(--accent)}
+.spark-axis{display:flex;justify-content:space-between;gap:8px;color:var(--muted);font-size:12px;font-variant-numeric:tabular-nums;margin-top:4px}
+.rec-list{margin:0;padding-left:24px}
+.rec-list li{margin:0 0 12px;padding-left:4px}
+.rec-title{font-weight:600;overflow-wrap:anywhere}
+.rec-meta{color:var(--muted);font-size:12px;overflow-wrap:anywhere}
 @media (prefers-reduced-motion: reduce){
   .view:not([hidden]){animation:none}
   .bar-fill,.progress-fill{transition:none}
@@ -161,6 +185,7 @@ dialog::backdrop{background:rgba(5,6,8,.6)}
 <div class="tabs-wrap">
 <div class="tabs" role="tablist" id="tabs" aria-label="Dashboard sections">
   <button type="button" role="tab" class="tab" id="tab-runs" data-view="runs" aria-controls="view-runs" aria-selected="true" tabindex="0">Runs</button>
+  <button type="button" role="tab" class="tab" id="tab-insights" data-view="insights" aria-controls="view-insights" aria-selected="false" tabindex="-1">Insights</button>
   <button type="button" role="tab" class="tab" id="tab-approvals" data-view="approvals" aria-controls="view-approvals" aria-selected="false" tabindex="-1">Approvals <span class="count" id="tab-approvals-count">0</span></button>
   <button type="button" role="tab" class="tab" id="tab-keys" data-view="keys" aria-controls="view-keys" aria-selected="false" tabindex="-1" hidden>API keys</button>
   <button type="button" role="tab" class="tab" id="tab-audit" data-view="audit" aria-controls="view-audit" aria-selected="false" tabindex="-1" hidden>Audit log</button>
@@ -236,16 +261,54 @@ dialog::backdrop{background:rgba(5,6,8,.6)}
   <input id="f-project" type="search" placeholder="Project" aria-label="Filter by project" maxlength="200">
   <input id="f-agent" type="search" placeholder="Agent" aria-label="Filter by agent" maxlength="200">
   <input id="f-min" type="number" min="0" max="100" placeholder="Min risk" aria-label="Minimum risk score">
+  <input id="f-quality" type="number" min="0" max="100" placeholder="Min quality" aria-label="Minimum quality score">
 </div>
 <div class="table-wrap">
 <table>
   <thead>
-    <tr><th>When</th><th>Developer</th><th>Project</th><th>Agent</th><th>Request</th><th class="num">Steps</th><th class="num">Cost</th><th>Risk</th><th class="num">Receipt</th></tr>
+    <tr><th>When</th><th>Developer</th><th>Project</th><th>Agent</th><th>Request</th><th class="num">Steps</th><th class="num">Cost</th><th>Risk</th><th class="num">Quality</th><th>AI review</th><th class="num">Receipt</th></tr>
   </thead>
   <tbody id="runs"></tbody>
 </table>
 </div>
 <div id="runs-empty" class="empty"></div>
+</section>
+
+<section class="view" id="view-insights" role="tabpanel" aria-labelledby="tab-insights" tabindex="-1" hidden>
+  <div class="insights-head">
+    <h2>Insights</h2>
+    <span class="label-inline" id="insights-window"></span>
+  </div>
+  <p class="msg" id="insights-msg" role="status" aria-live="polite"></p>
+  <section class="kpis" aria-label="Quality and AI review summary">
+    <div class="card"><div class="kpi-label">Average quality</div><div class="kpi-value"><span id="i-quality">-</span><span class="kpi-grade" id="i-quality-grade"></span></div><div class="kpi-sub" id="i-quality-sub"></div></div>
+    <div class="card"><div class="kpi-label">Estimated savings</div><div class="kpi-value" id="i-savings">-</div><div class="kpi-sub" id="i-savings-sub"></div></div>
+    <div class="card"><div class="kpi-label">AI-reviewed runs</div><div class="kpi-value" id="i-reviewed">-</div><div class="kpi-sub" id="i-reviewed-sub"></div></div>
+    <div class="card"><div class="kpi-label">False-positive rate</div><div class="kpi-value" id="i-fp">-</div><div class="kpi-sub" id="i-fp-sub"></div></div>
+  </section>
+  <section class="panels">
+    <div class="card"><div class="panel-title">Quality trend</div><div id="i-trend"></div></div>
+    <div class="card"><div class="panel-title">Grades</div><div id="i-grades"></div></div>
+  </section>
+  <h2>Models</h2>
+  <div class="table-wrap">
+  <table aria-label="Cost and quality by model">
+    <thead><tr><th>Model</th><th class="num">Runs</th><th class="num">Cost</th><th class="num">Cost per run</th><th class="num">Avg quality</th><th>Share of cost</th></tr></thead>
+    <tbody id="i-models"></tbody>
+  </table>
+  </div>
+  <div class="empty" id="i-models-empty"></div>
+  <h2>Agents</h2>
+  <div class="table-wrap">
+  <table aria-label="Cost and quality by agent">
+    <thead><tr><th>Agent</th><th class="num">Runs</th><th class="num">Avg quality</th><th class="num">Avg risk</th><th class="num">Cost</th></tr></thead>
+    <tbody id="i-agents"></tbody>
+  </table>
+  </div>
+  <div class="empty" id="i-agents-empty"></div>
+  <h2>Top recommendations</h2>
+  <ol class="rec-list" id="i-recs"></ol>
+  <div class="empty" id="i-recs-empty"></div>
 </section>
 
 <section class="view" id="view-keys" role="tabpanel" aria-labelledby="tab-keys" tabindex="-1" hidden>
@@ -371,7 +434,7 @@ dialog::backdrop{background:rgba(5,6,8,.6)}
   "use strict";
 
   var APPROVAL_POLL_MS = 3000;
-  var VIEWS = ["runs", "approvals", "keys", "audit", "settings"];
+  var VIEWS = ["runs", "insights", "approvals", "keys", "audit", "settings"];
   var ADMIN_VIEWS = { keys: true, audit: true, settings: true };
   var ROLES = ["admin", "member", "viewer"];
   var AUDIT_PAGE = 100;
@@ -623,6 +686,8 @@ dialog::backdrop{background:rgba(5,6,8,.6)}
       tr.appendChild(cell(r.steps, "num"));
       tr.appendChild(cell(money(r.cost_usd), "num"));
       tr.appendChild(cell(el("span", "badge " + lv, String(r.risk_score) + " " + lv)));
+      tr.appendChild(cell(qualityNode(r), "num"));
+      tr.appendChild(cell(verdictNode(r.ai_verdict)));
       var link = cell("", "num");
       if (r.has_html) {
         var a = el("a", null, "Open");
@@ -647,6 +712,10 @@ dialog::backdrop{background:rgba(5,6,8,.6)}
     var min = $("f-min").value.trim();
     if (min !== "") {
       params.set("min_risk", String(Math.min(100, Math.max(0, Math.floor(Number(min)) || 0))));
+    }
+    var minQuality = $("f-quality").value.trim();
+    if (minQuality !== "") {
+      params.set("min_quality", String(Math.min(100, Math.max(0, Math.floor(Number(minQuality)) || 0))));
     }
     params.set("limit", "200");
     return params.toString();
@@ -1196,6 +1265,252 @@ dialog::backdrop{background:rgba(5,6,8,.6)}
     return loadExports();
   }
 
+  // Quality and AI review cells for the runs table.
+
+  var GRADE_LIST = ["A", "B", "C", "D", "E", "F"];
+  var VERDICT_INFO = {
+    looks_safe: { tone: "v-safe", glyph: "✓", label: "Looks safe" },
+    needs_review: { tone: "v-review", glyph: "!", label: "Needs review" },
+    dangerous: { tone: "v-danger", glyph: "✕", label: "Dangerous" }
+  };
+
+  function gradeTone(grade) {
+    if (grade === "A" || grade === "B") { return "g-good"; }
+    if (grade === "C" || grade === "D") { return "g-warn"; }
+    return "g-bad";
+  }
+
+  function gradeNode(grade) {
+    if (GRADE_LIST.indexOf(grade) < 0) { return null; }
+    return el("span", "grade " + gradeTone(grade), grade);
+  }
+
+  function qualityNode(run) {
+    var score = pct(run.quality_score);
+    if (score === null) { return "-"; }
+    var wrap = el("span", "quality");
+    var grade = gradeNode(run.quality_grade);
+    if (grade) { wrap.appendChild(grade); }
+    wrap.appendChild(el("span", "score", String(score)));
+    return wrap;
+  }
+
+  function verdictNode(name) {
+    var info = Object.prototype.hasOwnProperty.call(VERDICT_INFO, name) ? VERDICT_INFO[name] : null;
+    if (!info) { return "-"; }
+    var wrap = el("span", "verdict " + info.tone);
+    var icon = el("span", "verdict-icon", info.glyph);
+    icon.setAttribute("aria-hidden", "true");
+    wrap.appendChild(icon);
+    wrap.appendChild(el("span", "verdict-text", info.label));
+    return wrap;
+  }
+
+  // Insights view (any role): GET /api/insights. Shows nothing it was not sent.
+
+  var SVG_NS = "http://www.w3.org/2000/svg";
+
+  function scoreText(value) {
+    return value === null || value === undefined ? "-" : Number(value).toFixed(1);
+  }
+
+  function topGrade(byGrade) {
+    var best = null;
+    var bestCount = 0;
+    GRADE_LIST.forEach(function (g) {
+      var n = Number((byGrade || {})[g]) || 0;
+      if (n > bestCount) { best = g; bestCount = n; }
+    });
+    return best;
+  }
+
+  function renderInsightKpis(data) {
+    var q = data.quality || {};
+    var ai = data.ai_review || {};
+    var recs = Array.isArray(data.top_recommendations) ? data.top_recommendations : [];
+    var scored = Number(q.scored_runs) || 0;
+
+    $("i-quality").textContent = scoreText(q.avg);
+    var top = topGrade(q.by_grade);
+    clear($("i-quality-grade"));
+    var badge = top ? gradeNode(top) : null;
+    if (badge) { $("i-quality-grade").appendChild(badge); }
+    $("i-quality-sub").textContent = scored
+      ? runCount(scored) + " scored" + (top ? " · most common grade " + top : "")
+      : "No scored runs in this window.";
+
+    $("i-savings").textContent = money(data.est_savings_usd);
+    $("i-savings-sub").textContent = recs.length
+      ? "Estimated from recommendations"
+      : "No recommendations in this window.";
+
+    var reviewed = Number(ai.reviewed_runs) || 0;
+    $("i-reviewed").textContent = String(reviewed);
+    $("i-reviewed-sub").textContent = reviewed
+      ? (Number(ai.dangerous) || 0) + " dangerous · " + (Number(ai.needs_review) || 0) + " need review · " +
+        (Number(ai.looks_safe) || 0) + " look safe"
+      : "No AI review in this window.";
+
+    var rate = ai.false_positive_rate;
+    var hasRate = rate !== null && rate !== undefined && isFinite(Number(rate));
+    $("i-fp").textContent = hasRate ? (Number(rate) * 100).toFixed(1) + "%" : "-";
+    $("i-fp-sub").textContent = hasRate
+      ? "Rule risks the AI marked as false positives"
+      : "No AI-assessed rule risks in this window.";
+  }
+
+  // The trend is one polyline and a dot per day, on a fixed 0 to 100 scale. Built with
+  // createElementNS and textContent only.
+  function sparkline(points) {
+    var W = 320;
+    var H = 110;
+    var P = 10;
+    var svg = document.createElementNS(SVG_NS, "svg");
+    svg.setAttribute("class", "spark");
+    svg.setAttribute("viewBox", "0 0 " + W + " " + H);
+    svg.setAttribute("role", "img");
+    svg.setAttribute("focusable", "false");
+    svg.setAttribute("aria-label", "Average quality per day over " + points.length + " days, scale 0 to 100");
+    var step = points.length > 1 ? (W - 2 * P) / (points.length - 1) : 0;
+    var marks = points.map(function (p, i) {
+      var avg = Math.max(0, Math.min(100, Number(p.avg) || 0));
+      return {
+        x: points.length > 1 ? P + i * step : W / 2,
+        y: H - P - (avg / 100) * (H - 2 * P),
+        date: String(p.date),
+        avg: avg
+      };
+    });
+    if (marks.length > 1) {
+      var line = document.createElementNS(SVG_NS, "polyline");
+      line.setAttribute("points", marks.map(function (m) {
+        return m.x.toFixed(1) + "," + m.y.toFixed(1);
+      }).join(" "));
+      svg.appendChild(line);
+    }
+    marks.forEach(function (m) {
+      var dot = document.createElementNS(SVG_NS, "circle");
+      dot.setAttribute("cx", m.x.toFixed(1));
+      dot.setAttribute("cy", m.y.toFixed(1));
+      dot.setAttribute("r", "3");
+      var tip = document.createElementNS(SVG_NS, "title");
+      tip.textContent = m.date + ": " + m.avg.toFixed(1);
+      dot.appendChild(tip);
+      svg.appendChild(dot);
+    });
+    return svg;
+  }
+
+  function renderTrend(points) {
+    var box = $("i-trend");
+    clear(box);
+    var list = Array.isArray(points) ? points : [];
+    if (!list.length) {
+      box.appendChild(el("div", "empty", "No scored runs in this window."));
+      return;
+    }
+    box.appendChild(sparkline(list));
+    var axis = el("div", "spark-axis");
+    axis.appendChild(el("span", null, list[0].date));
+    axis.appendChild(el("span", null, list[list.length - 1].date));
+    box.appendChild(axis);
+  }
+
+  function renderGrades(byGrade) {
+    var counts = byGrade || {};
+    var rows = GRADE_LIST.map(function (g) { return { grade: g, n: Number(counts[g]) || 0 }; });
+    var total = rows.reduce(function (sum, r) { return sum + r.n; }, 0);
+    renderBars($("i-grades"), total > 0 ? rows : [],
+      function (r) { return "Grade " + r.grade; },
+      function (r) { return r.n; },
+      function (r) { return runCount(r.n); },
+      "No scored runs in this window.");
+  }
+
+  function shareNode(share) {
+    if (share === null || share === undefined || !isFinite(Number(share))) { return "n/a"; }
+    var value = Math.max(0, Math.min(100, Number(share) * 100));
+    var wrap = el("div", "share");
+    var track = el("div", "bar-track");
+    var fill = el("div", "bar-fill");
+    fill.style.width = value.toFixed(1) + "%";
+    track.appendChild(fill);
+    wrap.appendChild(track);
+    wrap.appendChild(el("span", "bar-val", value.toFixed(1) + "%"));
+    return wrap;
+  }
+
+  function renderModels(rows) {
+    var list = Array.isArray(rows) ? rows : [];
+    var body = $("i-models");
+    clear(body);
+    list.forEach(function (m) {
+      var tr = el("tr");
+      tr.appendChild(cell(nameOf(m.model, "unknown")));
+      tr.appendChild(cell(String(m.runs || 0), "num"));
+      tr.appendChild(cell(money(m.cost_usd), "num"));
+      tr.appendChild(cell(money(m.cost_per_run), "num"));
+      tr.appendChild(cell(scoreText(m.avg_quality), "num"));
+      tr.appendChild(cell(shareNode(m.share_of_cost)));
+      body.appendChild(tr);
+    });
+    $("i-models-empty").textContent = list.length ? "" : "No model usage in this window.";
+  }
+
+  function renderAgents(rows) {
+    var list = Array.isArray(rows) ? rows : [];
+    var body = $("i-agents");
+    clear(body);
+    list.forEach(function (a) {
+      var tr = el("tr");
+      tr.appendChild(cell(nameOf(a.agent, "unknown")));
+      tr.appendChild(cell(String(a.runs || 0), "num"));
+      tr.appendChild(cell(scoreText(a.avg_quality), "num"));
+      tr.appendChild(cell(scoreText(a.avg_risk), "num"));
+      tr.appendChild(cell(money(a.cost_usd), "num"));
+      body.appendChild(tr);
+    });
+    $("i-agents-empty").textContent = list.length ? "" : "No agent runs in this window.";
+  }
+
+  function renderRecommendations(rows) {
+    var list = Array.isArray(rows) ? rows : [];
+    var box = $("i-recs");
+    clear(box);
+    list.forEach(function (r) {
+      var item = el("li");
+      item.appendChild(el("div", "rec-title", nameOf(r.title, "Untitled")));
+      var times = Number(r.count) || 0;
+      var savings = (r.est_savings_usd === null || r.est_savings_usd === undefined)
+        ? "no estimate"
+        : "est. " + money(r.est_savings_usd) + " saved";
+      var kind = nameOf(r.kind, "other").replace(/_/g, " ");
+      item.appendChild(el("div", "rec-meta",
+        kind + " · given " + times + (times === 1 ? " time" : " times") + " · " + savings));
+      box.appendChild(item);
+    });
+    $("i-recs-empty").textContent = list.length ? "" : "No recommendations in this window.";
+  }
+
+  function renderInsights(data) {
+    var body = data || {};
+    setMsg($("insights-msg"), "", false);
+    $("insights-window").textContent = "Last " + (Number(body.days) || state.days) + " days, UTC";
+    renderInsightKpis(body);
+    var q = body.quality || {};
+    renderTrend(q.trend);
+    renderGrades(q.by_grade);
+    renderModels(body.models);
+    renderAgents(body.agents);
+    renderRecommendations(body.top_recommendations);
+  }
+
+  function loadInsights() {
+    return getJSON("/api/insights?days=" + encodeURIComponent(String(state.days))).then(renderInsights, function (err) {
+      setMsg($("insights-msg"), unavailable(err), !isMissingOrDenied(err));
+    });
+  }
+
   // Dashboard session: role, views, and tabs.
 
   function isAdmin() {
@@ -1212,6 +1527,7 @@ dialog::backdrop{background:rgba(5,6,8,.6)}
   }
 
   function enterView(name) {
+    if (name === "insights") { loadInsights(); }
     if (name === "keys") { loadKeys(); }
     if (name === "audit") {
       loadAudit(true);
@@ -1277,6 +1593,7 @@ dialog::backdrop{background:rgba(5,6,8,.6)}
     refresh();
     loadBudget();
     loadApprovals();
+    if (state.view === "insights") { loadInsights(); }
     if (state.view === "keys") { loadKeys(); }
     if (state.view === "audit") { loadAudit(true); probeExport("audit").then(refreshExportLinks); }
     if (state.view === "settings") { loadSettings(); }
@@ -1287,9 +1604,10 @@ dialog::backdrop{background:rgba(5,6,8,.6)}
   $("days").addEventListener("change", function () {
     state.days = Number(this.value) || 30;
     report(loadStats());
+    if (state.view === "insights") { loadInsights(); }
   });
   $("refresh").addEventListener("click", refreshAll);
-  ["f-user", "f-project", "f-agent", "f-min"].forEach(function (id) {
+  ["f-user", "f-project", "f-agent", "f-min", "f-quality"].forEach(function (id) {
     $(id).addEventListener("input", applyFilters);
   });
 

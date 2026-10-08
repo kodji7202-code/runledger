@@ -71,7 +71,7 @@ export ANTHROPIC_API_KEY=sk-ant-...      # PowerShell: $env:ANTHROPIC_API_KEY = 
 runledger receipt --ai --open
 ```
 
-- The default model is `claude-haiku-4-5`. Change it with `--ai-model MODEL` or the environment
+- The default model is `claude-haiku-5-5`. Change it with `--ai-model MODEL` or the environment
   variable `RUNLEDGER_SUMMARY_MODEL`.
 - **This sends session content to Anthropic.** The prompts, each step's inputs (up to 600
   characters per field, which can include file contents being written), each tool result (up to

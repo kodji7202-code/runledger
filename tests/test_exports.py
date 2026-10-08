@@ -28,6 +28,7 @@ FIXED_NOW = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
 RUN_HEADER = [
     "id", "started_at", "user", "project", "agent", "models", "steps", "tokens",
     "files_changed", "cost_usd", "risk_score", "risk_level", "title",
+    "quality_score", "quality_grade", "ai_verdict", "est_savings_usd",
 ]
 AUDIT_HEADER = ["id", "at", "actor", "action", "target", "details_json"]
 KINDS = {"runs": "/api/export/runs.csv", "audit": "/api/export/audit.csv", "report": "/api/export/report.html"}

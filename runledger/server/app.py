@@ -1,9 +1,10 @@
 """HTTP server for the RunLedger team dashboard and the push API.
 
   POST /api/runs                              push a receipt -> 201 (admin, member)
-  GET  /api/runs[?user&project&agent&min_risk&limit]  list runs (any role)
+  GET  /api/runs[?user&project&agent&min_risk&min_quality&max_quality&ai_verdict&limit]  list runs (any role)
   GET  /api/runs/<id>                         one run with its receipt JSON and risk reasons
   GET  /api/stats[?days=30]                   team totals; cost by developer, model, project, agent
+  GET  /api/insights[?days=30]                quality, cost by model and agent, recommendations, AI review (any role)
   GET  /runs/<id>                             the stored receipt HTML
   POST /api/approvals                         request a human approval -> 201 {id, status} (admin, member)
   GET  /api/approvals[?status=pending]        list approvals (any role)
@@ -58,7 +59,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from .. import __version__
-from . import approvals, budgets, exports
+from . import approvals, budgets, exports, insights
 from .auth import (
     SESSION_TTL_SECONDS,
     FailureLimiter,
@@ -385,6 +386,9 @@ class _Handler(BaseHTTPRequestHandler):
         elif path == "/api/stats":
             self._only(method, ("GET",))
             self._stats(query)
+        elif path == "/api/insights":
+            self._only(method, ("GET",))
+            self._insights(query)
         elif path.startswith("/api/runs/"):
             self._only(method, ("GET",))
             self._get_run(path[len("/api/runs/"):])
@@ -610,6 +614,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _list_runs(self, query: Dict[str, List[str]]) -> None:
         ident = self._identify()
+        ai_verdict = _text_param(query, "ai_verdict", 20)
+        if ai_verdict is not None and ai_verdict not in insights.VERDICTS:
+            raise _HttpError(400, "bad_request", "'ai_verdict' must be one of looks_safe, needs_review, dangerous.")
         runs = self.server.db.list_runs(
             ident.team_id,
             user=_text_param(query, "user"),
@@ -617,6 +624,9 @@ class _Handler(BaseHTTPRequestHandler):
             min_risk=_int_param(query, "min_risk", None, 0, 100),
             limit=_int_param(query, "limit", 100, 1, 500),
             agent=_text_param(query, "agent"),
+            min_quality=_int_param(query, "min_quality", None, 0, 100),
+            max_quality=_int_param(query, "max_quality", None, 0, 100),
+            ai_verdict=ai_verdict,
         )
         self._send_json(200, {"runs": runs})
 
@@ -625,6 +635,12 @@ class _Handler(BaseHTTPRequestHandler):
         stats = self.server.db.stats(ident.team_id, _int_param(query, "days", 30, 1, 3650))
         stats["team"] = ident.team_name
         self._send_json(200, stats)
+
+    def _insights(self, query: Dict[str, List[str]]) -> None:
+        ident = self._identify()
+        days = _int_param(query, "days", 30, 1, 3650)
+        since = exports.since_for(budgets.now(), days)
+        self._send_json(200, insights.compute(self.server.db, ident.team_id, since, days))
 
     def _get_run(self, raw_id: str) -> None:
         ident = self._identify()
@@ -1105,9 +1121,13 @@ def receipt_to_run(payload: Dict[str, Any]) -> Dict[str, Any]:
     if html is not None and not isinstance(html, str):
         raise _HttpError(400, "invalid_receipt", "'html' must be a string.")
 
+    # The quality, recommendations and AI review keys are checked leniently: a bad value is
+    # stored as null (or dropped item by item) and never rejects the push.
+    review = insights.review_fields(payload)
     receipt = {k: v for k, v in payload.items() if k != "html"}
     receipt["user"] = user
     receipt["project"] = project
+    receipt.update({k: review[k] for k in ("quality", "recommendations", "ai_review")})
 
     return {
         "id": session_id,
@@ -1125,6 +1145,10 @@ def receipt_to_run(payload: Dict[str, Any]) -> Dict[str, Any]:
         "risk_score": score,
         "risk_level": level,
         "risks": risks,
+        "quality_score": review["quality_score"],
+        "quality_grade": review["quality_grade"],
+        "ai_verdict": review["ai_verdict"],
+        "est_savings_usd": review["est_savings_usd"],
         "receipt": receipt,
         "receipt_html": html,
     }

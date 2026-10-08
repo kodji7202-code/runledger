@@ -24,7 +24,7 @@ from typing import Any, Dict, Iterable, List, Sequence, Tuple
 from urllib.parse import quote
 
 from .. import __version__
-from . import budgets
+from . import budgets, insights
 from .db import TIME_FORMAT, Database
 
 BOM = b"\xef\xbb\xbf"
@@ -37,6 +37,7 @@ REPORT_CSP = (
 RUN_HEADER = [
     "id", "started_at", "user", "project", "agent", "models", "steps", "tokens",
     "files_changed", "cost_usd", "risk_score", "risk_level", "title",
+    "quality_score", "quality_grade", "ai_verdict", "est_savings_usd",
 ]
 AUDIT_HEADER = ["id", "at", "actor", "action", "target", "details_json"]
 
@@ -93,10 +94,14 @@ def _runs_csv(db: Database, team_id: int, since: str) -> Tuple[bytes, int]:
     for run in db.export_runs(team_id, since):
         models = json.loads(run["models"] or "{}")
         cost = run["cost"]
+        savings = run["est_savings_usd"]
         rows.append([
             run["id"], run["started_at"] or "", run["user"], run["project"], run["agent"] or "",
             "; ".join(sorted(models)), run["steps"], run["tokens"], run["files_changed"],
             "" if cost is None else round(cost, 6), run["risk_score"], run["risk_level"], run["title"] or "",
+            "" if run["quality_score"] is None else run["quality_score"],
+            run["quality_grade"] or "", run["ai_verdict"] or "",
+            "" if savings is None else round(savings, 6),
         ])
     return _csv_bytes(RUN_HEADER, rows), len(rows)
 
@@ -147,6 +152,8 @@ def _more(shown: int, fetched: int) -> str:
     return f'<p class="note">Showing the first {shown} rows. The CSV exports hold every row for the period.</p>'
 
 
+VERDICT_LABELS = {"dangerous": "Dangerous", "needs_review": "Needs review", "looks_safe": "Looks safe"}
+
 _REPORT_STYLE = """
 :root{color-scheme:light}
 body{font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;color:#15171a;background:#fff;margin:0}
@@ -154,6 +161,7 @@ main{max-width:980px;margin:0 auto;padding:28px 18px 48px}
 .kicker{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:#5b6270;margin:0}
 h1{font-size:26px;margin:4px 0 12px;overflow-wrap:anywhere}
 h2{font-size:17px;margin:28px 0 8px;padding-bottom:4px;border-bottom:1px solid #d9dde2}
+h3{font-size:14px;margin:16px 0 6px}
 .facts{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:6px 22px;margin:0}
 .facts dt{font-size:12px;color:#5b6270}
 .facts dd{margin:0 0 6px}
@@ -170,6 +178,51 @@ a{color:#1d4ed8}
 """
 
 
+def _quality_block(review: Dict[str, Any]) -> str:
+    """The Quality and AI review section. Every cell is escaped here, as in the other tables."""
+    quality = review["quality"]
+    ai = review["ai_review"]
+    if quality["avg"] is None:
+        avg_text = "no scored runs in this period"
+    else:
+        avg_text = f"{quality['avg']:.1f} of 100 across {quality['scored_runs']} scored runs"
+    rate = ai["false_positive_rate"]
+    rate_text = "no AI-assessed rule risks in this period" if rate is None else f"{rate * 100:.1f}%"
+    summary = _table(
+        ["Measure", "Value"],
+        [
+            ["Average quality score", _e(avg_text)],
+            ["AI-reviewed runs", _e(ai["reviewed_runs"])],
+            ["Estimated savings from recommendations", _e(_usd(review["est_savings_usd"]))],
+            ["False-positive rate of rule risks", _e(rate_text)],
+        ],
+        numeric=(1,),
+    )
+    grades = _table(
+        ["Grade", "Runs"], [[_e(grade), _e(count)] for grade, count in quality["by_grade"].items()], numeric=(1,),
+    )
+    verdicts = _table(
+        ["AI verdict", "Runs"], [[_e(label), _e(ai[key])] for key, label in VERDICT_LABELS.items()], numeric=(1,),
+    )
+    if review["top_recommendations"]:
+        recs = _table(
+            ["Kind", "Recommendation", "Times given", "Estimated savings"],
+            [
+                [_e(r["kind"]), _e(r["title"]), _e(r["count"]),
+                 _e("n/a" if r["est_savings_usd"] is None else _usd(r["est_savings_usd"]))]
+                for r in review["top_recommendations"]
+            ],
+            numeric=(2, 3),
+        )
+    else:
+        recs = '<p class="note">No recommendations were recorded in this period.</p>'
+    return (
+        "<section>\n<h2>Quality and AI review</h2>\n"
+        f"{summary}\n<h3>Grades</h3>\n{grades}\n<h3>AI verdicts</h3>\n{verdicts}\n"
+        f"<h3>Top recommendations</h3>\n{recs}\n</section>"
+    )
+
+
 def _report(db: Database, team_id: int, team_name: str, days: int, now: datetime) -> Tuple[bytes, int]:
     since = since_for(now, days)
     stats = db.stats(team_id, days, now=now)
@@ -179,6 +232,7 @@ def _report(db: Database, team_id: int, team_name: str, days: int, now: datetime
     decided = db.decided_approvals(team_id, since, REPORT_LIMIT + 1)
     events = db.audit_events(team_id, limit=REPORT_LIMIT + 1, since=since, action="key.")
     budget = budgets.status(db, team_id, now)
+    quality_html = _quality_block(insights.compute(db, team_id, since, days))
 
     moment = now.astimezone(timezone.utc)
     since_text = datetime.strptime(since, TIME_FORMAT).strftime("%Y-%m-%d %H:%M")
@@ -273,6 +327,8 @@ def _report(db: Database, team_id: int, team_name: str, days: int, now: datetime
         "missing. Pushing the same session again replaces its record and its figures.",
         "Key lifecycle events are the create, rotate and revoke entries of the audit log. The full audit "
         "log for the period is in the audit CSV export.",
+        "Quality scores, grades, recommendations and AI review verdicts are the values the client sent with "
+        "each receipt. An AI verdict is an automated model opinion, not a human sign-off.",
         "Budget figures cover the current UTC calendar month, not the report period. Each budget alert "
         "is sent once per threshold per month.",
         "The figures are computed from the team server database at generation time. Nothing in this "
@@ -317,6 +373,8 @@ server holds. It is not a certification, an audit opinion or legal advice.</p>
 <h2>Top risk codes</h2>
 {codes}
 </section>
+
+{quality_html}
 
 <section>
 <h2>High-risk runs</h2>

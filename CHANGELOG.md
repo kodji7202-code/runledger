@@ -5,7 +5,19 @@ All notable changes to RunLedger are listed here. The format follows
 [Semantic Versioning](https://semver.org/); before 1.0, a minor version may still
 change behavior, so read the entry before you upgrade.
 
-## [0.2.0] - unreleased
+## [Unreleased]
+
+### Added
+
+- **Session quality score** (0 to 100, grades A to F) with the signals behind it, and **cost recommendations** with estimated savings, in every receipt.
+- **AI risk review** (`runledger receipt --review`, opt-in): Claude Sonnet 5.5 assesses each rule-based risk as confirmed, false positive or uncertain and explains the diff. The rule-based score is never changed.
+- **Insights** tab and `GET /api/insights`: quality trend, model and agent comparison, top recommendations, AI false-positive rate. New run filters `min_quality`, `max_quality`, `ai_verdict`; quality and AI columns in exports and the compliance report.
+
+### Changed
+
+- AI step summaries default to Claude Haiku 5.5.
+
+## [0.2.0] - 2026-10-08
 
 ### Added
 
