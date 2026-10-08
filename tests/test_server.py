@@ -253,9 +253,12 @@ def test_dashboard_sign_in_sets_http_only_cookie(env):
     assert _http(base, "GET", "/api/stats", headers={"Cookie": token_pair})[0] == 200
     assert _http(base, "GET", "/api/runs", headers={"Cookie": token_pair})[0] == 200
 
-    # Cookies are for reading only; pushing needs the API key.
+    # A session takes the role of its key (admin here). A write through the cookie needs
+    # the CSRF header; without it the request is refused.
     body = client.build_payload(FIX, user="dev@example.com")
-    assert _http(base, "POST", "/api/runs", body=body, headers={"Cookie": token_pair})[0] == 401
+    assert _http(base, "POST", "/api/runs", body=body, headers={"Cookie": token_pair})[0] == 403
+    assert _http(base, "POST", "/api/runs", body=body,
+                 headers={"Cookie": token_pair, "X-Requested-With": "runledger"})[0] == 201
     assert _http(base, "GET", "/?key=rl_wrong")[0] == 401
 
 

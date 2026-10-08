@@ -302,16 +302,25 @@ def test_missing_or_wrong_credentials_are_401_and_store_nothing(env):
     assert _get_view(base, key, approval_id)["decided_by"] is None
 
 
-def test_dashboard_cookie_cannot_create_approvals_or_change_settings(env):
+def test_dashboard_cookie_follows_the_role_of_its_key(env):
     srv, base = env
-    _, key = srv.db.create_team("alpha")
-    cookie = _cookie_for(base, key)
-    assert _http(base, "POST", "/api/approvals", body=_valid(), headers={"Cookie": cookie, **CSRF})[0] == 401
-    assert _http(base, "GET", "/api/team/settings", headers={"Cookie": cookie})[0] == 401
-    status, _, _ = _http(base, "PUT", "/api/team/settings", body={"approval_ttl_s": 30},
-                         headers={"Cookie": cookie, **CSRF})
-    assert status == 401
+    team_id, key = srv.db.create_team("alpha")
+    viewer = srv.db.create_key(team_id, "reader", "viewer", actor="test")["key"]
+
+    # A viewer session can read the settings but cannot create approvals or change them.
+    viewer_cookie = _cookie_for(base, viewer)
+    assert _http(base, "POST", "/api/approvals", body=_valid(), headers={"Cookie": viewer_cookie, **CSRF})[0] == 403
+    assert _http(base, "GET", "/api/team/settings", headers={"Cookie": viewer_cookie})[0] == 200
+    status, _, raw = _http(base, "PUT", "/api/team/settings", body={"approval_ttl_s": 30},
+                           headers={"Cookie": viewer_cookie, **CSRF})
+    assert status == 403 and _json(raw)["error"]["code"] == "forbidden"
     assert _list_ids(base, key) == []
+
+    # An admin session can write, but only with the CSRF header.
+    admin_cookie = _cookie_for(base, key)
+    assert _http(base, "POST", "/api/approvals", body=_valid(), headers={"Cookie": admin_cookie})[0] == 403
+    assert _http(base, "POST", "/api/approvals", body=_valid(), headers={"Cookie": admin_cookie, **CSRF})[0] == 201
+    assert len(_list_ids(base, key)) == 1
 
 
 def test_cookie_decisions_need_the_csrf_header(env):

@@ -1,0 +1,9 @@
+# Caddy terminates HTTPS for RUNLEDGER_DOMAIN. Certificates come from Let's Encrypt
+# and renew automatically. Requests go to the RunLedger container on the compose network.
+{$RUNLEDGER_DOMAIN} {
+	encode zstd gzip
+
+	reverse_proxy runledger:8787 {
+		header_up X-Forwarded-Proto {scheme}
+	}
+}

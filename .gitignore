@@ -6,3 +6,6 @@ build/
 runledger.db
 .runledger/
 __pycache__/
+.venv/
+deploy/.env
+*.db

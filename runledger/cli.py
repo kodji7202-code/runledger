@@ -4,7 +4,12 @@
   runledger receipt [SESSION | --latest] [--project PATH] [--agent AGENT] [--format html|md|json]
                     [-o FILE] [--ai] [--ai-model MODEL] [--open]
   runledger serve [--host 127.0.0.1] [--port 8787] [--db runledger.db]
+                  [--tls-cert FILE --tls-key FILE] [--secure-cookies] [--trust-proxy]
   runledger team create NAME [--db runledger.db]
+  runledger key create --team-id N --label L --role admin|member|viewer [--db runledger.db]
+  runledger key list --team-id N [--db runledger.db]
+  runledger key revoke ID [--db runledger.db]
+  runledger key rotate ID [--db runledger.db]
   runledger push [SESSION | --latest] [--project PATH] [--agent AGENT] [--server URL] [--key KEY] [--user NAME]
   runledger guard                       Claude Code PreToolUse hook (reads the event on stdin)
   runledger guard install [--project PATH | --global]
@@ -133,10 +138,17 @@ _LOOPBACK = {"127.0.0.1", "localhost", "::1"}
 
 
 def cmd_serve(args) -> int:
-    from .server.app import make_server
+    from .server.app import TLSConfigError, make_server
 
     try:
-        server = make_server(args.db, host=args.host, port=args.port, log_requests=True)
+        server = make_server(
+            args.db, host=args.host, port=args.port, log_requests=True,
+            tls_cert=args.tls_cert, tls_key=args.tls_key,
+            secure_cookies=args.secure_cookies, trust_proxy=args.trust_proxy,
+        )
+    except TLSConfigError as exc:  # missing or unusable certificate or key
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     except OSError as exc:  # port in use, bad address
         print(f"error: cannot listen on {args.host}:{args.port}: {exc}", file=sys.stderr)
         return 1
@@ -144,8 +156,9 @@ def cmd_serve(args) -> int:
         print(f"error: cannot open database {args.db}: {exc}", file=sys.stderr)
         return 1
     host, port = server.server_address[:2]
-    print(f"RunLedger team server on http://{host}:{port}  (database: {args.db})")
-    if host not in _LOOPBACK:
+    scheme = "https" if server.tls_context is not None else "http"
+    print(f"RunLedger team server on {scheme}://{host}:{port}  (database: {args.db})")
+    if host not in _LOOPBACK and server.tls_context is None:
         print("Warning: listening on a network address. Put it behind HTTPS before sharing it.", file=sys.stderr)
     print("Create a team with: runledger team create NAME   (Ctrl+C to stop)")
     try:
@@ -177,6 +190,76 @@ def cmd_team_create(args) -> int:
     print("API key (shown once, store it safely):")
     print(key)
     print("Push runs with: runledger push --server URL --key KEY")
+    return 0
+
+
+def cmd_key(args) -> int:
+    """Local key administration on the team database. The server does not need to be running.
+    Changes are audited with the actor "cli"."""
+    from .server.auth import InvalidKey
+    from .server.db import Database
+
+    try:
+        db = Database(args.db)
+    except sqlite3.Error as exc:
+        print(f"error: cannot open database {args.db}: {exc}", file=sys.stderr)
+        return 1
+    try:
+        if args.key_cmd == "list":
+            return _key_list(db, args.team_id)
+        if args.key_cmd == "create":
+            if db.team_name(args.team_id) is None:
+                print(f"error: no team with id {args.team_id}", file=sys.stderr)
+                return 1
+            try:
+                view = db.create_key(args.team_id, args.label, args.role, actor="cli")
+            except (InvalidKey, ValueError) as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 1
+            print(f"Created {view['role']} key '{view['label']}' (id {view['id']}) for team {args.team_id}.")
+            print("API key (shown once, store it safely):")
+            print(view["key"])
+            return 0
+        team_id = db.key_team_id(args.key_id)
+        if team_id is None:
+            print(f"error: no key with id {args.key_id}", file=sys.stderr)
+            return 1
+        if args.key_cmd == "revoke":
+            outcome, view = db.revoke_key(team_id, args.key_id, actor="cli")
+            if outcome == "ok":
+                print(f"Revoked key '{view['label']}' (id {args.key_id}). Its sessions end at once.")
+                return 0
+            if outcome == "already_revoked":
+                print("error: this key is already revoked", file=sys.stderr)
+            else:
+                print("error: this is the team's last active admin key. Create or rotate another admin key first.",
+                      file=sys.stderr)
+            return 1
+        outcome, view = db.rotate_key(team_id, args.key_id, actor="cli")
+        if outcome != "ok":
+            print("error: a revoked key cannot be rotated", file=sys.stderr)
+            return 1
+        print(f"Rotated key '{view['label']}' (id {args.key_id}). The old key no longer works.")
+        print("New API key (shown once, store it safely):")
+        print(view["key"])
+        return 0
+    finally:
+        db.close()
+
+
+def _key_list(db, team_id: int) -> int:
+    if db.team_name(team_id) is None:
+        print(f"error: no team with id {team_id}", file=sys.stderr)
+        return 1
+    keys = db.list_keys(team_id)
+    if not keys:
+        print(f"No keys for team {team_id}.", file=sys.stderr)
+        return 1
+    print(f"{'id':<16}  {'label':<20}  {'role':<7}  {'prefix':<8}  {'created':<20}  {'last used':<20}  status")
+    for k in keys:
+        status = f"revoked {k['revoked_at']}" if k["revoked_at"] else "active"
+        print(f"{k['id']:<16}  {k['label'][:20]:<20}  {k['role']:<7}  {(k['prefix'] or '-'):<8}  "
+              f"{k['created_at']:<20}  {(k['last_used_at'] or 'never'):<20}  {status}")
     return 0
 
 
@@ -242,6 +325,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     ps.add_argument("--host", default="127.0.0.1", help="bind address (default 127.0.0.1)")
     ps.add_argument("--port", type=int, default=8787)
     ps.add_argument("--db", default="runledger.db", help="SQLite database file (default runledger.db)")
+    ps.add_argument("--tls-cert", metavar="FILE", help="PEM certificate: serve HTTPS (TLS 1.2+); needs --tls-key")
+    ps.add_argument("--tls-key", metavar="FILE", help="PEM private key for --tls-cert")
+    ps.add_argument("--secure-cookies", action="store_true",
+                    help="set the Secure flag on the dashboard cookie (also RUNLEDGER_SECURE_COOKIES=1)")
+    ps.add_argument("--trust-proxy", action="store_true",
+                    help="honour X-Forwarded-Proto: https from a reverse proxy (Caddy, nginx) for the Secure flag")
     ps.set_defaults(func=cmd_serve)
 
     pt = sub.add_parser("team", help="manage teams on a team server")
@@ -250,6 +339,27 @@ def main(argv: Optional[List[str]] = None) -> int:
     ptc.add_argument("name")
     ptc.add_argument("--db", default="runledger.db", help="SQLite database file (default runledger.db)")
     ptc.set_defaults(func=cmd_team_create)
+
+    pk = sub.add_parser("key", help="manage a team's API keys on a team database")
+    ksub = pk.add_subparsers(dest="key_cmd", required=True)
+    pkc = ksub.add_parser("create", help="create a key with a role and print it (shown once)")
+    pkc.add_argument("--team-id", type=int, required=True)
+    pkc.add_argument("--label", required=True, help="what the key is for, e.g. 'laptop' or 'CI'")
+    pkc.add_argument("--role", required=True, choices=["admin", "member", "viewer"])
+    pkc.add_argument("--db", default="runledger.db", help="SQLite database file (default runledger.db)")
+    pkc.set_defaults(func=cmd_key)
+    pkl = ksub.add_parser("list", help="list a team's keys (never their secrets)")
+    pkl.add_argument("--team-id", type=int, required=True)
+    pkl.add_argument("--db", default="runledger.db", help="SQLite database file (default runledger.db)")
+    pkl.set_defaults(func=cmd_key)
+    pkr = ksub.add_parser("revoke", help="revoke a key by id; its sessions end at once")
+    pkr.add_argument("key_id")
+    pkr.add_argument("--db", default="runledger.db", help="SQLite database file (default runledger.db)")
+    pkr.set_defaults(func=cmd_key)
+    pkt = ksub.add_parser("rotate", help="replace a key's secret; the old one stops working at once")
+    pkt.add_argument("key_id")
+    pkt.add_argument("--db", default="runledger.db", help="SQLite database file (default runledger.db)")
+    pkt.set_defaults(func=cmd_key)
 
     pp = sub.add_parser("push", help="send a session receipt to a team server")
     pp.add_argument("session", nargs="?", help="session file of any supported agent (default: latest for this folder)")

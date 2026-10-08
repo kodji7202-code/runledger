@@ -1,5 +1,6 @@
 [build-system]
-requires = ["setuptools>=61"]
+# setuptools 77 is the first release that accepts the SPDX `license` string (PEP 639).
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,8 +8,26 @@ name = "runledger"
 version = "0.1.0"
 description = "A black box recorder for AI coding agents: turn Claude Code runs into shareable receipts."
 readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.9"
-authors = [{ name = "Claudiu Cojocaru" }]
+authors = [{ name = "RunLedger", email = "hello@runledger.site" }]
+keywords = ["ai", "coding-agents", "claude-code", "codex", "aider", "audit", "receipts", "guardrails", "observability"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development",
+    "Topic :: Software Development :: Quality Assurance",
+]
 dependencies = []
 
 [project.urls]

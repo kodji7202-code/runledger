@@ -1,36 +1,45 @@
 """HTTP server for the RunLedger team dashboard and the push API.
 
-  POST /api/runs                              push a receipt (Bearer API key) -> 201
-  GET  /api/runs[?user&project&min_risk&limit] list runs (API key or dashboard session)
+  POST /api/runs                              push a receipt -> 201 (admin, member)
+  GET  /api/runs[?user&project&agent&min_risk&limit]  list runs (any role)
   GET  /api/runs/<id>                         one run with its receipt JSON and risk reasons
-  GET  /api/stats[?days=30]                   team totals, cost by developer/model/project, top risks
+  GET  /api/stats[?days=30]                   team totals; cost by developer, model, project, agent
   GET  /runs/<id>                             the stored receipt HTML
-  POST /api/approvals                         request a human approval (Bearer key) -> 201 {id, status}
-  GET  /api/approvals[?status=pending]        list approvals (API key or dashboard session)
+  POST /api/approvals                         request a human approval -> 201 {id, status} (admin, member)
+  GET  /api/approvals[?status=pending]        list approvals (any role)
   GET  /api/approvals/<id>                    one approval: status, decided_by, decided_at, reason
-  POST /api/approvals/<id>/decision           approve or deny: Bearer key, or dashboard session
-                                              plus header X-Requested-With: runledger
-  GET  /approvals/<id>                        approval page for a person (dashboard session)
-  GET|PUT /api/team/settings                  webhook URLs and approval_ttl_s (Bearer key)
+  POST /api/approvals/<id>/decision           approve or deny (admin, member)
+  GET  /approvals/<id>                        approval page for a person (any role)
+  GET  /api/team/settings                     webhook URLs and approval_ttl_s (any role; URLs masked unless admin)
+  PUT  /api/team/settings                     change them (admin)
+  GET  /api/me                                the caller's team, role and key (any role)
+  GET  /api/keys                              the team's keys, never their secrets (admin)
+  POST /api/keys                              {label, role} -> 201; the key is shown once (admin)
+  POST /api/keys/<id>/revoke                  revoke a key (admin)
+  POST /api/keys/<id>/rotate                  new secret for a key, same id, label and role (admin)
+  GET  /api/audit[?limit&before]              audit log, newest first (admin)
   GET  /                                      dashboard; sign in once with /?key=API_KEY
   GET  /health                                liveness, no auth
 
-Standard library only. Errors are JSON ({"error": {"code", "message"}}) and never
-include tracebacks; tracebacks go to the server's stderr.
+Credentials are "Authorization: Bearer KEY", or the dashboard session cookie. A cookie
+session has the role of the key it was signed in with. A POST or PUT that uses a cookie
+must also send the header "X-Requested-With: runledger".
+
+Errors are JSON ({"error": {"code", "message"}}) and never include tracebacks;
+tracebacks go to the server's stderr. Standard library only.
 """
 from __future__ import annotations
 
+import hmac
 import json
 import math
 import os
 import re
 import secrets
 import socket
+import ssl
 import sys
-import threading
-import time
 import traceback
-from collections import OrderedDict
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional, Tuple
@@ -38,19 +47,29 @@ from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from .. import __version__
 from . import approvals
+from .auth import (
+    FailureLimiter,
+    Identity,
+    InvalidKey,
+    SESSION_TTL_SECONDS,
+    SessionStore,
+    allows,
+    identity_from_row,
+)
 from .dashboard import APPROVAL_HTML, DASHBOARD_HTML
 from .db import TIME_FORMAT, Database
 
 MAX_BODY_BYTES = 10 * 1024 * 1024
 COOKIE_NAME = "rl_session"
-SESSION_TTL_SECONDS = 12 * 3600
-MAX_SESSIONS = 1000
 LEVELS = ("low", "medium", "high")
 SEVERITIES = ("low", "medium", "high")
 CSRF_HEADER = "X-Requested-With"
 CSRF_VALUE = "runledger"
 PUBLIC_URL_ENV = "RUNLEDGER_PUBLIC_URL"
+SECURE_COOKIES_ENV = "RUNLEDGER_SECURE_COOKIES"
+HSTS_VALUE = "max-age=31536000"
 _APPROVAL_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
+_KEY_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 RECEIPT_CSP = (
     "default-src 'none'; style-src 'unsafe-inline'; img-src data:; "
@@ -66,9 +85,13 @@ main{max-width:560px;margin:0 auto}code{font-family:ui-monospace,monospace;backg
 <h1 style="font-size:20px">RunLedger team dashboard</h1>
 <p>Open the dashboard once with your team API key. The server then sets a session cookie and the key leaves the address bar.</p>
 <p><code>/?key=YOUR_API_KEY</code></p>
-<p>Create a team and its key with <code>runledger team create NAME</code>.</p>
+<p>Create a team and its key with <code>runledger team create NAME</code>. Make more keys with <code>runledger key create</code>.</p>
 </main></body></html>
 """
+
+
+class TLSConfigError(ValueError):
+    """The TLS certificate or key cannot be used. The message is safe to print."""
 
 
 class _HttpError(Exception):
@@ -92,34 +115,18 @@ def _not_found(message: str = "Run not found.") -> _HttpError:
     return _HttpError(404, "not_found", message)
 
 
-class _Sessions:
-    """Dashboard sessions: random opaque tokens kept in memory, so the API key never
-    sits in a cookie. A server restart signs everyone out."""
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._items: "OrderedDict[str, Tuple[Dict[str, Any], float]]" = OrderedDict()
-
-    def issue(self, team: Dict[str, Any]) -> str:
-        token = secrets.token_urlsafe(32)
-        with self._lock:
-            self._items[token] = (team, time.time() + SESSION_TTL_SECONDS)
-            while len(self._items) > MAX_SESSIONS:
-                self._items.popitem(last=False)
-        return token
-
-    def team_for(self, token: Optional[str]) -> Optional[Dict[str, Any]]:
-        if not token:
-            return None
-        with self._lock:
-            item = self._items.get(token)
-            if item is None:
-                return None
-            team, expires = item
-            if expires < time.time():
-                del self._items[token]
-                return None
-            return team
+def make_tls_context(cert_file: str, key_file: str) -> ssl.SSLContext:
+    """A server-side TLS context: TLS 1.2 or newer, with the given PEM certificate and key."""
+    for path in (cert_file, key_file):
+        if not os.path.isfile(path):
+            raise TLSConfigError(f"file not found: {path}")
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    try:
+        context.load_cert_chain(certfile=cert_file, keyfile=key_file)
+    except (OSError, ssl.SSLError) as exc:
+        raise TLSConfigError(f"cannot load the certificate and key: {exc}") from None
+    return context
 
 
 class RunLedgerServer(ThreadingHTTPServer):
@@ -133,10 +140,17 @@ class RunLedgerServer(ThreadingHTTPServer):
         db: Database,
         log_requests: bool = False,
         public_url: Optional[str] = None,
+        tls_context: Optional[ssl.SSLContext] = None,
+        secure_cookies: bool = False,
+        trust_proxy: bool = False,
     ) -> None:
         self.db = db
         self.log_requests = log_requests
-        self.sessions = _Sessions()
+        self.tls_context = tls_context
+        self.secure_cookies = secure_cookies
+        self.trust_proxy = trust_proxy
+        self.sessions = SessionStore()
+        self.limiter = FailureLimiter()
         super().__init__(address, _Handler)
         # The base URL people see in approval links. The default is the bound address,
         # so set RUNLEDGER_PUBLIC_URL when the server sits behind a reverse proxy.
@@ -144,8 +158,47 @@ class RunLedgerServer(ThreadingHTTPServer):
         shown = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(host, host)
         if ":" in shown:
             shown = f"[{shown}]"
-        chosen = public_url or os.environ.get(PUBLIC_URL_ENV) or f"http://{shown}:{port}"
+        scheme = "https" if tls_context is not None else "http"
+        chosen = public_url or os.environ.get(PUBLIC_URL_ENV) or f"{scheme}://{shown}:{port}"
         self.public_url = chosen.strip().rstrip("/")
+
+    def get_request(self) -> Tuple[socket.socket, Any]:
+        # The handshake runs in the request's own thread (see _Handler.setup), so a slow
+        # client cannot stall the accept loop.
+        sock, addr = super().get_request()
+        if self.tls_context is not None:
+            sock = self.tls_context.wrap_socket(sock, server_side=True, do_handshake_on_connect=False)
+        return sock, addr
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        exc = sys.exc_info()[1]
+        if isinstance(exc, OSError):  # includes ssl.SSLError: a client that drops or speaks the wrong protocol
+            sys.stderr.write(f"RunLedger: connection from {client_address[0]} ended ({type(exc).__name__})\n")
+            return
+        super().handle_error(request, client_address)
+
+    def secure_for(self, forwarded_proto: Optional[str]) -> bool:
+        """Whether this exchange is secure: TLS on this server, --secure-cookies, or a trusted
+        reverse proxy that reports https. It sets the cookie's Secure flag and HSTS."""
+        if self.tls_context is not None or self.secure_cookies:
+            return True
+        return self.trust_proxy and _first_value(forwarded_proto) == "https"
+
+    def identify_key(self, token: str) -> Optional[Identity]:
+        row = self.db.key_for_token(token)
+        return identity_from_row(row, "key") if row else None
+
+    def identify_session(self, token: Optional[str]) -> Optional[Identity]:
+        """The identity behind a dashboard cookie. The session dies when its key is revoked
+        or rotated: the stored key hash must still match the current one."""
+        data = self.sessions.get(token)
+        if data is None:
+            return None
+        row = self.db.active_key(data["key_id"])
+        if row is None or not hmac.compare_digest(row["key_hash"], data["key_hash"]):
+            self.sessions.drop(token)
+            return None
+        return identity_from_row(row, "session")
 
 
 class _IPv6Server(RunLedgerServer):
@@ -158,14 +211,29 @@ def make_server(
     port: int = 8787,
     log_requests: bool = False,
     public_url: Optional[str] = None,
+    tls_cert: Optional[str] = None,
+    tls_key: Optional[str] = None,
+    secure_cookies: bool = False,
+    trust_proxy: bool = False,
 ) -> RunLedgerServer:
     """Open the database and bind the server. Port 0 picks a free port (see server_address).
     The caller owns the server: call shutdown(), server_close() and db.close() when done.
-    public_url defaults to $RUNLEDGER_PUBLIC_URL, then to the bound address."""
+
+    public_url defaults to $RUNLEDGER_PUBLIC_URL, then to the bound address. tls_cert and
+    tls_key (PEM files) turn on HTTPS. secure_cookies, or $RUNLEDGER_SECURE_COOKIES=1, sets
+    the Secure flag on the session cookie. trust_proxy honours X-Forwarded-Proto from a
+    reverse proxy the same way."""
+    if bool(tls_cert) != bool(tls_key):
+        raise TLSConfigError("--tls-cert and --tls-key must be given together.")
+    tls_context = make_tls_context(tls_cert, tls_key) if tls_cert else None
+    secure = bool(secure_cookies) or _env_flag(SECURE_COOKIES_ENV)
     db = Database(db_path)
     cls = _IPv6Server if ":" in host else RunLedgerServer
     try:
-        return cls((host, port), db, log_requests=log_requests, public_url=public_url)
+        return cls(
+            (host, port), db, log_requests=log_requests, public_url=public_url,
+            tls_context=tls_context, secure_cookies=secure, trust_proxy=bool(trust_proxy),
+        )
     except Exception:
         db.close()
         raise
@@ -175,6 +243,11 @@ class _Handler(BaseHTTPRequestHandler):
     server_version = "RunLedger"
     sys_version = ""
     timeout = 30  # a stalled client cannot hold a thread forever
+
+    def setup(self) -> None:
+        super().setup()
+        if isinstance(self.request, ssl.SSLSocket):
+            self.request.do_handshake()  # runs under the timeout above
 
     def do_GET(self) -> None:
         self._route("GET")
@@ -218,51 +291,78 @@ class _Handler(BaseHTTPRequestHandler):
             if path == "/health":
                 self._only(method, ("GET",))
                 self._send_json(200, {"ok": True, "version": __version__})
-            elif path == "/":
-                self._only(method, ("GET",))
-                self._dashboard(query)
-            elif path == "/api/runs":
-                self._only(method, ("GET", "POST"))
-                if method == "POST":
-                    self._create_run()
-                else:
-                    self._list_runs(query)
-            elif path == "/api/stats":
-                self._only(method, ("GET",))
-                self._stats(query)
-            elif path.startswith("/api/runs/"):
-                self._only(method, ("GET",))
-                self._get_run(path[len("/api/runs/"):])
-            elif path.startswith("/runs/"):
-                self._only(method, ("GET",))
-                self._receipt(path[len("/runs/"):])
-            elif path == "/api/approvals":
-                self._only(method, ("GET", "POST"))
-                if method == "POST":
-                    self._create_approval()
-                else:
-                    self._list_approvals(query)
-            elif path.startswith("/api/approvals/"):
-                rest = path[len("/api/approvals/"):]
-                if rest.endswith("/decision"):
-                    self._only(method, ("POST",))
-                    self._decide_approval(rest[:-len("/decision")])
-                else:
-                    self._only(method, ("GET",))
-                    self._get_approval(rest)
-            elif path == "/api/team/settings":
-                self._only(method, ("GET", "PUT"))
-                self._team_settings(method)
-            elif path.startswith("/approvals/"):
-                self._only(method, ("GET",))
-                self._approval_page(path[len("/approvals/"):])
-            else:
-                raise _HttpError(404, "not_found", "No such endpoint.")
+                return
+            self._check_rate_limit()
+            self._dispatch(method, path, query)
         except _HttpError as exc:
             self._send_json(exc.status, {"error": {"code": exc.code, "message": exc.message}}, exc.headers)
         except Exception:  # never leak internals to the client
             traceback.print_exc()
             self._send_json(500, {"error": {"code": "internal_error", "message": "Internal server error."}})
+
+    def _dispatch(self, method: str, path: str, query: Dict[str, List[str]]) -> None:
+        if path == "/":
+            self._only(method, ("GET",))
+            self._dashboard(query)
+        elif path == "/api/me":
+            self._only(method, ("GET",))
+            self._me()
+        elif path == "/api/runs":
+            self._only(method, ("GET", "POST"))
+            if method == "POST":
+                self._create_run()
+            else:
+                self._list_runs(query)
+        elif path == "/api/stats":
+            self._only(method, ("GET",))
+            self._stats(query)
+        elif path.startswith("/api/runs/"):
+            self._only(method, ("GET",))
+            self._get_run(path[len("/api/runs/"):])
+        elif path.startswith("/runs/"):
+            self._only(method, ("GET",))
+            self._receipt(path[len("/runs/"):])
+        elif path == "/api/approvals":
+            self._only(method, ("GET", "POST"))
+            if method == "POST":
+                self._create_approval()
+            else:
+                self._list_approvals(query)
+        elif path.startswith("/api/approvals/"):
+            rest = path[len("/api/approvals/"):]
+            if rest.endswith("/decision"):
+                self._only(method, ("POST",))
+                self._decide_approval(rest[:-len("/decision")])
+            else:
+                self._only(method, ("GET",))
+                self._get_approval(rest)
+        elif path == "/api/team/settings":
+            self._only(method, ("GET", "PUT"))
+            self._team_settings(method)
+        elif path.startswith("/approvals/"):
+            self._only(method, ("GET",))
+            self._approval_page(path[len("/approvals/"):])
+        elif path == "/api/keys":
+            self._only(method, ("GET", "POST"))
+            if method == "POST":
+                self._create_key()
+            else:
+                self._list_keys()
+        elif path.startswith("/api/keys/"):
+            rest = path[len("/api/keys/"):]
+            if rest.endswith("/revoke"):
+                self._only(method, ("POST",))
+                self._revoke_key(rest[:-len("/revoke")])
+            elif rest.endswith("/rotate"):
+                self._only(method, ("POST",))
+                self._rotate_key(rest[:-len("/rotate")])
+            else:
+                raise _HttpError(404, "not_found", "No such endpoint.")
+        elif path == "/api/audit":
+            self._only(method, ("GET",))
+            self._audit_log(query)
+        else:
+            raise _HttpError(404, "not_found", "No such endpoint.")
 
     def _only(self, method: str, allowed: Tuple[str, ...]) -> None:
         if method not in allowed:
@@ -273,6 +373,11 @@ class _Handler(BaseHTTPRequestHandler):
 
     # Responses
 
+    def _secure(self) -> bool:
+        headers = getattr(self, "headers", None)
+        forwarded = headers.get("X-Forwarded-Proto") if headers is not None else None
+        return self.server.secure_for(forwarded)
+
     def _send(self, status: int, body: bytes, content_type: str, headers: Optional[Dict[str, str]] = None) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
@@ -280,6 +385,9 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Frame-Options", "DENY")
+        if self._secure():
+            self.send_header("Strict-Transport-Security", HSTS_VALUE)
         for name, value in (headers or {}).items():
             self.send_header(name, value)
         self.end_headers()
@@ -292,13 +400,28 @@ class _Handler(BaseHTTPRequestHandler):
     def _send_html(self, status: int, html: str, headers: Optional[Dict[str, str]] = None) -> None:
         self._send(status, html.encode("utf-8"), "text/html; charset=utf-8", headers)
 
+    def _sign_in_page(self) -> None:
+        self._send_html(401, SIGN_IN_HTML, {"Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'"})
+
     # Auth
 
-    def _bearer_team(self) -> Optional[Dict[str, Any]]:
+    def _client_ip(self) -> str:
+        return self.client_address[0]
+
+    def _check_rate_limit(self) -> None:
+        wait = self.server.limiter.blocked_for(self._client_ip())
+        if wait:
+            raise _HttpError(
+                429, "rate_limited",
+                "Too many failed sign-in attempts from this address. Wait a few minutes and try again.",
+                {"Retry-After": str(wait)},
+            )
+
+    def _bearer_token(self) -> Optional[str]:
         scheme, _, token = (self.headers.get("Authorization") or "").strip().partition(" ")
         if scheme.lower() != "bearer" or not token.strip():
             return None
-        return self.server.db.team_for_key(token.strip())
+        return token.strip()
 
     def _cookie(self, name: str) -> Optional[str]:
         for part in (self.headers.get("Cookie") or "").split(";"):
@@ -307,11 +430,48 @@ class _Handler(BaseHTTPRequestHandler):
                 return value
         return None
 
-    def _reader_team(self) -> Dict[str, Any]:
-        team = self._bearer_team() or self.server.sessions.team_for(self._cookie(COOKIE_NAME))
-        if team is None:
-            raise _unauthorized()
-        return team
+    def _identify(self) -> Identity:
+        """Who is calling: an API key first, then the dashboard session.
+
+        A rejected API key counts toward the address's failure limit, because it is a
+        guess. A session cookie does not: it is random and cannot be guessed, and an
+        expired or revoked one is ordinary (a restart or an old tab), so counting it
+        would lock out a dashboard that is simply left open. Requests with no
+        credentials do not count either."""
+        token = self._bearer_token()
+        if token is not None:
+            ident = self.server.identify_key(token)
+            if ident is not None:
+                return ident
+        cookie = self._cookie(COOKIE_NAME)
+        if cookie:
+            ident = self.server.identify_session(cookie)
+            if ident is not None:
+                return ident
+        if token is not None:
+            self.server.limiter.record_failure(self._client_ip())
+        raise _unauthorized()
+
+    def _try_identify(self) -> Optional[Identity]:
+        try:
+            return self._identify()
+        except _HttpError as exc:
+            if exc.status == 401:
+                return None
+            raise
+
+    def _require(self, ident: Identity, minimum: str, what: str, write: bool = False) -> None:
+        """Check the role, and for a cookie write, the CSRF header. A cross-site form cannot set it."""
+        if not allows(ident.role, minimum):
+            raise _HttpError(
+                403, "forbidden",
+                f"The {ident.role} role cannot {what}. This needs the {minimum} role or higher.",
+            )
+        if write and ident.via == "session" and (self.headers.get(CSRF_HEADER) or "").strip() != CSRF_VALUE:
+            raise _HttpError(
+                403, "csrf_required",
+                f"Dashboard changes must send the header '{CSRF_HEADER}: {CSRF_VALUE}'.",
+            )
 
     # Endpoints
 
@@ -329,12 +489,19 @@ class _Handler(BaseHTTPRequestHandler):
             raise _HttpError(413, "payload_too_large", f"{what} are limited to {_size_text(limit)}.")
         return length
 
+    def _me(self) -> None:
+        ident = self._identify()
+        self._send_json(200, {
+            "team": {"id": ident.team_id, "name": ident.team_name},
+            "role": ident.role,
+            "key": {"id": ident.key_id, "label": ident.label, "prefix": ident.prefix},
+        })
+
     def _create_run(self) -> None:
         length = self._content_length()
         raw = self.rfile.read(length) if length else b""
-        team = self._bearer_team()
-        if team is None:
-            raise _unauthorized()
+        ident = self._identify()
+        self._require(ident, "member", "push runs", write=True)
         if not raw:
             raise _HttpError(400, "empty_body", "Send the receipt as a JSON object in the request body.")
         try:
@@ -344,7 +511,7 @@ class _Handler(BaseHTTPRequestHandler):
         if not isinstance(payload, dict):
             raise _HttpError(400, "invalid_json", "The body must be a JSON object.")
         run = receipt_to_run(payload)
-        self.server.db.upsert_run(team["id"], run)
+        self.server.db.upsert_run(ident.team_id, run, actor=ident.actor())
         self._send_json(201, {
             "id": run["id"],
             "url": "/runs/" + quote(run["id"], safe=""),
@@ -353,32 +520,33 @@ class _Handler(BaseHTTPRequestHandler):
         })
 
     def _list_runs(self, query: Dict[str, List[str]]) -> None:
-        team = self._reader_team()
+        ident = self._identify()
         runs = self.server.db.list_runs(
-            team["id"],
+            ident.team_id,
             user=_text_param(query, "user"),
             project=_text_param(query, "project"),
             min_risk=_int_param(query, "min_risk", None, 0, 100),
             limit=_int_param(query, "limit", 100, 1, 500),
+            agent=_text_param(query, "agent"),
         )
         self._send_json(200, {"runs": runs})
 
     def _stats(self, query: Dict[str, List[str]]) -> None:
-        team = self._reader_team()
-        stats = self.server.db.stats(team["id"], _int_param(query, "days", 30, 1, 3650))
-        stats["team"] = team["name"]
+        ident = self._identify()
+        stats = self.server.db.stats(ident.team_id, _int_param(query, "days", 30, 1, 3650))
+        stats["team"] = ident.team_name
         self._send_json(200, stats)
 
     def _get_run(self, raw_id: str) -> None:
-        team = self._reader_team()
-        run = self.server.db.get_run(team["id"], _run_id(raw_id))
+        ident = self._identify()
+        run = self.server.db.get_run(ident.team_id, _run_id(raw_id))
         if run is None:
             raise _not_found()
         self._send_json(200, {"run": run})
 
     def _receipt(self, raw_id: str) -> None:
-        team = self._reader_team()
-        html = self.server.db.get_receipt_html(team["id"], _run_id(raw_id))
+        ident = self._identify()
+        html = self.server.db.get_receipt_html(ident.team_id, _run_id(raw_id))
         if html is None:
             raise _not_found("Run not found, or it has no stored HTML receipt.")
         self._send(200, html.encode("utf-8"), "text/html; charset=utf-8", {"Content-Security-Policy": RECEIPT_CSP})
@@ -386,74 +554,60 @@ class _Handler(BaseHTTPRequestHandler):
     def _dashboard(self, query: Dict[str, List[str]]) -> None:
         if "key" in query:
             # Sign-in: trade the key for an opaque cookie and redirect so the key leaves the URL.
-            team = self.server.db.team_for_key((query["key"][0] or "").strip())
-            if team is None:
-                self._send_html(401, SIGN_IN_HTML, {"Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'"})
+            row = self.server.db.key_for_token((query["key"][0] or "").strip())
+            if row is None:
+                self.server.limiter.record_failure(self._client_ip())
+                self._sign_in_page()
                 return
-            token = self.server.sessions.issue(team)
-            self._send(302, b"", "text/plain; charset=utf-8", {
-                "Location": "/",
-                "Set-Cookie": f"{COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_TTL_SECONDS}",
-            })
+            token = self.server.sessions.issue({"key_id": row["id"], "key_hash": row["key_hash"]})
+            session = identity_from_row(row, "session")
+            self.server.db.record_audit(row["team_id"], session.actor(), "auth.sign_in", row["id"],
+                                        {"role": row["role"]})
+            cookie = f"{COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_TTL_SECONDS}"
+            if self._secure():
+                cookie += "; Secure"
+            self._send(302, b"", "text/plain; charset=utf-8", {"Location": "/", "Set-Cookie": cookie})
             return
-        team = self._bearer_team() or self.server.sessions.team_for(self._cookie(COOKIE_NAME))
-        if team is None:
-            self._send_html(401, SIGN_IN_HTML, {"Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'"})
+        if self._try_identify() is None:
+            self._sign_in_page()
             return
         nonce = secrets.token_urlsafe(16)
         self._send_html(200, DASHBOARD_HTML.replace("__CSP_NONCE__", nonce), {"Content-Security-Policy": _page_csp(nonce)})
 
     # Approvals
 
-    def _decider(self) -> Tuple[Dict[str, Any], str]:
-        """Who is deciding: the team's API key ("api") or a dashboard session ("dashboard").
-        A cookie decision must also send X-Requested-With, a header a cross-site form cannot set."""
-        team = self._bearer_team()
-        if team is not None:
-            return team, "api"
-        team = self.server.sessions.team_for(self._cookie(COOKIE_NAME))
-        if team is None:
-            raise _unauthorized()
-        if (self.headers.get(CSRF_HEADER) or "").strip() != CSRF_VALUE:
-            raise _HttpError(
-                403, "csrf_required",
-                f"Dashboard decisions must send the header '{CSRF_HEADER}: {CSRF_VALUE}'.",
-            )
-        return team, "dashboard"
-
     def _create_approval(self) -> None:
         length = self._content_length(approvals.CREATE_BODY_LIMIT, "Approval requests")
         raw = self.rfile.read(length) if length else b""
-        team = self._bearer_team()  # agents create approvals with the team key, never with a dashboard session
-        if team is None:
-            raise _unauthorized()
+        ident = self._identify()
+        self._require(ident, "member", "request approvals", write=True)
         try:
             fields = approvals.validate_new_approval(_json_object(raw))
         except approvals.InvalidInput as exc:
             raise _HttpError(400, "invalid_approval", str(exc)) from None
         db = self.server.db
-        settings = db.approval_settings(team["id"])
+        settings = db.approval_settings(ident.team_id)
         approval_id = approvals.new_approval_id()
-        view = db.create_approval(team["id"], approval_id, fields, settings["approval_ttl_s"])
+        view = db.create_approval(ident.team_id, approval_id, fields, settings["approval_ttl_s"])
         approvals.notify_new_approval(settings, view, self.server.public_url)
         self._send_json(201, {"id": approval_id, "status": "pending"})
 
     def _list_approvals(self, query: Dict[str, List[str]]) -> None:
-        team = self._reader_team()
+        ident = self._identify()
         status = _text_param(query, "status", 20)
         if status is not None and status not in approvals.APPROVAL_STATUSES:
             raise _HttpError(400, "bad_request", "'status' must be one of pending, approved, denied, expired.")
         db = self.server.db
         items = db.list_approvals(
-            team["id"], status, db.approval_ttl_s(team["id"]), limit=_int_param(query, "limit", 100, 1, 200),
+            ident.team_id, status, db.approval_ttl_s(ident.team_id), limit=_int_param(query, "limit", 100, 1, 200),
         )
         self._send_json(200, {"approvals": items})
 
     def _get_approval(self, raw_id: str) -> None:
-        team = self._reader_team()
+        ident = self._identify()
         approval_id = _approval_id(raw_id)
         db = self.server.db
-        view = db.get_approval(team["id"], approval_id, db.approval_ttl_s(team["id"]))
+        view = db.get_approval(ident.team_id, approval_id, db.approval_ttl_s(ident.team_id))
         if view is None:
             raise _not_found("Approval not found.")
         self._send_json(200, view)
@@ -462,16 +616,19 @@ class _Handler(BaseHTTPRequestHandler):
         approval_id = _approval_id(raw_id)
         length = self._content_length(approvals.SMALL_BODY_LIMIT, "Decisions")
         raw = self.rfile.read(length) if length else b""
-        team, source = self._decider()
+        ident = self._identify()
+        self._require(ident, "member", "decide approvals", write=True)
         try:
             decision, reason, name = approvals.validate_decision(_json_object(raw))
         except approvals.InvalidInput as exc:
             raise _HttpError(400, "invalid_decision", str(exc)) from None
         status = "approved" if decision == "approve" else "denied"
+        source = "dashboard" if ident.via == "session" else "api"
         decided_by = f"{source}: {name}" if name else source
         db = self.server.db
         outcome, view = db.decide_approval(
-            team["id"], approval_id, status, decided_by, reason, db.approval_ttl_s(team["id"]),
+            ident.team_id, approval_id, status, decided_by, reason, db.approval_ttl_s(ident.team_id),
+            actor=ident.actor(),
         )
         if outcome == "missing":
             raise _not_found("Approval not found.")
@@ -482,33 +639,96 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_json(200, view)
 
     def _team_settings(self, method: str) -> None:
-        raw = b""
+        db = self.server.db
         if method == "PUT":
             length = self._content_length(approvals.SMALL_BODY_LIMIT, "Settings")
             raw = self.rfile.read(length) if length else b""
-        team = self._bearer_team()
-        if team is None:
-            raise _unauthorized()
-        db = self.server.db
-        if method == "PUT":
+            ident = self._identify()
+            self._require(ident, "admin", "change team settings", write=True)
             try:
                 changes = approvals.validate_settings(_json_object(raw))
             except approvals.InvalidInput as exc:
                 raise _HttpError(400, "invalid_settings", str(exc)) from None
-            db.update_approval_settings(team["id"], changes)
-        self._send_json(200, {"team": team["name"], **db.approval_settings(team["id"])})
+            db.update_approval_settings(ident.team_id, changes, actor=ident.actor())
+        else:
+            ident = self._identify()
+        settings = db.approval_settings(ident.team_id)
+        if ident.role != "admin":
+            # Webhook URLs are secrets. Other roles see that a URL is set, and where it points.
+            settings = {
+                **settings,
+                "slack_webhook_url": _masked_url(settings["slack_webhook_url"]),
+                "webhook_url": _masked_url(settings["webhook_url"]),
+            }
+        self._send_json(200, {"team": ident.team_name, **settings})
 
     def _approval_page(self, raw_id: str) -> None:
         approval_id = _approval_id(raw_id)
-        team = self._bearer_team() or self.server.sessions.team_for(self._cookie(COOKIE_NAME))
-        if team is None:
-            self._send_html(401, SIGN_IN_HTML, {"Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'"})
+        ident = self._try_identify()
+        if ident is None:
+            self._sign_in_page()
             return
         db = self.server.db
-        if db.get_approval(team["id"], approval_id, db.approval_ttl_s(team["id"])) is None:
+        if db.get_approval(ident.team_id, approval_id, db.approval_ttl_s(ident.team_id)) is None:
             raise _not_found("Approval not found.")
         nonce = secrets.token_urlsafe(16)
         self._send_html(200, APPROVAL_HTML.replace("__CSP_NONCE__", nonce), {"Content-Security-Policy": _page_csp(nonce)})
+
+    # Keys and audit (admin only)
+
+    def _list_keys(self) -> None:
+        ident = self._identify()
+        self._require(ident, "admin", "list the team's keys")
+        self._send_json(200, {"keys": self.server.db.list_keys(ident.team_id)})
+
+    def _create_key(self) -> None:
+        length = self._content_length(approvals.SMALL_BODY_LIMIT, "Key requests")
+        raw = self.rfile.read(length) if length else b""
+        ident = self._identify()
+        self._require(ident, "admin", "create keys", write=True)
+        body = _json_object(raw)
+        try:
+            view = self.server.db.create_key(ident.team_id, body.get("label"), body.get("role"), ident.actor())
+        except InvalidKey as exc:
+            raise _HttpError(400, "invalid_key", str(exc)) from None
+        self._send_json(201, view)
+
+    def _revoke_key(self, raw_id: str) -> None:
+        key_id = _key_id(raw_id)
+        ident = self._identify()
+        self._require(ident, "admin", "revoke keys", write=True)
+        outcome, view = self.server.db.revoke_key(ident.team_id, key_id, ident.actor())
+        if outcome == "missing":
+            raise _HttpError(404, "not_found", "Key not found.")
+        if outcome == "already_revoked":
+            raise _HttpError(409, "already_revoked", "This key is already revoked.")
+        if outcome == "last_admin":
+            raise _HttpError(
+                409, "last_admin",
+                "This is the team's last active admin key. Create or rotate another admin key first.",
+            )
+        self._send_json(200, view)
+
+    def _rotate_key(self, raw_id: str) -> None:
+        key_id = _key_id(raw_id)
+        ident = self._identify()
+        self._require(ident, "admin", "rotate keys", write=True)
+        outcome, view = self.server.db.rotate_key(ident.team_id, key_id, ident.actor())
+        if outcome == "missing":
+            raise _HttpError(404, "not_found", "Key not found.")
+        if outcome == "revoked":
+            raise _HttpError(409, "key_revoked", "A revoked key cannot be rotated.")
+        self._send_json(200, view)
+
+    def _audit_log(self, query: Dict[str, List[str]]) -> None:
+        ident = self._identify()
+        self._require(ident, "admin", "read the audit log")
+        events = self.server.db.list_audit(
+            ident.team_id,
+            limit=_int_param(query, "limit", 100, 1, 500),
+            before=_int_param(query, "before", None, 1, 10 ** 18),
+        )
+        self._send_json(200, {"events": events})
 
 
 # Helpers
@@ -523,6 +743,23 @@ def _page_csp(nonce: str) -> str:
 
 def _size_text(limit: int) -> str:
     return f"{limit // (1024 * 1024)} MB" if limit >= 1024 * 1024 else f"{limit // 1024} KB"
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _first_value(header: Optional[str]) -> str:
+    """The first value of a possibly comma-separated proxy header, lower-cased."""
+    return (header or "").split(",")[0].strip().lower()
+
+
+def _masked_url(url: Optional[str]) -> Optional[str]:
+    """Scheme and host only. The path of a webhook URL is the secret part."""
+    if not url:
+        return None
+    parts = urlsplit(url)
+    return f"{parts.scheme}://{parts.netloc.rsplit('@', 1)[-1]}/[hidden]"
 
 
 def _json_object(raw: bytes) -> Dict[str, Any]:
@@ -543,6 +780,14 @@ def _approval_id(raw: str) -> str:
     if not _APPROVAL_ID.fullmatch(value):
         raise _not_found("Approval not found.")
     return value
+
+
+def _key_id(raw: str) -> str:
+    value = unquote(raw)
+    if not _KEY_ID.fullmatch(value):
+        raise _HttpError(404, "not_found", "Key not found.")
+    return value
+
 
 def _json_bytes(obj: Any) -> bytes:
     text = json.dumps(obj, ensure_ascii=False)
@@ -660,6 +905,7 @@ def receipt_to_run(payload: Dict[str, Any]) -> Dict[str, Any]:
     cwd = _text(payload.get("cwd"), 500)
     user = _text(payload.get("user"), 200) or "unknown"
     project = _text(payload.get("project"), 200) or _folder_name(cwd) or "unknown"
+    agent = _text(payload.get("agent"), 100)  # the agent's label, e.g. "Claude Code"
 
     score = _int(risk.get("score"), 0, 0, 100) or 0
     level = str(risk.get("level") or "").lower()
@@ -703,6 +949,7 @@ def receipt_to_run(payload: Dict[str, Any]) -> Dict[str, Any]:
         "id": session_id,
         "user": user,
         "project": project,
+        "agent": agent,
         "title": _title(payload),
         "started_at": _iso(payload.get("started")),
         "ended_at": _iso(payload.get("ended")),

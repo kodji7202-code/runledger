@@ -1,0 +1,46 @@
+# RunLedger team server with automatic HTTPS (Caddy).
+#
+# Setup, from this folder:
+#   cp .env.example .env                                      # set RUNLEDGER_DOMAIN and RUNLEDGER_PUBLIC_URL
+#   docker compose up -d --build
+#   docker compose run --rm runledger team create myteam      # prints the team API key once
+#
+# Only Caddy publishes ports. The RunLedger container is reachable from Caddy only.
+# See ../docs/self-hosting.md.
+
+services:
+  runledger:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      RUNLEDGER_PUBLIC_URL: ${RUNLEDGER_PUBLIC_URL:?set RUNLEDGER_PUBLIC_URL in deploy/.env}
+      # Reserved for the Secure cookie flag. The server does not read it yet.
+      RUNLEDGER_SECURE_COOKIES: "1"
+    volumes:
+      - runledger-data:/data
+    # Not published on the host. Only the Caddy service can reach this port.
+    expose:
+      - "8787"
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      - runledger
+    environment:
+      RUNLEDGER_DOMAIN: ${RUNLEDGER_DOMAIN:?set RUNLEDGER_DOMAIN in deploy/.env}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  runledger-data:
+  caddy-data:
+  caddy-config:
