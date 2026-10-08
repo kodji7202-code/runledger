@@ -73,6 +73,10 @@ class Run:
     overall_summary: str = ""
     agent: str = "claude-code"            # adapter NAME that produced this run
     reported_cost: Optional[float] = None  # cost reported by the agent itself, if any
+    # Phase 5 analysis results (see docs/analysis.md for the schemas):
+    quality: Optional[Dict[str, Any]] = None          # quality.py: {"score","grade","signals":[...]}
+    recommendations: List[Dict[str, Any]] = field(default_factory=list)  # advisor.py
+    ai_review: Optional[Dict[str, Any]] = None        # review.py (Claude Sonnet): verdict + assessments
 
     @property
     def duration_seconds(self) -> Optional[float]:

@@ -105,7 +105,7 @@ Details, inputs and the exit codes are in [docs/github.md](docs/github.md).
 RunLedger is local first. `receipt`, `list` and the guard run on your machine. RunLedger has no
 telemetry. The network calls it makes are the ones you ask for: pushing to your team server, the
 guard's approval requests to the server you configure, webhooks you set, the GitHub API in the
-action, and the Anthropic API only when you use `--ai`.
+action, and the Anthropic API only when you use `--ai` or `--review`.
 
 What a receipt contains:
 
@@ -120,7 +120,11 @@ like the session transcript it came from.
 
 - **`--ai`** sends the prompts, each step's inputs (up to 600 characters per field, which can include
   file contents being written), each tool result (up to 400 characters) and the agent's final message to
-  `api.anthropic.com`. Do not use it on sessions you may not share with that service.
+  `api.anthropic.com`. Known secret formats are masked first, but masking is pattern-based. Do not use it
+  on sessions you may not share with that service.
+- **`--review`** sends redacted prompts, commands, relative file paths, edit snippets and the rule
+  findings to Claude Sonnet for an explanation of each risk. Tool output is not sent. See
+  [docs/analysis.md](docs/analysis.md#ai-risk-review).
 - **The guard log** (`.runledger/guard.log`) records tool names, commands and paths. It masks known
   token formats and quoted secret values, but **not** unquoted ones such as `API_KEY=...`. Add
   `.runledger/` to your `.gitignore`.

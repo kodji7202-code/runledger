@@ -2,7 +2,7 @@
 
   runledger list [--project PATH] [--all] [--agent AGENT] [--limit N]
   runledger receipt [SESSION | --latest] [--project PATH] [--agent AGENT] [--format html|md|json]
-                    [-o FILE] [--ai] [--ai-model MODEL] [--open]
+                    [-o FILE] [--ai] [--ai-model MODEL] [--review] [--review-model MODEL] [--open]
   runledger serve [--host 127.0.0.1] [--port 8787] [--db runledger.db]
                   [--tls-cert FILE --tls-key FILE] [--secure-cookies] [--trust-proxy]
                   [--trusted-proxy CIDR ...]
@@ -12,6 +12,7 @@
   runledger key revoke ID [--db runledger.db]
   runledger key rotate ID [--db runledger.db]
   runledger push [SESSION | --latest] [--project PATH] [--agent AGENT] [--server URL] [--key KEY] [--user NAME]
+                 [--review] [--review-model MODEL]
   runledger guard                       Claude Code PreToolUse hook (reads the event on stdin)
   runledger guard install [--project PATH | --global]
   runledger guard test 'EVENT_JSON'
@@ -34,26 +35,50 @@ from typing import List, Optional
 from . import __version__
 from . import adapters
 from .pricing import apply_costs
+from .quality import analyze
 from .receipt import render
 from .risk import assess
+from .review import DEFAULT_REVIEW_MODEL, ai_review
 from .summarize import DEFAULT_AI_MODEL, ai_summaries, apply_templates
 
 AGENTS = ("claude-code", "codex", "aider", "native")
 
 
-def build(session_path: str, use_ai: bool = False, ai_model: str = DEFAULT_AI_MODEL):
+def build(session_path: str, use_ai: bool = False, ai_model: str = DEFAULT_AI_MODEL,
+          review: bool = False, review_model: str = DEFAULT_REVIEW_MODEL):
+    """Parse, price and assess a session. Returns (run, score, level, risks, note).
+
+    `use_ai` adds Claude step summaries; `review` adds the Claude risk review (run.ai_review).
+    The rule-based score and risks are the same with or without them. When an AI step fails,
+    the deterministic receipt is kept and `note` says why, one line per failed step."""
     path = Path(session_path)
     run = adapters.detect(path).parse(path)
     apply_costs(run)
     apply_templates(run)
-    ai_note = None
+    notes: List[str] = []
     if use_ai:
         try:
             ai_summaries(run, model=ai_model)
         except Exception as exc:  # keep the deterministic receipt
-            ai_note = f"AI summaries skipped: {exc}"
+            notes.append(f"AI summaries skipped: {_one_line(exc)}")
     score, level, risks = assess(run)
-    return run, score, level, risks, ai_note
+    analyze(run, risks)
+    if review:
+        try:
+            ai_review(run, risks, model=review_model)
+        except Exception as exc:  # keep the deterministic receipt
+            notes.append(f"AI risk review skipped: {_one_line(exc)}")
+    return run, score, level, risks, "\n".join(notes) or None
+
+
+def _one_line(exc: BaseException) -> str:
+    return " ".join(str(exc).split())
+
+
+def _print_notes(notes: List[str]) -> None:
+    for note in notes:
+        if note:
+            print(note, file=sys.stderr)
 
 
 def _file_stem(session_id: str) -> str:
@@ -116,7 +141,8 @@ def cmd_receipt(args) -> int:
     if path is None:
         return 1
     try:
-        run, score, level, risks, note = build(path, args.ai, args.ai_model)
+        run, score, level, risks, note = build(path, args.ai, args.ai_model,
+                                               review=args.review, review_model=args.review_model)
     except (OSError, ValueError) as exc:  # missing file, or a session file that does not validate
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -279,11 +305,15 @@ def cmd_push(args) -> int:
     path = _session_path(args)
     if path is None:
         return 1
+    notes: List[str] = []
     try:
-        result = push(server or "", key or "", path, user=args.user)
+        result = push(server or "", key or "", path, user=args.user,
+                      review=args.review, review_model=args.review_model, notes=notes)
     except PushError as exc:
+        _print_notes(notes)
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    _print_notes(notes)
     print(f"Pushed {result.get('id', '?')}  ·  risk {result.get('risk_score', '?')}/100 "
           f"({result.get('risk_level', '?')})  ·  {server.rstrip('/')}{result.get('url', '')}")
     return 0
@@ -325,6 +355,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     pr.add_argument("-o", "--output", help="output file, or - for stdout")
     pr.add_argument("--ai", action="store_true", help="plain-language summaries with Claude (needs ANTHROPIC_API_KEY)")
     pr.add_argument("--ai-model", default=DEFAULT_AI_MODEL, help=f"model for --ai (default {DEFAULT_AI_MODEL})")
+    pr.add_argument("--review", action="store_true",
+                    help="AI risk review of the flagged steps with Claude (opt-in; needs ANTHROPIC_API_KEY; "
+                         "sends redacted commands and edits, see docs/analysis.md)")
+    pr.add_argument("--review-model", default=DEFAULT_REVIEW_MODEL,
+                    help=f"model for --review (default {DEFAULT_REVIEW_MODEL})")
     pr.add_argument("--open", action="store_true", help="open the HTML receipt in a browser")
     pr.add_argument("--fail-on", type=int, metavar="SCORE", help="exit with code 2 if risk score >= SCORE (for CI/hooks)")
     pr.set_defaults(func=cmd_receipt)
@@ -381,6 +416,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     pp.add_argument("--server", help="server URL (default: $RUNLEDGER_SERVER)")
     pp.add_argument("--key", help="team API key (default: $RUNLEDGER_API_KEY)")
     pp.add_argument("--user", help="developer name shown on the dashboard (default: git user.email or OS user)")
+    pp.add_argument("--review", action="store_true",
+                    help="include an AI risk review from Claude (opt-in; needs ANTHROPIC_API_KEY; "
+                         "sends redacted commands and edits, see docs/analysis.md)")
+    pp.add_argument("--review-model", default=DEFAULT_REVIEW_MODEL,
+                    help=f"model for --review (default {DEFAULT_REVIEW_MODEL})")
     pp.set_defaults(func=cmd_push)
 
     pg = sub.add_parser("guard", help="real-time policy guard: Claude Code PreToolUse hook")

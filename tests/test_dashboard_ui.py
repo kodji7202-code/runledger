@@ -19,7 +19,7 @@ from runledger.server.app import make_server
 from runledger.server.dashboard import APPROVAL_HTML, DASHBOARD_HTML
 
 NONCE_PLACEHOLDER = "__CSP_NONCE__"
-VIEWS = ["runs", "approvals", "keys", "audit", "settings"]
+VIEWS = ["runs", "insights", "approvals", "keys", "audit", "settings"]
 ADMIN_TABS = ["keys", "audit", "settings"]
 
 # Every endpoint the page calls, from the team API contract.
@@ -27,6 +27,7 @@ CONTRACT_ENDPOINTS = [
     "/api/me",
     "/api/runs",
     "/api/stats",
+    "/api/insights",
     "/api/keys",
     "/api/audit",
     "/api/budgets",
@@ -145,7 +146,7 @@ def test_tabs_are_a_tablist_wired_to_their_panels():
 
     for name in VIEWS:
         assert f"view-{name}" in by_id and f"tab-{name}" in by_id
-    assert f'var VIEWS = ["runs", "approvals", "keys", "audit", "settings"];' in _script(DASHBOARD_HTML)
+    assert f'var VIEWS = ["runs", "insights", "approvals", "keys", "audit", "settings"];' in _script(DASHBOARD_HTML)
 
 
 def test_admin_tabs_start_hidden_so_members_and_viewers_never_see_them():

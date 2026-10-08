@@ -1,22 +1,22 @@
 """Plain-language step summaries.
 
 Default: deterministic templates (free, offline).
-With --ai: one batched call to a cheap Claude model (Haiku by default) that
-rewrites every step and writes a 2-3 sentence overview of the run.
+With --ai: one batched call to a cheap Claude model (Haiku 5.5 by default) that
+rewrites every step and writes a 2-3 sentence overview of the run. The call goes
+through llm.py, so every text is redacted before it is sent.
 """
 from __future__ import annotations
 
 import json
 import os
 import re
-import urllib.error
-import urllib.request
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
+from . import llm
 from .parser import Run, Step, Usage
 
-DEFAULT_AI_MODEL = os.environ.get("RUNLEDGER_SUMMARY_MODEL", "claude-haiku-4-5")
+DEFAULT_AI_MODEL = os.environ.get("RUNLEDGER_SUMMARY_MODEL", "claude-haiku-5-5")
 
 
 def _short(path: str, cwd: Optional[str]) -> str:
@@ -60,11 +60,18 @@ def file_changes(run: Run) -> Dict[str, FileChange]:
             changes.setdefault(p, FileChange(p)).added += _lines(s.input.get("new_source"))
         elif s.tool == "Bash":
             cmd = str(s.input.get("command", ""))
-            m = re.match(r"^\s*(git\s+rm|rm)\s+(?:-\S+\s+)*(.+)$", cmd)
-            if m:
+            # Only the arguments of an rm in each simple command count: `rm -rf build/ && pytest -q`
+            # deletes build/, not pytest.
+            for part in re.split(r"&&|\|\||;|\||\n", cmd):
+                m = re.match(r"^\s*(git\s+rm|rm)\s+(?:-\S+\s+)*(.+)$", part)
+                if not m:
+                    continue
                 for t in m.group(2).split():
-                    if not t.startswith("-") and not any(c in t for c in "|;&>"):
-                        changes.setdefault(t, FileChange(t)).deleted = True
+                    if ">" in t or "<" in t:
+                        break  # redirection target, not a deleted file
+                    if t.startswith(("-", "$")) or "&" in t:
+                        continue
+                    changes.setdefault(t, FileChange(t)).deleted = True
     return changes
 
 
@@ -133,48 +140,42 @@ def apply_templates(run: Run) -> None:
 
 # ---------------- AI summaries (Claude API) ----------------
 
+def _clip(text: Optional[str], limit: int) -> str:
+    """Redact first, then cut. A secret is replaced whole, so the cut cannot leave half of it."""
+    s = llm.redact(text or "")
+    return s if len(s) <= limit else s[:limit] + f"…[+{len(s) - limit} chars]"
+
+
 def _compact_step(s: Step) -> Dict:
     inp = {}
     for k, v in s.input.items():
-        if isinstance(v, str):
-            inp[k] = v if len(v) <= 600 else v[:600] + f"…[+{len(v) - 600} chars]"
-        else:
-            inp[k] = v
+        inp[k] = _clip(v, 600) if isinstance(v, str) else v
     return {"n": s.index, "tool": s.tool, "input": inp,
-            "result": (s.result_text or "")[:400], "error": s.is_error}
+            "result": _clip(s.result_text, 400), "error": s.is_error}
 
 
 def ai_summaries(run: Run, api_key: Optional[str] = None, model: str = DEFAULT_AI_MODEL,
                  timeout: int = 120) -> Usage:
-    """Rewrite step summaries with Claude. Returns the token usage it spent."""
+    """Rewrite step summaries with Claude. Returns the token usage it spent.
+    Raises llm.LLMError (a RuntimeError) when the call fails."""
     api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         raise RuntimeError("Set ANTHROPIC_API_KEY to use --ai summaries.")
     steps = [_compact_step(s) for s in run.steps]
+    requests = json.dumps([_clip(p, 1000) for p in run.prompts[:3]])[:2000]
     prompt = (
         "You write receipts for AI coding-agent runs for busy reviewers who may not be engineers.\n"
         "For each step, write ONE short plain-English sentence (max 18 words) saying what the agent did "
         "and why it matters. Name files by their short path. No speculation.\n"
         "Then write a 2-3 sentence overview of the whole run: goal, what changed, outcome.\n"
         "Return ONLY JSON: {\"overview\": str, \"steps\": [{\"n\": int, \"summary\": str}]}\n\n"
-        f"Working folder: {run.cwd}\nUser request(s): {json.dumps(run.prompts[:3])[:2000]}\n"
-        f"Agent's final message: {run.final_message[:1500]}\n"
+        f"Working folder: {_clip(run.cwd, 300)}\nUser request(s): {requests}\n"
+        f"Agent's final message: {_clip(run.final_message, 1500)}\n"
         f"Steps: {json.dumps(steps)[:60000]}"
     )
-    body = json.dumps({
-        "model": model, "max_tokens": 4000,
-        "messages": [{"role": "user", "content": prompt}],
-    }).encode()
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages", data=body, method="POST",
-        headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
-                 "content-type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"Claude API error {e.code}: {e.read().decode()[:300]}") from e
-    text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
+    data = llm.call([{"role": "user", "content": prompt}], model, max_tokens=4000,
+                    api_key=api_key, timeout=timeout)
+    text = llm.text_of(data)
     m = re.search(r"\{.*\}", text, re.S)
     if not m:
         raise RuntimeError("Claude did not return JSON summaries.")
@@ -185,5 +186,4 @@ def ai_summaries(run: Run, api_key: Optional[str] = None, model: str = DEFAULT_A
             s.summary = by_n[s.index].strip()
     if parsed.get("overview"):
         run.overall_summary = parsed["overview"].strip()
-    u = data.get("usage", {})
-    return Usage(int(u.get("input_tokens", 0)), int(u.get("output_tokens", 0)))
+    return llm.usage(data)

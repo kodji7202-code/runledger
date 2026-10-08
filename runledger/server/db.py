@@ -19,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ..pricing import friendly_model
+from .insights import AI_REVIEW_LIKE, QUALITY_LIKE, RECOMMENDATIONS_LIKE, review_fields
 from .auth import (
     INITIAL_KEY_LABEL,
     SESSION_TTL_SECONDS,
@@ -49,6 +50,16 @@ TEAM_SETTING_COLUMNS = (
 # Run columns added after the first release.
 RUN_COLUMNS = (
     ("agent", "TEXT"),
+)
+
+# Columns for the quality score, the AI verdict and the estimated savings of a run. They are
+# derived from the receipt (see insights.review_fields). Older databases get them in
+# _upgrade_review_columns(), which also fills them from receipts already stored.
+REVIEW_COLUMNS = (
+    ("quality_score", "INTEGER"),
+    ("quality_grade", "TEXT"),
+    ("ai_verdict", "TEXT"),
+    ("est_savings_usd", "REAL"),
 )
 
 SCHEMA = """
@@ -96,6 +107,10 @@ CREATE TABLE IF NOT EXISTS runs (
     cost           REAL,
     risk_score     INTEGER NOT NULL DEFAULT 0,
     risk_level     TEXT NOT NULL DEFAULT 'low',
+    quality_score  INTEGER,
+    quality_grade  TEXT,
+    ai_verdict     TEXT,
+    est_savings_usd REAL,
     receipt_json   TEXT NOT NULL,
     receipt_html   TEXT,
     created_at     TEXT NOT NULL,
@@ -160,7 +175,8 @@ CREATE TABLE IF NOT EXISTS budget_alerts (
 
 _SUMMARY_COLUMNS = (
     "id, user, project, agent, title, started_at, ended_at, steps, tokens, files_changed, "
-    "cost, risk_score, risk_level, created_at, updated_at, (receipt_html IS NOT NULL) AS has_html"
+    "cost, risk_score, risk_level, quality_score, quality_grade, ai_verdict, est_savings_usd, "
+    "created_at, updated_at, (receipt_html IS NOT NULL) AS has_html"
 )
 
 _KEY_COLUMNS = "id, label, role, prefix, created_at, last_used_at, revoked_at"
@@ -233,6 +249,10 @@ def _summary(row: sqlite3.Row) -> Dict[str, Any]:
         "cost_usd": row["cost"],
         "risk_score": row["risk_score"],
         "risk_level": row["risk_level"],
+        "quality_score": row["quality_score"],
+        "quality_grade": row["quality_grade"],
+        "ai_verdict": row["ai_verdict"],
+        "est_savings_usd": row["est_savings_usd"],
         "has_html": bool(row["has_html"]),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
@@ -256,6 +276,7 @@ class Database:
             self._conn.executescript(SCHEMA)
             self._add_missing_columns("teams", TEAM_SETTING_COLUMNS)
             self._add_missing_columns("runs", RUN_COLUMNS)
+            self._upgrade_review_columns()
             self._migrate_api_keys()
 
     def close(self) -> None:
@@ -269,6 +290,45 @@ class Database:
             if name not in present:
                 with self._conn:
                     self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+
+    def _upgrade_review_columns(self) -> None:
+        """Add the review columns to a runs table from before them. A receipt stored by an older
+        server kept any quality, recommendations or AI review keys the client sent, so each of
+        those receipts is filled in from its receipt_json and rewritten with the validated keys.
+        The ALTERs and the backfill share one transaction, so a failure leaves the old layout."""
+        present = {row["name"] for row in self._conn.execute("PRAGMA table_info(runs)")}
+        missing = [(name, ddl) for name, ddl in REVIEW_COLUMNS if name not in present]
+        if not missing:
+            return
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            for name, ddl in missing:
+                self._conn.execute(f"ALTER TABLE runs ADD COLUMN {name} {ddl}")
+            candidates = self._conn.execute(
+                "SELECT team_id, id, receipt_json FROM runs WHERE receipt_json LIKE ? "
+                "OR receipt_json LIKE ? OR receipt_json LIKE ?",
+                (QUALITY_LIKE, AI_REVIEW_LIKE, RECOMMENDATIONS_LIKE),
+            ).fetchall()
+            for row in candidates:
+                try:
+                    receipt = json.loads(row["receipt_json"])
+                except ValueError:
+                    continue
+                if not isinstance(receipt, dict):
+                    continue
+                fields = review_fields(receipt)
+                receipt.update({k: fields[k] for k in ("quality", "recommendations", "ai_review")})
+                self._conn.execute(
+                    "UPDATE runs SET quality_score = ?, quality_grade = ?, ai_verdict = ?, "
+                    "est_savings_usd = ?, receipt_json = ? WHERE team_id = ? AND id = ?",
+                    (fields["quality_score"], fields["quality_grade"], fields["ai_verdict"],
+                     fields["est_savings_usd"], json.dumps(receipt, ensure_ascii=False),
+                     row["team_id"], row["id"]),
+                )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
 
     def _migrate_api_keys(self) -> None:
         """Before roles, each team had one API key, kept in teams.api_key_hash. That key
@@ -554,8 +614,9 @@ class Database:
                 """
                 INSERT INTO runs (id, team_id, user, project, agent, title, started_at, ended_at, models,
                                   steps, tokens, files_changed, cost, risk_score, risk_level,
+                                  quality_score, quality_grade, ai_verdict, est_savings_usd,
                                   receipt_json, receipt_html, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (team_id, id) DO UPDATE SET
                     user = excluded.user,
                     project = excluded.project,
@@ -570,6 +631,10 @@ class Database:
                     cost = excluded.cost,
                     risk_score = excluded.risk_score,
                     risk_level = excluded.risk_level,
+                    quality_score = excluded.quality_score,
+                    quality_grade = excluded.quality_grade,
+                    ai_verdict = excluded.ai_verdict,
+                    est_savings_usd = excluded.est_savings_usd,
                     receipt_json = excluded.receipt_json,
                     receipt_html = excluded.receipt_html,
                     updated_at = excluded.updated_at
@@ -578,7 +643,9 @@ class Database:
                     run["id"], team_id, run["user"], run["project"], run["agent"], run["title"],
                     run["started_at"], run["ended_at"], models_json,
                     run["steps"], run["tokens"], run["files_changed"], run["cost"],
-                    run["risk_score"], run["risk_level"], receipt_json, run["receipt_html"],
+                    run["risk_score"], run["risk_level"],
+                    run["quality_score"], run["quality_grade"], run["ai_verdict"], run["est_savings_usd"],
+                    receipt_json, run["receipt_html"],
                     now, now,
                 ),
             )
@@ -604,6 +671,9 @@ class Database:
         min_risk: Optional[int] = None,
         limit: int = 100,
         agent: Optional[str] = None,
+        min_quality: Optional[int] = None,
+        max_quality: Optional[int] = None,
+        ai_verdict: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         clauses = ["team_id = ?"]
         params: List[Any] = [team_id]
@@ -619,6 +689,16 @@ class Database:
         if min_risk is not None:
             clauses.append("risk_score >= ?")
             params.append(int(min_risk))
+        # A run with no quality score matches neither bound.
+        if min_quality is not None:
+            clauses.append("quality_score >= ?")
+            params.append(int(min_quality))
+        if max_quality is not None:
+            clauses.append("quality_score <= ?")
+            params.append(int(max_quality))
+        if ai_verdict:
+            clauses.append("ai_verdict = ?")
+            params.append(ai_verdict)
         params.append(max(1, min(int(limit), 500)))
         sql = (
             f"SELECT {_SUMMARY_COLUMNS} FROM runs WHERE {' AND '.join(clauses)} "
@@ -730,12 +810,67 @@ class Database:
         with self._lock:
             rows = self._conn.execute(
                 "SELECT id, user, project, agent, models, started_at, created_at, steps, tokens, "
-                "files_changed, cost, risk_score, risk_level, title FROM runs "
+                "files_changed, cost, risk_score, risk_level, title, quality_score, quality_grade, "
+                "ai_verdict, est_savings_usd FROM runs "
                 "WHERE team_id = ? AND COALESCE(started_at, created_at) >= ? "
                 "ORDER BY COALESCE(started_at, created_at), id",
                 (team_id, since),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def insight_parts(self, team_id: int, since: str) -> Dict[str, Any]:
+        """The raw rows behind the Insights summary (see insights.compute), for runs that started
+        (or were pushed) at or after `since`. Aggregates are computed in SQL. Only the receipts that
+        can hold recommendations or an AI review are read back as JSON."""
+        window = "team_id = ? AND COALESCE(started_at, created_at) >= ?"
+        args = (team_id, since)
+        with self._lock:
+            quality = self._conn.execute(
+                f"SELECT COUNT(quality_score) AS scored, AVG(quality_score) AS avg FROM runs WHERE {window}",
+                args,
+            ).fetchone()
+            grades = self._conn.execute(
+                f"SELECT quality_grade AS grade, COUNT(*) AS n FROM runs "
+                f"WHERE {window} AND quality_grade IS NOT NULL GROUP BY quality_grade",
+                args,
+            ).fetchall()
+            trend = self._conn.execute(
+                "SELECT substr(COALESCE(started_at, created_at), 1, 10) AS day, AVG(quality_score) AS avg "
+                f"FROM runs WHERE {window} AND quality_score IS NOT NULL GROUP BY day ORDER BY day",
+                args,
+            ).fetchall()
+            verdicts = self._conn.execute(
+                f"SELECT ai_verdict AS verdict, COUNT(*) AS n FROM runs "
+                f"WHERE {window} AND ai_verdict IS NOT NULL GROUP BY ai_verdict",
+                args,
+            ).fetchall()
+            savings = self._conn.execute(
+                f"SELECT COALESCE(SUM(est_savings_usd), 0) AS total FROM runs WHERE {window}", args,
+            ).fetchone()
+            agents = self._conn.execute(
+                "SELECT COALESCE(agent, 'unknown') AS name, COUNT(*) AS runs, AVG(quality_score) AS avg_quality, "
+                "AVG(risk_score) AS avg_risk, COALESCE(SUM(cost), 0) AS cost_usd "
+                f"FROM runs WHERE {window} GROUP BY name ORDER BY cost_usd DESC, runs DESC, name",
+                args,
+            ).fetchall()
+            model_rows = self._conn.execute(
+                f"SELECT models, quality_score FROM runs WHERE {window}", args,
+            ).fetchall()
+            review_rows = self._conn.execute(
+                f"SELECT receipt_json FROM runs WHERE {window} AND (ai_verdict IS NOT NULL OR receipt_json LIKE ?)",
+                args + (RECOMMENDATIONS_LIKE,),
+            ).fetchall()
+        return {
+            "scored": quality["scored"],
+            "quality_avg": quality["avg"],
+            "grades": [dict(r) for r in grades],
+            "trend": [(r["day"], r["avg"]) for r in trend],
+            "verdicts": [dict(r) for r in verdicts],
+            "est_savings_usd": savings["total"],
+            "agents": [dict(r) for r in agents],
+            "model_rows": [dict(r) for r in model_rows],
+            "review_receipts": [r["receipt_json"] for r in review_rows],
+        }
 
     def risk_level_counts(self, team_id: int, since: str) -> Dict[str, int]:
         with self._lock:

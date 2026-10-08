@@ -152,6 +152,8 @@ Role: any. Lists runs, newest first.
 | `project` | Case-insensitive part of the project name. |
 | `agent` | Case-insensitive part of the agent name: `claude` matches `Claude Code`. |
 | `min_risk` | Only runs with a score of at least this (0 to 100). |
+| `min_quality`, `max_quality` | Only runs whose quality score (0 to 100) is in this range. Runs without a score are excluded. |
+| `ai_verdict` | `looks_safe`, `needs_review` or `dangerous`: only runs the AI review gave this verdict. |
 | `limit` | 1 to 500, default 100. |
 
 Each text filter is limited to 200 characters.
@@ -172,6 +174,10 @@ Each text filter is limited to 200 characters.
     "cost_usd": 0.108408,
     "risk_score": 80,
     "risk_level": "high",
+    "quality_score": 62,
+    "quality_grade": "C",
+    "ai_verdict": "needs_review",
+    "est_savings_usd": 0.031,
     "has_html": true,
     "created_at": "2026-10-08T16:37:34Z",
     "updated_at": "2026-10-08T16:37:34Z"
@@ -437,6 +443,40 @@ Errors: `400` `bad_request` (`limit` out of range, or `before` not a whole numbe
 `action` takes up to 100 characters. The actions are listed in
 [enterprise.md](enterprise.md#audit-log). Budget changes, budget alerts, dashboard sign-ins, and each
 export are recorded there too.
+
+## Insights
+
+### `GET /api/insights`
+
+Role: any. Quality, model, agent and AI-review aggregates over the last `days`
+(1 to 3650, default 30). Fields are `null` when there is no data to average.
+
+```json
+{
+  "days": 30,
+  "since": "2026-09-08T00:00:00Z",
+  "quality": {
+    "avg": 71.5, "scored_runs": 12,
+    "by_grade": {"A": 2, "B": 5, "C": 3, "D": 1, "F": 1},
+    "trend": [{"date": "2026-10-07", "avg": 68.0}, {"date": "2026-10-08", "avg": 74.0}]
+  },
+  "models": [{"model": "claude-sonnet-5-5", "runs": 9, "cost_usd": 1.42,
+              "avg_quality": 73.1, "cost_per_run": 0.158, "share_of_cost": 0.81}],
+  "agents": [{"agent": "Claude Code", "runs": 10, "avg_quality": 72.0,
+              "avg_risk": 31.5, "cost_usd": 1.61}],
+  "top_recommendations": [{"kind": "model_downgrade", "title": "Run read-only steps on Haiku",
+                           "count": 6, "est_savings_usd": 0.42}],
+  "est_savings_usd": 0.57,
+  "ai_review": {"reviewed_runs": 7, "dangerous": 1, "needs_review": 3, "looks_safe": 3,
+                "false_positive_rate": 0.25}
+}
+```
+
+`share_of_cost` and `false_positive_rate` are ratios from 0 to 1. `cost_per_run`
+divides by priced runs only. A run's quality counts toward every model it used.
+`top_recommendations` is ranked by total estimated savings, then count, at most 10.
+
+Errors: `400` `bad_request` (bad `days`); `401`.
 
 ## Budgets
 
