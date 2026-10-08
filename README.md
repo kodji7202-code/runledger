@@ -93,7 +93,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: OWNER/runledger@v0.2.0      # OWNER: the account that hosts RunLedger
+      - uses: kodji7202-code/runledger@v0.2.0
         with:
           fail-on: "60"                   # the job fails at 60 or above; "" never fails
 ```

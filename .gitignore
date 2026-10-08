@@ -10,3 +10,4 @@ __pycache__/
 deploy/.env
 *.db
 runledger-*.json
+.pytest_cache/
