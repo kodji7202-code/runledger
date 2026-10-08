@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "runledger"
+version = "0.1.0"
+description = "A black box recorder for AI coding agents: turn Claude Code runs into shareable receipts."
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "Claudiu Cojocaru" }]
+dependencies = []
+
+[project.urls]
+Homepage = "https://runledger.site"
+
+[project.scripts]
+runledger = "runledger.cli:main"
+
+[tool.setuptools]
+packages = ["runledger"]
