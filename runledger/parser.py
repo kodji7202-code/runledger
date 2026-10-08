@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -228,11 +229,19 @@ def claude_projects_dir() -> Path:
     return Path(base) / "projects" if base else Path.home() / ".claude" / "projects"
 
 
+_WINDOWS_ABSOLUTE = re.compile(r"^[A-Za-z]:[\\/]")
+
+
 def encode_project_path(project: str) -> str:
-    """Claude Code names project folders by replacing path separators (and
-    other non-alphanumerics) with '-'."""
-    p = os.path.abspath(project)
-    return "".join(ch if ch.isalnum() else "-" for ch in p)
+    """Claude Code names project folders by replacing every non-alphanumeric
+    character of the project path with '-': '/home/dev/my.app' becomes
+    '-home-dev-my-app' and 'D:\\runledger' becomes 'D--runledger'.
+
+    Paths that are already absolute (POSIX or Windows form) are encoded as
+    given; only relative paths are resolved against the current directory."""
+    if not (project.startswith("/") or _WINDOWS_ABSOLUTE.match(project)):
+        project = os.path.abspath(project)
+    return "".join(ch if ch.isascii() and ch.isalnum() else "-" for ch in project)
 
 
 def find_sessions(project: Optional[str] = None) -> List[Path]:

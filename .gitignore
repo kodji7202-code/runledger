@@ -3,3 +3,6 @@ __pycache__/
 .runledger/
 runledger-*.html
 build/
+runledger.db
+.runledger/
+__pycache__/
