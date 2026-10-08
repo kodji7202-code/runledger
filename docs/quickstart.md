@@ -9,7 +9,7 @@ this release.
 RunLedger needs Python 3.9 or later and has no runtime dependencies.
 
 ```bash
-pip install runledger            # from PyPI
+pip install runledger-ai            # from PyPI
 ```
 
 From a clone of this repository:

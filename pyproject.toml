@@ -4,7 +4,7 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "runledger"
+name = "runledger-ai"
 version = "0.2.0"
 description = "A black box recorder for AI coding agents: turn Claude Code runs into shareable receipts."
 readme = "README.md"

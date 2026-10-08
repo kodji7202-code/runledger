@@ -150,7 +150,7 @@ With a trusted proxy named, the server takes the client address from `X-Forwarde
 
    ```bash
    sudo python3 -m venv /opt/runledger/venv
-   sudo /opt/runledger/venv/bin/python -m pip install runledger
+   sudo /opt/runledger/venv/bin/python -m pip install runledger-ai
    # until the package is on PyPI, install a wheel built from this repository:
    # sudo /opt/runledger/venv/bin/python -m pip install /path/to/runledger-<version>-py3-none-any.whl
    ```

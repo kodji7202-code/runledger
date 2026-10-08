@@ -28,7 +28,7 @@ jobs:
           python -m pip install --upgrade build
           python -m build
       - name: Check that the wheel version matches the tag
-        run: test -f "dist/runledger-${GITHUB_REF_NAME#v}-py3-none-any.whl"
+        run: test -f "dist/runledger_ai-${GITHUB_REF_NAME#v}-py3-none-any.whl"
       - uses: actions/upload-artifact@v4
         with:
           name: dist

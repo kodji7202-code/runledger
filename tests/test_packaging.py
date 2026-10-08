@@ -62,7 +62,7 @@ def wheel(tmp_path_factory):
         if any(marker in proc.stdout for marker in OFFLINE_MARKERS):
             pytest.skip("pip cannot download the build backend (offline?); wheel checks skipped")
         pytest.fail("pip wheel failed:\n" + "\n".join(proc.stdout.splitlines()[-30:]))
-    built = sorted(out.glob("runledger-*.whl"))
+    built = sorted(out.glob("runledger_ai-*.whl"))
     assert len(built) == 1, built
     return built[0]
 
@@ -114,7 +114,7 @@ def test_wheel_metadata_matches_pyproject(wheel):
 
 def test_pyproject_project_table():
     project = _section("[project]")
-    assert _toml_string(project, "name") == "runledger"
+    assert _toml_string(project, "name") == "runledger-ai"
     assert _toml_string(project, "license") == "Apache-2.0"
     assert _toml_string(project, "requires-python") == ">=3.9"
     assert _toml_string(project, "readme") == "README.md"

@@ -11,7 +11,7 @@ Version 0.2.0 (unreleased). Python 3.9 or later, no runtime dependencies.
 ## Quickstart
 
 ```bash
-pip install runledger              # or `pip install .` from a clone of this repository
+pip install runledger-ai              # or `pip install .` from a clone of this repository
 cd ~/my-project                    # a folder where you ran a coding agent
 runledger receipt --open           # latest session as an HTML receipt, opened in your browser
 ```
