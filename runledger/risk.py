@@ -161,7 +161,7 @@ PATH_KEYS = ("file_path", "path", "notebook_path")
 _WIN_DRIVE_RE = re.compile(r"^[A-Za-z]:")
 _WIN_ROOT_RE = re.compile(r"^(?:[A-Za-z]:)?[\\/]*$")
 _WIN_ABS_RE = re.compile(r"^[A-Za-z]:[\\/]")
-_POSIX_TEMP_ROOTS = ("/tmp", "/var/folders", "/private/tmp")
+_POSIX_TEMP_ROOTS = ("/tmp", "/var/folders", "/private/tmp", "/private/var/folders", "/var/tmp")
 _APPDATA_TEMP_RE = re.compile(r"(?:^|[\\/])appdata[\\/]local[\\/]temp(?:[\\/]|$)", re.I)
 _MSYS_DRIVE_RE = re.compile(r"^/(?:(?:mnt|cygdrive)/)?([A-Za-z])(?=/|$)", re.I)
 _DEVICE_PREFIXES = ("/dev/", "/proc/", "/sys/", "//./", "//?/")
@@ -262,7 +262,8 @@ def _outside(path: str, cwd: Optional[str], base: Optional[str] = None) -> bool:
     if base:
         base = _msys_to_windows(base, win)
     mod = ntpath if _is_windows_style(path, cwd, base) else posixpath
-    target = path if mod.isabs(path) else mod.join(base or cwd, path)
+    # _is_abs, not mod.isabs: ntpath.isabs("/tmp") is False on Python 3.13+
+    target = path if _is_abs(path) else mod.join(base or cwd, path)
     if _in_temp(target):
         return False
     return not _within(target, cwd)
