@@ -17,20 +17,32 @@
   POST /api/keys                              {label, role} -> 201; the key is shown once (admin)
   POST /api/keys/<id>/revoke                  revoke a key (admin)
   POST /api/keys/<id>/rotate                  new secret for a key, same id, label and role (admin)
-  GET  /api/audit[?limit&before]              audit log, newest first (admin)
+  GET  /api/audit[?limit&before&action]       audit log, newest first; action= keeps a prefix, e.g. key. (admin)
+  GET  /api/budgets                           team budget (any role)
+  PUT  /api/budgets                           replace it (admin); alerts at 50/80/100% unless set otherwise
+  GET  /api/budgets/status                    this month's spend and percent of budget (any role)
+  GET  /api/export/runs.csv[?days=30]         runs as CSV (admin); HEAD returns headers only
+  GET  /api/export/audit.csv[?days=30]        audit log as CSV (admin)
+  GET  /api/export/report.html[?days=30]      printable compliance report (admin)
   GET  /                                      dashboard; sign in once with /?key=API_KEY
   GET  /health                                liveness, no auth
 
 Credentials are "Authorization: Bearer KEY", or the dashboard session cookie. A cookie
-session has the role of the key it was signed in with. A POST or PUT that uses a cookie
-must also send the header "X-Requested-With: runledger".
+session has the role of the key it was signed in with, and survives a restart. A POST or
+PUT that uses a cookie must also send the header "X-Requested-With: runledger".
+
+Behind a reverse proxy, pass --trusted-proxy CIDR (or RUNLEDGER_TRUSTED_PROXIES). A peer in
+a trusted range may report the client in X-Forwarded-For: the server then uses the right-most
+address that is not itself trusted, for the failure limit and the audit log. X-Forwarded-For
+from any other peer is ignored. With --trust-proxy, X-Forwarded-Proto is honoured only from
+trusted peers, or from anyone when no trusted proxy is configured (the earlier behaviour).
 
 Errors are JSON ({"error": {"code", "message"}}) and never include tracebacks;
 tracebacks go to the server's stderr. Standard library only.
 """
 from __future__ import annotations
 
-import hmac
+import ipaddress
 import json
 import math
 import os
@@ -42,17 +54,16 @@ import sys
 import traceback
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from .. import __version__
-from . import approvals
+from . import approvals, budgets, exports
 from .auth import (
+    SESSION_TTL_SECONDS,
     FailureLimiter,
     Identity,
     InvalidKey,
-    SESSION_TTL_SECONDS,
-    SessionStore,
     allows,
     identity_from_row,
 )
@@ -67,7 +78,14 @@ CSRF_HEADER = "X-Requested-With"
 CSRF_VALUE = "runledger"
 PUBLIC_URL_ENV = "RUNLEDGER_PUBLIC_URL"
 SECURE_COOKIES_ENV = "RUNLEDGER_SECURE_COOKIES"
+TRUSTED_PROXIES_ENV = "RUNLEDGER_TRUSTED_PROXIES"
 HSTS_VALUE = "max-age=31536000"
+EXPORT_ROUTES = {
+    "/api/export/runs.csv": "runs",
+    "/api/export/audit.csv": "audit",
+    "/api/export/report.html": "report",
+}
+_IPNetwork = Union[ipaddress.IPv4Network, ipaddress.IPv6Network]
 _APPROVAL_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 _KEY_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
@@ -143,13 +161,14 @@ class RunLedgerServer(ThreadingHTTPServer):
         tls_context: Optional[ssl.SSLContext] = None,
         secure_cookies: bool = False,
         trust_proxy: bool = False,
+        trusted_proxies: Sequence[_IPNetwork] = (),
     ) -> None:
         self.db = db
         self.log_requests = log_requests
         self.tls_context = tls_context
         self.secure_cookies = secure_cookies
         self.trust_proxy = trust_proxy
-        self.sessions = SessionStore()
+        self.trusted_proxies: Tuple[_IPNetwork, ...] = tuple(trusted_proxies)
         self.limiter = FailureLimiter()
         super().__init__(address, _Handler)
         # The base URL people see in approval links. The default is the bound address,
@@ -177,32 +196,72 @@ class RunLedgerServer(ThreadingHTTPServer):
             return
         super().handle_error(request, client_address)
 
-    def secure_for(self, forwarded_proto: Optional[str]) -> bool:
-        """Whether this exchange is secure: TLS on this server, --secure-cookies, or a trusted
-        reverse proxy that reports https. It sets the cookie's Secure flag and HSTS."""
+    def secure_for(self, forwarded_proto: Optional[str], peer: str) -> bool:
+        """Whether this exchange is secure: TLS on this server, --secure-cookies, or a reverse
+        proxy that reports https. It sets the cookie's Secure flag and HSTS. With trusted proxies
+        configured, the report is honoured only from one of them; with none configured, from anyone."""
         if self.tls_context is not None or self.secure_cookies:
             return True
-        return self.trust_proxy and _first_value(forwarded_proto) == "https"
+        if not self.trust_proxy or _first_value(forwarded_proto) != "https":
+            return False
+        return not self.trusted_proxies or self.is_trusted(peer)
+
+    def is_trusted(self, address: str) -> bool:
+        ip = _ip_or_none(address)
+        return ip is not None and _in_any(ip, self.trusted_proxies)
+
+    def client_ip(self, peer: str, forwarded_for: Optional[str]) -> str:
+        """The address for the failure limit and the audit log.
+
+        Only a peer inside a trusted range may say who the client is. The client is then the
+        right-most X-Forwarded-For address that is not trusted: a proxy appends the address it
+        saw, so entries to the left of it were written by the client and cannot be trusted. A
+        malformed chain, an untrusted peer, or no header all give the peer address itself."""
+        if not self.trusted_proxies or not self.is_trusted(peer):
+            return peer
+        hops = [hop.strip() for hop in (forwarded_for or "").split(",") if hop.strip()]
+        if not hops:
+            return peer
+        addresses: List[Any] = []
+        for hop in hops:
+            ip = _ip_or_none(hop)
+            if ip is None:
+                return peer
+            addresses.append(ip)
+        for ip in reversed(addresses):
+            if not _in_any(ip, self.trusted_proxies):
+                return str(ip)
+        return str(addresses[0])  # every hop is a trusted proxy: the left-most is the client
 
     def identify_key(self, token: str) -> Optional[Identity]:
         row = self.db.key_for_token(token)
         return identity_from_row(row, "key") if row else None
 
     def identify_session(self, token: Optional[str]) -> Optional[Identity]:
-        """The identity behind a dashboard cookie. The session dies when its key is revoked
-        or rotated: the stored key hash must still match the current one."""
-        data = self.sessions.get(token)
-        if data is None:
-            return None
-        row = self.db.active_key(data["key_id"])
-        if row is None or not hmac.compare_digest(row["key_hash"], data["key_hash"]):
-            self.sessions.drop(token)
-            return None
-        return identity_from_row(row, "session")
+        """The identity behind a dashboard cookie. The session is stored in the database, so it
+        survives a restart, and it ends when its key is revoked or rotated (see db.session_key)."""
+        row = self.db.session_key(token)
+        return identity_from_row(row, "session") if row else None
 
 
 class _IPv6Server(RunLedgerServer):
     address_family = socket.AF_INET6
+
+
+def parse_trusted_proxies(values: Iterable[str]) -> Tuple[_IPNetwork, ...]:
+    """Turn "10.0.0.0/8", "203.0.113.5" or "2001:db8::/32" into networks. Raises ValueError."""
+    networks: List[_IPNetwork] = []
+    for raw in values:
+        text = str(raw).strip()
+        if not text:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(text, strict=False))
+        except ValueError:
+            raise ValueError(
+                f"not an IP address or CIDR range: {text!r} (for example 10.0.0.0/8 or 203.0.113.5)"
+            ) from None
+    return tuple(networks)
 
 
 def make_server(
@@ -215,6 +274,7 @@ def make_server(
     tls_key: Optional[str] = None,
     secure_cookies: bool = False,
     trust_proxy: bool = False,
+    trusted_proxies: Optional[Sequence[str]] = None,
 ) -> RunLedgerServer:
     """Open the database and bind the server. Port 0 picks a free port (see server_address).
     The caller owns the server: call shutdown(), server_close() and db.close() when done.
@@ -222,9 +282,12 @@ def make_server(
     public_url defaults to $RUNLEDGER_PUBLIC_URL, then to the bound address. tls_cert and
     tls_key (PEM files) turn on HTTPS. secure_cookies, or $RUNLEDGER_SECURE_COOKIES=1, sets
     the Secure flag on the session cookie. trust_proxy honours X-Forwarded-Proto from a
-    reverse proxy the same way."""
+    reverse proxy the same way. trusted_proxies (and $RUNLEDGER_TRUSTED_PROXIES, comma
+    separated) are the proxy addresses or CIDR ranges whose X-Forwarded-For is believed.
+    Raises ValueError for a bad address or range, before the database is opened."""
     if bool(tls_cert) != bool(tls_key):
         raise TLSConfigError("--tls-cert and --tls-key must be given together.")
+    networks = parse_trusted_proxies(list(trusted_proxies or []) + _env_list(TRUSTED_PROXIES_ENV))
     tls_context = make_tls_context(tls_cert, tls_key) if tls_cert else None
     secure = bool(secure_cookies) or _env_flag(SECURE_COOKIES_ENV)
     db = Database(db_path)
@@ -233,6 +296,7 @@ def make_server(
         return cls(
             (host, port), db, log_requests=log_requests, public_url=public_url,
             tls_context=tls_context, secure_cookies=secure, trust_proxy=bool(trust_proxy),
+            trusted_proxies=networks,
         )
     except Exception:
         db.close()
@@ -251,6 +315,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         self._route("GET")
+
+    def do_HEAD(self) -> None:
+        self._route("HEAD")
 
     def do_POST(self) -> None:
         self._route("POST")
@@ -288,6 +355,8 @@ class _Handler(BaseHTTPRequestHandler):
             url = urlsplit(self.path)
             path = url.path
             query = parse_qs(url.query, keep_blank_values=True)
+            if method == "HEAD" and path not in EXPORT_ROUTES:
+                method = "GET"  # HEAD answers like GET without the body; exports handle HEAD themselves
             if path == "/health":
                 self._only(method, ("GET",))
                 self._send_json(200, {"ok": True, "version": __version__})
@@ -361,6 +430,15 @@ class _Handler(BaseHTTPRequestHandler):
         elif path == "/api/audit":
             self._only(method, ("GET",))
             self._audit_log(query)
+        elif path == "/api/budgets":
+            self._only(method, ("GET", "PUT"))
+            self._budgets(method)
+        elif path == "/api/budgets/status":
+            self._only(method, ("GET",))
+            self._budget_status()
+        elif path in EXPORT_ROUTES:
+            self._only(method, ("GET", "HEAD"))
+            self._export(EXPORT_ROUTES[path], query, head=method == "HEAD")
         else:
             raise _HttpError(404, "not_found", "No such endpoint.")
 
@@ -376,12 +454,19 @@ class _Handler(BaseHTTPRequestHandler):
     def _secure(self) -> bool:
         headers = getattr(self, "headers", None)
         forwarded = headers.get("X-Forwarded-Proto") if headers is not None else None
-        return self.server.secure_for(forwarded)
+        return self.server.secure_for(forwarded, self.client_address[0])
 
     def _send(self, status: int, body: bytes, content_type: str, headers: Optional[Dict[str, str]] = None) -> None:
+        self._start(status, content_type, headers, length=len(body))
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _start(self, status: int, content_type: str, headers: Optional[Dict[str, str]], length: Optional[int]) -> None:
+        """Status line and headers. length=None sends no Content-Length (a HEAD that builds nothing)."""
         self.send_response(status)
         self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
+        if length is not None:
+            self.send_header("Content-Length", str(length))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
@@ -391,8 +476,6 @@ class _Handler(BaseHTTPRequestHandler):
         for name, value in (headers or {}).items():
             self.send_header(name, value)
         self.end_headers()
-        if self.command != "HEAD":
-            self.wfile.write(body)
 
     def _send_json(self, status: int, obj: Any, headers: Optional[Dict[str, str]] = None) -> None:
         self._send(status, _json_bytes(obj), "application/json; charset=utf-8", headers)
@@ -406,7 +489,12 @@ class _Handler(BaseHTTPRequestHandler):
     # Auth
 
     def _client_ip(self) -> str:
-        return self.client_address[0]
+        """The address the failure limit and the audit log use. See RunLedgerServer.client_ip.
+        Every X-Forwarded-For line is read, since a proxy may append its own line."""
+        forwarded = None
+        if getattr(self, "headers", None) is not None:
+            forwarded = ", ".join(self.headers.get_all("X-Forwarded-For") or [])
+        return self.server.client_ip(self.client_address[0], forwarded)
 
     def _check_rate_limit(self) -> None:
         wait = self.server.limiter.blocked_for(self._client_ip())
@@ -512,6 +600,7 @@ class _Handler(BaseHTTPRequestHandler):
             raise _HttpError(400, "invalid_json", "The body must be a JSON object.")
         run = receipt_to_run(payload)
         self.server.db.upsert_run(ident.team_id, run, actor=ident.actor())
+        self._check_budget_alerts(ident)
         self._send_json(201, {
             "id": run["id"],
             "url": "/runs/" + quote(run["id"], safe=""),
@@ -559,10 +648,10 @@ class _Handler(BaseHTTPRequestHandler):
                 self.server.limiter.record_failure(self._client_ip())
                 self._sign_in_page()
                 return
-            token = self.server.sessions.issue({"key_id": row["id"], "key_hash": row["key_hash"]})
+            token = self.server.db.issue_session(row["team_id"], row["id"], row["role"])
             session = identity_from_row(row, "session")
             self.server.db.record_audit(row["team_id"], session.actor(), "auth.sign_in", row["id"],
-                                        {"role": row["role"]})
+                                        {"role": row["role"], "ip": self._client_ip()})
             cookie = f"{COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_TTL_SECONDS}"
             if self._secure():
                 cookie += "; Secure"
@@ -727,8 +816,61 @@ class _Handler(BaseHTTPRequestHandler):
             ident.team_id,
             limit=_int_param(query, "limit", 100, 1, 500),
             before=_int_param(query, "before", None, 1, 10 ** 18),
+            action=_text_param(query, "action", 100),
         )
         self._send_json(200, {"events": events})
+
+    # Budgets
+
+    def _check_budget_alerts(self, ident: Identity) -> None:
+        """After a push: record and announce any budget threshold that is newly crossed.
+        The push has already been stored, so a failure here is logged and never fails the push."""
+        try:
+            db = self.server.db
+            fired = budgets.check_alerts(db, ident.team_id)
+            if fired:
+                approvals.notify_budget_alerts(db.approval_settings(ident.team_id), ident.team_name, fired)
+        except Exception:
+            traceback.print_exc()
+
+    def _budgets(self, method: str) -> None:
+        db = self.server.db
+        if method == "PUT":
+            length = self._content_length(approvals.SMALL_BODY_LIMIT, "Budgets")
+            raw = self.rfile.read(length) if length else b""
+            ident = self._identify()
+            self._require(ident, "admin", "change the team budget", write=True)
+            try:
+                values = budgets.validate_budget(_json_object(raw))
+            except _HttpError as exc:  # no body, or not a JSON object
+                raise _HttpError(400, "invalid_budget", exc.message) from None
+            except budgets.InvalidBudget as exc:
+                raise _HttpError(400, "invalid_budget", str(exc)) from None
+            settings = db.update_budget_settings(ident.team_id, values, ident.actor())
+        else:
+            ident = self._identify()
+            settings = db.budget_settings(ident.team_id)
+        self._send_json(200, settings)
+
+    def _budget_status(self) -> None:
+        ident = self._identify()
+        self._send_json(200, budgets.status(self.server.db, ident.team_id))
+
+    # Exports (admin). HEAD answers with the headers only and builds nothing.
+
+    def _export(self, kind: str, query: Dict[str, List[str]], head: bool) -> None:
+        ident = self._identify()
+        self._require(ident, "admin", "export the team's data")
+        days = _int_param(query, "days", 30, 1, 3650)
+        now = budgets.now()
+        content_type, headers = exports.describe(kind, now)
+        if head:
+            self._start(200, content_type, headers, length=None)
+            return
+        body, rows = exports.build(kind, self.server.db, ident.team_id, ident.team_name, days, now)
+        self.server.db.record_audit(ident.team_id, ident.actor(), f"export.{kind}", None,
+                                    {"days": days, "rows": rows})
+        self._send(200, body, content_type, headers)
 
 
 # Helpers
@@ -752,6 +894,28 @@ def _env_flag(name: str) -> bool:
 def _first_value(header: Optional[str]) -> str:
     """The first value of a possibly comma-separated proxy header, lower-cased."""
     return (header or "").split(",")[0].strip().lower()
+
+
+def _env_list(name: str) -> List[str]:
+    return [part.strip() for part in os.environ.get(name, "").split(",") if part.strip()]
+
+
+def _ip_or_none(text: str) -> Any:
+    """An IP address object for `text`, or None. An IPv4-mapped IPv6 address becomes IPv4."""
+    value = text.strip().strip('"')
+    if value.startswith("[") and value.endswith("]"):
+        value = value[1:-1]
+    try:
+        ip = ipaddress.ip_address(value)
+    except ValueError:
+        return None
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        return ip.ipv4_mapped
+    return ip
+
+
+def _in_any(ip: Any, networks: Iterable[_IPNetwork]) -> bool:
+    return any(ip.version == net.version and ip in net for net in networks)
 
 
 def _masked_url(url: Optional[str]) -> Optional[str]:

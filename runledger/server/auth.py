@@ -12,7 +12,9 @@ Rotating a key replaces the hash and revoking it sets revoked_at; both take effe
 at once.
 
 The dashboard signs in with a key once and keeps an opaque session token in a cookie.
-The session carries the role of that key and ends when the key is revoked or rotated.
+The server stores only the SHA-256 hash of that token, in the sessions table (db.py), so
+a restart does not sign anyone out. The session carries the role of its key and ends
+when the key is revoked or rotated, or after SESSION_TTL_SECONDS.
 
 Rejected API keys and failed sign-ins are counted per client address, in memory. More
 than 20 within five minutes and that address gets 429 until enough of them age out.
@@ -27,9 +29,9 @@ import math
 import secrets
 import threading
 import time
-from collections import OrderedDict, deque
+from collections import deque
 from dataclasses import dataclass
-from typing import Any, Callable, Deque, Dict, Mapping, Optional, Tuple
+from typing import Callable, Deque, Dict, Mapping, Optional
 
 ROLES = ("admin", "member", "viewer")
 _RANK = {"viewer": 0, "member": 1, "admin": 2}
@@ -44,7 +46,6 @@ FAILURE_WINDOW_S = 300.0
 MAX_TRACKED_ADDRESSES = 10000
 
 SESSION_TTL_SECONDS = 12 * 3600
-MAX_SESSIONS = 1000
 
 
 class InvalidKey(ValueError):
@@ -57,7 +58,17 @@ def generate_key() -> str:
 
 
 def new_key_id() -> str:
-    return secrets.token_urlsafe(12)
+    """A random id for a key. It never starts with "-", because the command line would read
+    such an id as an option (runledger key revoke <id>)."""
+    while True:
+        candidate = secrets.token_urlsafe(12)
+        if not candidate.startswith("-"):
+            return candidate
+
+
+def new_session_token() -> str:
+    """The opaque value sent in the dashboard cookie. The server keeps only its hash."""
+    return secrets.token_urlsafe(32)
 
 
 def key_prefix(key: str) -> str:
@@ -171,46 +182,3 @@ class FailureLimiter:
                         self._recent(other, now)
                 times = self._failures.setdefault(address, deque())
             times.append(now)
-
-
-class SessionStore:
-    """Dashboard sessions: random opaque tokens kept in memory, so no key sits in a cookie.
-    A server restart signs everyone out."""
-
-    def __init__(
-        self,
-        max_sessions: int = MAX_SESSIONS,
-        ttl_s: float = SESSION_TTL_SECONDS,
-        clock: Callable[[], float] = time.time,
-    ) -> None:
-        self.max_sessions = max_sessions
-        self.ttl_s = ttl_s
-        self._clock = clock
-        self._lock = threading.Lock()
-        self._items: "OrderedDict[str, Tuple[Dict[str, Any], float]]" = OrderedDict()
-
-    def issue(self, data: Dict[str, Any]) -> str:
-        token = secrets.token_urlsafe(32)
-        with self._lock:
-            self._items[token] = (dict(data), self._clock() + self.ttl_s)
-            while len(self._items) > self.max_sessions:
-                self._items.popitem(last=False)
-        return token
-
-    def get(self, token: Optional[str]) -> Optional[Dict[str, Any]]:
-        if not token:
-            return None
-        with self._lock:
-            item = self._items.get(token)
-            if item is None:
-                return None
-            data, expires = item
-            if expires < self._clock():
-                del self._items[token]
-                return None
-            return dict(data)
-
-    def drop(self, token: Optional[str]) -> None:
-        if token:
-            with self._lock:
-                self._items.pop(token, None)

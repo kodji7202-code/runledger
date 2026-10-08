@@ -1130,7 +1130,7 @@ dialog::backdrop{background:rgba(5,6,8,.6)}
   // Each probe is a fresh GET, so Refresh and re-entering a tab re-check the server.
   function probeExport(name) {
     return fetch(EXPORT_PATHS[name] + "?days=7", {
-      method: "GET", credentials: "same-origin", cache: "no-store"
+      method: "HEAD", credentials: "same-origin", cache: "no-store"
     }).then(function (res) {
       if (res.body && typeof res.body.cancel === "function") { res.body.cancel().catch(function () {}); }
       return res.ok || res.status >= 500;

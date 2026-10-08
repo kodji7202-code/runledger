@@ -9,3 +9,4 @@ __pycache__/
 .venv/
 deploy/.env
 *.db
+runledger-*.json

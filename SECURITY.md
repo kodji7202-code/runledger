@@ -39,7 +39,15 @@ Read the security checklist and the "Known limits" section of
 [docs/self-hosting.md](docs/self-hosting.md) before you run the team server. In short:
 
 - The guard is a policy check, not a sandbox. It fails open on internal errors unless
-  `fail_closed` is set.
-- A team key cannot be rotated or revoked yet.
-- Receipts contain prompts, the file contents an agent read or wrote, and command output.
-  They can contain secrets.
+  `fail_closed` is set in either settings file.
+- API keys can be rotated and revoked, but they do not expire. A leaked key stays valid until it is
+  rotated or revoked.
+- A receipt holds the prompts (the first three in full), file paths, the first line of each command
+  (up to 120 characters), search patterns, URLs, test counts, models, cost and risk reasons. It does not
+  hold file contents or command output, but the agent's own session file, which RunLedger reads and does
+  not send, can. Receipts are not redacted, so a secret typed on a command line can appear in one.
+  `receipt --ai` sends session content to Anthropic.
+- The guard's log and approval requests mask known token formats and quoted secret values only.
+  Unquoted secrets are not masked.
+- Behind a reverse proxy, configure the proxy as a trusted proxy (`--trusted-proxy`). Until then, the
+  failed-sign-in limit and the audit log use the proxy's address.

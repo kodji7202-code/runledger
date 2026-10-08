@@ -5,6 +5,7 @@
                     [-o FILE] [--ai] [--ai-model MODEL] [--open]
   runledger serve [--host 127.0.0.1] [--port 8787] [--db runledger.db]
                   [--tls-cert FILE --tls-key FILE] [--secure-cookies] [--trust-proxy]
+                  [--trusted-proxy CIDR ...]
   runledger team create NAME [--db runledger.db]
   runledger key create --team-id N --label L --role admin|member|viewer [--db runledger.db]
   runledger key list --team-id N [--db runledger.db]
@@ -145,8 +146,12 @@ def cmd_serve(args) -> int:
             args.db, host=args.host, port=args.port, log_requests=True,
             tls_cert=args.tls_cert, tls_key=args.tls_key,
             secure_cookies=args.secure_cookies, trust_proxy=args.trust_proxy,
+            trusted_proxies=args.trusted_proxy,
         )
     except TLSConfigError as exc:  # missing or unusable certificate or key
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except ValueError as exc:  # a --trusted-proxy (or RUNLEDGER_TRUSTED_PROXIES) entry is not an address or range
         print(f"error: {exc}", file=sys.stderr)
         return 1
     except OSError as exc:  # port in use, bad address
@@ -158,6 +163,9 @@ def cmd_serve(args) -> int:
     host, port = server.server_address[:2]
     scheme = "https" if server.tls_context is not None else "http"
     print(f"RunLedger team server on {scheme}://{host}:{port}  (database: {args.db})")
+    if server.trusted_proxies:
+        shown = ", ".join(str(net) for net in server.trusted_proxies)
+        print(f"Trusting X-Forwarded-For from: {shown}")
     if host not in _LOOPBACK and server.tls_context is None:
         print("Warning: listening on a network address. Put it behind HTTPS before sharing it.", file=sys.stderr)
     print("Create a team with: runledger team create NAME   (Ctrl+C to stop)")
@@ -330,7 +338,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     ps.add_argument("--secure-cookies", action="store_true",
                     help="set the Secure flag on the dashboard cookie (also RUNLEDGER_SECURE_COOKIES=1)")
     ps.add_argument("--trust-proxy", action="store_true",
-                    help="honour X-Forwarded-Proto: https from a reverse proxy (Caddy, nginx) for the Secure flag")
+                    help="honour X-Forwarded-Proto: https from a reverse proxy (Caddy, nginx) for the Secure flag; "
+                         "only from --trusted-proxy addresses when any are given")
+    ps.add_argument("--trusted-proxy", action="append", default=[], metavar="CIDR",
+                    help="address or range of a reverse proxy whose X-Forwarded-For gives the client address "
+                         "(repeatable; also $RUNLEDGER_TRUSTED_PROXIES, comma separated)")
     ps.set_defaults(func=cmd_serve)
 
     pt = sub.add_parser("team", help="manage teams on a team server")

@@ -1,196 +1,164 @@
-# RunLedger (MVP 0.1)
+# RunLedger
 
-**A black box recorder for AI coding agents.** RunLedger reads a Claude Code session and turns it into a shareable receipt: what the agent changed, what it ran, which model did each step, what it cost, and what looked risky.
+**Receipts, cost and a real-time guard for AI coding agents.**
 
-> Early-stage project. This is a first working prototype, not a finished product.
+RunLedger reads the session logs of your coding agents and turns each run into a receipt: what
+changed, what ran, which model did each step, what it cost, and what looked risky. A Claude Code hook
+can stop risky calls before they run, and a small team server collects receipts from the whole team.
+
+Version 0.2.0 (unreleased). Python 3.9 or later, no runtime dependencies.
+
+## Quickstart
+
+```bash
+pip install runledger              # or `pip install .` from a clone of this repository
+cd ~/my-project                    # a folder where you ran a coding agent
+runledger receipt --open           # latest session as an HTML receipt, opened in your browser
+```
+
+The receipt is saved as `runledger-<first 8 characters of the session id>.html` in the current folder.
+More in [docs/quickstart.md](docs/quickstart.md).
 
 ## What you get
 
-- **Receipt** as a single HTML file (also Markdown or JSON)
-- **Files changed** with lines added / removed, new and deleted files
-- **Every step in plain language**: deterministic by default, or rewritten by Claude Haiku with `--ai`
-- **Model, tokens and estimated cost per step** (public Claude API list prices)
-- **Risk score 0–100 with reasons**: secrets files read or changed, deleted or skipped tests, writes outside the project folder, `rm -rf`, force-push, `sudo`, `curl | sh`, destructive SQL, package installs, MCP calls
-- `--fail-on SCORE` exit code for CI or hooks
-
-No dependencies. Python 3.9+. Works offline unless you use `--ai`.
-
-## Install
-
-```bash
-# unzip runledger-mvp.zip (or clone the repo), then:
-cd runledger
-pip install -e .
-```
-
-(Or run without installing: `python -m runledger ...` from this folder.)
-
-## Use
-
-```bash
-cd ~/my-project                 # a folder where you used Claude Code
-runledger list                  # recent sessions for this folder
-runledger receipt --open        # receipt for the latest session, opens in the browser
-runledger receipt --format md -o receipt.md
-runledger receipt path/to/session.jsonl --format json -o run.json
-
-# plain-language summaries by Claude (costs ~1 cent per run with Haiku)
-export ANTHROPIC_API_KEY=sk-ant-...
-runledger receipt --ai --open
-```
-
-Try it on the bundled sample run:
-
-```bash
-runledger receipt tests/fixtures/sample_session.jsonl --open
-```
-
-Claude Code keeps sessions in `~/.claude/projects/<project-folder>/<session-id>.jsonl` (or under `$CLAUDE_CONFIG_DIR`).
-
-## Automatic receipt after every run (Claude Code hook)
-
-Add this to `.claude/settings.json` in your project (or `~/.claude/settings.json`):
-
-```json
-{
-  "hooks": {
-    "Stop": [
-      {
-        "hooks": [
-          { "type": "command", "command": "runledger receipt -o .runledger/latest.html >/dev/null 2>&1 || true" }
-        ]
-      }
-    ]
-  }
-}
-```
-
-Every time Claude Code finishes, `.runledger/latest.html` is refreshed. Add `.runledger/` to `.gitignore`.
-
-## Real-time guard
-
-`runledger guard` is a Claude Code `PreToolUse` hook. It checks every tool call before it runs, with the same rules as the receipt, and answers **deny**, **ask** or nothing (no opinion).
-
-```bash
-pip install -e .                   # puts `runledger` on PATH; the hook runs it
-runledger guard install            # this project: .claude/settings.json
-runledger guard install --global   # every project: ~/.claude/settings.json
-runledger guard test '{"session_id":"s1","cwd":"D:\my-app","tool_name":"Bash","tool_input":{"command":"rm -rf /"}}'
-```
-
-`install` merges one entry into `hooks.PreToolUse` and keeps everything else. Before the first change it copies the file to `settings.json.bak`. Running it again changes nothing. If a guard entry already exists, its timeout is updated in place and no second entry is added.
-
-```json
-"PreToolUse": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "runledger guard", "timeout": 135 }] }]
-```
-
-**Defaults** (used for any list that no file sets):
-
-- **deny**: a hardcoded secret written into a file, and high-severity shell commands (`rm -rf`, force push, `curl | sh`, `DROP TABLE`, `npm publish`, `kubectl apply`). `sudo` is the exception: it asks.
-- **ask**: other high-severity risks, such as `sudo`, reading `.env`, writing outside the project or deleting tests.
-- **allow**: medium and low risks.
-
-**Two settings files, and they are not equal.**
-
-- `~/.runledger/config.json` is yours. It may set everything: the approval server and key, the lists, the mode.
-- `<project>/.runledger.json` belongs to the repository. It may only **tighten** the guard. Each setting in it that would loosen the guard is ignored, and a warning line is written to `guard.log`.
-
-**Your file** (`~/.runledger/config.json`; the home folder is `HOME`, or `USERPROFILE` on Windows):
-
-```json
-{
-  "server": "https://runledger.example.com",
-  "api_key_env": "RUNLEDGER_API_KEY",
-  "guard": {
-    "mode": "enforce",
-    "deny": ["secret_in_content", "command:high", "!reason:ran a command with sudo"],
-    "ask": ["severity:high", "mcp"],
-    "fail_closed": false,
-    "approval": { "timeout_s": 120, "on_timeout": "deny" }
-  }
-}
-```
-
-**The project's file** (`<project>/.runledger.json`, section `guard`) adds to your rules:
-
-```json
-{
-  "guard": {
-    "deny": ["mcp"],
-    "ask": ["severity:medium"],
-    "fail_closed": true,
-    "approval": { "timeout_s": 60 }
-  }
-}
-```
-
-What the project file can and cannot do:
-
-- **mode**: `monitor` takes effect only when your file also says `monitor`. A project can switch monitor to `enforce`, never the reverse.
-- **fail_closed**: on if either file turns it on.
-- **deny and ask**: the project's entries are added to your list (or the default). Nothing is removed. A `!` exclusion in the project file cancels matches only within that same project list, so it cannot remove one of your rules or a default rule.
-- **severity**: `severity_overrides` may raise a risk's severity, not lower it. Its `ignore` list is not applied by the guard (the receipt still uses it).
-- **approval**: `timeout_s` may come from the project. `on_timeout: "ask"` (a local prompt instead of a deny) would loosen the guard, so only your file can set it.
-- **approval server and key**: the project file may not set them (see Approval below).
-
-Entry forms for every list: a risk code (`mcp`), `severity:<high|medium|low>`, `reason:<text>` (a case-insensitive part of the reason), or `<code>:<level>` (`command:high`). A leading `!` is an exclusion from its own list. Invalid entries are ignored. A `deny` or `ask` list in your file replaces the default for that list. The decision is the most restrictive one: any deny beats any ask.
-
-- **mode**: `enforce` (default) or `monitor`. Monitor never blocks: it only logs what it would have done, and it ignores `fail_closed`.
-
-**Approval.** When a call is an *ask* and an approval server is configured, the guard posts the call to `POST {server}/api/approvals` with `Authorization: Bearer <key>`, then polls `GET {server}/api/approvals/{id}` every 2 seconds. Status `approved` allows the call, `denied` or `expired` blocks it, and no answer within `timeout_s` follows `on_timeout` (`deny`, or `ask` to fall back to the local prompt). If the server cannot be reached, the guard shows the normal local prompt.
-
-The server and key come only from the environment (`RUNLEDGER_SERVER`, `RUNLEDGER_API_KEY`) or from your `~/.runledger/config.json`. `api_key_env` names the variable that holds the key. For the server, the environment variable wins over the file. A project's `.runledger.json` can never choose either one, so a cloned repository cannot send your key to a server of its choosing.
-
-`install` writes the hook's `timeout` as `timeout_s` + 15 seconds: 135 s by default, or the project's own `timeout_s` when you install per project. The hook must outlive the approval wait, or its answer is lost. Run `install` again after you change `timeout_s`; it updates the existing entry.
-
-**What the hook prints.** `deny` and `ask` go to Claude Code with a reason; Claude reads a deny reason and adapts. A plain allow prints nothing, so Claude Code's own permission rules still decide. Only an approval from the server prints `allow`, because a hook that answers `allow` skips the user's permission prompts.
-
-**Failures.** An internal error or unreadable input prints nothing and exits 0, so the call goes through Claude Code's normal permissions (fail open). Set `"fail_closed": true` (in either file) to deny instead.
-
-**Log.** Each decision is one JSON line in `<project>/.runledger/guard.log`: time, session, tool, decision, risk codes, and a command or file path. Each project setting that was ignored adds a `warning` line saying what was ignored. Secrets are masked and text is cut at 200 characters. File contents are never logged. The folder is already in `.gitignore`.
+- **Receipts** as HTML, Markdown or JSON: files changed with lines added and removed, every step in
+  plain language, the model, tokens and estimated cost for each step, and a risk score from 0 to 100
+  with the reason for each finding.
+- **Summaries with Claude** (`--ai`), optional. This sends session content to Anthropic. See
+  [Privacy](#privacy).
+- **A CI gate:** `runledger receipt --fail-on 60` exits with code 2 when the score is 60 or more.
+- **A real-time guard** for Claude Code. It denies, asks or allows each tool call, and it can route
+  "ask" decisions to a person on the team server. See [docs/guard.md](docs/guard.md).
+- **A team server:** a shared dashboard, API keys with roles, an audit log, approvals with Slack and
+  webhook notifications, team budgets with alerts, and compliance exports. See
+  [docs/enterprise.md](docs/enterprise.md) and [docs/api.md](docs/api.md).
+- **Pull request receipts:** one sticky comment per pull request, updated on every push. See
+  [docs/github.md](docs/github.md).
 
 ## Supported agents
 
-`list`, `receipt` and `push` read each agent's own session logs. Choose one agent
-with `--agent`; without it, the newest session from any agent in the folder is used.
+| Agent | `--agent` | Status | Reads sessions from |
+| --- | --- | --- | --- |
+| Claude Code | `claude-code` | Stable | `~/.claude/projects/<project>/` |
+| Codex CLI | `codex` | Beta | `$CODEX_HOME/sessions/` (default `~/.codex`) |
+| Aider | `aider` | Beta | `.aider.chat.history.md` in the project folder |
+| Any agent | `native` | Open format | `<project>/.runledger/runs/` |
 
-| Agent | `--agent` | Where its sessions are |
-| --- | --- | --- |
-| Claude Code | `claude-code` | `~/.claude/projects/<project>/<session>.jsonl` (or `$CLAUDE_CONFIG_DIR`) |
-| Codex CLI | `codex` | `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl` (default `~/.codex`) |
-| Aider | `aider` | `.aider.chat.history.md` in the project folder |
-| Any other agent | `native` | `<project>/.runledger/runs/*.runledger.json` or `*.runledger.jsonl` |
+Any agent can write the RunLedger format and get receipts, risk scores and pushes without an adapter.
+The specification is in [docs/format.md](docs/format.md). Details per agent are in
+[docs/agents.md](docs/agents.md).
 
-Any agent can write the RunLedger format, so it needs no adapter. The format is
-documented in [docs/format.md](docs/format.md), with a Python and a Node example.
+## Team server in five steps
 
 ```bash
-runledger list --agent native
-runledger receipt .runledger/runs/3f9c2e1a.runledger.jsonl --open
+runledger team create myteam --db runledger.db       # 1. create the team; prints its API key once
+runledger serve --db runledger.db                    # 2. start the server on http://127.0.0.1:8787
+# 3. open http://127.0.0.1:8787/?key=YOUR_KEY once, then use the plain address
+export RUNLEDGER_SERVER=http://127.0.0.1:8787        # 4. on each developer's machine
+export RUNLEDGER_API_KEY=YOUR_KEY
+runledger push --user "ana@example.com"              # 5. push the latest run
 ```
 
-When an agent reports its own cost, the receipt shows it as "reported by agent"
-next to the list-price estimate.
+For a shared server, serve it over HTTPS: [docs/self-hosting.md](docs/self-hosting.md) has a Docker
+Compose setup with automatic certificates and a bare-metal setup behind nginx.
+[docs/enterprise.md](docs/enterprise.md) covers roles, key rotation and the audit log.
 
-## How the numbers work
-
-- **Cost** = tokens × list price of the model for each assistant message (cache writes at 1.25× input, cache reads at the cache-hit rate). On a Claude subscription you are not billed per token, so read it as "what this run would cost on the API".
-- When one model message issues several tool calls, its tokens are split evenly across those steps.
-- **Risk score** is rule-based on purpose: every point has a reason you can check. High = 30 pts, Medium = 15, Low = 5, repeats of the same kind count less, capped at 100. Low < 25 ≤ Medium < 60 ≤ High.
-
-## Roadmap
-
-- Hosted share links (one URL per receipt) and team approval
-- Risk review and diff explanations by Claude Sonnet / Opus for flagged runs
-- Permission rules enforced through Claude Code `PreToolUse` hooks
-- One-click rollback (git snapshot before each run)
-- MCP and other agents
-
-## Tests
+## Real-time guard in three commands
 
 ```bash
+runledger guard install                              # 1. this project: .claude/settings.json
+runledger guard test '{"session_id":"s1","cwd":"/work/my-app","tool_name":"Bash","tool_input":{"command":"rm -rf /"}}'   # 2. see a decision
+runledger guard install --global                     # 3. or every project: ~/.claude/settings.json
+```
+
+By default the guard **denies** a hardcoded secret written into a file and high-severity commands such
+as `rm -rf`, force pushes, `curl | sh`, `DROP TABLE`, `npm publish` and `kubectl apply`. It **asks**
+before `sudo`, reading a `.env` file, writing outside the project, or deleting a test. Everything else
+is allowed. Two settings files control it: your own `~/.runledger/config.json` may set anything, and a
+project's `.runledger.json` may only make the guard stricter. See [docs/guard.md](docs/guard.md).
+
+## GitHub Action
+
+Post a receipt on every pull request. Commit the session files you want reviewed to
+`.runledger/sessions/`, then add this workflow:
+
+```yaml
+name: RunLedger receipt
+on: pull_request
+permissions:
+  contents: read
+  pull-requests: write
+jobs:
+  receipt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: OWNER/runledger@v0.2.0      # OWNER: the account that hosts RunLedger
+        with:
+          fail-on: "60"                   # the job fails at 60 or above; "" never fails
+```
+
+Details, inputs and the exit codes are in [docs/github.md](docs/github.md).
+
+## Privacy
+
+RunLedger is local first. `receipt`, `list` and the guard run on your machine. RunLedger has no
+telemetry. The network calls it makes are the ones you ask for: pushing to your team server, the
+guard's approval requests to the server you configure, webhooks you set, the GitHub API in the
+action, and the Anthropic API only when you use `--ai`.
+
+What a receipt contains:
+
+- the prompts (the first three, in full, in the JSON receipt);
+- each step: the first line of a command (up to 120 characters), file paths and line counts, search
+  patterns and URLs, and the step's model, tokens and cost;
+- the risk findings and their reasons.
+
+A receipt does **not** contain file contents or command output (only test pass and fail counts).
+**Receipts are not redacted**: a token typed into a command line appears in the receipt. Treat a receipt
+like the session transcript it came from.
+
+- **`--ai`** sends the prompts, each step's inputs (up to 600 characters per field, which can include
+  file contents being written), each tool result (up to 400 characters) and the agent's final message to
+  `api.anthropic.com`. Do not use it on sessions you may not share with that service.
+- **The guard log** (`.runledger/guard.log`) records tool names, commands and paths. It masks known
+  token formats and quoted secret values, but **not** unquoted ones such as `API_KEY=...`. Add
+  `.runledger/` to your `.gitignore`.
+- **The team server** stores every pushed receipt, including its HTML, in one SQLite file. Anyone with a
+  team key can read all of that team's runs. Keys are stored only as hashes. Nothing is deleted
+  automatically.
+
+## Pricing
+
+Cost figures are estimates from the public Claude API list prices. A subscription is not billed per token,
+so read them as "what this run would cost on the API".
+
+Plans: Free, Team at $15 per developer per month, and Enterprise. Details at
+[runledger.site](https://runledger.site).
+
+## Documentation
+
+- [Quickstart](docs/quickstart.md): install, first receipt, summaries, CI, hooks, a local team server
+- [Supported agents](docs/agents.md): where each agent's sessions are, and `--agent`
+- [Session format](docs/format.md): the open format for any agent
+- [Real-time guard](docs/guard.md): policy files, approvals, fail-open and fail-closed, the log
+- [Enterprise guide](docs/enterprise.md): roles, API keys, audit, budgets, exports, HTTPS
+- [HTTP API](docs/api.md): every endpoint, with examples and error codes
+- [Self-hosting](docs/self-hosting.md): Docker Compose, bare metal, backups, upgrades
+- [GitHub pull requests](docs/github.md): the action and the comment format
+- [Contributing](CONTRIBUTING.md)
+
+## Development
+
+```bash
+python -m pip install -e . pytest
 python -m pytest -q
 ```
 
+## License and security
+
+RunLedger is licensed under the Apache License 2.0; see [LICENSE](LICENSE). To report a security
+problem, email **hello@runledger.site** and do not open a public issue. See [SECURITY.md](SECURITY.md).
+
 ---
-RunLedger · founded October 2026 by Claudiu Cojocaru · https://runledger.site · hello@runledger.site
+RunLedger · [runledger.site](https://runledger.site) · hello@runledger.site

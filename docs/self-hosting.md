@@ -1,24 +1,27 @@
 # Self-hosting the RunLedger team server
 
-The team server collects receipts that developers push with `runledger push`, stores them
-in one SQLite database, and serves a shared dashboard and the approval API. This guide covers
-two setups:
+The team server collects receipts that developers push with `runledger push`, stores them in one
+SQLite database, and serves a shared dashboard, the approval API, team budgets and compliance exports.
+This guide covers three setups:
 
-- **Docker Compose with HTTPS** (recommended): the server, plus Caddy, which gets and renews
-  the certificate.
-- **Bare metal**: a Python virtual environment, a systemd service, and nginx as the HTTPS
-  proxy.
+- **Docker Compose with HTTPS** (recommended): the server, plus Caddy, which gets and renews the
+  certificate.
+- **Bare metal**: a Python virtual environment, a systemd service, and nginx as the HTTPS proxy.
+- **Built-in TLS**: the server serves HTTPS itself, with no proxy in front. See
+  [Built-in TLS](#built-in-tls-no-reverse-proxy).
 
-The server uses only the Python standard library and SQLite. There is no other database and
-no other service to run.
+The server uses only the Python standard library and SQLite. There is no other database and no other
+service to run. For roles, keys, the audit log and the admin features, see [enterprise.md](enterprise.md).
+For every endpoint, see [api.md](api.md).
 
 ## Requirements
 
-- A host with a public address, and a domain name whose DNS record points at it. For HTTPS,
-  ports **80 and 443** must be reachable from the internet, because Caddy and Let's Encrypt
-  need them.
+- A host with a public address, and a domain name whose DNS record points at it. For HTTPS with
+  Caddy or nginx, ports **80 and 443** must be reachable from the internet, because Let's Encrypt needs
+  them.
 - For Docker: Docker Engine with Compose v2 (`docker compose version`).
 - For bare metal: Python 3.9 or later with `venv`, systemd, and nginx.
+- For built-in TLS: a certificate and private key in PEM format.
 - Disk space for the database. It grows with every pushed receipt.
 
 ## Quickstart: Docker Compose with HTTPS
@@ -67,14 +70,14 @@ Run these commands on the host, from the repository's `deploy` folder.
    docker compose run --rm runledger team create myteam
    ```
 
-   The API key is printed once. Save it in a password manager. The server stores only a hash
-   of it, so it cannot show the key again.
+   The team's first key is an admin key labelled `initial`. It is printed once. Save it in a password
+   manager. The server stores only a hash of it, so it cannot show the key again.
 
 6. Open the dashboard once with the key: `https://runledger.example.com/?key=YOUR_KEY`. The
    server sets a session cookie and redirects, so the key leaves the address bar. After that,
    open the plain address.
 
-7. Push a run from a developer's machine:
+7. Push a run from a developer's machine, with a member or admin key:
 
    ```bash
    export RUNLEDGER_SERVER=https://runledger.example.com
@@ -91,6 +94,47 @@ docker compose down                # stop; keeps the volumes and the data
 ```
 
 Do not run `docker compose down -v` unless you want to delete the data volumes.
+
+### Trusted proxy on the Compose network (recommended)
+
+Caddy reaches the server over the Compose network, so the server sees Caddy's address as the client.
+Until the server is told that Caddy is a trusted proxy:
+
+- every user shares one failed-sign-in counter with Caddy's address, so a few bad keys from anyone can
+  lock out everyone for up to five minutes (`429`);
+- the audit log records Caddy's address instead of the user's.
+
+Name the Compose network as a trusted proxy:
+
+1. After the stack is running, find the subnet of the network. Compose names it `<project>_default`,
+   which is `deploy_default` in this folder:
+
+   ```bash
+   docker network inspect deploy_default --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}'
+   ```
+
+2. Tell the server the subnet. The simplest way is the environment of the `runledger` service in
+   `deploy/docker-compose.yml`, which needs no change to the command:
+
+   ```yaml
+   environment:
+     RUNLEDGER_PUBLIC_URL: ${RUNLEDGER_PUBLIC_URL:?set RUNLEDGER_PUBLIC_URL in deploy/.env}
+     RUNLEDGER_TRUSTED_PROXIES: "172.20.0.0/16"   # the subnet from step 1
+   ```
+
+   The equivalent flag is `--trusted-proxy 172.20.0.0/16` in the server command (the `CMD` in the
+   `Dockerfile`, or a `command:` in the compose file).
+
+3. Apply the change with `docker compose up -d`. The server prints
+   `Trusting X-Forwarded-For from: 172.20.0.0/16` when it starts.
+
+Docker assigns subnets, and a network that is recreated can get a different one. Check the subnet again
+after you change the network, and pin it in the compose file if it must stay the same. Only the Caddy
+container should be on this network, which is the case by default.
+
+With a trusted proxy named, the server takes the client address from `X-Forwarded-For`, and it honours
+`X-Forwarded-Proto` (set by Caddy) only from that proxy. The `Dockerfile` command also passes
+`--trust-proxy`, so the HTTPS cookie flags work through Caddy.
 
 ## Bare metal: pip, systemd and nginx
 
@@ -124,7 +168,7 @@ Do not run `docker compose down -v` unless you want to delete the data volumes.
    Group=runledger
    WorkingDirectory=/var/lib/runledger
    Environment=RUNLEDGER_PUBLIC_URL=https://runledger.example.com
-   ExecStart=/opt/runledger/venv/bin/runledger serve --host 127.0.0.1 --port 8787 --db /var/lib/runledger/runledger.db --trust-proxy
+   ExecStart=/opt/runledger/venv/bin/runledger serve --host 127.0.0.1 --port 8787 --db /var/lib/runledger/runledger.db --trust-proxy --trusted-proxy 127.0.0.1
    Restart=on-failure
    NoNewPrivileges=true
    ProtectSystem=strict
@@ -143,7 +187,8 @@ Do not run `docker compose down -v` unless you want to delete the data volumes.
    sudo systemctl status runledger
    ```
 
-   The server listens on `127.0.0.1` only. nginx is the only thing that reaches it.
+   The server listens on `127.0.0.1` only, and nginx is the only thing that reaches it. nginx connects
+   from `127.0.0.1`, so the unit names `127.0.0.1` as the trusted proxy.
 
 4. Create the first team, as the service user, with the same database path:
 
@@ -181,27 +226,64 @@ Do not run `docker compose down -v` unless you want to delete the data volumes.
    }
    ```
 
-   Run `sudo nginx -t && sudo systemctl reload nginx`. The `X-Forwarded-Proto` header tells
-   the server that the client used HTTPS. `--trust-proxy` makes the server read that header, so
-   only use it when nothing else can reach port 8787.
+   Run `sudo nginx -t && sudo systemctl reload nginx`.
 
-## Teams and keys
+   The server reads `X-Forwarded-Proto` only from the trusted proxy (`--trusted-proxy 127.0.0.1` in the
+   unit above), and it reads `X-Forwarded-For` from the same proxy. `--trust-proxy` on its own honours
+   `X-Forwarded-Proto` from any address, so keep the trusted-proxy option with it, and keep port 8787
+   reachable only from the proxy.
 
-Each team has one API key. Create a team, and its key, with:
+## Built-in TLS (no reverse proxy)
+
+The server can serve HTTPS itself. Give it a PEM certificate and its private key:
+
+```bash
+runledger serve --host 0.0.0.0 --port 8443 --db /var/lib/runledger/runledger.db \
+  --tls-cert /etc/ssl/runledger/fullchain.pem --tls-key /etc/ssl/runledger/privkey.pem
+```
+
+- The server accepts TLS 1.2 and later. `--tls-cert` and `--tls-key` must be given together, and the
+  server refuses to start if a file is missing or cannot be loaded.
+- With TLS on, the session cookie is `Secure` and the server sends `Strict-Transport-Security`.
+- The certificate is read when the server starts. After you renew it, restart the server.
+- Plain HTTP connections to the TLS port get no response.
+- To make the server reachable from the internet, open only the TLS port in the firewall. If a load
+  balancer or proxy is already in front, use the proxy setup above instead.
+
+## Teams, roles and keys
+
+Create a team, and its first admin key, with:
 
 ```bash
 runledger team create NAME --db /path/to/runledger.db
 ```
 
-- The key is printed once. The database stores only its SHA-256 hash.
-- Every key can push runs, read every run of its team, use the dashboard, and approve or deny
-  approvals for its team. Teams cannot see each other's runs.
-- Team settings (webhook URLs and the approval timeout) are read and changed with
-  `GET` and `PUT /api/team/settings`, using the team key.
-- Dashboard sessions last 12 hours and are kept in memory. A restart signs everyone out.
+The command prints the team's id and its key. The key is printed once. The database stores only its
+SHA-256 hash.
 
-This version has no `runledger key create` command and no roles. There are also no commands to
-rotate or revoke a key (see the security checklist and the known limits below).
+Each key has one role. Viewers read everything; members also push runs and handle approvals; admins also
+manage team settings, keys, the audit log, budgets and exports. The full matrix is in
+[enterprise.md](enterprise.md#model-teams-keys-and-roles).
+
+Keys are managed with these commands. They act on the database file directly, so run them where the
+database lives. They do not need the server to be running, and they do not check roles.
+
+```bash
+runledger key list   --team-id 1 --db /path/to/runledger.db
+runledger key create --team-id 1 --label "ci-nightly" --role member --db /path/to/runledger.db
+runledger key rotate <key id> --db /path/to/runledger.db    # new secret; the old one stops working at once
+runledger key revoke <key id> --db /path/to/runledger.db    # permanent; its dashboard sessions end at once
+```
+
+The same actions are available over the API to admins (`/api/keys`, see [api.md](api.md)).
+A team's last active admin key cannot be revoked, and a revoked key cannot be rotated.
+
+Keys do not expire. Rotate a key when a person leaves or when a key may have leaked.
+
+- Team settings (webhook URLs and the approval time limit) are read with `GET /api/team/settings`, which
+  masks the URLs for non-admins, and changed with `PUT /api/team/settings` by an admin.
+- Dashboard sessions last 12 hours. They are stored in the database as hashes, so a server restart does
+  not sign anyone out. A session ends when its key is revoked or rotated.
 
 ## Configuration
 
@@ -209,12 +291,16 @@ rotate or revoke a key (see the security checklist and the known limits below).
 | --- | --- | --- |
 | `--host` | `runledger serve` | Address to listen on. Default `127.0.0.1`. |
 | `--port` | `runledger serve` | Port. Default `8787`. |
-| `--db` | `runledger serve`, `team create` | Path to the SQLite file. Default `runledger.db`. |
-| `--trust-proxy` | `runledger serve` | Trust the `X-Forwarded-*` headers from the reverse proxy. Use it only when the proxy is the only way in. |
+| `--db` | `runledger serve`, `team create`, `key ...` | Path to the SQLite file. Default `runledger.db`. |
+| `--tls-cert FILE`, `--tls-key FILE` | `runledger serve` | PEM certificate and key. The server then serves HTTPS (TLS 1.2 or later). |
+| `--secure-cookies`, or `RUNLEDGER_SECURE_COOKIES=1` | `runledger serve`, environment | Sets the `Secure` flag on the dashboard cookie and sends HSTS. |
+| `--trust-proxy` | `runledger serve` | Honours `X-Forwarded-Proto: https` for the `Secure` flag and HSTS. Only from the `--trusted-proxy` addresses when any are given; otherwise from any address. |
+| `--trusted-proxy CIDR` (repeatable), or `RUNLEDGER_TRUSTED_PROXIES` (comma-separated) | `runledger serve`, environment | The addresses or ranges of your reverse proxies, for example `127.0.0.1` or `172.20.0.0/16`. The client address is read from `X-Forwarded-For` only for these peers. It is used for the failed-sign-in limit and the audit log. |
 | `RUNLEDGER_PUBLIC_URL` | environment | Public base URL used in approval links. Set it whenever the server is behind a proxy. |
 
-The database is upgraded automatically when the server starts. Missing columns are added,
-so an old database keeps working.
+The database is upgraded automatically when the server starts. Missing columns are added, so an old
+database keeps working. A database from before roles existed keeps its one key as an admin key labelled
+`initial`.
 
 ## Backups
 
@@ -249,7 +335,7 @@ docker compose up -d
 ```
 
 Store backups off the host, encrypted. They contain the same data as the live database,
-including prompts and file paths. Test a restore before you need one.
+including keys' hashes, prompts, file paths and webhook URLs. Test a restore before you need one.
 
 **Restore.** Stop the server. Replace `runledger.db` with the backup file, and delete any
 `runledger.db-wal` and `runledger.db-shm` files that belong to the old database. Start the
@@ -273,48 +359,65 @@ roll back, install the older version and restore the backup from before the upgr
 ## Security checklist
 
 - [ ] **Serve only over HTTPS.** Keys travel in the `Authorization` header and in the dashboard
-      sign-in. Plain HTTP exposes them. Redirect port 80 to HTTPS (both setups above do this).
-- [ ] **Keep port 8787 off the internet.** In Compose it is only reachable from Caddy. On bare
-      metal it listens on `127.0.0.1`. Open only 80 and 443 in the firewall.
+      sign-in. Plain HTTP exposes them. Use a proxy or the built-in TLS. Redirect port 80 to HTTPS
+      (both proxy setups above do this).
+- [ ] **Keep the server off the internet except through HTTPS.** In Compose it is only reachable from
+      Caddy. On bare metal it listens on `127.0.0.1`. Open only the HTTPS port in the firewall.
+- [ ] **Name your proxy as a trusted proxy.** With a proxy in front, set `--trusted-proxy` or
+      `RUNLEDGER_TRUSTED_PROXIES` to the proxy's address or subnet. Without it, the failed-sign-in limit
+      and the audit log use the proxy's address, and `--trust-proxy` honours the forwarded protocol from
+      any address.
+- [ ] **Give each person or system their own key, with the lowest role that works.** Viewers can read,
+      members can push and handle approvals, and only admins can manage keys and settings.
+- [ ] **Rotate and revoke keys.** Rotate when a person leaves or a key may have leaked, and revoke the
+      keys you no longer use. Keys do not expire on their own.
+- [ ] **Protect the database file.** The `team` and `key` commands act on it directly, without roles.
+      Whoever can write the file can create an admin key.
 - [ ] **Treat team keys as passwords.** Keep them out of Git, CI logs, and shell history. Pass
       them in environment variables (`RUNLEDGER_API_KEY`), not in command arguments.
-- [ ] **Plan for a leaked key.** This version cannot revoke or replace a key, so a leaked key
-      stays valid until the database is changed by hand. Keep keys out of places they can leak
-      from, and do not share one key between people who should not see each other's runs.
-- [ ] **Assume every key holder can read the whole team.** The dashboard and the API show all
-      runs of the team to any holder of its key, and anyone with the key can approve requests.
-- [ ] **Review what developers push.** A receipt holds the prompts, the files the agent read or
-      changed, command output, and the risk reasons. It can contain secrets, such as the contents
-      of `.env` files. See the privacy note in [docs/github.md](github.md).
+- [ ] **Know what receipts contain.** A receipt holds the prompts (the first three in full), file paths,
+      the first line of each command (up to 120 characters), search patterns, URLs, test counts, models,
+      cost and risk reasons. It does not hold file contents or command output. Receipts are not redacted,
+      so a secret typed on a command line can appear in one. See the privacy note in
+      [docs/github.md](github.md).
+- [ ] **Limit the webhook targets.** Approval and budget notifications go to the URLs you set in the team
+      settings. Use only URLs you control. The URLs are stored as set in the database.
+- [ ] **Review the audit log, and protect exports.** Admins can read the audit log and download the CSV
+      and HTML exports. They contain developer and project names, run titles (the first request, up to 200
+      characters), risk findings, approval decisions and audit details. Treat them as confidential. They are
+      records, not a compliance certification.
 - [ ] **Know that there is no retention policy.** Runs stay until the database is removed. To
       erase data, stop the server, back up what you need, and delete the database file and its
       `-wal` and `-shm` files. This removes every team.
-- [ ] **Limit the webhook targets.** Approval notifications are sent to the URLs you set in the
-      team settings. Use only URLs you control.
-- [ ] **Restrict network access to the proxy.** Use `--trust-proxy` only when the proxy is the
-      only route to the server. Otherwise a client can send its own `X-Forwarded-*` headers.
 - [ ] **Keep the host and the images updated.** Rebuild the Docker image with `--pull` when a new
       base image is released. The container runs as the unprivileged `runledger` user.
 - [ ] **Back up regularly, and test the restore.**
 
 ## Known limits in 0.2.0
 
-- Enterprise authentication is in progress. Today there are no per-user accounts, no roles, no
-  key rotation, and no key revocation.
-- Runs are never deleted automatically. There is no delete or retention command.
+- No single sign-on, no per-person accounts, no multi-factor authentication, and no key expiry.
+- Runs and audit events are never deleted automatically. There is no delete or retention command.
 - One server process and one SQLite file. This is not a multi-node cluster.
-- Dashboard sessions are held in memory, so a restart signs everyone out.
-- The server does not terminate TLS. Use the Caddy or nginx setups above, or your own proxy.
+- There is no sign-out endpoint. Sessions end when their key is revoked or rotated, or after 12 hours.
+- Receipts are not redacted. The guard's log masks known token formats and quoted secret values only.
+- The failed-sign-in limit counts the connection address, unless trusted proxies are configured. Its
+  counter is held in memory, so a restart clears it.
 
 ## Troubleshooting
 
 - **`cannot listen on ...: Address already in use`**: another process has the port. Change `--port`
   or stop the other process.
+- **`--tls-cert and --tls-key must be given together`, or `file not found`**: give both options, with
+  files that exist and that the server can read.
 - **The container exits at once**: run `docker compose logs runledger`. An unrecognised argument
   means the image and the command line disagree; rebuild with `docker compose build --pull`.
 - **Caddy cannot get a certificate**: check the DNS record, and that ports 80 and 443 reach the
   host. The logs are in `docker compose logs caddy`.
+- **Everyone gets `429 rate_limited`**: one address sent more than 20 failed credentials in five
+  minutes. Wait for the `Retry-After` time. If the server is behind a proxy, set the proxy as a trusted
+  proxy (see above) so that the limit counts each client.
 - **The dashboard asks you to sign in**: open `https://YOUR_DOMAIN/?key=YOUR_KEY` once, as in
-  step 6 of the quickstart.
+  step 6 of the quickstart. Sessions last 12 hours.
 - **`runledger push` says there is no server or key**: set `RUNLEDGER_SERVER` and
   `RUNLEDGER_API_KEY`, or pass `--server` and `--key`.
+- **`runledger push` answers `403`**: the key has the viewer role. Use a member or admin key.

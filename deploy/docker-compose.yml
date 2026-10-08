@@ -16,8 +16,12 @@ services:
     restart: unless-stopped
     environment:
       RUNLEDGER_PUBLIC_URL: ${RUNLEDGER_PUBLIC_URL:?set RUNLEDGER_PUBLIC_URL in deploy/.env}
-      # Reserved for the Secure cookie flag. The server does not read it yet.
+      # Sets the Secure flag on the dashboard cookie and sends HSTS. The server reads this variable.
       RUNLEDGER_SECURE_COOKIES: "1"
+      # Recommended: name the Compose network's subnet as a trusted proxy, so the server reads the
+      # client address from X-Forwarded-For and counts each user separately. See ../docs/self-hosting.md
+      # ("Trusted proxy on the Compose network") for how to find the subnet. Not set here.
+      # RUNLEDGER_TRUSTED_PROXIES: "172.20.0.0/16"
     volumes:
       - runledger-data:/data
     # Not published on the host. Only the Caddy service can reach this port.

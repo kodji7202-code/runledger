@@ -4,7 +4,8 @@ A guard client creates an approval (POST /api/approvals) and polls it until a
 person decides it in the dashboard or through the API. A team can point the
 server at a Slack incoming webhook and/or a generic JSON webhook. Those calls run
 on a background thread, so they never delay the request that created the
-approval, and a failed delivery is only written to the server's stderr.
+approval, and a failed delivery is only written to the server's stderr. Budget
+alerts (see budgets.py) use the same two webhooks and the same background sender.
 
 Webhook URLs are secrets (a Slack URL lets anyone post to the channel), so they
 are never written to the log.
@@ -12,6 +13,7 @@ are never written to the log.
 from __future__ import annotations
 
 import json
+import math
 import secrets
 import sys
 import threading
@@ -237,6 +239,48 @@ def slack_text(approval: Dict[str, Any], link: str) -> str:
     lines.append(where)
     lines.append(f"Review: {link}")
     return _slack_escape("\n".join(lines))
+
+
+def _usd(amount: float) -> str:
+    return f"${amount:,.2f}" if amount >= 0.01 or amount == 0 else f"${amount:.4f}"
+
+
+def budget_slack_text(alert: Dict[str, Any]) -> str:
+    """One line for Slack, e.g. "RunLedger budget: team spend $0.11 is 216% of $0.05 for 2026-10"."""
+    who = "team spend" if alert.get("user") is None else f"developer {alert['user']} spend"
+    text = (
+        f"RunLedger budget: {who} {_usd(alert['spend_usd'])} is {math.floor(alert['pct'])}% "
+        f"of {_usd(alert['limit_usd'])} for {alert['month']}"
+    )
+    return _slack_escape(text)
+
+
+def budget_webhook_payload(team_name: str, alert: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "type": "budget_alert",
+        "team": team_name,
+        "month": alert["month"],
+        "scope": alert["scope"],
+        "user": alert.get("user"),
+        "threshold": alert["threshold"],
+        "spend_usd": alert["spend_usd"],
+        "limit_usd": alert["limit_usd"],
+        "pct": alert["pct"],
+    }
+
+
+def notify_budget_alerts(settings: Dict[str, Any], team_name: str, alerts: List[Dict[str, Any]]) -> None:
+    """Queue Slack and generic-webhook messages for newly fired budget alerts. Returns at once."""
+    jobs: List[Tuple[str, str, Any]] = []
+    slack = settings.get("slack_webhook_url")
+    hook = settings.get("webhook_url")
+    for alert in alerts:
+        if slack:
+            jobs.append(("Slack", slack, {"text": budget_slack_text(alert)}))
+        if hook:
+            jobs.append(("webhook", hook, budget_webhook_payload(team_name, alert)))
+    if jobs:
+        threading.Thread(target=_deliver, args=(jobs,), name="runledger-notify", daemon=True).start()
 
 
 def notify_new_approval(settings: Dict[str, Any], approval: Dict[str, Any], public_url: str) -> None:

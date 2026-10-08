@@ -41,4 +41,8 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD ["python", "-c", "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8787/health', timeout=4).status == 200 else 1)"]
 
 ENTRYPOINT ["runledger"]
+# --trust-proxy honours X-Forwarded-Proto from any address until a trusted proxy is named.
+# Recommended with deploy/docker-compose.yml: also name the Compose network's subnet, with
+# --trusted-proxy <subnet> here or with RUNLEDGER_TRUSTED_PROXIES in the compose environment.
+# See docs/self-hosting.md ("Trusted proxy on the Compose network").
 CMD ["serve", "--host", "0.0.0.0", "--port", "8787", "--db", "/data/runledger.db", "--trust-proxy"]

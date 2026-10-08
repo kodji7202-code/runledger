@@ -5,8 +5,9 @@ hold the same session id without overwriting each other. API keys live in
 api_keys, stored only as SHA-256 hashes (see auth.py); the plaintext is returned
 once, by create_team(), create_key() or rotate_key().
 
-Every change to keys, team settings, approvals and pushed runs also writes a row to
-audit_log, in the same transaction as the change itself.
+Every change to keys, team settings, budgets, approvals and pushed runs also writes a row
+to audit_log, in the same transaction as the change itself. Dashboard sessions are kept
+in the sessions table as SHA-256 hashes of their tokens, so they survive a restart.
 """
 from __future__ import annotations
 
@@ -15,21 +16,24 @@ import sqlite3
 import threading
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ..pricing import friendly_model
 from .auth import (
     INITIAL_KEY_LABEL,
+    SESSION_TTL_SECONDS,
     generate_key,
     hash_key,
     key_prefix,
     new_key_id,
+    new_session_token,
     validate_label,
     validate_role,
 )
 
 TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 LAST_USED_WRITE_INTERVAL_S = 60
+DEFAULT_ALERT_THRESHOLDS = "[50, 80, 100]"
 
 # Team settings added after the first release. Databases created earlier get them
 # through _add_missing_columns().
@@ -37,6 +41,9 @@ TEAM_SETTING_COLUMNS = (
     ("slack_webhook_url", "TEXT"),
     ("webhook_url", "TEXT"),
     ("approval_ttl_s", "INTEGER NOT NULL DEFAULT 600"),
+    ("monthly_budget_usd", "REAL"),
+    ("per_user_budget_usd", "REAL"),
+    ("alert_thresholds", "TEXT NOT NULL DEFAULT '[50, 80, 100]'"),
 )
 
 # Run columns added after the first release.
@@ -52,7 +59,10 @@ CREATE TABLE IF NOT EXISTS teams (
     created_at      TEXT NOT NULL,
     slack_webhook_url TEXT,
     webhook_url     TEXT,
-    approval_ttl_s  INTEGER NOT NULL DEFAULT 600
+    approval_ttl_s  INTEGER NOT NULL DEFAULT 600,
+    monthly_budget_usd  REAL,
+    per_user_budget_usd REAL,
+    alert_thresholds    TEXT NOT NULL DEFAULT '[50, 80, 100]'
 );
 CREATE TABLE IF NOT EXISTS approvals (
     id           TEXT PRIMARY KEY,
@@ -126,6 +136,26 @@ CREATE TABLE IF NOT EXISTS audit_log (
     details  TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS audit_by_team ON audit_log (team_id, id);
+CREATE TABLE IF NOT EXISTS sessions (
+    token_hash  TEXT PRIMARY KEY,
+    team_id     INTEGER NOT NULL REFERENCES teams (id),
+    key_id      TEXT NOT NULL REFERENCES api_keys (id),
+    role        TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    expires_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS sessions_by_key ON sessions (key_id);
+-- One row per team, month, scope and threshold: the primary key is what makes an alert fire once.
+CREATE TABLE IF NOT EXISTS budget_alerts (
+    team_id    INTEGER NOT NULL REFERENCES teams (id),
+    month      TEXT NOT NULL,
+    scope      TEXT NOT NULL,
+    threshold  INTEGER NOT NULL,
+    spend_usd  REAL NOT NULL,
+    limit_usd  REAL NOT NULL,
+    fired_at   TEXT NOT NULL,
+    PRIMARY KEY (team_id, month, scope, threshold)
+);
 """
 
 _SUMMARY_COLUMNS = (
@@ -354,6 +384,50 @@ class Database:
             (now.strftime(TIME_FORMAT), key_id, stale_before),
         )
 
+    # Dashboard sessions
+
+    def issue_session(self, team_id: int, key_id: str, role: str, ttl_s: int = SESSION_TTL_SECONDS) -> str:
+        """Start a dashboard session for a key. Returns the plaintext token (for the cookie);
+        only its hash is stored. Expired sessions are purged here, so the table stays small."""
+        token = new_session_token()
+        now = datetime.now(timezone.utc)
+        now_text = now.strftime(TIME_FORMAT)
+        expires = (now + timedelta(seconds=ttl_s)).strftime(TIME_FORMAT)
+        with self._lock, self._conn:
+            self._conn.execute("DELETE FROM sessions WHERE expires_at <= ?", (now_text,))
+            self._conn.execute(
+                "INSERT INTO sessions (token_hash, team_id, key_id, role, created_at, expires_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (hash_key(token), team_id, key_id, role, now_text, expires),
+            )
+        return token
+
+    def session_key(self, token: Optional[str]) -> Optional[Dict[str, Any]]:
+        """The active key behind a dashboard session token, or None. A session that has
+        expired, or whose key was revoked or rotated, is deleted here."""
+        if not token or len(token) > 512:
+            return None
+        token_hash = hash_key(token)
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT key_id, team_id, expires_at FROM sessions WHERE token_hash = ?", (token_hash,)
+            ).fetchone()
+            if row is None:
+                return None
+            if row["expires_at"] <= datetime.now(timezone.utc).strftime(TIME_FORMAT):
+                self._conn.execute("DELETE FROM sessions WHERE token_hash = ?", (token_hash,))
+                return None
+            key = self._conn.execute(
+                _KEY_JOIN + " WHERE k.id = ? AND k.team_id = ? AND k.revoked_at IS NULL",
+                (row["key_id"], row["team_id"]),
+            ).fetchone()
+            if key is None:
+                self._conn.execute("DELETE FROM sessions WHERE token_hash = ?", (token_hash,))
+                return None
+            self._touch_key(key["id"])
+        return dict(key)
+
+
     def list_keys(self, team_id: int) -> List[Dict[str, Any]]:
         """The team's keys, oldest first. Never includes a secret or a hash."""
         with self._lock:
@@ -396,6 +470,7 @@ class Database:
             )
             row = self._key_row(team_id, key_id)
             if cur.rowcount == 1 and row is not None:
+                self._conn.execute("DELETE FROM sessions WHERE key_id = ?", (key_id,))
                 self._audit(team_id, actor, "key.revoke", key_id,
                             {"label": row["label"], "role": row["role"], "prefix": row["prefix"]})
                 return "ok", row
@@ -419,19 +494,46 @@ class Database:
                 return "missing", None
             if cur.rowcount != 1:
                 return "revoked", row
+            # The old secret is gone, so every dashboard session it started ends with it.
+            self._conn.execute("DELETE FROM sessions WHERE key_id = ?", (key_id,))
             self._audit(team_id, actor, "key.rotate", key_id,
                         {"label": row["label"], "role": row["role"], "prefix": row["prefix"]})
         return "ok", dict(row, key=new_key)
 
-    def list_audit(self, team_id: int, limit: int = 100, before: Optional[int] = None) -> List[Dict[str, Any]]:
-        """Audit events for a team, newest first. `before` returns only events with a smaller id."""
+    def list_audit(
+        self, team_id: int, limit: int = 100, before: Optional[int] = None, action: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Audit events for a team, newest first. `before` returns only events with a smaller id.
+        `action` keeps events whose action starts with it ("key." matches key.create and key.revoke)."""
+        return self.audit_events(team_id, limit=max(1, min(int(limit), 500)), before=before, action=action)
+
+    def audit_events(
+        self,
+        team_id: int,
+        limit: Optional[int] = None,
+        before: Optional[int] = None,
+        action: Optional[str] = None,
+        since: Optional[str] = None,
+        ascending: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """The general form of list_audit. `since` is a TIME_FORMAT text bound on the event time.
+        limit=None returns every match (used by the export)."""
         sql = "SELECT id, at, actor, action, target, details FROM audit_log WHERE team_id = ?"
         params: List[Any] = [team_id]
+        if since is not None:
+            sql += " AND at >= ?"
+            params.append(since)
+        if action:
+            # substr() compares the literal prefix: no LIKE wildcards to escape.
+            sql += " AND substr(action, 1, ?) = ?"
+            params += [len(action), action]
         if before is not None:
             sql += " AND id < ?"
             params.append(int(before))
-        sql += " ORDER BY id DESC LIMIT ?"
-        params.append(max(1, min(int(limit), 500)))
+        sql += " ORDER BY id " + ("ASC" if ascending else "DESC")
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
         with self._lock:
             rows = self._conn.execute(sql, params).fetchall()
         return [
@@ -553,9 +655,10 @@ class Database:
 
     # Statistics
 
-    def stats(self, team_id: int, since_days: int = 30) -> Dict[str, Any]:
+    def stats(self, team_id: int, since_days: int = 30, now: Optional[datetime] = None) -> Dict[str, Any]:
         days = max(1, int(since_days))
-        since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime(TIME_FORMAT)
+        moment = now or datetime.now(timezone.utc)
+        since = (moment - timedelta(days=days)).strftime(TIME_FORMAT)
         window = "team_id = ? AND COALESCE(started_at, created_at) >= ?"
         args = (team_id, since)
         with self._lock:
@@ -618,6 +721,119 @@ class Database:
                 {"code": r["code"], "occurrences": r["occurrences"], "runs": r["runs"]} for r in top
             ],
         }
+
+    # Exports and the compliance report (read only)
+
+    def export_runs(self, team_id: int, since: str) -> List[Dict[str, Any]]:
+        """Every run that started (or was pushed) at or after `since`, oldest first, with its
+        models. Never the receipt JSON or the HTML."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, user, project, agent, models, started_at, created_at, steps, tokens, "
+                "files_changed, cost, risk_score, risk_level, title FROM runs "
+                "WHERE team_id = ? AND COALESCE(started_at, created_at) >= ? "
+                "ORDER BY COALESCE(started_at, created_at), id",
+                (team_id, since),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def risk_level_counts(self, team_id: int, since: str) -> Dict[str, int]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT risk_level, COUNT(*) AS n FROM runs WHERE team_id = ? "
+                "AND COALESCE(started_at, created_at) >= ? GROUP BY risk_level",
+                (team_id, since),
+            ).fetchall()
+        counts = {"low": 0, "medium": 0, "high": 0}
+        for r in rows:
+            counts[r["risk_level"]] = counts.get(r["risk_level"], 0) + int(r["n"])
+        return counts
+
+    def high_risk_runs(self, team_id: int, since: str, limit: int) -> List[Dict[str, Any]]:
+        """Up to `limit` high-risk runs since `since`, riskiest first."""
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {_SUMMARY_COLUMNS} FROM runs WHERE team_id = ? AND risk_level = 'high' "
+                "AND COALESCE(started_at, created_at) >= ? "
+                "ORDER BY risk_score DESC, COALESCE(started_at, created_at) DESC, id LIMIT ?",
+                (team_id, since, int(limit)),
+            ).fetchall()
+        return [_summary(r) for r in rows]
+
+    def decided_approvals(self, team_id: int, since: str, limit: int) -> List[Dict[str, Any]]:
+        """Approvals decided at or after `since`, newest decision first."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, tool, status, decided_by, decided_at FROM approvals "
+                "WHERE team_id = ? AND decided_at IS NOT NULL AND decided_at >= ? "
+                "ORDER BY decided_at DESC, id LIMIT ?",
+                (team_id, since, int(limit)),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # Budgets
+
+    def budget_settings(self, team_id: int) -> Dict[str, Any]:
+        """The team's budget: monthly_usd, per_user_monthly_usd (each a number or None) and
+        alert_thresholds (a list of whole percentages)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT monthly_budget_usd, per_user_budget_usd, alert_thresholds FROM teams WHERE id = ?",
+                (team_id,),
+            ).fetchone()
+        return {
+            "monthly_usd": row["monthly_budget_usd"],
+            "per_user_monthly_usd": row["per_user_budget_usd"],
+            "alert_thresholds": json.loads(row["alert_thresholds"] or DEFAULT_ALERT_THRESHOLDS),
+        }
+
+    def update_budget_settings(self, team_id: int, values: Dict[str, Any], actor: str) -> Dict[str, Any]:
+        """Replace the team's budget. The change and its audit row are one transaction."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE teams SET monthly_budget_usd = ?, per_user_budget_usd = ?, alert_thresholds = ? WHERE id = ?",
+                (values["monthly_usd"], values["per_user_monthly_usd"], json.dumps(values["alert_thresholds"]), team_id),
+            )
+            self._audit(team_id, actor, "budget.update", "budget", {
+                "monthly_usd": values["monthly_usd"],
+                "per_user_monthly_usd": values["per_user_monthly_usd"],
+                "alert_thresholds": values["alert_thresholds"],
+            })
+        return self.budget_settings(team_id)
+
+    def month_spend(self, team_id: int, start: str, end: str) -> Tuple[float, List[Tuple[str, float]]]:
+        """Total run cost for runs whose start (or push time, when there is no start) is in [start, end),
+        and the same per developer. Runs without a cost count as zero."""
+        window = "team_id = ? AND COALESCE(started_at, created_at) >= ? AND COALESCE(started_at, created_at) < ?"
+        args = (team_id, start, end)
+        with self._lock:
+            total = self._conn.execute(f"SELECT COALESCE(SUM(cost), 0) FROM runs WHERE {window}", args).fetchone()[0]
+            rows = self._conn.execute(
+                f"SELECT user AS name, COALESCE(SUM(cost), 0) AS spend FROM runs WHERE {window} GROUP BY user",
+                args,
+            ).fetchall()
+        return float(total or 0.0), [(r["name"], float(r["spend"])) for r in rows]
+
+    def record_budget_alerts(self, team_id: int, month: str, candidates: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Record the candidate alerts that have not fired this month. Each insert is conditional
+        on the unique key, so a threshold fires once per month even when pushes race. Every new
+        alert gets its audit row in the same transaction. Returns the candidates that were new."""
+        fired: List[Dict[str, Any]] = []
+        now_text = utc_now()
+        with self._lock, self._conn:
+            for item in candidates:
+                cur = self._conn.execute(
+                    "INSERT OR IGNORE INTO budget_alerts (team_id, month, scope, threshold, spend_usd, limit_usd, fired_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (team_id, month, item["scope"], item["threshold"], item["spend_usd"], item["limit_usd"], now_text),
+                )
+                if cur.rowcount == 1:
+                    self._audit(team_id, "system", "budget.alert", item["scope"], {
+                        "month": month, "threshold": item["threshold"], "spend_usd": item["spend_usd"],
+                        "limit_usd": item["limit_usd"], "pct": item["pct"],
+                    })
+                    fired.append(item)
+        return fired
 
     def _group(self, column: str, window: str, args: Tuple[Any, ...]) -> List[sqlite3.Row]:
         # column is always a fixed expression from this module ("user", "project", ...)

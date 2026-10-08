@@ -107,12 +107,12 @@ def test_page_uses_no_forbidden_dom_sinks():
 
 def test_every_write_goes_through_the_csrf_header_helper():
     js = _script(DASHBOARD_HTML)
-    # fetch() is called in two places: request() (every API call) and probeExport() (GET only).
+    # fetch() is called in two places: request() (every API call) and probeExport() (HEAD only).
     assert js.count("fetch(") == 2
     assert 'if (method !== "GET") {' in js
     assert 'opts.headers["X-Requested-With"] = "runledger";' in js
     probe = js[js.index("function probeExport"):js.index("function setExportLink")]
-    assert 'method: "GET"' in probe
+    assert 'method: "HEAD"' in probe
     # No call site writes a method literal of its own; writes go through the helper.
     assert not re.search(r'method:\s*"(POST|PUT|DELETE|PATCH)"', js)
     writes = re.findall(r"\b(postJSON|putJSON)\(", js)
