@@ -5,6 +5,13 @@
   GET  /api/runs/<id>                         one run with its receipt JSON and risk reasons
   GET  /api/stats[?days=30]                   team totals, cost by developer/model/project, top risks
   GET  /runs/<id>                             the stored receipt HTML
+  POST /api/approvals                         request a human approval (Bearer key) -> 201 {id, status}
+  GET  /api/approvals[?status=pending]        list approvals (API key or dashboard session)
+  GET  /api/approvals/<id>                    one approval: status, decided_by, decided_at, reason
+  POST /api/approvals/<id>/decision           approve or deny: Bearer key, or dashboard session
+                                              plus header X-Requested-With: runledger
+  GET  /approvals/<id>                        approval page for a person (dashboard session)
+  GET|PUT /api/team/settings                  webhook URLs and approval_ttl_s (Bearer key)
   GET  /                                      dashboard; sign in once with /?key=API_KEY
   GET  /health                                liveness, no auth
 
@@ -16,6 +23,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import secrets
 import socket
 import sys
@@ -29,7 +37,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from .. import __version__
-from .dashboard import DASHBOARD_HTML
+from . import approvals
+from .dashboard import APPROVAL_HTML, DASHBOARD_HTML
 from .db import TIME_FORMAT, Database
 
 MAX_BODY_BYTES = 10 * 1024 * 1024
@@ -38,6 +47,10 @@ SESSION_TTL_SECONDS = 12 * 3600
 MAX_SESSIONS = 1000
 LEVELS = ("low", "medium", "high")
 SEVERITIES = ("low", "medium", "high")
+CSRF_HEADER = "X-Requested-With"
+CSRF_VALUE = "runledger"
+PUBLIC_URL_ENV = "RUNLEDGER_PUBLIC_URL"
+_APPROVAL_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 RECEIPT_CSP = (
     "default-src 'none'; style-src 'unsafe-inline'; img-src data:; "
@@ -114,11 +127,25 @@ class RunLedgerServer(ThreadingHTTPServer):
     # On Windows, SO_REUSEADDR lets a second process take over a bound port.
     allow_reuse_address = os.name != "nt"
 
-    def __init__(self, address: Tuple[str, int], db: Database, log_requests: bool = False) -> None:
+    def __init__(
+        self,
+        address: Tuple[str, int],
+        db: Database,
+        log_requests: bool = False,
+        public_url: Optional[str] = None,
+    ) -> None:
         self.db = db
         self.log_requests = log_requests
         self.sessions = _Sessions()
         super().__init__(address, _Handler)
+        # The base URL people see in approval links. The default is the bound address,
+        # so set RUNLEDGER_PUBLIC_URL when the server sits behind a reverse proxy.
+        host, port = self.server_address[:2]
+        shown = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(host, host)
+        if ":" in shown:
+            shown = f"[{shown}]"
+        chosen = public_url or os.environ.get(PUBLIC_URL_ENV) or f"http://{shown}:{port}"
+        self.public_url = chosen.strip().rstrip("/")
 
 
 class _IPv6Server(RunLedgerServer):
@@ -130,13 +157,15 @@ def make_server(
     host: str = "127.0.0.1",
     port: int = 8787,
     log_requests: bool = False,
+    public_url: Optional[str] = None,
 ) -> RunLedgerServer:
     """Open the database and bind the server. Port 0 picks a free port (see server_address).
-    The caller owns the server: call shutdown(), server_close() and db.close() when done."""
+    The caller owns the server: call shutdown(), server_close() and db.close() when done.
+    public_url defaults to $RUNLEDGER_PUBLIC_URL, then to the bound address."""
     db = Database(db_path)
     cls = _IPv6Server if ":" in host else RunLedgerServer
     try:
-        return cls((host, port), db, log_requests=log_requests)
+        return cls((host, port), db, log_requests=log_requests, public_url=public_url)
     except Exception:
         db.close()
         raise
@@ -207,6 +236,26 @@ class _Handler(BaseHTTPRequestHandler):
             elif path.startswith("/runs/"):
                 self._only(method, ("GET",))
                 self._receipt(path[len("/runs/"):])
+            elif path == "/api/approvals":
+                self._only(method, ("GET", "POST"))
+                if method == "POST":
+                    self._create_approval()
+                else:
+                    self._list_approvals(query)
+            elif path.startswith("/api/approvals/"):
+                rest = path[len("/api/approvals/"):]
+                if rest.endswith("/decision"):
+                    self._only(method, ("POST",))
+                    self._decide_approval(rest[:-len("/decision")])
+                else:
+                    self._only(method, ("GET",))
+                    self._get_approval(rest)
+            elif path == "/api/team/settings":
+                self._only(method, ("GET", "PUT"))
+                self._team_settings(method)
+            elif path.startswith("/approvals/"):
+                self._only(method, ("GET",))
+                self._approval_page(path[len("/approvals/"):])
             else:
                 raise _HttpError(404, "not_found", "No such endpoint.")
         except _HttpError as exc:
@@ -266,7 +315,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     # Endpoints
 
-    def _content_length(self) -> int:
+    def _content_length(self, limit: int = MAX_BODY_BYTES, what: str = "Receipts") -> int:
         header = self.headers.get("Content-Length")
         if header is None:
             raise _HttpError(411, "length_required", "Send a Content-Length header.")
@@ -276,8 +325,8 @@ class _Handler(BaseHTTPRequestHandler):
             raise _HttpError(400, "bad_request", "Content-Length must be a number.") from None
         if length < 0:
             raise _HttpError(400, "bad_request", "Content-Length must not be negative.")
-        if length > MAX_BODY_BYTES:
-            raise _HttpError(413, "payload_too_large", f"Receipts are limited to {MAX_BODY_BYTES // (1024 * 1024)} MB.")
+        if length > limit:
+            raise _HttpError(413, "payload_too_large", f"{what} are limited to {_size_text(limit)}.")
         return length
 
     def _create_run(self) -> None:
@@ -344,7 +393,7 @@ class _Handler(BaseHTTPRequestHandler):
             token = self.server.sessions.issue(team)
             self._send(302, b"", "text/plain; charset=utf-8", {
                 "Location": "/",
-                "Set-Cookie": f"{COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_TTL_SECONDS}",
+                "Set-Cookie": f"{COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_TTL_SECONDS}",
             })
             return
         team = self._bearer_team() or self.server.sessions.team_for(self._cookie(COOKIE_NAME))
@@ -352,14 +401,148 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_html(401, SIGN_IN_HTML, {"Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'"})
             return
         nonce = secrets.token_urlsafe(16)
-        csp = (
-            "default-src 'none'; script-src 'nonce-" + nonce + "'; style-src 'unsafe-inline'; "
-            "connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+        self._send_html(200, DASHBOARD_HTML.replace("__CSP_NONCE__", nonce), {"Content-Security-Policy": _page_csp(nonce)})
+
+    # Approvals
+
+    def _decider(self) -> Tuple[Dict[str, Any], str]:
+        """Who is deciding: the team's API key ("api") or a dashboard session ("dashboard").
+        A cookie decision must also send X-Requested-With, a header a cross-site form cannot set."""
+        team = self._bearer_team()
+        if team is not None:
+            return team, "api"
+        team = self.server.sessions.team_for(self._cookie(COOKIE_NAME))
+        if team is None:
+            raise _unauthorized()
+        if (self.headers.get(CSRF_HEADER) or "").strip() != CSRF_VALUE:
+            raise _HttpError(
+                403, "csrf_required",
+                f"Dashboard decisions must send the header '{CSRF_HEADER}: {CSRF_VALUE}'.",
+            )
+        return team, "dashboard"
+
+    def _create_approval(self) -> None:
+        length = self._content_length(approvals.CREATE_BODY_LIMIT, "Approval requests")
+        raw = self.rfile.read(length) if length else b""
+        team = self._bearer_team()  # agents create approvals with the team key, never with a dashboard session
+        if team is None:
+            raise _unauthorized()
+        try:
+            fields = approvals.validate_new_approval(_json_object(raw))
+        except approvals.InvalidInput as exc:
+            raise _HttpError(400, "invalid_approval", str(exc)) from None
+        db = self.server.db
+        settings = db.approval_settings(team["id"])
+        approval_id = approvals.new_approval_id()
+        view = db.create_approval(team["id"], approval_id, fields, settings["approval_ttl_s"])
+        approvals.notify_new_approval(settings, view, self.server.public_url)
+        self._send_json(201, {"id": approval_id, "status": "pending"})
+
+    def _list_approvals(self, query: Dict[str, List[str]]) -> None:
+        team = self._reader_team()
+        status = _text_param(query, "status", 20)
+        if status is not None and status not in approvals.APPROVAL_STATUSES:
+            raise _HttpError(400, "bad_request", "'status' must be one of pending, approved, denied, expired.")
+        db = self.server.db
+        items = db.list_approvals(
+            team["id"], status, db.approval_ttl_s(team["id"]), limit=_int_param(query, "limit", 100, 1, 200),
         )
-        self._send_html(200, DASHBOARD_HTML.replace("__CSP_NONCE__", nonce), {"Content-Security-Policy": csp})
+        self._send_json(200, {"approvals": items})
+
+    def _get_approval(self, raw_id: str) -> None:
+        team = self._reader_team()
+        approval_id = _approval_id(raw_id)
+        db = self.server.db
+        view = db.get_approval(team["id"], approval_id, db.approval_ttl_s(team["id"]))
+        if view is None:
+            raise _not_found("Approval not found.")
+        self._send_json(200, view)
+
+    def _decide_approval(self, raw_id: str) -> None:
+        approval_id = _approval_id(raw_id)
+        length = self._content_length(approvals.SMALL_BODY_LIMIT, "Decisions")
+        raw = self.rfile.read(length) if length else b""
+        team, source = self._decider()
+        try:
+            decision, reason, name = approvals.validate_decision(_json_object(raw))
+        except approvals.InvalidInput as exc:
+            raise _HttpError(400, "invalid_decision", str(exc)) from None
+        status = "approved" if decision == "approve" else "denied"
+        decided_by = f"{source}: {name}" if name else source
+        db = self.server.db
+        outcome, view = db.decide_approval(
+            team["id"], approval_id, status, decided_by, reason, db.approval_ttl_s(team["id"]),
+        )
+        if outcome == "missing":
+            raise _not_found("Approval not found.")
+        if outcome == "expired":
+            raise _HttpError(409, "expired", "This approval expired before it was decided.")
+        if outcome == "conflict":
+            raise _HttpError(409, "already_decided", f"This approval was already {view['status']}.")
+        self._send_json(200, view)
+
+    def _team_settings(self, method: str) -> None:
+        raw = b""
+        if method == "PUT":
+            length = self._content_length(approvals.SMALL_BODY_LIMIT, "Settings")
+            raw = self.rfile.read(length) if length else b""
+        team = self._bearer_team()
+        if team is None:
+            raise _unauthorized()
+        db = self.server.db
+        if method == "PUT":
+            try:
+                changes = approvals.validate_settings(_json_object(raw))
+            except approvals.InvalidInput as exc:
+                raise _HttpError(400, "invalid_settings", str(exc)) from None
+            db.update_approval_settings(team["id"], changes)
+        self._send_json(200, {"team": team["name"], **db.approval_settings(team["id"])})
+
+    def _approval_page(self, raw_id: str) -> None:
+        approval_id = _approval_id(raw_id)
+        team = self._bearer_team() or self.server.sessions.team_for(self._cookie(COOKIE_NAME))
+        if team is None:
+            self._send_html(401, SIGN_IN_HTML, {"Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'"})
+            return
+        db = self.server.db
+        if db.get_approval(team["id"], approval_id, db.approval_ttl_s(team["id"])) is None:
+            raise _not_found("Approval not found.")
+        nonce = secrets.token_urlsafe(16)
+        self._send_html(200, APPROVAL_HTML.replace("__CSP_NONCE__", nonce), {"Content-Security-Policy": _page_csp(nonce)})
 
 
 # Helpers
+
+
+def _page_csp(nonce: str) -> str:
+    return (
+        "default-src 'none'; script-src 'nonce-" + nonce + "'; style-src 'unsafe-inline'; "
+        "connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+    )
+
+
+def _size_text(limit: int) -> str:
+    return f"{limit // (1024 * 1024)} MB" if limit >= 1024 * 1024 else f"{limit // 1024} KB"
+
+
+def _json_object(raw: bytes) -> Dict[str, Any]:
+    """Parse a request body that must be one JSON object."""
+    if not raw:
+        raise _HttpError(400, "empty_body", "Send a JSON object in the request body.")
+    try:
+        payload = json.loads(raw.decode("utf-8"), parse_constant=_reject_constant)
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        raise _HttpError(400, "invalid_json", "The body must be UTF-8 JSON.") from None
+    if not isinstance(payload, dict):
+        raise _HttpError(400, "invalid_json", "The body must be a JSON object.")
+    return payload
+
+
+def _approval_id(raw: str) -> str:
+    value = unquote(raw)
+    if not _APPROVAL_ID.fullmatch(value):
+        raise _not_found("Approval not found.")
+    return value
 
 def _json_bytes(obj: Any) -> bytes:
     text = json.dumps(obj, ensure_ascii=False)

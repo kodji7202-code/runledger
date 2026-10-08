@@ -6,6 +6,9 @@
   runledger serve [--host 127.0.0.1] [--port 8787] [--db runledger.db]
   runledger team create NAME [--db runledger.db]
   runledger push [SESSION.jsonl | --latest] [--project PATH] [--server URL] [--key KEY] [--user NAME]
+  runledger guard                       Claude Code PreToolUse hook (reads the event on stdin)
+  runledger guard install [--project PATH | --global]
+  runledger guard test 'EVENT_JSON'
 """
 from __future__ import annotations
 
@@ -155,6 +158,16 @@ def cmd_push(args) -> int:
     return 0
 
 
+def cmd_guard(args) -> int:
+    from . import guard
+
+    if args.guard_cmd == "install":
+        return guard.cmd_install(args.project, args.global_scope)
+    if args.guard_cmd == "test":
+        return guard.cmd_test(args.event)
+    return guard.main()
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="runledger", description="Turn Claude Code runs into shareable receipts.")
     p.add_argument("--version", action="version", version=f"runledger {__version__}")
@@ -199,6 +212,16 @@ def main(argv=None) -> int:
     pp.add_argument("--key", help="team API key (default: $RUNLEDGER_API_KEY)")
     pp.add_argument("--user", help="developer name shown on the dashboard (default: git user.email or OS user)")
     pp.set_defaults(func=cmd_push)
+
+    pg = sub.add_parser("guard", help="real-time policy guard: Claude Code PreToolUse hook")
+    gsub = pg.add_subparsers(dest="guard_cmd", metavar="{install,test}")
+    pgi = gsub.add_parser("install", help="add the guard hook to Claude Code settings.json")
+    scope = pgi.add_mutually_exclusive_group()
+    scope.add_argument("--project", metavar="PATH", help="project folder: writes PATH/.claude/settings.json (default: current folder)")
+    scope.add_argument("--global", dest="global_scope", action="store_true", help="writes ~/.claude/settings.json")
+    pgt = gsub.add_parser("test", help="print the decision for one PreToolUse event (JSON)")
+    pgt.add_argument("event", help="the event as a JSON object")
+    pg.set_defaults(func=cmd_guard)
 
     args = p.parse_args(argv)
     return args.func(args)

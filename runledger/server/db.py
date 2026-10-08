@@ -11,6 +11,7 @@ import json
 import secrets
 import sqlite3
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -18,13 +19,40 @@ from ..pricing import friendly_model
 
 TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
+# Team settings added after the first release. Databases created earlier get them
+# through _add_missing_team_columns().
+TEAM_SETTING_COLUMNS = (
+    ("slack_webhook_url", "TEXT"),
+    ("webhook_url", "TEXT"),
+    ("approval_ttl_s", "INTEGER NOT NULL DEFAULT 600"),
+)
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS teams (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    name          TEXT NOT NULL UNIQUE,
-    api_key_hash  TEXT NOT NULL UNIQUE,
-    created_at    TEXT NOT NULL
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    name            TEXT NOT NULL UNIQUE,
+    api_key_hash    TEXT NOT NULL UNIQUE,
+    created_at      TEXT NOT NULL,
+    slack_webhook_url TEXT,
+    webhook_url     TEXT,
+    approval_ttl_s  INTEGER NOT NULL DEFAULT 600
 );
+CREATE TABLE IF NOT EXISTS approvals (
+    id           TEXT PRIMARY KEY,
+    team_id      INTEGER NOT NULL REFERENCES teams (id),
+    session_id   TEXT NOT NULL,
+    tool         TEXT NOT NULL,
+    summary      TEXT NOT NULL,
+    risks        TEXT NOT NULL DEFAULT '[]',
+    cwd          TEXT,
+    status       TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'denied')),
+    decided_by   TEXT,
+    decided_at   TEXT,
+    reason       TEXT,
+    created_at   TEXT NOT NULL,
+    created_ts   REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS approvals_by_team ON approvals (team_id, status, created_ts);
 CREATE TABLE IF NOT EXISTS runs (
     id             TEXT NOT NULL,
     team_id        INTEGER NOT NULL REFERENCES teams (id),
@@ -80,6 +108,43 @@ def _contains(text: str) -> str:
     return f"%{escaped}%"
 
 
+_APPROVAL_COLUMNS = (
+    "id, session_id, tool, summary, risks, cwd, status, decided_by, decided_at, reason, "
+    "created_at, created_ts"
+)
+
+
+def _stamp(ts: float) -> str:
+    return datetime.fromtimestamp(ts, timezone.utc).strftime(TIME_FORMAT)
+
+
+def _approval_view(data: Dict[str, Any], ttl_s: int, now: float) -> Dict[str, Any]:
+    """The approval as the API reports it. A pending approval older than the team's TTL reads as expired."""
+    status = data["status"]
+    if status == "pending" and now - data["created_ts"] > ttl_s:
+        status = "expired"
+    return {
+        "id": data["id"],
+        "status": status,
+        "decided_by": data["decided_by"],
+        "decided_at": data["decided_at"],
+        "reason": data["reason"],
+        "session_id": data["session_id"],
+        "tool": data["tool"],
+        "summary": data["summary"],
+        "risks": data["risks"],
+        "cwd": data["cwd"],
+        "created_at": data["created_at"],
+        "expires_at": _stamp(data["created_ts"] + ttl_s),
+    }
+
+
+def _approval_row_view(row: sqlite3.Row, ttl_s: int, now: float) -> Dict[str, Any]:
+    data = dict(row)
+    data["risks"] = json.loads(data["risks"] or "[]")
+    return _approval_view(data, ttl_s, now)
+
+
 def _summary(row: sqlite3.Row) -> Dict[str, Any]:
     return {
         "id": row["id"],
@@ -115,10 +180,19 @@ class Database:
             except sqlite3.DatabaseError:
                 pass  # some filesystems refuse WAL; the default journal still works
             self._conn.executescript(SCHEMA)
+            self._add_missing_team_columns()
 
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+
+    def _add_missing_team_columns(self) -> None:
+        """Upgrade a database created before the approval settings existed."""
+        present = {row["name"] for row in self._conn.execute("PRAGMA table_info(teams)")}
+        for name, ddl in TEAM_SETTING_COLUMNS:
+            if name not in present:
+                with self._conn:
+                    self._conn.execute(f"ALTER TABLE teams ADD COLUMN {name} {ddl}")
 
     # Teams and keys
 
@@ -324,3 +398,118 @@ class Database:
             "ORDER BY cost_usd DESC, runs DESC, name LIMIT 20",
             args,
         ).fetchall()
+
+    # Team approval settings
+
+    def approval_settings(self, team_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT slack_webhook_url, webhook_url, approval_ttl_s FROM teams WHERE id = ?", (team_id,)
+            ).fetchone()
+        return {
+            "slack_webhook_url": row["slack_webhook_url"],
+            "webhook_url": row["webhook_url"],
+            "approval_ttl_s": int(row["approval_ttl_s"]),
+        }
+
+    def approval_ttl_s(self, team_id: int) -> int:
+        return self.approval_settings(team_id)["approval_ttl_s"]
+
+    def update_approval_settings(self, team_id: int, changes: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply validated settings. Only the three known column names can reach the SQL text."""
+        columns = [c for c in ("slack_webhook_url", "webhook_url", "approval_ttl_s") if c in changes]
+        if columns:
+            sql = "UPDATE teams SET " + ", ".join(f"{c} = ?" for c in columns) + " WHERE id = ?"
+            with self._lock, self._conn:
+                self._conn.execute(sql, [changes[c] for c in columns] + [team_id])
+        return self.approval_settings(team_id)
+
+    # Approvals
+
+    def create_approval(
+        self, team_id: int, approval_id: str, approval: Dict[str, Any], ttl_s: int
+    ) -> Dict[str, Any]:
+        """Store a new pending approval. Returns its API view (the same shape GET returns)."""
+        now = time.time()
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO approvals (id, team_id, session_id, tool, summary, risks, cwd, status, "
+                "created_at, created_ts) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+                (
+                    approval_id, team_id, approval["session_id"], approval["tool"], approval["summary"],
+                    json.dumps(approval["risks"], ensure_ascii=False), approval["cwd"], _stamp(now), now,
+                ),
+            )
+        data = {
+            "id": approval_id, "status": "pending", "decided_by": None, "decided_at": None,
+            "reason": None, "session_id": approval["session_id"], "tool": approval["tool"],
+            "summary": approval["summary"], "risks": approval["risks"], "cwd": approval["cwd"],
+            "created_at": _stamp(now), "created_ts": now,
+        }
+        return _approval_view(data, ttl_s, now)
+
+    def get_approval(self, team_id: int, approval_id: str, ttl_s: int) -> Optional[Dict[str, Any]]:
+        """One approval of this team, or None. Another team's approval reads as missing."""
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT {_APPROVAL_COLUMNS} FROM approvals WHERE id = ? AND team_id = ?",
+                (approval_id, team_id),
+            ).fetchone()
+        return _approval_row_view(row, ttl_s, time.time()) if row else None
+
+    def list_approvals(
+        self, team_id: int, status: Optional[str], ttl_s: int, limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """Newest first. "pending" and "expired" are split by the TTL cutoff, not by a stored status."""
+        now = time.time()
+        cutoff = now - ttl_s
+        clauses = ["team_id = ?"]
+        params: List[Any] = [team_id]
+        if status == "pending":
+            clauses += ["status = 'pending'", "created_ts >= ?"]
+            params.append(cutoff)
+        elif status == "expired":
+            clauses += ["status = 'pending'", "created_ts < ?"]
+            params.append(cutoff)
+        elif status:
+            clauses.append("status = ?")
+            params.append(status)
+        params.append(max(1, min(int(limit), 200)))
+        sql = (
+            f"SELECT {_APPROVAL_COLUMNS} FROM approvals WHERE {' AND '.join(clauses)} "
+            "ORDER BY created_ts DESC, id LIMIT ?"
+        )
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [_approval_row_view(r, ttl_s, now) for r in rows]
+
+    def decide_approval(
+        self,
+        team_id: int,
+        approval_id: str,
+        status: str,
+        decided_by: str,
+        reason: Optional[str],
+        ttl_s: int,
+    ) -> Tuple[str, Optional[Dict[str, Any]]]:
+        """Record approved/denied on a pending, unexpired approval, atomically.
+
+        Returns (outcome, view): "decided", "missing" (no such approval for this team),
+        "expired", or "conflict" (already decided)."""
+        now = time.time()
+        with self._lock:
+            with self._conn:
+                cur = self._conn.execute(
+                    "UPDATE approvals SET status = ?, decided_by = ?, decided_at = ?, reason = ? "
+                    "WHERE id = ? AND team_id = ? AND status = 'pending' AND created_ts >= ?",
+                    (status, decided_by, _stamp(now), reason, approval_id, team_id, now - ttl_s),
+                )
+                decided = cur.rowcount == 1
+            view = self.get_approval(team_id, approval_id, ttl_s)
+        if view is None:
+            return "missing", None
+        if decided:
+            return "decided", view
+        if view["status"] == "expired":
+            return "expired", view
+        return "conflict", view

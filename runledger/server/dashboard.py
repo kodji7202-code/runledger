@@ -60,6 +60,22 @@ tr:last-child td{border-bottom:0}
 .badge.high{background:color-mix(in srgb,var(--red) 18%,transparent);color:var(--red)}
 a{color:var(--accent)}
 footer{margin-top:28px;color:var(--muted);font-size:12px}
+.approvals{margin:0 0 22px}
+.approvals-head{display:flex;align-items:center;gap:10px;margin-bottom:10px}
+.approvals-head h2{margin:0}
+.count{font:700 12px ui-monospace,monospace;background:var(--chip);color:var(--muted);border-radius:99px;padding:2px 9px}
+.approvals-list{display:grid;gap:12px}
+.approval{border-left:3px solid var(--amber)}
+.approval-head{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:baseline;gap:8px}
+.approval-tool{font:600 13px ui-monospace,SFMono-Regular,Menlo,monospace;overflow-wrap:anywhere}
+.approval-summary{margin:10px 0 0;white-space:pre-wrap;word-break:break-word;font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--chip);border-radius:8px;padding:10px 12px;max-height:220px;overflow:auto}
+.approval-risks{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+.approval-meta{color:var(--muted);font-size:12px;margin-top:8px;overflow-wrap:anywhere}
+.approval-actions{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-top:12px}
+.btn{font-weight:600;padding:7px 16px}
+.btn.approve{background:var(--accent);border-color:var(--accent);color:var(--bg)}
+.btn.deny{color:var(--red);border-color:var(--red)}
+button:disabled{opacity:.5;cursor:default}
 </style>
 </head>
 <body>
@@ -80,6 +96,16 @@ footer{margin-top:28px;color:var(--muted);font-size:12px}
     <button type="button" id="refresh">Refresh</button>
   </div>
 </header>
+
+<section class="approvals" aria-labelledby="approvals-title">
+  <div class="approvals-head">
+    <h2 id="approvals-title">Pending approvals</h2>
+    <span class="count" id="approvals-count" aria-live="polite">0</span>
+  </div>
+  <div id="approvals-notice" class="notice" role="alert"></div>
+  <div id="approvals-list" class="approvals-list"></div>
+  <div id="approvals-empty" class="empty"></div>
+</section>
 
 <div id="notice" class="notice" role="alert"></div>
 
@@ -164,20 +190,31 @@ footer{margin-top:28px;color:var(--muted);font-size:12px}
     return n + (Number(n) === 1 ? " run" : " runs");
   }
 
+  function parseBody(res) {
+    return res.text().then(function (text) {
+      var body = {};
+      try { body = text ? JSON.parse(text) : {}; } catch (e) { body = {}; }
+      if (!res.ok) {
+        var err = new Error((body.error && body.error.message) || ("Request failed with HTTP " + res.status));
+        err.status = res.status;
+        throw err;
+      }
+      return body;
+    });
+  }
+
   function getJSON(url) {
     return fetch(url, { credentials: "same-origin", headers: { "Accept": "application/json" } })
-      .then(function (res) {
-        return res.text().then(function (text) {
-          var body = {};
-          try { body = text ? JSON.parse(text) : {}; } catch (e) { body = {}; }
-          if (!res.ok) {
-            var err = new Error((body.error && body.error.message) || ("Request failed with HTTP " + res.status));
-            err.status = res.status;
-            throw err;
-          }
-          return body;
-        });
-      });
+      .then(parseBody);
+  }
+
+  function postJSON(url, payload) {
+    return fetch(url, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Accept": "application/json", "Content-Type": "application/json", "X-Requested-With": "runledger" },
+      body: JSON.stringify(payload || {})
+    }).then(parseBody);
   }
 
   function explain(err) {
@@ -350,7 +387,353 @@ footer{margin-top:28px;color:var(--muted);font-size:12px}
     $(id).addEventListener("input", applyFilters);
   });
 
+  // Pending approvals: refreshed every 3 seconds. Only the newest request is applied,
+  // so a slow earlier response cannot overwrite a newer one.
+  var APPROVAL_POLL_MS = 3000;
+  var approvalsView = { seq: 0, signature: null };
+
+  function approvalNotice(message) {
+    var box = $("approvals-notice");
+    box.textContent = message || "";
+    box.className = message ? "notice show error" : "notice";
+  }
+
+  function approvalCard(a) {
+    var card = el("article", "card approval");
+    var head = el("div", "approval-head");
+    head.appendChild(el("div", "approval-tool", a.tool));
+    head.appendChild(el("span", "mono", when(a.created_at)));
+    card.appendChild(head);
+    card.appendChild(el("pre", "approval-summary", a.summary));
+
+    if (a.risks && a.risks.length) {
+      var risks = el("div", "approval-risks");
+      a.risks.forEach(function (r) {
+        var chip = el("span", "badge " + level(r.severity), String(r.code || "risk").replace(/_/g, " "));
+        chip.title = r.reason || "";
+        risks.appendChild(chip);
+      });
+      card.appendChild(risks);
+    }
+
+    var where = [];
+    if (a.session_id) { where.push("session " + a.session_id); }
+    if (a.cwd) { where.push(a.cwd); }
+    card.appendChild(el("div", "approval-meta", where.join(" · ")));
+
+    var approve = el("button", "btn approve", "Approve");
+    var deny = el("button", "btn deny", "Deny");
+    approve.type = "button";
+    deny.type = "button";
+    var pair = [approve, deny];
+    approve.addEventListener("click", function () { decide(a.id, "approve", pair); });
+    deny.addEventListener("click", function () { decide(a.id, "deny", pair); });
+    var details = el("a", null, "Details");
+    details.href = "/approvals/" + encodeURIComponent(a.id);
+
+    var actions = el("div", "approval-actions");
+    actions.appendChild(approve);
+    actions.appendChild(deny);
+    actions.appendChild(details);
+    card.appendChild(actions);
+    return card;
+  }
+
+  function renderApprovals(items) {
+    $("approvals-count").textContent = String(items.length);
+    $("approvals-empty").textContent = items.length
+      ? ""
+      : "Nothing waiting. Risky agent actions appear here for a yes or no.";
+    var signature = JSON.stringify(items);
+    if (signature === approvalsView.signature) { return; }  // unchanged: keep the buttons as they are
+    approvalsView.signature = signature;
+    var list = $("approvals-list");
+    clear(list);
+    items.forEach(function (a) { list.appendChild(approvalCard(a)); });
+  }
+
+  function loadApprovals() {
+    var mine = ++approvalsView.seq;
+    return getJSON("/api/approvals?status=pending&limit=50").then(function (body) {
+      if (mine !== approvalsView.seq) { return; }
+      approvalNotice("");
+      renderApprovals((body && body.approvals) || []);
+    }, function (err) {
+      if (mine !== approvalsView.seq) { return; }
+      approvalNotice(explain(err));
+    });
+  }
+
+  function decisionError(err) {
+    if (err.status === 409) { return "This approval was already decided or has expired."; }
+    if (err.status === 404) { return "This approval no longer exists."; }
+    return "Could not record the decision: " + explain(err);
+  }
+
+  function decide(id, decision, buttons) {
+    buttons.forEach(function (b) { b.disabled = true; });
+    approvalNotice("");
+    postJSON("/api/approvals/" + encodeURIComponent(id) + "/decision", { decision: decision })
+      .then(function () {}, function (err) { approvalNotice(decisionError(err)); })
+      .then(function () {
+        approvalsView.signature = null;  // redraw from the server, which also re-enables the buttons
+        return loadApprovals();
+      });
+  }
+
+  loadApprovals();
+  setInterval(loadApprovals, APPROVAL_POLL_MS);
+
   refresh();
+})();
+</script>
+</body>
+</html>
+"""
+
+APPROVAL_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>RunLedger approval</title>
+<style>
+:root{--bg:#0a0b0d;--panel:#111316;--line:#1f2328;--text:#eef0f2;--muted:#9aa1ab;--accent:#4fe0b0;--amber:#f5b547;--red:#ff6b6b;--chip:#171a1e}
+@media (prefers-color-scheme: light){:root{--bg:#f7f8f9;--panel:#fff;--line:#e3e6ea;--text:#121417;--muted:#5d6670;--accent:#047857;--amber:#b45309;--red:#c62828;--chip:#f0f2f4}}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--text)}
+body{font:14px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+.wrap{max-width:720px;margin:0 auto;padding:28px 16px 64px}
+.brand{color:var(--muted);font-size:12px;letter-spacing:.05em;text-transform:uppercase}
+h1{font-size:22px;margin:6px 0 16px;overflow-wrap:anywhere}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 18px;margin-bottom:12px;min-width:0}
+.row{display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center;justify-content:space-between}
+.label{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.05em;margin-top:14px}
+.label:first-child{margin-top:0}
+.mono{font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;overflow-wrap:anywhere}
+pre.summary{white-space:pre-wrap;word-break:break-word;font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--chip);border-radius:8px;padding:12px;margin:6px 0 0;max-height:360px;overflow:auto}
+.risks{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
+dl{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:8px 16px;margin:0}
+dt{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.05em;padding-top:2px}
+dd{margin:0;overflow-wrap:anywhere}
+.badge{display:inline-block;font:700 11px ui-monospace,monospace;padding:2px 8px;border-radius:99px;white-space:nowrap;background:var(--chip);color:var(--muted)}
+.badge.low{background:var(--chip);color:var(--muted)}
+.badge.medium{background:color-mix(in srgb,var(--amber) 18%,transparent);color:var(--amber)}
+.badge.high{background:color-mix(in srgb,var(--red) 18%,transparent);color:var(--red)}
+.badge.st-pending{background:color-mix(in srgb,var(--amber) 18%,transparent);color:var(--amber)}
+.badge.st-approved{background:color-mix(in srgb,var(--accent) 18%,transparent);color:var(--accent)}
+.badge.st-denied{background:color-mix(in srgb,var(--red) 18%,transparent);color:var(--red)}
+.badge.st-expired{background:var(--chip);color:var(--muted)}
+.fields{display:grid;gap:10px}
+input,button{font:inherit;color:var(--text);background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:8px 10px;min-width:0}
+input{width:100%}
+.actions{display:flex;flex-wrap:wrap;gap:10px;margin-top:14px}
+.btn{font-weight:600;padding:9px 18px;cursor:pointer}
+.btn.approve{background:var(--accent);border-color:var(--accent);color:var(--bg)}
+.btn.deny{color:var(--red);border-color:var(--red)}
+button:disabled{opacity:.5;cursor:default}
+.notice{display:none;margin:0 0 12px;padding:10px 14px;border-radius:10px;border:1px solid var(--line);background:var(--panel)}
+.notice.show{display:block}
+.notice.error{border-color:var(--red);color:var(--red)}
+.muted{color:var(--muted)}
+a{color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="wrap">
+<div class="brand">RunLedger approval</div>
+<h1 id="title">Approval request</h1>
+<div id="notice" class="notice" role="alert"></div>
+
+<div class="card">
+  <div class="row">
+    <span class="badge" id="status" aria-live="polite">loading</span>
+    <span class="mono muted" id="created"></span>
+  </div>
+  <div class="label">Tool</div>
+  <div class="mono" id="tool"></div>
+  <div class="label">What the agent wants to do</div>
+  <pre class="summary" id="summary"></pre>
+  <div class="label">Risks</div>
+  <div class="risks" id="risks"></div>
+</div>
+
+<div class="card">
+  <dl>
+    <dt>Session</dt><dd class="mono" id="session"></dd>
+    <dt>Folder</dt><dd class="mono" id="cwd"></dd>
+    <dt>Expires</dt><dd id="expires"></dd>
+    <dt>Decided by</dt><dd id="decided-by"></dd>
+    <dt>Decided at</dt><dd id="decided-at"></dd>
+    <dt>Reason</dt><dd id="reason"></dd>
+  </dl>
+</div>
+
+<div class="card" id="decide">
+  <div class="fields">
+    <input id="who" type="text" maxlength="100" placeholder="Your name (optional)" aria-label="Your name">
+    <input id="why" type="text" maxlength="500" placeholder="Reason (optional)" aria-label="Reason for the decision">
+  </div>
+  <div class="actions">
+    <button type="button" class="btn approve" id="approve">Approve</button>
+    <button type="button" class="btn deny" id="deny">Deny</button>
+  </div>
+</div>
+
+<p><a href="/">Back to the dashboard</a></p>
+</div>
+
+<script nonce="__CSP_NONCE__">
+(function () {
+  "use strict";
+
+  var POLL_MS = 3000;
+  var approvalId = location.pathname.slice("/approvals/".length);
+  var timer = null;
+  var busy = false;
+
+  function $(id) { return document.getElementById(id); }
+
+  function el(tag, className, text) {
+    var node = document.createElement(tag);
+    if (className) { node.className = className; }
+    if (text !== undefined && text !== null) { node.textContent = String(text); }
+    return node;
+  }
+
+  function clear(node) {
+    while (node.firstChild) { node.removeChild(node.firstChild); }
+  }
+
+  function when(iso) {
+    if (!iso) { return "-"; }
+    var d = new Date(iso);
+    return isNaN(d.getTime()) ? String(iso) : d.toLocaleString();
+  }
+
+  function level(value) {
+    return value === "high" || value === "medium" ? value : "low";
+  }
+
+  function parseBody(res) {
+    return res.text().then(function (text) {
+      var body = {};
+      try { body = text ? JSON.parse(text) : {}; } catch (e) { body = {}; }
+      if (!res.ok) {
+        var err = new Error((body.error && body.error.message) || ("Request failed with HTTP " + res.status));
+        err.status = res.status;
+        throw err;
+      }
+      return body;
+    });
+  }
+
+  function request(method, url, payload) {
+    var opts = { method: method, credentials: "same-origin", headers: { "Accept": "application/json" } };
+    if (payload !== undefined) {
+      opts.headers["Content-Type"] = "application/json";
+      opts.headers["X-Requested-With"] = "runledger";
+      opts.body = JSON.stringify(payload);
+    }
+    return fetch(url, opts).then(parseBody);
+  }
+
+  function explain(err) {
+    if (err.status === 401) {
+      return "Not signed in, or the session expired. Open the dashboard once with ?key=YOUR_API_KEY, then open this page again.";
+    }
+    if (err.status === 404) { return "This approval was not found for your team."; }
+    return "Could not load the approval: " + err.message;
+  }
+
+  function notice(message) {
+    var box = $("notice");
+    box.textContent = message || "";
+    box.className = message ? "notice show error" : "notice";
+  }
+
+  function setButtons(disabled) {
+    $("approve").disabled = disabled;
+    $("deny").disabled = disabled;
+  }
+
+  function renderRisks(risks) {
+    var box = $("risks");
+    clear(box);
+    if (!risks || !risks.length) {
+      box.appendChild(el("span", "muted", "None recorded"));
+      return;
+    }
+    risks.forEach(function (r) {
+      var chip = el("span", "badge " + level(r.severity), String(r.code || "risk").replace(/_/g, " "));
+      chip.title = r.reason || "";
+      box.appendChild(chip);
+    });
+  }
+
+  function render(a) {
+    var status = a.status || "pending";
+    var badge = $("status");
+    badge.textContent = status;
+    badge.className = "badge st-" + status;
+    $("title").textContent = a.tool ? "Approval: " + a.tool : "Approval request";
+    $("tool").textContent = a.tool || "-";
+    $("summary").textContent = a.summary || "";
+    $("created").textContent = when(a.created_at);
+    renderRisks(a.risks);
+    $("session").textContent = a.session_id || "-";
+    $("cwd").textContent = a.cwd || "-";
+    $("expires").textContent = when(a.expires_at);
+    $("decided-by").textContent = a.decided_by || "-";
+    $("decided-at").textContent = a.decided_at ? when(a.decided_at) : "-";
+    $("reason").textContent = a.reason || "-";
+    var open = status === "pending";
+    $("decide").style.display = open ? "" : "none";
+    if (!open && timer) { clearInterval(timer); timer = null; }
+  }
+
+  function load() {
+    return request("GET", "/api/approvals/" + encodeURIComponent(approvalId)).then(function (a) {
+      notice("");
+      render(a);
+    }, function (err) {
+      notice(explain(err));
+    });
+  }
+
+  function decisionError(err) {
+    if (err.status === 409) { return "This approval was already decided or has expired. Showing the current state."; }
+    return "Could not record the decision: " + explain(err);
+  }
+
+  function decide(decision) {
+    if (busy) { return; }
+    busy = true;
+    setButtons(true);
+    var payload = { decision: decision };
+    var who = $("who").value.trim();
+    var why = $("why").value.trim();
+    if (who) { payload.name = who; }
+    if (why) { payload.reason = why; }
+    request("POST", "/api/approvals/" + encodeURIComponent(approvalId) + "/decision", payload)
+      .then(function (a) {
+        notice("");
+        render(a);
+      }, function (err) {
+        notice(decisionError(err));
+        return load();
+      })
+      .then(function () {
+        busy = false;
+        setButtons(false);
+      });
+  }
+
+  $("approve").addEventListener("click", function () { decide("approve"); });
+  $("deny").addEventListener("click", function () { decide("deny"); });
+  load();
+  timer = setInterval(load, POLL_MS);
 })();
 </script>
 </body>

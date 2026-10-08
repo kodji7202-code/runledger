@@ -241,7 +241,7 @@ def test_dashboard_sign_in_sets_http_only_cookie(env):
     status, headers, _ = _http(base, "GET", f"/?key={key}")
     assert status == 302 and headers["location"] == "/"
     cookie = headers["set-cookie"]
-    assert "HttpOnly" in cookie and "SameSite=Strict" in cookie
+    assert "HttpOnly" in cookie and "SameSite=Lax" in cookie
     token_pair = cookie.split(";")[0]
     assert key not in cookie  # the API key itself is not stored in the cookie
 
