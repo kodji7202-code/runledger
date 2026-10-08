@@ -149,6 +149,29 @@ The server and key come only from the environment (`RUNLEDGER_SERVER`, `RUNLEDGE
 
 **Log.** Each decision is one JSON line in `<project>/.runledger/guard.log`: time, session, tool, decision, risk codes, and a command or file path. Each project setting that was ignored adds a `warning` line saying what was ignored. Secrets are masked and text is cut at 200 characters. File contents are never logged. The folder is already in `.gitignore`.
 
+## Supported agents
+
+`list`, `receipt` and `push` read each agent's own session logs. Choose one agent
+with `--agent`; without it, the newest session from any agent in the folder is used.
+
+| Agent | `--agent` | Where its sessions are |
+| --- | --- | --- |
+| Claude Code | `claude-code` | `~/.claude/projects/<project>/<session>.jsonl` (or `$CLAUDE_CONFIG_DIR`) |
+| Codex CLI | `codex` | `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl` (default `~/.codex`) |
+| Aider | `aider` | `.aider.chat.history.md` in the project folder |
+| Any other agent | `native` | `<project>/.runledger/runs/*.runledger.json` or `*.runledger.jsonl` |
+
+Any agent can write the RunLedger format, so it needs no adapter. The format is
+documented in [docs/format.md](docs/format.md), with a Python and a Node example.
+
+```bash
+runledger list --agent native
+runledger receipt .runledger/runs/3f9c2e1a.runledger.jsonl --open
+```
+
+When an agent reports its own cost, the receipt shows it as "reported by agent"
+next to the list-price estimate.
+
 ## How the numbers work
 
 - **Cost** = tokens × list price of the model for each assistant message (cache writes at 1.25× input, cache reads at the cache-hit rate). On a Claude subscription you are not billed per token, so read it as "what this run would cost on the API".

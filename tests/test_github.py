@@ -96,7 +96,7 @@ def test_dry_run_renders_sample_session(capsys):
     assert rc == 0
     assert out.startswith(MARKER + "\n## RunLedger receipt · 🔴 High risk · 80/100\n")
     assert "| The payment retry logic gives up after the first failure." in out
-    assert "| Sonnet 4.5, Haiku 4.5 | 10 | $0.108 | 🔴 80/100 High |" in out
+    assert "| Claude Code · Sonnet 4.5, Haiku 4.5 | 10 | $0.108 | 🔴 80/100 High |" in out
     assert "<summary>Details for <code>7f3c2a10</code>: 5 risk reason(s), 3 file(s) changed</summary>" in out
     assert "- **HIGH** · step 4: Read a secrets file (.env.local)" in out
     assert "- `src/payments/retry.ts` +11 −1" in out

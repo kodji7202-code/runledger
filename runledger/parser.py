@@ -71,6 +71,8 @@ class Run:
     models: Dict[str, Usage]
     cost: Optional[float] = None
     overall_summary: str = ""
+    agent: str = "claude-code"            # adapter NAME that produced this run
+    reported_cost: Optional[float] = None  # cost reported by the agent itself, if any
 
     @property
     def duration_seconds(self) -> Optional[float]:

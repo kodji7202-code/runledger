@@ -58,7 +58,11 @@ def build_payload(
     path = Path(session_path)
     if not path.is_file():
         raise PushError(f"Session file not found: {path}")
-    run, score, level, risks, _note = build(str(path))
+    try:
+        run, score, level, risks, _note = build(str(path))
+    except (OSError, ValueError) as exc:  # unreadable file, or a native file that does not validate
+        raise PushError(str(exc)) from None
+    # The JSON receipt carries "agent" (label, e.g. "Codex CLI") and "agent_id".
     payload = json.loads(render(run, score, level, risks, "json"))
     # Exact cost per model, including messages that issued no tool call
     # (step costs alone would miss those).

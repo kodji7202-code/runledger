@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from . import __version__
+from .adapters import label as agent_label
 from .cli import build
 from .parser import Run
 from .pricing import friendly_model
@@ -108,6 +109,19 @@ def _models(run: Run) -> str:
     return _text(", ".join(names)) or "n/a"
 
 
+def _agent_model(run: Run) -> str:
+    return f"{_text(agent_label(run.agent))} · {_models(run)}"
+
+
+def _cost_cell(run: Run) -> str:
+    """The estimate when there is one; otherwise the figure the agent reported."""
+    if run.cost is not None:
+        return _money(run.cost)
+    if run.reported_cost is not None:
+        return f"{_money(run.reported_cost)} reported"
+    return "n/a"
+
+
 def _run_details(item: Scored) -> List[str]:
     run = item.run
     changes = list(file_changes(run).values())
@@ -171,13 +185,13 @@ def render_comment(items: List[Scored], limit: int = MAX_COMMENT_CHARS) -> str:
         "",
         f"**{runs}** · {steps} steps · {files} files changed · estimated cost {total}",
         "",
-        "| Run | Model | Steps | Cost | Risk |",
+        "| Run | Agent · Model | Steps | Cost | Risk |",
         "| --- | --- | ---: | ---: | --- |",
     ]
     for s in items:
         lines.append(
-            f"| {_title(s.run)} | {_models(s.run)} | {len(s.run.steps)} | "
-            f"{_money(s.run.cost)} | {_badge(s.level)} {s.score}/100 {s.level} |")
+            f"| {_title(s.run)} | {_agent_model(s.run)} | {len(s.run.steps)} | "
+            f"{_cost_cell(s.run)} | {_badge(s.level)} {s.score}/100 {s.level} |")
     lines.append("")
     for s in items:
         lines += _run_details(s)
@@ -330,7 +344,8 @@ def _pr_arg(text: str) -> int:
 def _session_paths(sessions: List[str], sessions_dir: Optional[str]) -> List[Path]:
     candidates = [Path(s) for s in sessions]
     if sessions_dir:
-        candidates += sorted(Path(sessions_dir).glob("*.jsonl"))
+        folder = Path(sessions_dir)
+        candidates += sorted(folder.glob("*.jsonl")) + sorted(folder.glob("*.runledger.json"))
     unique: List[Path] = []
     seen = set()
     for path in candidates:
@@ -448,7 +463,7 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--session", action="append", metavar="PATH",
                    help="session .jsonl file (repeatable)")
     c.add_argument("--sessions-dir", metavar="DIR",
-                   help="score every .jsonl file in this folder")
+                   help="score every .jsonl and .runledger.json session file in this folder")
     c.add_argument("--fail-on", type=_score_arg, metavar="SCORE",
                    help="exit 1 if the highest risk score is >= SCORE (0-100)")
     c.add_argument("--repo", metavar="owner/name",

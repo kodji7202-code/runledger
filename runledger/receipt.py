@@ -7,6 +7,7 @@ from dataclasses import asdict
 from typing import Dict, List, Optional
 
 from . import __version__
+from .adapters import label as agent_label
 from .parser import Run
 from .pricing import friendly_model
 from .risk import Risk
@@ -31,11 +32,34 @@ def _dur(sec: Optional[float]) -> str:
     return f"{h}h {m}m" if h else f"{m}m {s}s"
 
 
+def _cost_text(run: Run) -> str:
+    """Estimate from list prices, the agent's own figure, or both."""
+    if run.cost is not None and run.reported_cost is not None:
+        return f"{_money(run.cost)} est. · {_money(run.reported_cost)} reported by agent"
+    if run.cost is not None:
+        return _money(run.cost)
+    if run.reported_cost is not None:
+        return f"{_money(run.reported_cost)} reported by agent"
+    return "n/a"
+
+
+def _cost_card(run: Run) -> str:
+    if run.cost is None and run.reported_cost is None:
+        return '<div class="card"><span>Cost</span><b>n/a</b></div>'
+    if run.cost is not None:
+        note = (f"<small>est. · reported by agent {_money(run.reported_cost)}</small>"
+                if run.reported_cost is not None else "")
+        return f'<div class="card"><span>Cost</span><b>{_money(run.cost)}</b>{note}</div>'
+    return (f'<div class="card"><span>Cost</span><b>{_money(run.reported_cost)}</b>'
+            "<small>reported by agent</small></div>")
+
+
 def to_dict(run: Run, score: int, level: str, risks: List[Risk]) -> Dict:
     changes = file_changes(run)
     return {
         "runledger_version": __version__,
         "session_id": run.session_id,
+        "agent": agent_label(run.agent), "agent_id": run.agent,
         "cwd": run.cwd, "git_branch": run.git_branch,
         "started": run.started, "ended": run.ended,
         "duration_seconds": run.duration_seconds,
@@ -47,7 +71,8 @@ def to_dict(run: Run, score: int, level: str, risks: List[Risk]) -> Dict:
                    "input_tokens": run.usage.input_tokens, "output_tokens": run.usage.output_tokens,
                    "cache_write_tokens": run.usage.cache_write_tokens,
                    "cache_read_tokens": run.usage.cache_read_tokens,
-                   "cost_usd": run.cost, "files_changed": len(changes)},
+                   "cost_usd": run.cost, "reported_cost_usd": run.reported_cost,
+                   "files_changed": len(changes)},
         "models": {m: {"tokens": u.total} for m, u in run.models.items()},
         "files": [asdict(c) for c in changes.values()],
         "steps": [{"n": s.index, "tool": s.tool, "summary": s.summary, "model": s.model,
@@ -59,8 +84,8 @@ def to_dict(run: Run, score: int, level: str, risks: List[Risk]) -> Dict:
 def to_markdown(run: Run, score: int, level: str, risks: List[Risk]) -> str:
     changes = file_changes(run)
     out = [f"# Run receipt · {run.session_id[:8]}", ""]
-    out.append(f"- **Folder:** `{run.cwd}`  ·  **Branch:** `{run.git_branch or '-'}`  ·  **Duration:** {_dur(run.duration_seconds)}")
-    out.append(f"- **Risk:** {score}/100 ({level})  ·  **Cost:** {_money(run.cost)}  ·  **Tokens:** {_tok(run.usage.total)}  ·  **Files changed:** {len(changes)}")
+    out.append(f"- **Agent:** {agent_label(run.agent)}  ·  **Folder:** `{run.cwd}`  ·  **Branch:** `{run.git_branch or '-'}`  ·  **Duration:** {_dur(run.duration_seconds)}")
+    out.append(f"- **Risk:** {score}/100 ({level})  ·  **Cost:** {_cost_text(run)}  ·  **Tokens:** {_tok(run.usage.total)}  ·  **Files changed:** {len(changes)}")
     out += ["", "## Overview", run.overall_summary, ""]
     if risks:
         out.append("## Why it was flagged")
@@ -103,6 +128,7 @@ tr.flag td:first-child{box-shadow:inset 3px 0 var(--amber)}tr.flag.high td:first
 .pill{font:12px ui-monospace,monospace;color:var(--muted);border:1px solid var(--line);border-radius:6px;padding:1px 6px;white-space:nowrap}
 code{font:13px ui-monospace,monospace;background:var(--line);padding:1px 5px;border-radius:5px;word-break:break-all}
 .add{color:var(--accent)}.rem{color:var(--red)}
+.card small{display:block;color:var(--muted);font-size:12px;margin-top:4px}
 footer{margin-top:40px;color:var(--muted);font-size:12px}
 """
 
@@ -140,6 +166,7 @@ def to_html(run: Run, score: int, level: str, risks: List[Risk]) -> str:
         )
     models = ", ".join(f"{friendly_model(m)} ({_tok(u.total)})" for m, u in run.models.items())
     request = e(run.prompts[0][:400]) if run.prompts else "—"
+    reported_note = " Reported cost comes from the agent itself." if run.reported_cost is not None else ""
 
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -147,10 +174,10 @@ def to_html(run: Run, score: int, level: str, risks: List[Risk]) -> str:
 <body><div class="wrap">
 <div class="brand"><div class="mark">RL</div>RunLedger · Run receipt</div>
 <h1>{request}</h1>
-<div class="meta">#{e(run.session_id[:8])} · Claude Code · {e(run.cwd or '?')} · branch {e(run.git_branch or '-')} · {e(run.started or '')}</div>
+<div class="meta">#{e(run.session_id[:8])} · {e(agent_label(run.agent))} · {e(run.cwd or '?')} · branch {e(run.git_branch or '-')} · {e(run.started or '')}</div>
 <div class="grid">
  <div class="card"><span>Risk</span><b style="color:{color}">{score}/100</b><div class="bar"><i style="width:{score}%;background:{color}"></i></div></div>
- <div class="card"><span>Cost</span><b>{_money(run.cost)}</b></div>
+ {_cost_card(run)}
  <div class="card"><span>Tokens</span><b>{_tok(run.usage.total)}</b></div>
  <div class="card"><span>Steps</span><b>{len(run.steps)}</b></div>
  <div class="card"><span>Files changed</span><b>{len(changes)}</b></div>
@@ -160,7 +187,7 @@ def to_html(run: Run, score: int, level: str, risks: List[Risk]) -> str:
 <h2>Risk · {level}</h2><div class="overview">{risk_html}</div>
 <h2>Files changed</h2><table>{files_html}</table>
 <h2>Steps</h2><table><tr><th>#</th><th>What happened</th><th>Model</th><th style="text-align:right">Tokens</th><th style="text-align:right">Cost</th></tr>{''.join(rows)}</table>
-<footer>Models: {e(models or 'n/a')}. Costs are estimates from public Claude API list prices; subscription plans are billed differently.
+<footer>Models: {e(models or 'n/a')}. Costs are estimates from public Claude API list prices; subscription plans are billed differently.{reported_note}
 Risk score is rule-based. Generated by RunLedger {__version__} · runledger.site</footer>
 </div></body></html>"""
 

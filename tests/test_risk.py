@@ -3,7 +3,9 @@ command rules, hardcoded secrets in written content, and the per-project
 .runledger.json policy. Every sample secret below is synthetic."""
 import json
 import os
+import re
 import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -407,3 +409,230 @@ def test_invalid_policy_file_never_breaks_assess(tmp_path):
     score, level, risks = assess(_run([_step("Bash", 1, command="sudo ls")], str(tmp_path)))
     assert isinstance(score, int) and level in ("Low", "Medium", "High")
     assert [r.severity for r in risks] == ["high"]
+
+
+# ---------------------------------------------------------------- Git Bash / MSYS, devices, switches
+
+@pytest.mark.parametrize("path", ["/d/runledger/src/a.py", "/mnt/d/runledger/a.py", "/cygdrive/d/runledger/a.py"])
+def test_msys_drive_paths_inside_windows_cwd_are_not_outside(path):
+    assert _outside(path, WIN_CWD) is False
+
+
+@pytest.mark.parametrize("path", ["/c/Users/claud/.claude/CLAUDE.md", "/mnt/c/Users/x.txt", "/d/runledger2/x.py"])
+def test_msys_drive_paths_outside_windows_cwd_are_outside(path):
+    assert _outside(path, WIN_CWD) is True
+
+
+@pytest.mark.parametrize("path", ["/dev/null", "/dev/stdout", "/dev/stderr", "NUL", "nul", "/proc/self/status"])
+def test_device_paths_are_never_outside(path):
+    assert _outside(path, WIN_CWD) is False
+    assert _outside(path, POSIX_CWD) is False
+
+
+def test_windows_switches_are_not_paths():
+    assert _reasons(_risks("Bash", command="cmd /c dir /S /Q")) == []
+    assert _reasons(_risks("Bash", command="robocopy D:\\runledger\\a D:\\runledger\\b /MIR /MT:8")) == []
+
+
+def test_url_and_sed_expression_are_not_paths():
+    assert _reasons(_risks("Bash", command="curl -o out.txt https://example.com/a/b/c")) == []
+    assert _reasons(_risks("Bash", command="sed -i 's#/old/path#/new/path#g' file.txt")) == []
+
+
+def test_option_value_path_after_equals_is_checked():
+    risks = _risks("Bash", command="python -m runledger push x.jsonl --db=/c/Users/bob/keep.db")
+    assert [(r.severity, r.code) for r in risks] == [("low", "shell_outside")]
+
+
+def test_heredoc_body_and_echo_text_are_not_analysed():
+    assert _reasons(_risks("Bash", command="cat <<'EOF' > notes.txt\nrm -rf /\n.env\nEOF")) == []
+    assert _reasons(_risks("Bash", command='echo "cat .env && rm tests/test_x.py"')) == []
+
+
+def test_env_var_in_temp_is_not_outside(tmp_path, monkeypatch):
+    monkeypatch.setenv("TEMP", str(tmp_path))
+    assert _reasons(_risks("Bash", command='rm -f "$TEMP/e2e.db"')) == []
+
+
+# ---------------------------------------------------------------- real Windows session commands
+
+CASES_FILE = Path(__file__).parent / "fixtures" / "real_windows_commands.txt"
+
+
+def _load_cases():
+    cases = {}
+    text = CASES_FILE.read_text(encoding="utf-8")
+    for block in re.split(r"^---[ \t]*$", text, flags=re.M):
+        lines = block.strip("\n").split("\n")
+        name, tool = None, "Bash"
+        while lines and re.match(r"^#\s*(case|tool):", lines[0]):
+            key, value = re.match(r"^#\s*(case|tool):\s*(.+)$", lines[0]).groups()
+            if key == "case":
+                name = value.strip()
+            else:
+                tool = value.strip()
+            lines.pop(0)
+        if name:
+            cases[name] = (tool, "\n".join(lines).strip("\n"))
+    return cases
+
+
+# (severity, code) of every finding, sorted. Each expectation was checked by hand against the
+# real command in tests/fixtures/real_windows_commands.txt.
+EXPECTED = {
+    "cd_inside_cwd": [],
+    "heredoc_claude_md": [("low", "shell_outside")],
+    "taskkill_image_name": [("medium", "command")],
+    "taskkill_by_pid": [],
+    "env_var_temp_db": [],
+    "rm_test_source": [("high", "test_deleted")],
+    "rm_test_fixture": [("low", "test_deleted")],
+    "rm_fixture_in_compound_with_push": [("low", "test_deleted")],
+    "git_commit_text_mentions_rm": [],
+    "git_commit_heredoc_message": [],
+    "rm_rf_root": [("high", "command")],
+    "curl_pipe_sh": [("high", "command")],
+    "sudo_real": [("high", "command")],
+    "sudo_in_echo_is_text": [],
+    "mnt_drive_outside": [("low", "shell_outside")],
+    "cygdrive_inside": [],
+    "devices_are_not_paths": [],
+    "msys_option_value_in_temp": [],
+    "python_c_text_is_not_code": [],
+    "python_heredoc_body_is_not_code": [],
+    "echo_printed_token": [("medium", "command")],
+    "cat_env_file": [("high", "secret_file")],
+    "force_push": [("high", "command"), ("medium", "command")],
+    "kill_and_rm_with_unknown_vars": [],
+    "rm_rf_temp_dir": [("high", "command")],
+    "cd_switch_and_clone": [],
+    "robocopy_switches": [("low", "shell_outside")],
+    "sed_expression": [],
+    "ps_remove_recurse_force": [("high", "command")],
+    "ps_remove_recurse_outside": [("high", "shell_outside")],
+    "ps_printed_env_secret": [("medium", "command")],
+    "ps_download_to_file": [],
+    "ps_remove_test_file": [("high", "test_deleted")],
+}
+CASES = _load_cases()
+
+
+def test_every_fixture_case_has_an_expectation():
+    assert set(CASES) == set(EXPECTED)
+
+
+@pytest.mark.parametrize("name", sorted(EXPECTED))
+def test_real_windows_command_findings(name):
+    tool, command = CASES[name]
+    outcome = sorted((r.severity, r.code) for r in _risks(tool, command=command))
+    assert outcome == EXPECTED[name]
+
+
+def test_taskkill_by_image_name_reason_is_explicit():
+    hits = _risks("Bash", command="taskkill //F //IM python.exe")
+    assert [r.reason for r in hits] == ["Killed all processes by image name (taskkill /IM)"]
+
+
+def test_heredoc_claude_md_reason_names_the_file():
+    hits = _risks("Bash", command="cat >> /c/Users/claud/.claude/CLAUDE.md <<'EOF'\nrm -rf /\nEOF")
+    assert [r.reason for r in hits] == [
+        "Shell command wrote outside the working folder (/c/Users/claud/.claude/CLAUDE.md)"]
+
+
+# ---------------------------------------------------------------- Delete tool
+
+@pytest.mark.parametrize("path, expected", [
+    ("tests/test_payments.py", [("high", "test_deleted")]),
+    ("tests/old.spec.ts", [("high", "test_deleted")]),
+    ("tests/fixtures/data.json", [("low", "test_deleted")]),
+    ("src/app.py", []),
+    (".env", [("high", "secret_file")]),
+    (r"E:\data\x.txt", [("high", "write_outside")]),
+    (r"D:\runledger\src\x.py", []),
+])
+def test_delete_tool_is_checked_like_rm(path, expected):
+    assert sorted((r.severity, r.code) for r in _risks("Delete", file_path=path)) == expected
+
+
+def test_delete_tool_reason_names_the_test_file():
+    hits = _risks("Delete", file_path="tests/test_payments.py")
+    assert _reasons(hits) == ["Deleted a test file (test_payments.py)"]
+
+
+# ---------------------------------------------------------------- .git folder
+
+@pytest.mark.parametrize("tool, inp", [
+    ("Write", {"file_path": ".git/config", "content": "x"}),
+    ("Edit", {"file_path": r"D:\runledger\.git\hooks\pre-commit", "old_string": "a", "new_string": "b"}),
+    ("MultiEdit", {"file_path": ".git/HEAD", "edits": [{"old_string": "a", "new_string": "b"}]}),
+    ("Delete", {"file_path": ".git/index"}),
+])
+def test_writes_inside_git_folder_are_medium(tool, inp):
+    hits = [(r.severity, r.code) for r in _risks(tool, **inp)]
+    assert ("medium", "git_internals") in hits
+
+
+@pytest.mark.parametrize("tool, inp", [
+    ("Write", {"file_path": ".github/workflows/ci.yml", "content": "x"}),
+    ("Write", {"file_path": ".gitignore", "content": "x"}),
+    ("Read", {"file_path": ".git/config"}),
+])
+def test_git_folder_rule_is_for_writes_only(tool, inp):
+    assert "git_internals" not in {r.code for r in _risks(tool, **inp)}
+
+
+# ---------------------------------------------------------------- workdir
+
+def test_workdir_outside_working_folder_is_medium():
+    hits = _risks("Bash", command="ls", workdir=r"E:\other")
+    assert [(r.severity, r.code, r.reason) for r in hits] == [
+        ("medium", "shell_outside", "Ran a command outside the working folder (E:\\other)")]
+
+
+def test_workdir_inside_working_folder_is_quiet():
+    assert _reasons(_risks("Bash", command="cat x/y.md", workdir=r"D:\runledger\sub")) == []
+
+
+def test_relative_argument_resolves_against_workdir():
+    hits = _risks("Bash", command="rm tests/test_payments.py", workdir=r"E:\proj")
+    codes = sorted((r.severity, r.code) for r in hits)
+    assert ("high", "test_deleted") in codes and ("high", "shell_outside") in codes
+    outside = [r for r in hits if r.reason.startswith("Shell command referenced")]
+    assert [r.severity for r in outside] == ["high"]
+    assert r"E:\proj\tests\test_payments.py" in outside[0].reason
+
+
+def test_relative_read_resolves_against_workdir():
+    hits = [r for r in _risks("Bash", command="cat notes/readme.md", workdir=r"E:\proj")
+            if r.reason.startswith("Shell command referenced")]
+    assert [r.severity for r in hits] == ["low"]
+
+
+def test_relative_path_without_workdir_is_inside_cwd():
+    assert _reasons(_risks("Bash", command="cat notes/readme.md")) == []
+
+
+def test_relative_workdir_is_ignored():
+    assert _reasons(_risks("Bash", command="cat notes/readme.md", workdir="sub")) == []
+
+
+# ---------------------------------------------------------------- scoring caps
+
+def _steps(tool, n, **inp):
+    return [_step(tool, index=i + 1, **inp) for i in range(n)]
+
+
+def test_low_findings_cap_at_ten_points(tmp_path):
+    steps = [_step(f"mcp__github__call_{i}", i + 1) for i in range(50)]
+    score, _, _ = assess(_run(steps, str(tmp_path)))
+    assert score == 10
+
+
+def test_medium_findings_cap_at_forty_five_points(tmp_path):
+    score, _, _ = assess(_run(_steps("Bash", 30, command="git push origin main"), str(tmp_path)))
+    assert score == 45
+
+
+def test_high_findings_are_not_capped_below_one_hundred(tmp_path):
+    score, _, _ = assess(_run(_steps("Bash", 4, command="sudo ls"), str(tmp_path)))
+    assert score == 60  # 30 for the first sudo, then 10 for each repeat

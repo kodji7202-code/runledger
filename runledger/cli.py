@@ -1,35 +1,43 @@
 """runledger command line.
 
-  runledger list [--project PATH] [--all]
-  runledger receipt [SESSION.jsonl | --latest] [--project PATH] [--format html|md|json]
+  runledger list [--project PATH] [--all] [--agent AGENT] [--limit N]
+  runledger receipt [SESSION | --latest] [--project PATH] [--agent AGENT] [--format html|md|json]
                     [-o FILE] [--ai] [--ai-model MODEL] [--open]
   runledger serve [--host 127.0.0.1] [--port 8787] [--db runledger.db]
   runledger team create NAME [--db runledger.db]
-  runledger push [SESSION.jsonl | --latest] [--project PATH] [--server URL] [--key KEY] [--user NAME]
+  runledger push [SESSION | --latest] [--project PATH] [--agent AGENT] [--server URL] [--key KEY] [--user NAME]
   runledger guard                       Claude Code PreToolUse hook (reads the event on stdin)
   runledger guard install [--project PATH | --global]
   runledger guard test 'EVENT_JSON'
+
+SESSION is a session file of any supported agent; the agent is detected from the file.
+AGENT is one of claude-code, codex, aider, native (the RunLedger format, docs/format.md).
 """
 from __future__ import annotations
 
 import argparse
 import os
+import re
 import sqlite3
 import sys
 import webbrowser
 from datetime import datetime
 from pathlib import Path
+from typing import List, Optional
 
 from . import __version__
-from .parser import find_sessions, parse_session
+from . import adapters
 from .pricing import apply_costs
 from .receipt import render
 from .risk import assess
 from .summarize import DEFAULT_AI_MODEL, ai_summaries, apply_templates
 
+AGENTS = ("claude-code", "codex", "aider", "native")
+
 
 def build(session_path: str, use_ai: bool = False, ai_model: str = DEFAULT_AI_MODEL):
-    run = parse_session(session_path)
+    path = Path(session_path)
+    run = adapters.detect(path).parse(path)
     apply_costs(run)
     apply_templates(run)
     ai_note = None
@@ -42,33 +50,70 @@ def build(session_path: str, use_ai: bool = False, ai_model: str = DEFAULT_AI_MO
     return run, score, level, risks, ai_note
 
 
+def _file_stem(session_id: str) -> str:
+    """Session ids come from agents' files, so keep only file-name-safe characters."""
+    return re.sub(r"[^A-Za-z0-9._-]", "_", session_id)[:8] or "run"
+
+
+def _latest(project: Optional[str], agent: Optional[str]) -> Optional[str]:
+    """Path of the newest session for the project (of `agent` only, if given).
+    Prints the reason and returns None when there is none."""
+    try:
+        files = adapters.find_sessions(project, agent)
+    except KeyError as exc:  # the agent's adapter is not installed
+        print(f"error: {exc.args[0]}", file=sys.stderr)
+        return None
+    if not files:
+        kind = f"{adapters.label(agent)} " if agent else ""
+        print(f"No {kind}sessions found for this folder. Pass a session file or use --project.", file=sys.stderr)
+        return None
+    return str(files[0])
+
+
+def _session_path(args) -> Optional[str]:
+    if args.session:
+        if getattr(args, "agent", None):
+            print("note: --agent is ignored when a session file is given", file=sys.stderr)
+        return args.session
+    return _latest(args.project or os.getcwd(), getattr(args, "agent", None))
+
+
 def cmd_list(args) -> int:
     project = None if args.all else (args.project or os.getcwd())
-    files = find_sessions(project)
+    try:
+        files = adapters.find_sessions(project, args.agent)
+    except KeyError as exc:  # the agent's adapter is not installed
+        print(f"error: {exc.args[0]}", file=sys.stderr)
+        return 1
     if not files:
         where = "any project" if args.all else project
-        print(f"No Claude Code sessions found for {where}.", file=sys.stderr)
+        kind = f"{adapters.label(args.agent)} " if args.agent else ""
+        print(f"No {kind}sessions found for {where}.", file=sys.stderr)
         return 1
+    print(f"{'when':<16}  {'id':<8}  {'agent':<12}  {'steps':>5}  first request")
     for f in files[: args.limit]:
-        run = parse_session(f)
+        try:
+            run = adapters.detect(f).parse(f)
+        except (OSError, ValueError) as exc:
+            print(f"skipped: {exc}", file=sys.stderr)
+            continue
         when = datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
         first = (run.prompts[0] if run.prompts else "").replace("\n", " ")[:60]
-        print(f"{when}  {f.stem[:8]}  {len(run.steps):>4} steps  {first}")
+        print(f"{when}  {run.session_id[:8]:<8}  {run.agent[:12]:<12}  {len(run.steps):>5} steps  {first}")
         if args.all:
             print(f"                  {run.cwd}")
     return 0
 
 
 def cmd_receipt(args) -> int:
-    if args.session:
-        path = args.session
-    else:
-        files = find_sessions(args.project or os.getcwd())
-        if not files:
-            print("No Claude Code sessions found for this folder. Pass a .jsonl path or use --project.", file=sys.stderr)
-            return 1
-        path = str(files[0])
-    run, score, level, risks, note = build(path, args.ai, args.ai_model)
+    path = _session_path(args)
+    if path is None:
+        return 1
+    try:
+        run, score, level, risks, note = build(path, args.ai, args.ai_model)
+    except (OSError, ValueError) as exc:  # missing file, or a session file that does not validate
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     out = render(run, score, level, risks, args.format)
     if note:
         print(note, file=sys.stderr)
@@ -76,7 +121,7 @@ def cmd_receipt(args) -> int:
         sys.stdout.write(out)
         return 0
     ext = {"html": "html", "md": "md", "json": "json"}[args.format]
-    target = Path(args.output or f"runledger-{run.session_id[:8]}.{ext}")
+    target = Path(args.output or f"runledger-{_file_stem(run.session_id)}.{ext}")
     target.write_text(out, encoding="utf-8")
     print(f"Receipt: {target}  ·  risk {score}/100 ({level})  ·  {len(run.steps)} steps")
     if args.open and args.format == "html":
@@ -140,14 +185,9 @@ def cmd_push(args) -> int:
 
     server = args.server or os.environ.get("RUNLEDGER_SERVER")
     key = args.key or os.environ.get("RUNLEDGER_API_KEY")
-    if args.session:
-        path = args.session
-    else:
-        files = find_sessions(args.project or os.getcwd())
-        if not files:
-            print("No Claude Code sessions found for this folder. Pass a .jsonl path or use --project.", file=sys.stderr)
-            return 1
-        path = str(files[0])
+    path = _session_path(args)
+    if path is None:
+        return 1
     try:
         result = push(server or "", key or "", path, user=args.user)
     except PushError as exc:
@@ -168,21 +208,28 @@ def cmd_guard(args) -> int:
     return guard.main()
 
 
-def main(argv=None) -> int:
-    p = argparse.ArgumentParser(prog="runledger", description="Turn Claude Code runs into shareable receipts.")
+def _agent_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--agent", choices=AGENTS,
+                        help="only sessions from this agent (default: every agent)")
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    p = argparse.ArgumentParser(prog="runledger", description="Turn coding-agent runs into shareable receipts.")
     p.add_argument("--version", action="version", version=f"runledger {__version__}")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    pl = sub.add_parser("list", help="list recent Claude Code sessions")
+    pl = sub.add_parser("list", help="list recent sessions")
     pl.add_argument("--project", help="project folder (default: current folder)")
     pl.add_argument("--all", action="store_true", help="sessions from every project")
+    _agent_arg(pl)
     pl.add_argument("--limit", type=int, default=20)
     pl.set_defaults(func=cmd_list)
 
     pr = sub.add_parser("receipt", help="build a receipt for a session")
-    pr.add_argument("session", nargs="?", help="path to a session .jsonl (default: latest for this folder)")
+    pr.add_argument("session", nargs="?", help="session file of any supported agent (default: latest for this folder)")
     pr.add_argument("--latest", action="store_true", help="use the latest session (default)")
     pr.add_argument("--project", help="project folder (default: current folder)")
+    _agent_arg(pr)
     pr.add_argument("--format", choices=["html", "md", "json"], default="html")
     pr.add_argument("-o", "--output", help="output file, or - for stdout")
     pr.add_argument("--ai", action="store_true", help="plain-language summaries with Claude (needs ANTHROPIC_API_KEY)")
@@ -205,9 +252,10 @@ def main(argv=None) -> int:
     ptc.set_defaults(func=cmd_team_create)
 
     pp = sub.add_parser("push", help="send a session receipt to a team server")
-    pp.add_argument("session", nargs="?", help="path to a session .jsonl (default: latest for this folder)")
+    pp.add_argument("session", nargs="?", help="session file of any supported agent (default: latest for this folder)")
     pp.add_argument("--latest", action="store_true", help="use the latest session (default)")
     pp.add_argument("--project", help="project folder to find sessions in (default: current folder)")
+    _agent_arg(pp)
     pp.add_argument("--server", help="server URL (default: $RUNLEDGER_SERVER)")
     pp.add_argument("--key", help="team API key (default: $RUNLEDGER_API_KEY)")
     pp.add_argument("--user", help="developer name shown on the dashboard (default: git user.email or OS user)")

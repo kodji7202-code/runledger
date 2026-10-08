@@ -54,6 +54,8 @@ def file_changes(run: Run) -> Dict[str, FileChange]:
                 o, n = e.get("old_string") or "", e.get("new_string") or ""
                 fc.removed += _lines(o)
                 fc.added += _lines(n)
+        elif s.tool == "Delete" and p:
+            changes.setdefault(p, FileChange(p)).deleted = True
         elif s.tool == "NotebookEdit" and p:
             changes.setdefault(p, FileChange(p)).added += _lines(s.input.get("new_source"))
         elif s.tool == "Bash":
@@ -71,6 +73,10 @@ def template_summary(step: Step, cwd: Optional[str]) -> str:
     p = _short(str(i.get("file_path") or i.get("notebook_path") or i.get("path") or ""), cwd)
     if t == "Read":
         return f"Read {p}"
+    if t == "Delete":
+        return f"Deleted {p}"
+    if t == "Search":
+        return f"Searched for '{i.get('pattern', '')}'" + (f" in {p}" if p else "")
     if t == "Write":
         return f"Wrote {p} ({_lines(i.get('content'))} lines)"
     if t in ("Edit", "MultiEdit"):

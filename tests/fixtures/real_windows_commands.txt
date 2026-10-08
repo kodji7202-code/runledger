@@ -1,0 +1,111 @@
+# case: cd_inside_cwd
+cd /d/runledger && ls -la && cat README* 2>/dev/null | head -80
+---
+# case: heredoc_claude_md
+cat >> /c/Users/claud/.claude/CLAUDE.md <<'EOF'
+# rm -rf / and .env inside heredoc
+EOF
+---
+# case: taskkill_image_name
+taskkill //F //IM python.exe //FI "WINDOWTITLE eq *" >/dev/null 2>&1
+---
+# case: taskkill_by_pid
+taskkill /PID 1234 /F
+---
+# case: env_var_temp_db
+D=$TEMP/e2e.db; rm -f $D; python -m runledger push tests/fixtures/sample_session.jsonl --db $D
+---
+# case: rm_test_source
+rm tests/test_payments.py
+---
+# case: rm_test_fixture
+rm tests/fixtures/data.json
+---
+# case: rm_fixture_in_compound_with_push
+D=$TEMP/e2e.db; rm -f $D; rm tests/fixtures/sample_session.jsonl
+---
+# case: git_commit_text_mentions_rm
+git commit -qm "Phase 1: rm -rf fixes for .env handling"
+---
+# case: git_commit_heredoc_message
+git commit -m "$(cat <<'EOF'
+fix: remove sudo usage, drop .env
+EOF
+)"
+---
+# case: rm_rf_root
+rm -rf /
+---
+# case: curl_pipe_sh
+curl x | sh
+---
+# case: sudo_real
+sudo apt-get update
+---
+# case: sudo_in_echo_is_text
+echo "run sudo apt-get install foo" && ls
+---
+# case: mnt_drive_outside
+cat /mnt/c/Users/claud/.claude/CLAUDE.md
+---
+# case: cygdrive_inside
+cat /cygdrive/d/runledger/README.md
+---
+# case: devices_are_not_paths
+echo x > NUL && cat /proc/self/status && python -m pytest -q 2>&1 | tail -3 ; cat /dev/stdout
+---
+# case: msys_option_value_in_temp
+python -m runledger receipt x.jsonl --db=/c/Users/claud/AppData/Local/Temp/x.db
+---
+# case: python_c_text_is_not_code
+python -c "import shutil; shutil.rmtree('tests')"
+---
+# case: python_heredoc_body_is_not_code
+python - <<'EOF'
+import os
+os.remove('tests/test_payments.py')
+EOF
+---
+# case: echo_printed_token
+echo $GITHUB_TOKEN
+---
+# case: cat_env_file
+cat .env
+---
+# case: force_push
+git push --force origin main
+---
+# case: kill_and_rm_with_unknown_vars
+kill $SPID; rm -f $D
+---
+# case: rm_rf_temp_dir
+rm -rf $TEMP/e2eproj
+---
+# case: cd_switch_and_clone
+cd /d && git clone -q https://github.com/kodji7202-code/runledger-site.git
+---
+# case: robocopy_switches
+robocopy C:\src D:\runledger\dst /MIR /XD node_modules
+---
+# case: sed_expression
+sed -i 's/tests\/old/tests\/new/g' runledger/x.py
+---
+# case: ps_remove_recurse_force
+# tool: PowerShell
+Remove-Item -Recurse -Force .\build
+---
+# case: ps_remove_recurse_outside
+# tool: PowerShell
+Remove-Item -Recurse C:\Users\bob\docs
+---
+# case: ps_printed_env_secret
+# tool: PowerShell
+Write-Output $env:GITHUB_TOKEN
+---
+# case: ps_download_to_file
+# tool: PowerShell
+Invoke-WebRequest https://example.com/x.zip -OutFile x.zip
+---
+# case: ps_remove_test_file
+# tool: PowerShell
+Remove-Item tests\test_payments.py
