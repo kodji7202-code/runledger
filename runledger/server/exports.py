@@ -324,7 +324,8 @@ def _report(db: Database, team_id: int, team_name: str, days: int, now: datetime
         "Costs are estimates: token counts multiplied by published list prices (runledger/prices.json). "
         "They do not match an invoice, a subscription or a negotiated rate.",
         "A run counts toward the period by its start time, or by its push time when the start time is "
-        "missing. Pushing the same session again replaces its record and its figures.",
+        "missing. Runs are immutable: an identical re-push is an idempotent retry, while different "
+        "content for the same session id is rejected.",
         "Key lifecycle events are the create, rotate and revoke entries of the audit log. The full audit "
         "log for the period is in the audit CSV export.",
         "Quality scores, grades, recommendations and AI review verdicts are the values the client sent with "

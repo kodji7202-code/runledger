@@ -28,7 +28,10 @@ the work in the pull request.
 > to share. Anyone who can read the repository can read the committed file. The PR
 > comment itself shows each session's first request, the file paths and the risk
 > reasons, with known secret formats masked, and it is visible to everyone who can
-> see the pull request.
+> see the pull request. The masking in the PR comment does not sanitize the committed
+> session file. For a public repository, do not commit a raw transcript unless you are
+> comfortable publishing the whole file; run `runledger receipt` locally instead, or
+> use this action with session files only in a private repository.
 
 ## 2. Add the workflow
 

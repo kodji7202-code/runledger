@@ -469,8 +469,8 @@ def test_report_counts_runs_by_risk_level(env):
 
 def test_report_lists_approvals_decided_and_key_lifecycle_events(env):
     srv, base = env
-    _, admin, _, _ = team_with_keys(srv)
-    approval_id = _json(_http(base, "POST", "/api/approvals", body=APPROVAL, headers=_auth(admin))[2])["id"]
+    _, admin, member, _ = team_with_keys(srv)
+    approval_id = _json(_http(base, "POST", "/api/approvals", body=APPROVAL, headers=_auth(member))[2])["id"]
     assert _http(base, "POST", f"/api/approvals/{approval_id}/decision", body={"decision": "approve"},
                  headers=_auth(admin))[0] == 200
     created = _json(_http(base, "POST", "/api/keys", body={"label": "ci", "role": "member"},

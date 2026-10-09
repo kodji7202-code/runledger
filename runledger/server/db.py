@@ -19,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ..pricing import friendly_model
-from .billing import ACTIVE, ENDED, PAST_DUE
+from .billing import ACTIVE, ENDED, PAST_DUE, access as billing_access, write_refusal as billing_write_refusal
 from .insights import AI_REVIEW_LIKE, QUALITY_LIKE, RECOMMENDATIONS_LIKE, review_fields
 from .auth import (
     INITIAL_KEY_LABEL,
@@ -51,6 +51,14 @@ TEAM_SETTING_COLUMNS = (
 # Run columns added after the first release.
 RUN_COLUMNS = (
     ("agent", "TEXT"),
+    ("pushed_by_key_id", "TEXT"),
+)
+
+# Approval requester identity was added after the first approval release. It is
+# internal provenance: API views expose the attested display value, not the key id.
+APPROVAL_IDENTITY_COLUMNS = (
+    ("requester_key_id", "TEXT"),
+    ("requested_by", "TEXT"),
 )
 
 # Columns for the quality score, the AI verdict and the estimated savings of a run. They are
@@ -84,6 +92,8 @@ CREATE TABLE IF NOT EXISTS approvals (
     summary      TEXT NOT NULL,
     risks        TEXT NOT NULL DEFAULT '[]',
     cwd          TEXT,
+    requester_key_id TEXT,
+    requested_by TEXT,
     status       TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'denied')),
     decided_by   TEXT,
     decided_at   TEXT,
@@ -114,6 +124,7 @@ CREATE TABLE IF NOT EXISTS runs (
     est_savings_usd REAL,
     receipt_json   TEXT NOT NULL,
     receipt_html   TEXT,
+    pushed_by_key_id TEXT,
     created_at     TEXT NOT NULL,
     updated_at     TEXT NOT NULL,
     PRIMARY KEY (team_id, id)
@@ -142,6 +153,16 @@ CREATE TABLE IF NOT EXISTS api_keys (
     revoked_at    TEXT
 );
 CREATE INDEX IF NOT EXISTS api_keys_by_team ON api_keys (team_id);
+-- A recovery key may inherit one already-paid seat without rewriting the run
+-- that originally occupied it. Only billing recovery creates these aliases.
+-- Repeated recoveries rotate the same active alias key, so this cannot grow an
+-- unbounded family of simultaneously usable keys for one seat.
+CREATE TABLE IF NOT EXISTS seat_aliases (
+    key_id       TEXT PRIMARY KEY REFERENCES api_keys (id),
+    team_id      INTEGER NOT NULL REFERENCES teams (id),
+    seat_key_id  TEXT NOT NULL REFERENCES api_keys (id)
+);
+CREATE INDEX IF NOT EXISTS seat_aliases_by_team ON seat_aliases (team_id);
 CREATE TABLE IF NOT EXISTS audit_log (
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
     team_id  INTEGER NOT NULL REFERENCES teams (id),
@@ -225,8 +246,19 @@ def _contains(text: str) -> str:
     return f"%{escaped}%"
 
 
+def _canonical_json(value: Any) -> str:
+    """Type-sensitive canonical JSON for immutable receipt equality.
+
+    Comparing decoded Python values directly is unsafe here because bool is a
+    subclass of int, so True == 1. JSON serialization preserves that type
+    distinction while normalizing object key order and insignificant spacing.
+    """
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
 _APPROVAL_COLUMNS = (
-    "id, session_id, tool, summary, risks, cwd, status, decided_by, decided_at, reason, "
+    "id, session_id, tool, summary, risks, cwd, requester_key_id, requested_by, "
+    "status, decided_by, decided_at, reason, "
     "created_at, created_ts"
 )
 
@@ -246,6 +278,7 @@ def _approval_view(data: Dict[str, Any], ttl_s: int, now: float) -> Dict[str, An
         "decided_by": data["decided_by"],
         "decided_at": data["decided_at"],
         "reason": data["reason"],
+        "requested_by": data.get("requested_by"),
         "session_id": data["session_id"],
         "tool": data["tool"],
         "summary": data["summary"],
@@ -304,6 +337,7 @@ class Database:
             self._conn.executescript(SCHEMA)
             self._add_missing_columns("teams", TEAM_SETTING_COLUMNS)
             self._add_missing_columns("runs", RUN_COLUMNS)
+            self._add_missing_columns("approvals", APPROVAL_IDENTITY_COLUMNS)
             self._upgrade_review_columns()
             self._migrate_api_keys()
 
@@ -559,6 +593,72 @@ class Database:
             self._audit(team_id, actor, "key.create", key_id, {"label": label, "role": role, "prefix": prefix})
         return {"id": key_id, "label": label, "role": role, "prefix": prefix, "created_at": now, "key": key}
 
+    def create_recovery_key(
+        self, team_id: int, label: Any, actor: str, seat_since: str
+    ) -> Dict[str, Any]:
+        """Create or rotate the team's billing-recovery admin key.
+
+        If an admin key already occupies a recent billed seat, the recovery key
+        aliases that seat. The original run keeps its original pushed_by_key_id,
+        and the original key remains valid. A later recovery rotates the same
+        active recovery key instead of creating another active alias.
+
+        If no admin key currently occupies a seat, the recovery key is a normal
+        new key and must acquire a seat like any other key.
+        """
+        label = validate_label(label)
+        new_key = generate_key()
+        now = utc_now()
+        with self._lock, self._conn:
+            if self._conn.execute("SELECT 1 FROM teams WHERE id = ?", (team_id,)).fetchone() is None:
+                raise ValueError(f"No team with id {team_id}.")
+
+            existing = self._conn.execute(
+                "SELECT k.id, k.created_at, sa.seat_key_id FROM api_keys k "
+                "JOIN seat_aliases sa ON sa.key_id = k.id "
+                "WHERE k.team_id = ? AND k.revoked_at IS NULL "
+                "ORDER BY k.created_at, k.rowid LIMIT 1",
+                (team_id,),
+            ).fetchone()
+            if existing is not None:
+                prefix = key_prefix(new_key)
+                self._conn.execute(
+                    "UPDATE api_keys SET label = ?, role = 'admin', key_hash = ?, prefix = ? WHERE id = ?",
+                    (label, hash_key(new_key), prefix, existing["id"]),
+                )
+                self._conn.execute("DELETE FROM sessions WHERE key_id = ?", (existing["id"],))
+                self._audit(
+                    team_id,
+                    actor,
+                    "key.rotate",
+                    existing["id"],
+                    {"label": label, "role": "admin", "prefix": prefix},
+                )
+                return {
+                    "id": existing["id"], "label": label, "role": "admin", "prefix": prefix,
+                    "created_at": existing["created_at"], "key": new_key,
+                }
+
+            occupied = self._conn.execute(
+                "SELECT COALESCE(sa.seat_key_id, r.pushed_by_key_id) AS seat_key_id "
+                "FROM runs r JOIN api_keys k ON k.id = r.pushed_by_key_id "
+                "LEFT JOIN seat_aliases sa ON sa.key_id = r.pushed_by_key_id "
+                "WHERE r.team_id = ? AND r.updated_at >= ? AND r.pushed_by_key_id IS NOT NULL "
+                "AND k.role = 'admin' "
+                "ORDER BY r.updated_at DESC, r.rowid DESC LIMIT 1",
+                (team_id, seat_since),
+            ).fetchone()
+
+            key_id = self._insert_key(team_id, label, "admin", new_key, now)
+            if occupied is not None:
+                self._conn.execute(
+                    "INSERT INTO seat_aliases (key_id, team_id, seat_key_id) VALUES (?, ?, ?)",
+                    (key_id, team_id, occupied["seat_key_id"]),
+                )
+            prefix = key_prefix(new_key)
+            self._audit(team_id, actor, "key.create", key_id, {"label": label, "role": "admin", "prefix": prefix})
+        return {"id": key_id, "label": label, "role": "admin", "prefix": prefix, "created_at": now, "key": new_key}
+
     def revoke_key(self, team_id: int, key_id: str, actor: str) -> Tuple[str, Optional[Dict[str, Any]]]:
         """Revoke a key. Returns (outcome, view): "ok", "missing", "already_revoked", or
         "last_admin" (the team's only active admin key cannot be revoked)."""
@@ -645,40 +745,95 @@ class Database:
 
     # Runs
 
-    def upsert_run(self, team_id: int, run: Dict[str, Any], actor: Optional[str] = None) -> None:
-        """Insert or replace one run (re-pushing a session updates it). With an actor, the push is audited."""
+    def upsert_run(
+        self,
+        team_id: int,
+        run: Dict[str, Any],
+        actor: Optional[str] = None,
+        *,
+        key_id: Optional[str] = None,
+        seat_since: Optional[str] = None,
+        enforce_billing: bool = False,
+    ) -> Dict[str, Any]:
+        """Store one run immutably.
+
+        An identical re-push is idempotent. A different receipt with the same
+        team/session id is rejected instead of replacing evidence. When a seat
+        limit is supplied, admission for a new authenticated key and the insert
+        share this lock/transaction, so concurrent pushes cannot oversubscribe
+        a single server process.
+
+        Returns a result dict whose outcome is inserted, duplicate, conflict,
+        payment_required or seat_limit. Billing state and seat count are read
+        under this same lock as the insert, so a concurrent subscription
+        webhook cannot make admission use stale plan data.
+        """
         now = utc_now()
         models_json = json.dumps(run["models"], sort_keys=True)
         receipt_json = json.dumps(run["receipt"], ensure_ascii=False)
         with self._lock, self._conn:
+            seat_limit: Optional[int] = None
+            if enforce_billing:
+                sub = self._conn.execute(
+                    "SELECT * FROM billing_subscriptions WHERE team_id = ?", (team_id,)
+                ).fetchone()
+                if sub is not None:
+                    info = billing_access(sub)
+                    refusal = billing_write_refusal(info)
+                    if refusal:
+                        return {"outcome": "payment_required", "message": refusal}
+                    seat_limit = int(info["seats"])
+
+            existing = self._conn.execute(
+                "SELECT receipt_json, receipt_html, risk_score, risk_level "
+                "FROM runs WHERE team_id = ? AND id = ?",
+                (team_id, run["id"]),
+            ).fetchone()
+            if existing is not None:
+                try:
+                    same_receipt = _canonical_json(json.loads(existing["receipt_json"])) == _canonical_json(run["receipt"])
+                except (TypeError, ValueError):
+                    same_receipt = False
+                if same_receipt and existing["receipt_html"] == run["receipt_html"]:
+                    return {
+                        "outcome": "duplicate",
+                        "risk_score": existing["risk_score"],
+                        "risk_level": existing["risk_level"],
+                    }
+                return {"outcome": "conflict"}
+
+            if key_id is not None and seat_limit is not None and seat_since is not None:
+                rows = self._conn.execute(
+                    "SELECT r.pushed_by_key_id, r.user, sa.seat_key_id FROM runs r "
+                    "LEFT JOIN seat_aliases sa ON sa.key_id = r.pushed_by_key_id "
+                    "WHERE r.team_id = ? AND r.updated_at >= ?",
+                    (team_id, seat_since),
+                ).fetchall()
+                # Legacy rows were attributed from the receipt's caller-supplied
+                # user string, so they cannot be mapped securely to a key during
+                # migration. The first post-upgrade authenticated push starts a
+                # fresh key-backed seat ledger instead of double-counting legacy
+                # rows for the rest of the seat window.
+                identities = {
+                    "key:" + (row["seat_key_id"] or row["pushed_by_key_id"])
+                    for row in rows
+                    if row["pushed_by_key_id"]
+                }
+                alias = self._conn.execute(
+                    "SELECT seat_key_id FROM seat_aliases WHERE key_id = ? AND team_id = ?",
+                    (key_id, team_id),
+                ).fetchone()
+                seat_key_id = alias["seat_key_id"] if alias else key_id
+                if "key:" + seat_key_id not in identities and len(identities) >= int(seat_limit):
+                    return {"outcome": "seat_limit", "seat_limit": seat_limit}
+
             self._conn.execute(
                 """
                 INSERT INTO runs (id, team_id, user, project, agent, title, started_at, ended_at, models,
                                   steps, tokens, files_changed, cost, risk_score, risk_level,
                                   quality_score, quality_grade, ai_verdict, est_savings_usd,
-                                  receipt_json, receipt_html, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT (team_id, id) DO UPDATE SET
-                    user = excluded.user,
-                    project = excluded.project,
-                    agent = excluded.agent,
-                    title = excluded.title,
-                    started_at = excluded.started_at,
-                    ended_at = excluded.ended_at,
-                    models = excluded.models,
-                    steps = excluded.steps,
-                    tokens = excluded.tokens,
-                    files_changed = excluded.files_changed,
-                    cost = excluded.cost,
-                    risk_score = excluded.risk_score,
-                    risk_level = excluded.risk_level,
-                    quality_score = excluded.quality_score,
-                    quality_grade = excluded.quality_grade,
-                    ai_verdict = excluded.ai_verdict,
-                    est_savings_usd = excluded.est_savings_usd,
-                    receipt_json = excluded.receipt_json,
-                    receipt_html = excluded.receipt_html,
-                    updated_at = excluded.updated_at
+                                  receipt_json, receipt_html, pushed_by_key_id, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run["id"], team_id, run["user"], run["project"], run["agent"], run["title"],
@@ -686,7 +841,7 @@ class Database:
                     run["steps"], run["tokens"], run["files_changed"], run["cost"],
                     run["risk_score"], run["risk_level"],
                     run["quality_score"], run["quality_grade"], run["ai_verdict"], run["est_savings_usd"],
-                    receipt_json, run["receipt_html"],
+                    receipt_json, run["receipt_html"], key_id,
                     now, now,
                 ),
             )
@@ -703,6 +858,7 @@ class Database:
             if actor is not None:
                 self._audit(team_id, actor, "run.push", run["id"],
                             {"agent": run["agent"], "project": run["project"]})
+        return {"outcome": "inserted", "risk_score": run["risk_score"], "risk_level": run["risk_level"]}
 
     def list_runs(
         self,
@@ -1056,23 +1212,33 @@ class Database:
     # Approvals
 
     def create_approval(
-        self, team_id: int, approval_id: str, approval: Dict[str, Any], ttl_s: int
+        self,
+        team_id: int,
+        approval_id: str,
+        approval: Dict[str, Any],
+        ttl_s: int,
+        *,
+        requester_key_id: Optional[str] = None,
+        requested_by: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Store a new pending approval. Returns its API view (the same shape GET returns)."""
         now = time.time()
         with self._lock, self._conn:
             self._conn.execute(
-                "INSERT INTO approvals (id, team_id, session_id, tool, summary, risks, cwd, status, "
-                "created_at, created_ts) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+                "INSERT INTO approvals (id, team_id, session_id, tool, summary, risks, cwd, "
+                "requester_key_id, requested_by, status, created_at, created_ts) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
                 (
                     approval_id, team_id, approval["session_id"], approval["tool"], approval["summary"],
-                    json.dumps(approval["risks"], ensure_ascii=False), approval["cwd"], _stamp(now), now,
+                    json.dumps(approval["risks"], ensure_ascii=False), approval["cwd"],
+                    requester_key_id, requested_by, _stamp(now), now,
                 ),
             )
         data = {
             "id": approval_id, "status": "pending", "decided_by": None, "decided_at": None,
             "reason": None, "session_id": approval["session_id"], "tool": approval["tool"],
             "summary": approval["summary"], "risks": approval["risks"], "cwd": approval["cwd"],
+            "requester_key_id": requester_key_id, "requested_by": requested_by,
             "created_at": _stamp(now), "created_ts": now,
         }
         return _approval_view(data, ttl_s, now)
@@ -1120,16 +1286,34 @@ class Database:
         decided_by: str,
         reason: Optional[str],
         ttl_s: int,
+        approver_key_id: Optional[str] = None,
         actor: Optional[str] = None,
     ) -> Tuple[str, Optional[Dict[str, Any]]]:
         """Record approved/denied on a pending, unexpired approval, atomically. With an actor,
         the decision is audited in the same transaction.
 
-        Returns (outcome, view): "decided", "missing" (no such approval for this team),
-        "expired", or "conflict" (already decided)."""
+        Returns (outcome, view): decided, missing (no such approval for this team),
+        self, legacy_unverifiable, expired, or conflict (already decided)."""
         now = time.time()
         with self._lock:
             with self._conn:
+                requester = self._conn.execute(
+                    "SELECT requester_key_id, status, created_ts FROM approvals WHERE id = ? AND team_id = ?",
+                    (approval_id, team_id),
+                ).fetchone()
+                if requester is None:
+                    return "missing", None
+                if requester["status"] != "pending":
+                    return "conflict", self.get_approval(team_id, approval_id, ttl_s)
+                if requester["created_ts"] < now - ttl_s:
+                    return "expired", self.get_approval(team_id, approval_id, ttl_s)
+                if requester["requester_key_id"] is None:
+                    return "legacy_unverifiable", self.get_approval(team_id, approval_id, ttl_s)
+                if (
+                    approver_key_id is not None
+                    and requester["requester_key_id"] == approver_key_id
+                ):
+                    return "self", self.get_approval(team_id, approval_id, ttl_s)
                 cur = self._conn.execute(
                     "UPDATE approvals SET status = ?, decided_by = ?, decided_at = ?, reason = ? "
                     "WHERE id = ? AND team_id = ? AND status = 'pending' AND created_ts >= ?",
@@ -1279,13 +1463,27 @@ class Database:
         return dict(row) if row else None
 
     def seat_users(self, team_id: int, since: str) -> List[str]:
-        """The developers who pushed a run at or after `since` (the seats in use)."""
+        """Authenticated seat identities active since the supplied timestamp.
+
+        New rows count by API key id. Rows created before key attribution was
+        introduced keep counting by their legacy receipt user until they age
+        out of the seat window.
+        """
         with self._lock:
             rows = self._conn.execute(
-                "SELECT DISTINCT user FROM runs WHERE team_id = ? AND updated_at >= ? ORDER BY user",
+                "SELECT r.pushed_by_key_id, r.user, sa.seat_key_id FROM runs r "
+                "LEFT JOIN seat_aliases sa ON sa.key_id = r.pushed_by_key_id "
+                "WHERE r.team_id = ? AND r.updated_at >= ? "
+                "ORDER BY r.pushed_by_key_id, r.user",
                 (team_id, since),
             ).fetchall()
-        return [r["user"] for r in rows]
+        keyed = {
+            "key:" + (r["seat_key_id"] or r["pushed_by_key_id"])
+            for r in rows if r["pushed_by_key_id"]
+        }
+        if keyed:
+            return sorted(keyed)
+        return sorted({"legacy-user:" + r["user"] for r in rows})
 
     def subscriptions_for_email(self, email: str) -> List[Dict[str, Any]]:
         """Subscriptions with a team (not yet deleted) for this customer email."""
@@ -1330,7 +1528,8 @@ class Database:
         """Delete a team and everything it owns. Its subscription row stays, for the billing
         history, without the team and without the customer's email."""
         with self._lock, self._conn:
-            for table in ("sessions", "risks", "runs", "approvals", "audit_log", "budget_alerts", "api_keys"):
+            for table in ("sessions", "risks", "runs", "approvals", "audit_log", "budget_alerts",
+                          "seat_aliases", "api_keys"):
                 self._conn.execute(f"DELETE FROM {table} WHERE team_id = ?", (team_id,))
             self._conn.execute(
                 "UPDATE billing_subscriptions SET team_id = NULL, email = NULL, updated_at = ? WHERE team_id = ?",

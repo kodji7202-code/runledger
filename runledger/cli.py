@@ -157,13 +157,13 @@ def cmd_receipt(args) -> int:
         print(note, file=sys.stderr)
     if args.output == "-":
         sys.stdout.write(out)
-        return 0
-    ext = {"html": "html", "md": "md", "json": "json"}[args.format]
-    target = Path(args.output or f"runledger-{_file_stem(run.session_id)}.{ext}")
-    target.write_text(out, encoding="utf-8")
-    print(f"Receipt: {target}  ·  risk {score}/100 ({level})  ·  {len(run.steps)} steps")
-    if args.open and args.format == "html":
-        webbrowser.open(target.resolve().as_uri())
+    else:
+        ext = {"html": "html", "md": "md", "json": "json"}[args.format]
+        target = Path(args.output or f"runledger-{_file_stem(run.session_id)}.{ext}")
+        target.write_text(out, encoding="utf-8")
+        print(f"Receipt: {target}  ·  risk {score}/100 ({level})  ·  {len(run.steps)} steps")
+        if args.open and args.format == "html":
+            webbrowser.open(target.resolve().as_uri())
     return 2 if (args.fail_on is not None and score >= args.fail_on) else 0
 
 

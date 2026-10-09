@@ -137,8 +137,9 @@ session transcript it came from.
 - **The guard log** (`.runledger/guard.log`) records tool names, commands and paths, masked the same
   way. Add `.runledger/` to your `.gitignore`.
 - **The team server** stores every pushed receipt, including its HTML, in one SQLite file. Anyone with a
-  team key can read all of that team's runs. Keys are stored only as hashes. Nothing is deleted
-  automatically.
+  team key can read all of that team's runs. Keys are stored only as hashes. By default nothing is
+  deleted automatically; `RUNLEDGER_RETENTION_DAYS` enables automatic retention. See
+  [docs/self-hosting.md](docs/self-hosting.md#configuration).
 
 ## Pricing
 

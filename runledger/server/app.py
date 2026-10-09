@@ -9,7 +9,7 @@
   POST /api/approvals                         request a human approval -> 201 {id, status} (admin, member)
   GET  /api/approvals[?status=pending]        list approvals (any role)
   GET  /api/approvals/<id>                    one approval: status, decided_by, decided_at, reason
-  POST /api/approvals/<id>/decision           approve or deny (admin, member)
+  POST /api/approvals/<id>/decision           approve or deny (admin)
   GET  /approvals/<id>                        approval page for a person (any role)
   GET  /api/team/settings                     webhook URLs and approval_ttl_s (any role; URLs masked unless admin)
   PUT  /api/team/settings                     change them (admin)
@@ -678,21 +678,21 @@ class _Handler(BaseHTTPRequestHandler):
         info["portal_url"] = self.server.billing.portal_url if self.server.billing else None
         return info
 
-    def _check_billing(self, ident: Identity, user: Optional[str] = None) -> None:
-        """Refuse a write (402) from a billed team that is read only, or, for a push by `user`,
-        from a developer who would need a seat when every seat is taken."""
+    def _check_billing(self, ident: Identity) -> Optional[int]:
+        """Refuse a write from a billed team that is read only.
+
+        For a writable billed team, return its seat limit so a run push can
+        perform seat admission atomically with the immutable insert.
+        """
         db = self.server.db
         row = db.billing_for_team(ident.team_id)
         if row is None:
-            return
+            return None
         info = billing.access(row)
         refusal = billing.write_refusal(info)
         if refusal:
             raise _HttpError(402, "payment_required", refusal)
-        if user is not None:
-            users = db.seat_users(ident.team_id, _seat_window_start())
-            if user not in users and len(users) >= info["seats"]:
-                raise _HttpError(402, "seat_limit", billing.seat_refusal(info["seats"]))
+        return int(info["seats"])
 
     def _polar_webhook(self) -> None:
         config = self.server.billing
@@ -786,7 +786,9 @@ class _Handler(BaseHTTPRequestHandler):
             if not db.claim_recovery(sub["polar_id"], cutoff):
                 continue
             label = "recovered " + datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            view = db.create_key(sub["team_id"], label, "admin", actor="billing:recover")
+            view = db.create_recovery_key(
+                sub["team_id"], label, actor="billing:recover", seat_since=_seat_window_start()
+            )
             db.record_audit(sub["team_id"], "billing:recover", "billing.recover", view["id"], {"ip": address})
             billing.send_quietly(self.server.mailer, email,
                                  billing.recovery_email(config, self.server.public_url, sub["team_name"], view["key"]))
@@ -807,14 +809,31 @@ class _Handler(BaseHTTPRequestHandler):
         if not isinstance(payload, dict):
             raise _HttpError(400, "invalid_json", "The body must be a JSON object.")
         run = receipt_to_run(payload)
-        self._check_billing(ident, user=run["user"])
-        self.server.db.upsert_run(ident.team_id, run, actor=ident.actor())
+        result = self.server.db.upsert_run(
+            ident.team_id,
+            run,
+            actor=ident.actor(),
+            key_id=ident.key_id,
+            seat_since=_seat_window_start(),
+            enforce_billing=True,
+        )
+        outcome = result["outcome"]
+        if outcome == "payment_required":
+            raise _HttpError(402, "payment_required", result["message"])
+        if outcome == "seat_limit":
+            raise _HttpError(402, "seat_limit", billing.seat_refusal(result["seat_limit"]))
+        if outcome == "conflict":
+            raise _HttpError(
+                409,
+                "run_conflict",
+                "A different receipt already exists for this session_id. Run receipts are immutable; use a new session_id.",
+            )
         self._check_budget_alerts(ident)
         self._send_json(201, {
             "id": run["id"],
             "url": "/runs/" + quote(run["id"], safe=""),
-            "risk_score": run["risk_score"],
-            "risk_level": run["risk_level"],
+            "risk_score": result["risk_score"],
+            "risk_level": result["risk_level"],
         })
 
     def _list_runs(self, query: Dict[str, List[str]]) -> None:
@@ -899,7 +918,14 @@ class _Handler(BaseHTTPRequestHandler):
         db = self.server.db
         settings = db.approval_settings(ident.team_id)
         approval_id = approvals.new_approval_id()
-        view = db.create_approval(ident.team_id, approval_id, fields, settings["approval_ttl_s"])
+        view = db.create_approval(
+            ident.team_id,
+            approval_id,
+            fields,
+            settings["approval_ttl_s"],
+            requester_key_id=ident.key_id,
+            requested_by=_attested_identity(ident),
+        )
         approvals.notify_new_approval(settings, view, self.server.public_url)
         self._send_json(201, {"id": approval_id, "status": "pending"})
 
@@ -928,21 +954,33 @@ class _Handler(BaseHTTPRequestHandler):
         length = self._content_length(approvals.SMALL_BODY_LIMIT, "Decisions")
         raw = self.rfile.read(length) if length else b""
         ident = self._identify()
-        self._require(ident, "member", "decide approvals", write=True)
+        self._require(ident, "admin", "decide approvals", write=True)
         try:
-            decision, reason, name = approvals.validate_decision(_json_object(raw))
+            decision, reason, _name = approvals.validate_decision(_json_object(raw))
         except approvals.InvalidInput as exc:
             raise _HttpError(400, "invalid_decision", str(exc)) from None
         status = "approved" if decision == "approve" else "denied"
-        source = "dashboard" if ident.via == "session" else "api"
-        decided_by = f"{source}: {name}" if name else source
+        decided_by = _attested_identity(ident)
         db = self.server.db
         outcome, view = db.decide_approval(
             ident.team_id, approval_id, status, decided_by, reason, db.approval_ttl_s(ident.team_id),
+            approver_key_id=ident.key_id,
             actor=ident.actor(),
         )
         if outcome == "missing":
             raise _not_found("Approval not found.")
+        if outcome == "self":
+            raise _HttpError(
+                403,
+                "self_approval",
+                "The key that requested this approval cannot decide it. Use a different admin key.",
+            )
+        if outcome == "legacy_unverifiable":
+            raise _HttpError(
+                409,
+                "legacy_unverifiable",
+                "This approval predates requester identity tracking and cannot be decided safely. Submit a new approval request.",
+            )
         if outcome == "expired":
             raise _HttpError(409, "expired", "This approval expired before it was decided.")
         if outcome == "conflict":
@@ -1100,6 +1138,13 @@ class _Handler(BaseHTTPRequestHandler):
 
 def _seat_window_start() -> str:
     return billing.stamp(billing.now() - timedelta(days=billing.SEAT_WINDOW_DAYS))
+
+
+def _attested_identity(ident: Identity) -> str:
+    """Stable human-readable attribution derived only from authenticated key data."""
+    source = "dashboard" if ident.via == "session" else "api"
+    key_ref = ident.prefix or ident.key_id
+    return f"{source}: {ident.label} ({key_ref})"
 
 
 def _page_csp(nonce: str) -> str:

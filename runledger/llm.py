@@ -85,7 +85,10 @@ def _system_blocks(system: Any, cache: bool) -> Optional[List[Dict[str, Any]]]:
         if cache:
             block["cache_control"] = {"type": "ephemeral"}   # prompt caching for the static prompt
         return [block]
-    return list(system)
+    return [dict(block, text=redact(block["text"]))
+            if isinstance(block, dict) and isinstance(block.get("text"), str)
+            else dict(block) if isinstance(block, dict) else block
+            for block in system]
 
 
 # ---------------------------------------------------------------- transport

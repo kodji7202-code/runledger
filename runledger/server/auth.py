@@ -2,8 +2,8 @@
 
 A team has any number of API keys. Each key has one role:
 
-  admin   everything, including key management, team settings and the audit log
-  member  push runs, request and decide approvals, read everything
+  admin   everything, including deciding approvals, key management, team settings and the audit log
+  member  push runs, request approvals, read everything
   viewer  read only: every GET endpoint except the admin ones
 
 A key looks like "rl_" followed by 40 URL-safe characters. The server keeps only the

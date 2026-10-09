@@ -172,6 +172,30 @@ def test_bash_shell_outside_windows_path_is_high_when_deleting():
     assert outside and outside[0].severity == "high"
 
 
+def test_git_dash_c_rm_resolves_delete_operand_against_git_working_folder():
+    risks = _risks("Bash", cwd=POSIX_CWD, command="git -C /opt/other-repo rm victim.txt")
+    outside = [r for r in risks if r.code == "shell_outside" and r.severity == "high"]
+    assert len(outside) == 1
+    assert "/opt/other-repo/victim.txt" in outside[0].reason
+
+
+def test_git_dash_c_rm_inside_project_is_not_outside():
+    risks = _risks("Bash", cwd=POSIX_CWD,
+                   command=f"git -C {POSIX_CWD}/subdir rm victim.txt")
+    assert not any(r.code == "shell_outside" for r in risks)
+
+
+def test_find_delete_marks_outside_search_root_as_high():
+    risks = _risks("Bash", cwd=POSIX_CWD, command="find /opt/other-tree -delete")
+    outside = [r for r in risks if r.code == "shell_outside"]
+    assert [(r.severity, r.code) for r in outside] == [("high", "shell_outside")]
+
+
+def test_find_delete_inside_project_is_not_outside():
+    assert not any(r.code == "shell_outside" for r in
+                   _risks("Bash", cwd=POSIX_CWD, command="find ./build -delete"))
+
+
 # ---------------------------------------------------------------- PowerShell tool
 
 def test_powershell_remove_item_recurse_force_is_high():
@@ -241,6 +265,20 @@ def test_powershell_assigning_env_var_is_not_printing():
 
 def test_powershell_also_gets_shared_shell_rules():
     assert "Force-pushed to a git remote" in _reasons(_risks("PowerShell", command="git push --force origin main"))
+
+
+def test_existing_junit_disabled_annotation_is_not_reported_as_new_skip():
+    risks = _risks("Edit", cwd=POSIX_CWD, file_path=POSIX_CWD + "/tests/FooTest.java",
+                   old_string="@Disabled\nvoid testThing() { assertEquals(1, 1); }",
+                   new_string="@Disabled\nvoid testThing() { assertEquals(2, 2); }")
+    assert "test_skipped" not in {r.code for r in risks}
+
+
+def test_new_junit_disabled_annotation_is_reported():
+    risks = _risks("Edit", cwd=POSIX_CWD, file_path=POSIX_CWD + "/tests/FooTest.java",
+                   old_string="void testThing() { assertEquals(1, 1); }",
+                   new_string="@Disabled\nvoid testThing() { assertEquals(1, 1); }")
+    assert "test_skipped" in {r.code for r in risks}
 
 
 def test_powershell_windows_path_argument_is_checked_outside_cwd():

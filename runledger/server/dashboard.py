@@ -201,7 +201,7 @@ dialog::backdrop{background:rgba(5,6,8,.6)}
     <h2 id="approvals-title">Pending approvals</h2>
     <span class="count" id="approvals-count" aria-live="polite">0</span>
   </div>
-  <p class="msg" id="approvals-readonly" hidden>Read only: your role can see these requests but cannot approve or deny them.</p>
+  <p class="msg" id="approvals-readonly" hidden>Read only: only an admin can approve or deny requests.</p>
   <div id="approvals-notice" class="notice" role="alert"></div>
   <div id="approvals-list" class="approvals-list"></div>
   <div id="approvals-empty" class="empty"></div>
@@ -449,7 +449,7 @@ dialog::backdrop{background:rgba(5,6,8,.6)}
     report: "/api/export/report.html"
   };
 
-  var state = { days: 30, role: null, meLoaded: false, view: null, thresholds: [50, 80, 100] };
+  var state = { days: 30, role: null, keyRef: null, meLoaded: false, view: null, thresholds: [50, 80, 100] };
   var budgetState = { edited: false, settings: null, status: null };
   var approvalsView = { seq: 0, signature: null, items: [] };
   var keysView = { items: [] };
@@ -879,8 +879,13 @@ dialog::backdrop{background:rgba(5,6,8,.6)}
     box.className = message ? "notice show error" : "notice";
   }
 
-  function canDecide() {
-    return state.role !== "viewer";
+  function requestedByThisKey(a) {
+    if (!a || !state.keyRef || !a.requested_by) { return false; }
+    return String(a.requested_by).endsWith("(" + state.keyRef + ")");
+  }
+
+  function canDecide(a) {
+    return isAdmin() && !!(a && a.requested_by) && !requestedByThisKey(a);
   }
 
   function approvalCard(a) {
@@ -907,7 +912,7 @@ dialog::backdrop{background:rgba(5,6,8,.6)}
     card.appendChild(el("div", "approval-meta", where.join(" · ")));
 
     var actions = el("div", "approval-actions");
-    if (canDecide()) {
+    if (canDecide(a)) {
       var approve = el("button", "btn approve", "Approve");
       var deny = el("button", "btn deny", "Deny");
       approve.type = "button";
@@ -917,6 +922,10 @@ dialog::backdrop{background:rgba(5,6,8,.6)}
       deny.addEventListener("click", function () { decide(a.id, "deny", pair); });
       actions.appendChild(approve);
       actions.appendChild(deny);
+    } else if (!a.requested_by) {
+      actions.appendChild(el("span", "msg", "Requester identity is unavailable; re-request this approval."));
+    } else if (isAdmin() && requestedByThisKey(a)) {
+      actions.appendChild(el("span", "msg", "Requested with this key; another admin must decide."));
     }
     var details = el("a", null, "Details");
     details.href = "/approvals/" + encodeURIComponent(a.id);
@@ -932,7 +941,7 @@ dialog::backdrop{background:rgba(5,6,8,.6)}
     $("approvals-empty").textContent = items.length
       ? ""
       : "Nothing waiting. Risky agent actions appear here for a yes or no.";
-    var signature = JSON.stringify([canDecide(), items]);
+    var signature = JSON.stringify([state.role, state.keyRef, items]);
     if (signature === approvalsView.signature) { return; }  // unchanged: keep the buttons as they are
     approvalsView.signature = signature;
     var list = $("approvals-list");
@@ -1573,7 +1582,7 @@ dialog::backdrop{background:rgba(5,6,8,.6)}
     ["keys", "audit", "settings"].forEach(function (v) { $("tab-" + v).hidden = !isAdmin(); });
     $("budget-form").hidden = !isAdmin();
     if (isAdmin() && budgetState.settings && !budgetState.edited) { fillBudgetForm(budgetState.settings); }
-    $("approvals-readonly").hidden = state.role !== "viewer";
+    $("approvals-readonly").hidden = isAdmin();
     renderApprovals(approvalsView.items);
     showView(currentRoute());
   }
@@ -1623,6 +1632,7 @@ dialog::backdrop{background:rgba(5,6,8,.6)}
     return getJSON("/api/me").then(function (me) {
       state.meLoaded = true;
       state.role = ROLES.indexOf(me && me.role) >= 0 ? me.role : null;
+      state.keyRef = me && me.key ? (me.key.prefix || me.key.id || null) : null;
       if (me && me.team && me.team.name) { setTeam(me.team.name); }
       showBilling(me && me.billing);
       applyRole();
@@ -1630,6 +1640,7 @@ dialog::backdrop{background:rgba(5,6,8,.6)}
       // Without /api/me the role is unknown: keep the runs and approvals views, hide admin tabs.
       state.meLoaded = true;
       state.role = null;
+      state.keyRef = null;
       applyRole();
     });
   }
@@ -1843,7 +1854,9 @@ a{color:var(--accent)}
   </dl>
 </div>
 
-<div class="card" id="decide">
+<p class="muted" id="decision-note"></p>
+
+<div class="card" id="decide" hidden>
   <div class="fields">
     <input id="who" type="text" maxlength="100" placeholder="Your name (optional)" aria-label="Your name">
     <input id="why" type="text" maxlength="500" placeholder="Reason (optional)" aria-label="Reason for the decision">
@@ -1865,6 +1878,10 @@ a{color:var(--accent)}
   var approvalId = location.pathname.slice("/approvals/".length);
   var timer = null;
   var busy = false;
+  var role = null;
+  var keyRef = null;
+  var meLoaded = false;
+  var currentApproval = null;
 
   function $(id) { return document.getElementById(id); }
 
@@ -1931,6 +1948,33 @@ a{color:var(--accent)}
     $("deny").disabled = disabled;
   }
 
+  function requestedByThisKey(a) {
+    if (!a || !keyRef || !a.requested_by) { return false; }
+    return String(a.requested_by).endsWith("(" + keyRef + ")");
+  }
+
+  function canDecide(a) {
+    return role === "admin" && !!(a && a.requested_by) && !requestedByThisKey(a);
+  }
+
+  function applyDecisionAccess() {
+    var pending = currentApproval && currentApproval.status === "pending";
+    $("decide").hidden = !(pending && canDecide(currentApproval));
+    if (!pending) {
+      $("decision-note").textContent = "";
+    } else if (!currentApproval.requested_by) {
+      $("decision-note").textContent = "Requester identity is unavailable for this legacy approval. Re-request it before deciding.";
+    } else if (!meLoaded) {
+      $("decision-note").textContent = "Checking whether this session can decide the request…";
+    } else if (role !== "admin") {
+      $("decision-note").textContent = "Read only: only an admin can approve or deny this request.";
+    } else if (requestedByThisKey(currentApproval)) {
+      $("decision-note").textContent = "This key requested the approval. Use a different admin key to decide it.";
+    } else {
+      $("decision-note").textContent = "";
+    }
+  }
+
   function renderRisks(risks) {
     var box = $("risks");
     clear(box);
@@ -1946,6 +1990,7 @@ a{color:var(--accent)}
   }
 
   function render(a) {
+    currentApproval = a;
     var status = a.status || "pending";
     var badge = $("status");
     badge.textContent = status;
@@ -1962,8 +2007,22 @@ a{color:var(--accent)}
     $("decided-at").textContent = a.decided_at ? when(a.decided_at) : "-";
     $("reason").textContent = a.reason || "-";
     var open = status === "pending";
-    $("decide").style.display = open ? "" : "none";
+    applyDecisionAccess();
     if (!open && timer) { clearInterval(timer); timer = null; }
+  }
+
+  function loadMe() {
+    return request("GET", "/api/me").then(function (me) {
+      role = me && me.role ? me.role : null;
+      keyRef = me && me.key ? (me.key.prefix || me.key.id || null) : null;
+      meLoaded = true;
+      applyDecisionAccess();
+    }, function () {
+      role = null;
+      keyRef = null;
+      meLoaded = true;
+      applyDecisionAccess();
+    });
   }
 
   function load() {
@@ -1981,7 +2040,7 @@ a{color:var(--accent)}
   }
 
   function decide(decision) {
-    if (busy) { return; }
+    if (busy || !canDecide(currentApproval)) { return; }
     busy = true;
     setButtons(true);
     var payload = { decision: decision };
@@ -2005,6 +2064,7 @@ a{color:var(--accent)}
 
   $("approve").addEventListener("click", function () { decide("approve"); });
   $("deny").addEventListener("click", function () { decide("deny"); });
+  loadMe();
   load();
   timer = setInterval(load, POLL_MS);
 })();

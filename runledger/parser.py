@@ -40,6 +40,16 @@ class Usage:
         self.cache_read_tokens += other.cache_read_tokens
 
 
+def _split_usage(usage: Usage, count: int) -> List[Usage]:
+    """Split usage across `count` steps without losing integer remainders."""
+    parts = [Usage() for _ in range(count)]
+    for field_name in ("input_tokens", "output_tokens", "cache_write_tokens", "cache_read_tokens"):
+        quotient, remainder = divmod(getattr(usage, field_name), count)
+        for i, part in enumerate(parts):
+            setattr(part, field_name, quotient + (1 if i < remainder else 0))
+    return parts
+
+
 @dataclass
 class Step:
     index: int
@@ -48,7 +58,7 @@ class Step:
     tool_use_id: str
     model: Optional[str]
     timestamp: Optional[str]
-    usage: Usage = field(default_factory=Usage)   # usage of the assistant message that issued it (shared share)
+    usage: Usage = field(default_factory=Usage)   # allocated share of the assistant message that issued it
     cost: Optional[float] = None
     result_text: str = ""
     is_error: bool = False
@@ -217,10 +227,7 @@ def parse_session(path: str | os.PathLike) -> Run:
         models.setdefault(m, Usage()).add(u)
         issued = seen_msg_ids.get(mid) or []
         if issued:
-            n = len(issued)
-            share = Usage(u.input_tokens // n, u.output_tokens // n,
-                          u.cache_write_tokens // n, u.cache_read_tokens // n)
-            for s in issued:
+            for s, share in zip(issued, _split_usage(u, len(issued))):
                 s.usage = share
 
     return Run(

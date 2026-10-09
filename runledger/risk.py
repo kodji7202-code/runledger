@@ -355,6 +355,7 @@ class _Word:
     quoted: bool
     role: str = "word"    # word | assign | text | write | read | skip
     delete: bool = False  # an argument of a delete command
+    base: Optional[str] = None  # alternate base for relative paths (for example `git -C`)
 
 
 def _name(word: str) -> str:
@@ -516,6 +517,14 @@ def _mark_message_args(words: List[_Word]) -> None:
             take = True
 
 
+def _join_base(current: Optional[str], value: str) -> str:
+    """Apply a git -C/work-tree path to the current git base without using host OS semantics."""
+    if _is_abs(value) or not current:
+        return value
+    mod = ntpath if _is_windows_style(current, value) else posixpath
+    return mod.normpath(mod.join(current, value))
+
+
 def _plan(words: List[_Word], ps: bool) -> Optional[str]:
     """Give each word of one simple command its role and mark the arguments of delete
     commands. Returns the command name (lower case, no .exe), or None."""
@@ -541,12 +550,46 @@ def _plan(words: List[_Word], ps: bool) -> Optional[str]:
         for w in rest:
             w.role = "text"
     elif name == "git":
-        sub_at = next((q for q in range(j + 1, len(plain)) if not plain[q].value.startswith("-")), None)
+        q = j + 1
+        git_base: Optional[str] = None
+        while q < len(plain):
+            value = plain[q].value
+            if value == "--":
+                q += 1
+                break
+            if value in ("-C", "--work-tree"):
+                if q + 1 < len(plain):
+                    git_base = _join_base(git_base, plain[q + 1].value)
+                    q += 2
+                    continue
+                q += 1
+                continue
+            if value.startswith("--work-tree="):
+                git_base = _join_base(git_base, value.split("=", 1)[1])
+                q += 1
+                continue
+            if value in ("-c", "--git-dir", "--namespace", "--super-prefix", "--config-env"):
+                q += 2
+                continue
+            if value.startswith("-"):
+                q += 1
+                continue
+            break
+        sub_at = q if q < len(plain) else None
         sub = plain[sub_at].value.lower() if sub_at is not None else ""
         if sub == "rm":
             delete_from = sub_at + 1
+            for w in plain[delete_from:]:
+                w.base = git_base
         elif sub in ("commit", "tag"):
             _mark_message_args(plain[sub_at + 1:])
+    elif name == "find" and any(w.value == "-delete" for w in rest):
+        # `find ROOT... -delete` recursively removes matches below its search roots.
+        # Mark only the starting paths; expressions beginning with '-' do not name files.
+        for w in rest:
+            if w.value.startswith("-") or w.value in ("!", "(", ")"):
+                break
+            w.delete = True
     elif name in _INTERPRETERS:
         take = False
         for w in rest:
@@ -621,9 +664,15 @@ def _check_shell_word(w: _Word, name: str, cwd: Optional[str], workdir: Optional
     if mode != "delete" and not path_like:
         return  # a bare word such as a command name or an option value
     target = os.path.expanduser(exp)
-    if not _outside(target, cwd, workdir):
+    base = workdir
+    if w.base:
+        expanded_base = _expand(w.base, assigns)
+        if expanded_base is not None:
+            base = (expanded_base if _is_abs(expanded_base)
+                    else _resolved(expanded_base, workdir or cwd))
+    if not _outside(target, cwd, base):
         return
-    shown = _resolved(target, workdir)
+    shown = _resolved(target, base)
     if mode == "write":
         risks.append(Risk("low", "shell_outside", f"Shell command wrote outside the working folder ({shown})", step.index))
     elif mode == "delete":
@@ -783,7 +832,8 @@ def assess_step(step: Step, cwd: Optional[str], policy: Optional[Dict[str, Any]]
         text = " ".join((e.get("old_string") or "") for e in edits)
         new_text = " ".join((e.get("new_string") or "") for e in edits)
         asserts_removed = len(re.findall(r"\b(assert|expect)\b", text)) - len(re.findall(r"\b(assert|expect)\b", new_text))
-        skip_added = re.search(r"\.(skip|only)\(|@pytest\.mark\.skip|xit\(|xdescribe\(|@Ignore|@Disabled", new_text) and not re.search(r"\.(skip|only)\(|@pytest\.mark\.skip|xit\(|xdescribe\(", text)
+        skip_pattern = r"\.(skip|only)\(|@pytest\.mark\.skip|xit\(|xdescribe\(|@Ignore|@Disabled"
+        skip_added = re.search(skip_pattern, new_text) and not re.search(skip_pattern, text)
         if skip_added:
             risks.append(Risk("high", "test_skipped", f"Disabled or skipped tests in {_basename(paths[0])}", step.index))
         elif asserts_removed >= 2 or (removed - added) >= 15:

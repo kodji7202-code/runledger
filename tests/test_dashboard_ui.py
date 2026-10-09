@@ -158,8 +158,39 @@ def test_admin_tabs_start_hidden_so_members_and_viewers_never_see_them():
     assert "hidden" not in attrs["tab-runs"] and "hidden" not in attrs["view-runs"]
     js = _script(DASHBOARD_HTML)
     assert 'var ADMIN_VIEWS = { keys: true, audit: true, settings: true };' in js
-    # Approve and Deny exist only when the role allows it.
-    assert "if (canDecide()) {" in js and 'return state.role !== "viewer";' in js
+    # Approval decisions are admin-only, and the requesting key cannot decide its own request.
+    assert "if (canDecide(a)) {" in js
+    assert 'return isAdmin() && !!(a && a.requested_by) && !requestedByThisKey(a);' in js
+    assert 'state.keyRef = me && me.key ? (me.key.prefix || me.key.id || null) : null;' in js
+    assert 'String(a.requested_by).endsWith("(" + state.keyRef + ")")' in js
+
+
+def test_dashboard_explains_read_only_and_self_approval_without_offering_buttons():
+    js = _script(DASHBOARD_HTML)
+    assert "Read only: only an admin can approve or deny requests." in DASHBOARD_HTML
+    assert '$("approvals-readonly").hidden = isAdmin();' in js
+    assert 'else if (!a.requested_by) {' in js
+    assert "Requester identity is unavailable; re-request this approval." in js
+    assert 'else if (isAdmin() && requestedByThisKey(a)) {' in js
+    assert "Requested with this key; another admin must decide." in js
+    assert 'var signature = JSON.stringify([state.role, state.keyRef, items]);' in js
+
+
+def test_individual_approval_page_starts_without_decision_controls_and_checks_me():
+    page = _page(APPROVAL_HTML)
+    attrs = {a["id"]: a for _, a in page.elements if a.get("id")}
+    assert "hidden" in attrs["decide"]
+
+    js = _script(APPROVAL_HTML)
+    assert 'request("GET", "/api/me")' in js
+    assert 'return role === "admin" && !!(a && a.requested_by) && !requestedByThisKey(a);' in js
+    assert 'keyRef = me && me.key ? (me.key.prefix || me.key.id || null) : null;' in js
+    assert 'String(a.requested_by).endsWith("(" + keyRef + ")")' in js
+    assert 'if (busy || !canDecide(currentApproval)) { return; }' in js
+    assert "Read only: only an admin can approve or deny this request." in js
+    assert 'else if (!currentApproval.requested_by) {' in js
+    assert "Requester identity is unavailable for this legacy approval. Re-request it before deciding." in js
+    assert "This key requested the approval. Use a different admin key to decide it." in js
 
 
 def test_every_element_id_is_unique_and_every_script_lookup_exists():
