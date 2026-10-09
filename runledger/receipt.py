@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from . import __version__
 from .adapters import label as agent_label
+from .guard import redact
 from .parser import Run
 from .pricing import friendly_model
 from .risk import Risk
@@ -361,6 +362,44 @@ def _ai_md_suffix(risk: Risk, ai_map: Dict[Tuple[int, str], Dict[str, Any]]) -> 
     label, _ = _ASSESSMENTS.get(str(a.get("assessment") or ""), ("Uncertain", "uncertain"))
     return f" — AI: {label.lower()}"
 
+
+# ---------------------------------------------------------------- redaction
+
+# Step inputs that reach a receipt: file paths in "Files changed" (rm arguments come from the command).
+_SHOWN_INPUT_KEYS = ("file_path", "notebook_path", "path", "command", "url", "pattern", "query")
+
+
+def _redact_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return redact(value)
+    if isinstance(value, list):
+        return [_redact_value(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _redact_value(v) for k, v in value.items()}
+    return value
+
+
+def redact_run(run: Run, risks: List[Risk]) -> None:
+    """Mask secrets in every text a receipt, a push or a PR comment shows, in place.
+    Call it after scoring and analysis: the risk rules need the raw text to find secrets.
+    File contents and command output are not shown, so they are left as they are."""
+    run.prompts = [redact(p) for p in run.prompts]
+    run.overall_summary = redact(run.overall_summary)
+    run.final_message = redact(run.final_message)
+    for s in run.steps:
+        s.summary = redact(s.summary)
+        for key in _SHOWN_INPUT_KEYS:
+            if isinstance(s.input.get(key), str):
+                s.input[key] = redact(s.input[key])
+    every = {id(r): r for r in list(risks) + [r for s in run.steps for r in s.risks]}
+    for r in every.values():
+        r.reason = redact(r.reason)
+    run.quality = _redact_value(run.quality)
+    run.recommendations = _redact_value(run.recommendations)
+    run.ai_review = _redact_value(run.ai_review)
+
+
+# ---------------------------------------------------------------- output formats
 
 def to_dict(run: Run, score: int, level: str, risks: List[Risk]) -> Dict:
     changes = file_changes(run)

@@ -6,7 +6,7 @@ RunLedger reads the session logs of your coding agents and turns each run into a
 changed, what ran, which model did each step, what it cost, and what looked risky. A Claude Code hook
 can stop risky calls before they run, and a small team server collects receipts from the whole team.
 
-Version 0.2.0 (unreleased). Python 3.9 or later, no runtime dependencies.
+Version 0.3.0. Python 3.9 or later, no runtime dependencies.
 
 ## Quickstart
 
@@ -23,7 +23,11 @@ More in [docs/quickstart.md](docs/quickstart.md).
 
 - **Receipts** as HTML, Markdown or JSON: files changed with lines added and removed, every step in
   plain language, the model, tokens and estimated cost for each step, and a risk score from 0 to 100
-  with the reason for each finding.
+  with the reason for each finding. Known secret formats are masked.
+- **A quality score** (grades A to F) with the signals behind it, and **cost tips** with estimated
+  savings, in every receipt. See [docs/analysis.md](docs/analysis.md).
+- **An AI risk review** (`--review`), optional: Claude marks each finding as confirmed, false
+  positive or uncertain. The rule-based score does not change.
 - **Summaries with Claude** (`--ai`), optional. This sends session content to Anthropic. See
   [Privacy](#privacy).
 - **A CI gate:** `runledger receipt --fail-on 60` exits with code 2 when the score is 60 or more.
@@ -69,6 +73,7 @@ Compose setup with automatic certificates and a bare-metal setup behind nginx.
 runledger guard install                              # 1. this project: .claude/settings.json
 runledger guard test '{"session_id":"s1","cwd":"/work/my-app","tool_name":"Bash","tool_input":{"command":"rm -rf /"}}'   # 2. see a decision
 runledger guard install --global                     # 3. or every project: ~/.claude/settings.json
+runledger guard uninstall                            # remove it again (--global for ~/.claude)
 ```
 
 By default the guard **denies** a hardcoded secret written into a file and high-severity commands such
@@ -93,7 +98,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: kodji7202-code/runledger@v0.2.0
+      - uses: kodji7202-code/runledger@v0.3.0
         with:
           fail-on: "60"                   # the job fails at 60 or above; "" never fails
 ```
@@ -115,8 +120,12 @@ What a receipt contains:
 - the risk findings and their reasons.
 
 A receipt does **not** contain file contents or command output (only test pass and fail counts).
-**Receipts are not redacted**: a token typed into a command line appears in the receipt. Treat a receipt
-like the session transcript it came from.
+**Secrets are masked** in everything a receipt shows, and so in what `push` sends and in the PR
+comment: known token formats (Anthropic, OpenAI, AWS, GitHub, GitLab, Slack, Stripe, Google, npm,
+Hugging Face, RunLedger keys, JWTs, `Bearer` and `Basic` values, private-key headers), assignments such
+as `API_KEY=…`, `password="…"` and `?access_token=…`, flags such as `--token …`, and passwords in URLs.
+Masking is pattern-based, so an unusual secret can still get through. Treat a receipt like the
+session transcript it came from.
 
 - **`--ai`** sends the prompts, each step's inputs (up to 600 characters per field, which can include
   file contents being written), each tool result (up to 400 characters) and the agent's final message to
@@ -125,9 +134,8 @@ like the session transcript it came from.
 - **`--review`** sends redacted prompts, commands, relative file paths, edit snippets and the rule
   findings to Claude Sonnet for an explanation of each risk. Tool output is not sent. See
   [docs/analysis.md](docs/analysis.md#ai-risk-review).
-- **The guard log** (`.runledger/guard.log`) records tool names, commands and paths. It masks known
-  token formats and quoted secret values, but **not** unquoted ones such as `API_KEY=...`. Add
-  `.runledger/` to your `.gitignore`.
+- **The guard log** (`.runledger/guard.log`) records tool names, commands and paths, masked the same
+  way. Add `.runledger/` to your `.gitignore`.
 - **The team server** stores every pushed receipt, including its HTML, in one SQLite file. Anyone with a
   team key can read all of that team's runs. Keys are stored only as hashes. Nothing is deleted
   automatically.
@@ -146,6 +154,7 @@ Plans: Free, Team at $15 per developer per month, and Enterprise. Details at
 - [Supported agents](docs/agents.md): where each agent's sessions are, and `--agent`
 - [Session format](docs/format.md): the open format for any agent
 - [Real-time guard](docs/guard.md): policy files, approvals, fail-open and fail-closed, the log
+- [Analysis](docs/analysis.md): the quality score, cost tips and the AI risk review
 - [Enterprise guide](docs/enterprise.md): roles, API keys, audit, budgets, exports, HTTPS
 - [HTTP API](docs/api.md): every endpoint, with examples and error codes
 - [Self-hosting](docs/self-hosting.md): Docker Compose, bare metal, backups, upgrades

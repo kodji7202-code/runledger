@@ -1,6 +1,6 @@
-# Release: when a tag such as v0.2.0 is pushed, build the sdist and wheel and publish them to PyPI.
+# Release: when a tag such as v0.3.0 is pushed, build the sdist and wheel and publish them to PyPI.
 #
-# One-time setup, before the first release: create the "runledger" project on PyPI, then add
+# One-time setup, before the first release: create the "runledger-ai" project on PyPI, then add
 # this repository, the workflow file name "release.yml" and the environment "pypi" as a trusted
 # publisher (PyPI: project > Settings > Publishing). After that, no API token is needed.
 
@@ -41,7 +41,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/p/runledger
+      url: https://pypi.org/p/runledger-ai
     permissions:
       contents: read
       id-token: write

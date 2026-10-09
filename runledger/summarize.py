@@ -93,7 +93,8 @@ def template_summary(step: Step, cwd: Optional[str]) -> str:
         return f"Edited {p} (+{a} −{r})"
     if t == "Bash":
         desc = i.get("description")
-        cmd = str(i.get("command", "")).strip().splitlines()[0][:120]
+        # Redact before cutting, so the 120-character limit cannot keep half of a secret.
+        cmd = llm.redact((str(i.get("command", "")).strip().splitlines() or [""])[0])[:120]
         outcome = " — failed" if step.is_error else ""
         m = re.search(r"(\d+)\s+passed", step.result_text)
         f = re.search(r"(\d+)\s+failed", step.result_text)
@@ -132,7 +133,7 @@ def apply_templates(run: Run) -> None:
         s.summary = template_summary(s, run.cwd)
     if not run.overall_summary:
         n_files = len(file_changes(run))
-        goal = run.prompts[0][:200] if run.prompts else "an unspecified task"
+        goal = llm.redact(run.prompts[0])[:200] if run.prompts else "an unspecified task"
         goal = goal.rstrip(" .")
         run.overall_summary = (f"Asked to: “{goal}”. The agent took {len(run.steps)} steps "
                                f"and changed {n_files} file{'s' if n_files != 1 else ''}.")

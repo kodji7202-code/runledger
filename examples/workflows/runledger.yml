@@ -16,7 +16,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Post the RunLedger receipt
-        uses: kodji7202-code/runledger@v0.2.0
+        uses: kodji7202-code/runledger@v0.3.0
         with:
           sessions-dir: .runledger/sessions
           fail-on: "60"

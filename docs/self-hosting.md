@@ -377,9 +377,10 @@ roll back, install the older version and restore the backup from before the upgr
       them in environment variables (`RUNLEDGER_API_KEY`), not in command arguments.
 - [ ] **Know what receipts contain.** A receipt holds the prompts (the first three in full), file paths,
       the first line of each command (up to 120 characters), search patterns, URLs, test counts, models,
-      cost and risk reasons. It does not hold file contents or command output. Receipts are not redacted,
-      so a secret typed on a command line can appear in one. See the privacy note in
-      [docs/github.md](github.md).
+      cost and risk reasons. It does not hold file contents or command output. Known secret formats and
+      assignments such as `API_KEY=…` are masked, but masking is pattern-based, so an unusual secret
+      typed on a command line can still appear in one. See [docs/guard.md](guard.md#the-guard-log) for
+      what is masked and the privacy note in [docs/github.md](github.md).
 - [ ] **Limit the webhook targets.** Approval and budget notifications go to the URLs you set in the team
       settings. Use only URLs you control. The URLs are stored as set in the database.
 - [ ] **Review the audit log, and protect exports.** Admins can read the audit log and download the CSV
@@ -393,13 +394,15 @@ roll back, install the older version and restore the backup from before the upgr
       base image is released. The container runs as the unprivileged `runledger` user.
 - [ ] **Back up regularly, and test the restore.**
 
-## Known limits in 0.2.0
+## Known limits in 0.3.0
 
 - No single sign-on, no per-person accounts, no multi-factor authentication, and no key expiry.
 - Runs and audit events are never deleted automatically. There is no delete or retention command.
 - One server process and one SQLite file. This is not a multi-node cluster.
 - There is no sign-out endpoint. Sessions end when their key is revoked or rotated, or after 12 hours.
-- Receipts are not redacted. The guard's log masks known token formats and quoted secret values only.
+- Receipts and the guard's log mask secrets by pattern. A secret in an unknown format, or a short
+  one, is not masked. The server stores what clients send; receipts pushed by clients older than
+  0.3.0 were not masked.
 - The failed-sign-in limit counts the connection address, unless trusted proxies are configured. Its
   counter is held in memory, so a restart clears it.
 

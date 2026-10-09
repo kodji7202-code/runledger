@@ -122,7 +122,7 @@ The guard is a Claude Code `PreToolUse` hook. It checks each tool call before it
 allow, ask or deny.
 
 ```bash
-runledger guard install                   # this project: .claude/settings.json
+runledger guard install                   # this project: .claude/settings.json (undo: guard uninstall)
 runledger guard test '{"session_id":"s1","cwd":"/work/my-app","tool_name":"Bash","tool_input":{"command":"rm -rf /"}}'
 ```
 

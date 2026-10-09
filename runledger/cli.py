@@ -15,6 +15,7 @@
                  [--review] [--review-model MODEL]
   runledger guard                       Claude Code PreToolUse hook (reads the event on stdin)
   runledger guard install [--project PATH | --global]
+  runledger guard uninstall [--project PATH | --global]
   runledger guard test 'EVENT_JSON'
 
 SESSION is a session file of any supported agent; the agent is detected from the file.
@@ -34,9 +35,10 @@ from typing import List, Optional
 
 from . import __version__
 from . import adapters
+from .guard import redact
 from .pricing import apply_costs
 from .quality import analyze
-from .receipt import render
+from .receipt import redact_run, render
 from .risk import assess
 from .review import DEFAULT_REVIEW_MODEL, ai_review
 from .summarize import DEFAULT_AI_MODEL, ai_summaries, apply_templates
@@ -50,7 +52,8 @@ def build(session_path: str, use_ai: bool = False, ai_model: str = DEFAULT_AI_MO
 
     `use_ai` adds Claude step summaries; `review` adds the Claude risk review (run.ai_review).
     The rule-based score and risks are the same with or without them. When an AI step fails,
-    the deterministic receipt is kept and `note` says why, one line per failed step."""
+    the deterministic receipt is kept and `note` says why, one line per failed step.
+    Secrets are masked in everything the receipt shows, after the rules have scored the raw text."""
     path = Path(session_path)
     run = adapters.detect(path).parse(path)
     apply_costs(run)
@@ -68,6 +71,7 @@ def build(session_path: str, use_ai: bool = False, ai_model: str = DEFAULT_AI_MO
             ai_review(run, risks, model=review_model)
         except Exception as exc:  # keep the deterministic receipt
             notes.append(f"AI risk review skipped: {_one_line(exc)}")
+    redact_run(run, risks)
     return run, score, level, risks, "\n".join(notes) or None
 
 
@@ -129,7 +133,7 @@ def cmd_list(args) -> int:
             print(f"skipped: {exc}", file=sys.stderr)
             continue
         when = datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
-        first = (run.prompts[0] if run.prompts else "").replace("\n", " ")[:60]
+        first = redact(run.prompts[0] if run.prompts else "").replace("\n", " ")[:60]
         print(f"{when}  {run.session_id[:8]:<8}  {run.agent[:12]:<12}  {len(run.steps):>5} steps  {first}")
         if args.all:
             print(f"                  {run.cwd}")
@@ -324,6 +328,8 @@ def cmd_guard(args) -> int:
 
     if args.guard_cmd == "install":
         return guard.cmd_install(args.project, args.global_scope)
+    if args.guard_cmd == "uninstall":
+        return guard.cmd_uninstall(args.project, args.global_scope)
     if args.guard_cmd == "test":
         return guard.cmd_test(args.event)
     return guard.main()
@@ -424,11 +430,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     pp.set_defaults(func=cmd_push)
 
     pg = sub.add_parser("guard", help="real-time policy guard: Claude Code PreToolUse hook")
-    gsub = pg.add_subparsers(dest="guard_cmd", metavar="{install,test}")
+    gsub = pg.add_subparsers(dest="guard_cmd", metavar="{install,uninstall,test}")
     pgi = gsub.add_parser("install", help="add the guard hook to Claude Code settings.json")
     scope = pgi.add_mutually_exclusive_group()
     scope.add_argument("--project", metavar="PATH", help="project folder: writes PATH/.claude/settings.json (default: current folder)")
     scope.add_argument("--global", dest="global_scope", action="store_true", help="writes ~/.claude/settings.json")
+    pgu = gsub.add_parser("uninstall", help="remove the guard hook from Claude Code settings.json")
+    uscope = pgu.add_mutually_exclusive_group()
+    uscope.add_argument("--project", metavar="PATH", help="project folder: edits PATH/.claude/settings.json (default: current folder)")
+    uscope.add_argument("--global", dest="global_scope", action="store_true", help="edits ~/.claude/settings.json")
     pgt = gsub.add_parser("test", help="print the decision for one PreToolUse event (JSON)")
     pgt.add_argument("event", help="the event as a JSON object")
     pg.set_defaults(func=cmd_guard)
