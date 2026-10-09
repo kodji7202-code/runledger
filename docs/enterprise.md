@@ -314,16 +314,20 @@ The team database (one SQLite file) holds:
 - **The audit log.**
 - **In this release:** budgets and budget alerts, and dashboard sessions as hashes.
 
-**Retention.** RunLedger keeps everything until you delete it. There is no retention setting and no
-delete command for runs or the audit log. To erase data, stop the server, keep any backup you need, and
-delete the database file along with its `-wal` and `-shm` files. That removes every team in the
-database. See [self-hosting.md](self-hosting.md) for backups and restores.
+**Retention.** By default RunLedger keeps everything until you delete it. Set
+`RUNLEDGER_RETENTION_DAYS` (for example `90`) and the server deletes runs, approvals, audit events and
+budget alerts older than that, at start and every hour. The period applies to every team on the
+server. To erase all data, stop the server, keep any backup you need, and delete the database file
+along with its `-wal` and `-shm` files. That removes every team in the database. See
+[self-hosting.md](self-hosting.md) for backups and restores. On the hosted plan, history is kept for
+90 days and a team is deleted 30 days after its subscription ends ([hosted.md](hosted.md)).
 
 ## What RunLedger does not do
 
 - It has no single sign-on (SAML or OIDC), no per-person accounts and no multi-factor authentication.
 - Keys do not expire, and there is no IP allow-list.
-- Runs and audit events are never deleted automatically.
+- Without `RUNLEDGER_RETENTION_DAYS`, runs and audit events are never deleted automatically. There is
+  no per-team retention period.
 - One server process uses one SQLite file. It is not a cluster.
 - Receipts and the guard's log mask secrets by pattern, as described in [guard.md](guard.md#the-guard-log).
   A secret in an unknown format, or a short one, is not masked. Receipts pushed by clients older

@@ -297,6 +297,8 @@ Keys do not expire. Rotate a key when a person leaves or when a key may have lea
 | `--trust-proxy` | `runledger serve` | Honours `X-Forwarded-Proto: https` for the `Secure` flag and HSTS. Only from the `--trusted-proxy` addresses when any are given; otherwise from any address. |
 | `--trusted-proxy CIDR` (repeatable), or `RUNLEDGER_TRUSTED_PROXIES` (comma-separated) | `runledger serve`, environment | The addresses or ranges of your reverse proxies, for example `127.0.0.1` or `172.20.0.0/16`. The client address is read from `X-Forwarded-For` only for these peers. It is used for the failed-sign-in limit and the audit log. |
 | `RUNLEDGER_PUBLIC_URL` | environment | Public base URL used in approval links. Set it whenever the server is behind a proxy. |
+| `RUNLEDGER_RETENTION_DAYS` | environment | Delete runs, approvals, audit events and budget alerts older than this many days. Checked at start and every hour. Unset keeps everything. |
+| `RUNLEDGER_POLAR_WEBHOOK_SECRET` and the other billing settings | environment | Only for running the paid hosted plan. See [hosted.md](hosted.md). Leave unset. |
 
 The database is upgraded automatically when the server starts. Missing columns are added, so an old
 database keeps working. A database from before roles existed keeps its one key as an admin key labelled
@@ -314,13 +316,19 @@ mechanism instead.
 sudo sqlite3 /var/lib/runledger/runledger.db ".backup '/var/backups/runledger-$(date +%F).db'"
 ```
 
-**Docker.** The image has no `sqlite3` command. Use Python's backup API inside the container,
-then copy the file out:
+**Any install**, with `runledger backup` (0.4.0 and later). It uses SQLite's online backup, so the
+server keeps running, writes `runledger-YYYYmmdd-HHMMSS.db` and keeps the newest 14 copies:
 
 ```bash
-docker compose exec runledger python -c "import sqlite3; src = sqlite3.connect('/data/runledger.db'); dst = sqlite3.connect('/data/backup.db'); src.backup(dst); dst.close(); src.close()"
-docker compose cp runledger:/data/backup.db "./runledger-$(date +%F).db"
-docker compose exec runledger rm /data/backup.db
+runledger backup --db /var/lib/runledger/runledger.db --dir /var/backups/runledger --keep 14
+```
+
+**Docker.** `deploy/backup.sh` runs the same command in the container, keeps 14 copies in the data
+volume, and copies the newest to `deploy/backups/` on the host. Run it from cron:
+
+```bash
+chmod +x deploy/backup.sh
+crontab -e   # add: 15 3 * * * cd /path/to/runledger/deploy && ./backup.sh >> backup.log 2>&1
 ```
 
 **Whole volume.** For a complete copy, including the certificates in the Caddy volume, stop
@@ -387,17 +395,19 @@ roll back, install the older version and restore the backup from before the upgr
       and HTML exports. They contain developer and project names, run titles (the first request, up to 200
       characters), risk findings, approval decisions and audit details. Treat them as confidential. They are
       records, not a compliance certification.
-- [ ] **Know that there is no retention policy.** Runs stay until the database is removed. To
-      erase data, stop the server, back up what you need, and delete the database file and its
+- [ ] **Choose a retention period.** Without `RUNLEDGER_RETENTION_DAYS`, runs stay until the database
+      is removed. With it, older runs, approvals and audit events are deleted every hour. To erase
+      everything, stop the server, back up what you need, and delete the database file and its
       `-wal` and `-shm` files. This removes every team.
 - [ ] **Keep the host and the images updated.** Rebuild the Docker image with `--pull` when a new
       base image is released. The container runs as the unprivileged `runledger` user.
 - [ ] **Back up regularly, and test the restore.**
 
-## Known limits in 0.3.0
+## Known limits in 0.4.0
 
 - No single sign-on, no per-person accounts, no multi-factor authentication, and no key expiry.
-- Runs and audit events are never deleted automatically. There is no delete or retention command.
+- Retention is one period for the whole server (`RUNLEDGER_RETENTION_DAYS`), not per team. There is no
+  command to delete a single run.
 - One server process and one SQLite file. This is not a multi-node cluster.
 - There is no sign-out endpoint. Sessions end when their key is revoked or rotated, or after 12 hours.
 - Receipts and the guard's log mask secrets by pattern. A secret in an unknown format, or a short

@@ -19,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ..pricing import friendly_model
+from .billing import ACTIVE, ENDED, PAST_DUE
 from .insights import AI_REVIEW_LIKE, QUALITY_LIKE, RECOMMENDATIONS_LIKE, review_fields
 from .auth import (
     INITIAL_KEY_LABEL,
@@ -171,6 +172,33 @@ CREATE TABLE IF NOT EXISTS budget_alerts (
     fired_at   TEXT NOT NULL,
     PRIMARY KEY (team_id, month, scope, threshold)
 );
+-- Hosted plan (see billing.py). A team with a row here is billed; team_id is NULL once the
+-- team has been deleted, and email is then cleared too.
+CREATE TABLE IF NOT EXISTS billing_subscriptions (
+    polar_id             TEXT PRIMARY KEY,
+    team_id              INTEGER UNIQUE REFERENCES teams (id),
+    customer_id          TEXT,
+    email                TEXT,
+    product_id           TEXT,
+    status               TEXT NOT NULL,
+    seats                INTEGER NOT NULL DEFAULT 1,
+    current_period_end   TEXT,
+    cancel_at_period_end INTEGER NOT NULL DEFAULT 0,
+    past_due_since       TEXT,
+    ended_at             TEXT,
+    source_modified_at   TEXT,
+    welcome_sent_at      TEXT,
+    last_recovery_at     TEXT,
+    created_at           TEXT NOT NULL,
+    updated_at           TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS billing_by_email ON billing_subscriptions (email);
+-- Webhook ids already handled, so a redelivered event is applied once.
+CREATE TABLE IF NOT EXISTS billing_events (
+    webhook_id   TEXT PRIMARY KEY,
+    type         TEXT NOT NULL,
+    received_at  TEXT NOT NULL
+);
 """
 
 _SUMMARY_COLUMNS = (
@@ -283,6 +311,15 @@ class Database:
         with self._lock:
             self._conn.close()
 
+    def backup_to(self, path: str) -> None:
+        """A consistent copy of the database at `path`, taken while the server keeps running."""
+        target = sqlite3.connect(str(path))
+        try:
+            with self._lock:
+                self._conn.backup(target)
+        finally:
+            target.close()
+
     def _add_missing_columns(self, table: str, columns: Tuple[Tuple[str, str], ...]) -> None:
         """Upgrade a database created before these columns existed."""
         present = {row["name"] for row in self._conn.execute(f"PRAGMA table_info({table})")}
@@ -372,22 +409,26 @@ class Database:
         name = (name or "").strip()
         if not name or len(name) > 100:
             raise ValueError("Team name must be 1-100 characters.")
+        with self._lock, self._conn:
+            return self._create_team_locked(name, actor)
+
+    def _create_team_locked(self, name: str, actor: str) -> Tuple[int, str]:
+        """create_team() inside the caller's lock and transaction."""
         key = generate_key()
         now = utc_now()
-        with self._lock, self._conn:
-            try:
-                cur = self._conn.execute(
-                    # The legacy column keeps the hash of the first key so the NOT NULL and UNIQUE
-                    # constraints hold. Authentication reads api_keys only.
-                    "INSERT INTO teams (name, api_key_hash, created_at) VALUES (?, ?, ?)",
-                    (name, hash_key(key), now),
-                )
-            except sqlite3.IntegrityError:
-                raise ValueError(f"A team named {name!r} already exists.") from None
-            team_id = int(cur.lastrowid)
-            key_id = self._insert_key(team_id, INITIAL_KEY_LABEL, "admin", key, now)
-            self._audit(team_id, actor, "key.create", key_id,
-                        {"label": INITIAL_KEY_LABEL, "role": "admin", "prefix": key_prefix(key)})
+        try:
+            cur = self._conn.execute(
+                # The legacy column keeps the hash of the first key so the NOT NULL and UNIQUE
+                # constraints hold. Authentication reads api_keys only.
+                "INSERT INTO teams (name, api_key_hash, created_at) VALUES (?, ?, ?)",
+                (name, hash_key(key), now),
+            )
+        except sqlite3.IntegrityError:
+            raise ValueError(f"A team named {name!r} already exists.") from None
+        team_id = int(cur.lastrowid)
+        key_id = self._insert_key(team_id, INITIAL_KEY_LABEL, "admin", key, now)
+        self._audit(team_id, actor, "key.create", key_id,
+                    {"label": INITIAL_KEY_LABEL, "role": "admin", "prefix": key_prefix(key)})
         return team_id, key
 
     def _insert_key(self, team_id: int, label: str, role: str, key: str, created_at: str) -> str:
@@ -1105,3 +1146,218 @@ class Database:
         if view["status"] == "expired":
             return "expired", view
         return "conflict", view
+
+    # Billing (see billing.py)
+
+    def billing_event_seen(self, webhook_id: str) -> bool:
+        with self._lock:
+            row = self._conn.execute("SELECT 1 FROM billing_events WHERE webhook_id = ?", (webhook_id,)).fetchone()
+        return row is not None
+
+    def record_billing_event(self, webhook_id: str, event_type: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO billing_events (webhook_id, type, received_at) VALUES (?, ?, ?)",
+                (webhook_id, str(event_type)[:100], utc_now()),
+            )
+
+    def apply_subscription(self, sub: Dict[str, Any], actor: str = "billing:polar") -> Dict[str, Any]:
+        """Store a subscription from a webhook (see billing.parse_subscription) and create its team
+        the first time it is active. Returns the stored row plus:
+
+          stale            the event was older than what is stored, or late for a deleted team: ignored
+          previous_status  the status before this event (None for a new subscription)
+          created_key      the new team's admin key, when this event created the team
+          team_name        the team's name, or None
+
+        Polar may deliver events out of order, so an event whose modified_at is older than the one
+        stored is ignored, and "incomplete" never replaces a later status."""
+        now = utc_now()
+        status = sub["status"]
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT * FROM billing_subscriptions WHERE polar_id = ?", (sub["id"],)
+            ).fetchone()
+            previous = row["status"] if row else None
+            extra: Dict[str, Any] = {"stale": False, "previous_status": previous, "created_key": None}
+            if row is not None:
+                older = bool(sub["modified_at"] and row["source_modified_at"]
+                             and sub["modified_at"] < row["source_modified_at"])
+                regress = status == "incomplete" and previous != "incomplete"
+                deleted = row["team_id"] is None and row["ended_at"] is not None and status not in ACTIVE
+                if older or regress or deleted:
+                    extra["stale"] = True
+                    return self._billing_result(row, extra)
+            past_due_since = ((row["past_due_since"] if row else None) or now) if status in PAST_DUE else None
+            ended_at = ((row["ended_at"] if row else None) or sub["ended_at"] or now) if status in ENDED else None
+            team_id = row["team_id"] if row else None
+            if team_id is None and status in ACTIVE:
+                team_id, key = self._create_team_locked(self._free_team_name(sub["team_name"]), actor)
+                extra["created_key"] = key
+                self._audit(team_id, actor, "billing.provision", sub["id"], {"seats": sub["seats"]})
+            values = (
+                team_id, sub["customer_id"], sub["email"], sub["product_id"], status, sub["seats"],
+                sub["current_period_end"], int(sub["cancel_at_period_end"]), past_due_since, ended_at,
+                sub["modified_at"], now,
+            )
+            if row is None:
+                self._conn.execute(
+                    "INSERT INTO billing_subscriptions (team_id, customer_id, email, product_id, status, seats, "
+                    "current_period_end, cancel_at_period_end, past_due_since, ended_at, source_modified_at, "
+                    "updated_at, created_at, polar_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    values + (now, sub["id"]),
+                )
+            else:
+                self._conn.execute(
+                    "UPDATE billing_subscriptions SET team_id = ?, customer_id = ?, email = ?, product_id = ?, "
+                    "status = ?, seats = ?, current_period_end = ?, cancel_at_period_end = ?, past_due_since = ?, "
+                    "ended_at = ?, source_modified_at = ?, updated_at = ? WHERE polar_id = ?",
+                    values + (sub["id"],),
+                )
+            changed = row is None or (previous, row["seats"], bool(row["cancel_at_period_end"])) != (
+                status, sub["seats"], bool(sub["cancel_at_period_end"]))
+            if team_id is not None and changed:
+                self._audit(team_id, actor, "billing.subscription", sub["id"], {
+                    "status": status, "seats": sub["seats"],
+                    "cancel_at_period_end": bool(sub["cancel_at_period_end"]),
+                })
+            stored = self._conn.execute(
+                "SELECT * FROM billing_subscriptions WHERE polar_id = ?", (sub["id"],)
+            ).fetchone()
+            return self._billing_result(stored, extra)
+
+    def _billing_result(self, row: sqlite3.Row, extra: Dict[str, Any]) -> Dict[str, Any]:
+        result = dict(row)
+        result.update(extra)
+        result["team_name"] = None
+        if row["team_id"] is not None:
+            name = self._conn.execute("SELECT name FROM teams WHERE id = ?", (row["team_id"],)).fetchone()
+            result["team_name"] = name["name"] if name else None
+        return result
+
+    def _free_team_name(self, base: str) -> str:
+        """`base`, or "base 2", "base 3"... when a team already has that name."""
+        name, n = base, 2
+        while self._conn.execute("SELECT 1 FROM teams WHERE name = ?", (name,)).fetchone() is not None:
+            name = f"{base} {n}"
+            n += 1
+        return name
+
+    def welcome_key(self, team_id: int, actor: str = "billing:polar") -> str:
+        """A fresh secret for the team's first admin key, for a welcome email that has to be sent
+        again (the plaintext of the earlier one is gone). Falls back to a new admin key "owner"."""
+        new_key = generate_key()
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT id, label FROM api_keys WHERE team_id = ? AND role = 'admin' AND label = ? "
+                "AND revoked_at IS NULL ORDER BY created_at, rowid LIMIT 1",
+                (team_id, INITIAL_KEY_LABEL),
+            ).fetchone()
+            if row is None:
+                key_id = self._insert_key(team_id, "owner", "admin", new_key, utc_now())
+                self._audit(team_id, actor, "key.create", key_id,
+                            {"label": "owner", "role": "admin", "prefix": key_prefix(new_key)})
+                return new_key
+            self._conn.execute("UPDATE api_keys SET key_hash = ?, prefix = ? WHERE id = ?",
+                               (hash_key(new_key), key_prefix(new_key), row["id"]))
+            self._conn.execute("DELETE FROM sessions WHERE key_id = ?", (row["id"],))
+            self._audit(team_id, actor, "key.rotate", row["id"],
+                        {"label": row["label"], "role": "admin", "prefix": key_prefix(new_key)})
+        return new_key
+
+    def mark_welcome_sent(self, polar_id: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute("UPDATE billing_subscriptions SET welcome_sent_at = ? WHERE polar_id = ?",
+                               (utc_now(), polar_id))
+
+    def billing_for_team(self, team_id: int) -> Optional[Dict[str, Any]]:
+        """The subscription of a billed team, or None for a team created with `runledger team create`."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM billing_subscriptions WHERE team_id = ?", (team_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def seat_users(self, team_id: int, since: str) -> List[str]:
+        """The developers who pushed a run at or after `since` (the seats in use)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT user FROM runs WHERE team_id = ? AND updated_at >= ? ORDER BY user",
+                (team_id, since),
+            ).fetchall()
+        return [r["user"] for r in rows]
+
+    def subscriptions_for_email(self, email: str) -> List[Dict[str, Any]]:
+        """Subscriptions with a team (not yet deleted) for this customer email."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT s.*, t.name AS team_name FROM billing_subscriptions s JOIN teams t ON t.id = s.team_id "
+                "WHERE s.email = ? ORDER BY s.created_at",
+                (email,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def claim_recovery(self, polar_id: str, cutoff: str) -> bool:
+        """Record a key recovery for this subscription unless one happened after `cutoff`."""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE billing_subscriptions SET last_recovery_at = ? WHERE polar_id = ? "
+                "AND (last_recovery_at IS NULL OR last_recovery_at < ?)",
+                (utc_now(), polar_id, cutoff),
+            )
+        return cur.rowcount == 1
+
+    def list_subscriptions(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT s.*, t.name AS team_name FROM billing_subscriptions s "
+                "LEFT JOIN teams t ON t.id = s.team_id ORDER BY s.created_at"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def teams_due_for_deletion(self, ended_before: str) -> List[Dict[str, Any]]:
+        """Billed teams whose subscription ended before `ended_before`."""
+        placeholders = ", ".join("?" for _ in ENDED)
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT polar_id, team_id FROM billing_subscriptions WHERE team_id IS NOT NULL "
+                f"AND status IN ({placeholders}) AND ended_at IS NOT NULL AND ended_at < ?",
+                tuple(ENDED) + (ended_before,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def delete_team(self, team_id: int) -> None:
+        """Delete a team and everything it owns. Its subscription row stays, for the billing
+        history, without the team and without the customer's email."""
+        with self._lock, self._conn:
+            for table in ("sessions", "risks", "runs", "approvals", "audit_log", "budget_alerts", "api_keys"):
+                self._conn.execute(f"DELETE FROM {table} WHERE team_id = ?", (team_id,))
+            self._conn.execute(
+                "UPDATE billing_subscriptions SET team_id = NULL, email = NULL, updated_at = ? WHERE team_id = ?",
+                (utc_now(), team_id),
+            )
+            self._conn.execute("DELETE FROM teams WHERE id = ?", (team_id,))
+
+    def purge_before(self, cutoff: str) -> Dict[str, int]:
+        """Delete, for every team, runs that started (or were pushed) before `cutoff`, and approvals,
+        audit events and budget alerts older than it. Returns the number of rows removed per table."""
+        counts: Dict[str, int] = {}
+        with self._lock, self._conn:
+            old_runs = "SELECT team_id, id FROM runs WHERE COALESCE(started_at, created_at) < ?"
+            self._conn.execute(
+                f"DELETE FROM risks WHERE (team_id, run_id) IN ({old_runs})", (cutoff,)
+            )
+            counts["runs"] = self._conn.execute(
+                "DELETE FROM runs WHERE COALESCE(started_at, created_at) < ?", (cutoff,)
+            ).rowcount
+            counts["approvals"] = self._conn.execute(
+                "DELETE FROM approvals WHERE created_at < ?", (cutoff,)
+            ).rowcount
+            counts["audit_log"] = self._conn.execute(
+                "DELETE FROM audit_log WHERE at < ?", (cutoff,)
+            ).rowcount
+            counts["budget_alerts"] = self._conn.execute(
+                "DELETE FROM budget_alerts WHERE fired_at < ?", (cutoff,)
+            ).rowcount
+            self._conn.execute("DELETE FROM billing_events WHERE received_at < ?", (cutoff,))
+        return counts

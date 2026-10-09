@@ -6,7 +6,7 @@
 #   docker compose run --rm runledger team create myteam      # prints the team API key once
 #
 # Only Caddy publishes ports. The RunLedger container is reachable from Caddy only.
-# See ../docs/self-hosting.md.
+# See ../docs/self-hosting.md, and ../docs/hosted.md for running the paid hosted plan.
 
 services:
   runledger:
@@ -20,8 +20,17 @@ services:
       RUNLEDGER_SECURE_COOKIES: "1"
       # Recommended: name the Compose network's subnet as a trusted proxy, so the server reads the
       # client address from X-Forwarded-For and counts each user separately. See ../docs/self-hosting.md
-      # ("Trusted proxy on the Compose network") for how to find the subnet. Not set here.
-      # RUNLEDGER_TRUSTED_PROXIES: "172.20.0.0/16"
+      # ("Trusted proxy on the Compose network") for how to find the subnet.
+      RUNLEDGER_TRUSTED_PROXIES: ${RUNLEDGER_TRUSTED_PROXIES:-}
+      # Delete runs, approvals and audit events older than this many days. Empty keeps everything.
+      RUNLEDGER_RETENTION_DAYS: ${RUNLEDGER_RETENTION_DAYS:-}
+      # Hosted plan only (../docs/hosted.md). Leave empty to run without billing.
+      RUNLEDGER_POLAR_WEBHOOK_SECRET: ${RUNLEDGER_POLAR_WEBHOOK_SECRET:-}
+      RUNLEDGER_POLAR_PRODUCT_IDS: ${RUNLEDGER_POLAR_PRODUCT_IDS:-}
+      RUNLEDGER_BILLING_PORTAL_URL: ${RUNLEDGER_BILLING_PORTAL_URL:-}
+      RUNLEDGER_RESEND_API_KEY: ${RUNLEDGER_RESEND_API_KEY:-}
+      RUNLEDGER_MAIL_FROM: ${RUNLEDGER_MAIL_FROM:-}
+      RUNLEDGER_SUPPORT_EMAIL: ${RUNLEDGER_SUPPORT_EMAIL:-}
     volumes:
       - runledger-data:/data
     # Not published on the host. Only the Caddy service can reach this port.

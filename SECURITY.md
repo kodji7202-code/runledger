@@ -21,8 +21,9 @@ changelog if you want that.
 
 | Version | Security fixes |
 | --- | --- |
-| 0.3.x | Yes |
-| 0.2.x | No; upgrade to 0.3.0, which masks secrets in receipts |
+| 0.4.x | Yes |
+| 0.3.x | Yes, until 0.5.0 |
+| 0.2.x | No; upgrade to 0.4.0. Since 0.3.0, receipts mask secrets |
 | Earlier versions | No |
 
 ## Scope
