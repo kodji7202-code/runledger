@@ -519,6 +519,89 @@ def test_cli_install_project_and_global_scope(tmp_path, monkeypatch, capsys):
     assert "Installed" in capsys.readouterr().out
 
 
+# ---------------------------------------------------------------- uninstaller
+
+def test_uninstall_removes_only_the_guard_and_keeps_every_other_setting(tmp_path):
+    settings = tmp_path / ".claude" / "settings.json"
+    settings.parent.mkdir()
+    original = {
+        "permissions": {"allow": ["Bash(npm test)"]},
+        "hooks": {
+            "Stop": [{"hooks": [{"type": "command", "command": "echo done"}]}],
+            "PreToolUse": [
+                {"matcher": "Write", "hooks": [{"type": "command", "command": "./check.sh"}]},
+                {"matcher": "Bash", "hooks": [{"type": "command", "command": "./lint.sh"},
+                                              {"type": "command", "command": "runledger guard", "timeout": 135}]},
+            ],
+        },
+    }
+    settings.write_text(json.dumps(original, indent=2), encoding="utf-8")
+    before = settings.read_bytes()
+
+    changed, backup = guard.uninstall_hook(settings)
+
+    assert changed is True
+    assert backup == settings.with_name("settings.json.bak")
+    assert backup.read_bytes() == before
+    data = json.loads(settings.read_text(encoding="utf-8"))
+    assert data["permissions"] == original["permissions"]
+    assert data["hooks"]["Stop"] == original["hooks"]["Stop"]
+    assert data["hooks"]["PreToolUse"] == [
+        {"matcher": "Write", "hooks": [{"type": "command", "command": "./check.sh"}]},
+        {"matcher": "Bash", "hooks": [{"type": "command", "command": "./lint.sh"}]},
+    ]
+
+
+def test_uninstall_after_install_leaves_no_empty_hook_sections(tmp_path):
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"env": {"FOO": "1"}}), encoding="utf-8")
+    guard.install_hook(settings)
+    assert guard.uninstall_hook(settings)[0] is True
+    assert json.loads(settings.read_text(encoding="utf-8")) == {"env": {"FOO": "1"}}
+
+
+def test_uninstall_without_the_hook_or_the_file_writes_nothing(tmp_path):
+    missing = tmp_path / "none" / "settings.json"
+    assert guard.uninstall_hook(missing) == (False, None)
+    assert not missing.exists()
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"hooks": {"PreToolUse": [
+        {"matcher": "*", "hooks": [{"type": "command", "command": "./check.sh"}]}]}}), encoding="utf-8")
+    before = settings.read_bytes()
+    assert guard.uninstall_hook(settings) == (False, None)
+    assert settings.read_bytes() == before
+    assert not settings.with_name("settings.json.bak").exists()
+
+
+def test_uninstall_refuses_invalid_json_and_leaves_the_file(tmp_path):
+    settings = tmp_path / "settings.json"
+    settings.write_text("{ this is not json", encoding="utf-8")
+    before = settings.read_bytes()
+    with pytest.raises(guard.InstallError):
+        guard.uninstall_hook(settings)
+    assert settings.read_bytes() == before
+
+
+def test_cli_uninstall_project_and_global_scope(tmp_path, monkeypatch, capsys):
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    assert cli_main(["guard", "install", "--project", str(proj)]) == 0
+    assert cli_main(["guard", "install", "--global"]) == 0
+    capsys.readouterr()
+
+    assert cli_main(["guard", "uninstall", "--project", str(proj)]) == 0
+    assert "Removed" in capsys.readouterr().out
+    assert "hooks" not in json.loads((proj / ".claude" / "settings.json").read_text(encoding="utf-8"))
+    assert cli_main(["guard", "uninstall", "--global"]) == 0
+    assert "hooks" not in json.loads((home / ".claude" / "settings.json").read_text(encoding="utf-8"))
+    assert cli_main(["guard", "uninstall", "--global"]) == 0
+    assert "Nothing changed" in capsys.readouterr().out
+
+
 # ---------------------------------------------------------------- who may choose the approval server
 
 def _write_project_policy(cwd, approval):

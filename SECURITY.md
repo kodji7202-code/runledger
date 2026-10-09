@@ -21,8 +21,8 @@ changelog if you want that.
 
 | Version | Security fixes |
 | --- | --- |
-| 0.2.0 (unreleased, the development line) | Yes |
-| 0.1.x | Until 0.2.0 is released |
+| 0.3.x | Yes |
+| 0.2.x | No; upgrade to 0.3.0, which masks secrets in receipts |
 | Earlier versions | No |
 
 ## Scope
@@ -45,9 +45,9 @@ Read the security checklist and the "Known limits" section of
 - A receipt holds the prompts (the first three in full), file paths, the first line of each command
   (up to 120 characters), search patterns, URLs, test counts, models, cost and risk reasons. It does not
   hold file contents or command output, but the agent's own session file, which RunLedger reads and does
-  not send, can. Receipts are not redacted, so a secret typed on a command line can appear in one.
-  `receipt --ai` sends session content to Anthropic.
-- The guard's log and approval requests mask known token formats and quoted secret values only.
-  Unquoted secrets are not masked.
+  not send, can. Secrets in receipts are masked by pattern, so a secret in an unknown format typed on
+  a command line can still appear in one. `receipt --ai` sends session content to Anthropic.
+- The guard's log and approval requests use the same pattern-based masking, described in
+  [docs/guard.md](docs/guard.md#the-guard-log).
 - Behind a reverse proxy, configure the proxy as a trusted proxy (`--trusted-proxy`). Until then, the
   failed-sign-in limit and the audit log use the proxy's address.

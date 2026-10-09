@@ -325,9 +325,9 @@ database. See [self-hosting.md](self-hosting.md) for backups and restores.
 - Keys do not expire, and there is no IP allow-list.
 - Runs and audit events are never deleted automatically.
 - One server process uses one SQLite file. It is not a cluster.
-- The receipts are not redacted. A command that contains a token shows that token in the receipt.
-- The guard's log masks only known token formats and quoted assignments, as described in
-  [guard.md](guard.md).
+- Receipts and the guard's log mask secrets by pattern, as described in [guard.md](guard.md#the-guard-log).
+  A secret in an unknown format, or a short one, is not masked. Receipts pushed by clients older
+  than 0.3.0 were not masked.
 
 For the checklist to work through before you open a server to your team, see the security checklist in
 [self-hosting.md](self-hosting.md#security-checklist).

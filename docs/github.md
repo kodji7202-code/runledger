@@ -27,7 +27,8 @@ the work in the pull request.
 > Review a session file before you commit it, and remove the lines you do not want
 > to share. Anyone who can read the repository can read the committed file. The PR
 > comment itself shows each session's first request, the file paths and the risk
-> reasons, and it is visible to everyone who can see the pull request.
+> reasons, with known secret formats masked, and it is visible to everyone who can
+> see the pull request.
 
 ## 2. Add the workflow
 
@@ -37,7 +38,7 @@ RunLedger. The job needs `pull-requests: write` to post the comment.
 
 ```yaml
 - uses: actions/checkout@v4
-- uses: kodji7202-code/runledger@v0.2.0
+- uses: kodji7202-code/runledger@v0.3.0
   with:
     sessions-dir: .runledger/sessions   # default
     fail-on: "60"                        # default; "" never fails the job

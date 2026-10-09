@@ -22,6 +22,7 @@ Contents:
 runledger guard install                  # this project: writes .claude/settings.json
 runledger guard install --project PATH   # the project at PATH instead of the current folder
 runledger guard install --global         # every project: writes ~/.claude/settings.json
+runledger guard uninstall                # remove it from this project (also --project PATH, --global)
 runledger guard test 'EVENT_JSON'        # print the decision for one event; writes no log
 ```
 
@@ -31,6 +32,12 @@ runledger guard test 'EVENT_JSON'        # print the decision for one event; wri
 timeout is updated in place and no second entry is added. If nothing would change, the file is not
 written. If the file is not valid JSON or is not an object, `install` stops with an error and
 changes nothing.
+
+`uninstall` removes every `runledger guard` hook from the chosen settings file and keeps everything
+else, including other hooks in the same group. A group left empty is removed, and so are an empty
+`PreToolUse` list and an empty `hooks` object. The file is copied to `settings.json.bak` first. If
+there is no guard hook, the file is not written. Your policy files and `guard.log` stay where they
+are.
 
 Choose one scope. Each settings file you install into gets its own entry, so installing in both
 `~/.claude/settings.json` and a project's `.claude/settings.json` would check every call twice.
@@ -258,16 +265,23 @@ The log records the tool name, the **summary**, the codes and the reason. For sh
 summary is the command. For file tools it is the path. Write and Edit bodies, file contents and MCP
 arguments are never logged. Each string is cut at 200 characters.
 
-**Redaction is limited.** Before writing, the guard masks secrets in the summary and the reason. It
-recognises:
+**Redaction is pattern-based.** Before writing, the guard masks secrets in the summary and the
+reason. Receipts use the same masking. It recognises:
 
-- token formats: `sk-ant-…`, `sk-…`, `AKIA…`, `ghp_…` and other GitHub tokens, Slack `xox…` tokens,
-  `Bearer …` values, and private-key headers;
+- token formats: `sk-ant-…`, `sk-…`, `AKIA…`, `ghp_…` and other GitHub tokens, GitLab `glpat-…`,
+  Slack `xox…`, Stripe `sk_live_…` and `rk_live_…`, Google `AIza…`, npm `npm_…`, Hugging Face `hf_…`,
+  RunLedger `rl_…` keys, JWTs, `Bearer …` and `Authorization: Basic …` values, and private-key headers;
 - quoted assignments such as `api_key="…"`, `secret='…'`, `token: "…"` and `password="…"` with a value
-  of 8 or more characters.
+  of 8 or more characters;
+- unquoted assignments to a name containing `api_key`, `access_key`, `private_key`, `secret`,
+  `token`, `password`, `passwd` or `credential`, such as `export DB_PASSWORD=…`, `TOKEN=… npm publish` or `?access_token=…` in a URL,
+  and flags such as `--token …` and `--password …`;
+- the password in a URL such as `postgres://user:…@host`.
 
-It does **not** mask an unquoted assignment such as `export API_KEY=abc…`, a short value, or a token in
-a URL query string. Treat `guard.log` as sensitive and keep it out of version control. The
+An unquoted value is masked when it has a digit or is at least 12 characters long, so `token=refresh`
+stays as it is. Variable references (`$TOKEN`, `%TOKEN%`), placeholders (`<your key>`) and names in
+capitals such as `GITHUB_TOKEN` are not masked. A secret in another format, or a short one, can still
+get through. Treat `guard.log` as sensitive and keep it out of version control. The
 RunLedger repository's `.gitignore` lists `.runledger/`, but your project's `.gitignore` does not
 include it unless you add it.
 

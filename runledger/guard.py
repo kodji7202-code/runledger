@@ -83,9 +83,34 @@ _FALLBACK_SECRET_RES = [
     re.compile(r"(?<![A-Za-z0-9])xox[baprs]-[A-Za-z0-9-]{10,}"),
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
     re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{12,}"),
+    re.compile(r"(?<![A-Za-z0-9])[rs]k_(?:live|test)_[A-Za-z0-9]{16,}"),
+    re.compile(r"(?<![A-Za-z0-9])AIza[0-9A-Za-z_-]{35}"),
+    re.compile(r"(?<![A-Za-z0-9])glpat-[A-Za-z0-9_-]{20,}"),
+    re.compile(r"(?<![A-Za-z0-9])npm_[A-Za-z0-9]{36}"),
+    re.compile(r"(?<![A-Za-z0-9])hf_[A-Za-z0-9]{30,}"),
+    re.compile(r"(?<![A-Za-z0-9_])rl_[A-Za-z0-9_-]{30,}"),
+    re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"),
 ]
 _FALLBACK_GENERIC_RE = re.compile(
     r"(api[_-]?key|secret|token|password)[\"']?\s*[:=]\s*[\"']([^\"'\s]{8,})[\"']", re.I)
+
+# Unquoted values, masked last. Only the named group "v" is replaced.
+_SECRET_NAME = (r"(?:api[_-]?key|apikey|secret|token|passw(?:or)?d|credentials?"
+                r"|private[_-]?key|access[_-]?key)")
+_VALUE_SECRET_RES = [
+    # TOKEN=abc123, export DB_PASSWORD=..., ?access_token=..., --password=...
+    # The name parts are bounded so a long blob without "=" cannot cause quadratic backtracking.
+    re.compile(r"(?i)(?<![A-Za-z0-9])[A-Za-z0-9_.-]{0,40}" + _SECRET_NAME
+               + r"[A-Za-z0-9_.-]{0,40}\s*=\s*(?P<v>[^\s\"'&;|,)}\]]{6,})"),
+    # --token abc123, --password hunter2
+    re.compile(r"(?i)(?<![A-Za-z0-9-])--?(?:api[-_]?key|(?:access[-_]|auth[-_])?token|passw(?:or)?d"
+               r"|(?:client[-_])?secret)\s+(?P<v>[^\s\"'-][^\s\"']{3,})"),
+    # https://user:password@host
+    re.compile(r"(?i)\b[a-z][a-z0-9+.-]{0,20}://[^\s/:@\"']{1,128}:(?P<v>[^\s/@\"']{3,256})@"),
+    re.compile(r"(?i)\bauthorization:\s*basic\s+(?P<v>[A-Za-z0-9+/=]{8,})"),
+]
+_PLACEHOLDER_START = ("$", "%", "{", "<", "[", "(", "*")
+_ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
 ApproverFn = Callable[[Dict[str, Any], Dict[str, Any]], str]
 
@@ -103,6 +128,25 @@ class InstallError(Exception):
 def _mask_value(m: "re.Match") -> str:
     whole = m.group(0)
     a, b = m.start(2) - m.start(0), m.end(2) - m.start(0)
+    return whole[:a] + REDACTED + whole[b:]
+
+
+def _looks_secret(value: str) -> bool:
+    """An unquoted value worth masking: not a placeholder or a variable name, and either
+    containing a digit or at least 12 characters long (so `token=refresh` stays readable)."""
+    if value.startswith(_PLACEHOLDER_START) or value.isdigit():
+        return False
+    if _ENV_NAME_RE.match(value) and not any(c.isdigit() for c in value):
+        return False
+    return any(c.isdigit() for c in value) or len(value) >= 12
+
+
+def _mask_named(m: "re.Match") -> str:
+    value = m.group("v")
+    if not _looks_secret(value):
+        return m.group(0)
+    whole = m.group(0)
+    a, b = m.start("v") - m.start(0), m.end("v") - m.start(0)
     return whole[:a] + REDACTED + whole[b:]
 
 
@@ -125,6 +169,8 @@ def redact(text: Any) -> str:
             s = rx.sub(_mask_value, s)
         for rx in _secret_patterns():
             s = rx.sub(REDACTED, s)
+        for rx in _VALUE_SECRET_RES:
+            s = rx.sub(_mask_named, s)
         return s
     except Exception:
         return REDACTED
@@ -801,17 +847,7 @@ def install_hook(path: Path, approval_timeout_s: Optional[float] = None) -> Tupl
     (and writes nothing) if the file is not a JSON object."""
     path = Path(path)
     want = hook_timeout_for(approval_timeout_s)
-    existed = path.exists()
-    settings: Any = {}
-    if existed:
-        text = path.read_text(encoding="utf-8-sig")
-        if text.strip():
-            try:
-                settings = json.loads(text)
-            except ValueError as exc:
-                raise InstallError(f"{path} is not valid JSON ({exc}); fix or move it. Nothing was changed.") from None
-        if not isinstance(settings, dict):
-            raise InstallError(f"{path} must contain a JSON object. Nothing was changed.")
+    existed, settings = _read_settings(path)
     hooks = settings.get("hooks")
     hooks = {} if hooks is None else hooks
     if not isinstance(hooks, dict):
@@ -839,6 +875,62 @@ def install_hook(path: Path, approval_timeout_s: Optional[float] = None) -> Tupl
 
     hooks["PreToolUse"] = pre
     settings["hooks"] = hooks
+    return True, _write_settings(path, settings, existed)
+
+
+def uninstall_hook(path: Path) -> Tuple[bool, Optional[Path]]:
+    """Remove every RunLedger guard hook from a settings.json, keeping everything else.
+
+    Other hooks in the same PreToolUse group stay. A group left with no hooks is removed,
+    then an empty PreToolUse list and an empty hooks object. Returns (changed, backup);
+    the original is copied to `settings.json.bak` first, and a file without the hook is
+    not written. Raises InstallError (and writes nothing) if the file is not a JSON object."""
+    path = Path(path)
+    existed, settings = _read_settings(path)
+    hooks = settings.get("hooks")
+    pre = hooks.get("PreToolUse") if isinstance(hooks, dict) else None
+    if not isinstance(pre, list):
+        return False, None
+    kept: List[Any] = []
+    removed = False
+    for group in pre:
+        if not _group_has_guard(group):
+            kept.append(group)
+            continue
+        removed = True
+        rest = [h for h in group["hooks"] if not _is_guard_hook(h)]
+        if rest:
+            kept.append(dict(group, hooks=rest))
+    if not removed:
+        return False, None
+    if kept:
+        hooks["PreToolUse"] = kept
+    else:
+        del hooks["PreToolUse"]
+    if not hooks:
+        del settings["hooks"]
+    return True, _write_settings(path, settings, existed)
+
+
+def _read_settings(path: Path) -> Tuple[bool, Dict[str, Any]]:
+    """(existed, settings). A missing or empty file gives {}. Raises InstallError if the
+    file is not a JSON object."""
+    if not path.exists():
+        return False, {}
+    text = path.read_text(encoding="utf-8-sig")
+    if not text.strip():
+        return True, {}
+    try:
+        settings = json.loads(text)
+    except ValueError as exc:
+        raise InstallError(f"{path} is not valid JSON ({exc}); fix or move it. Nothing was changed.") from None
+    if not isinstance(settings, dict):
+        raise InstallError(f"{path} must contain a JSON object. Nothing was changed.")
+    return True, settings
+
+
+def _write_settings(path: Path, settings: Dict[str, Any], existed: bool) -> Optional[Path]:
+    """Write atomically, after copying an existing file to `settings.json.bak`. Returns the backup."""
     path.parent.mkdir(parents=True, exist_ok=True)
     backup = None
     if existed:
@@ -847,7 +939,7 @@ def install_hook(path: Path, approval_timeout_s: Optional[float] = None) -> Tupl
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(settings, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     os.replace(tmp, path)
-    return True, backup
+    return backup
 
 
 def cmd_install(project: Optional[str] = None, global_scope: bool = False,
@@ -872,4 +964,26 @@ def cmd_install(project: Optional[str] = None, global_scope: bool = False,
             print(f"Backup of the previous file: {backup}")
     else:
         print(f"The RunLedger guard hook in {target} is already up to date (hook timeout {hook_s} s). Nothing changed.")
+    return 0
+
+
+def cmd_uninstall(project: Optional[str] = None, global_scope: bool = False,
+                  home: Optional[Path] = None) -> int:
+    """Remove the hook from the project's or the user's Claude Code settings."""
+    target = settings_path(project, global_scope, home)
+    try:
+        changed, backup = uninstall_hook(target)
+    except InstallError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print(f"error: cannot update {target}: {exc}", file=sys.stderr)
+        return 1
+    if not changed:
+        print(f"No RunLedger guard hook in {target}. Nothing changed.")
+        return 0
+    print(f"Removed the RunLedger guard hook from {target}")
+    if backup is not None:
+        print(f"Backup of the previous file: {backup}")
+    print("Policy files (.runledger.json, ~/.runledger/config.json) and .runledger/guard.log were left as they are.")
     return 0

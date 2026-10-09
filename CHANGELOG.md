@@ -7,15 +7,38 @@ change behavior, so read the entry before you upgrade.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-09
+
 ### Added
 
 - **Session quality score** (0 to 100, grades A to F) with the signals behind it, and **cost recommendations** with estimated savings, in every receipt.
 - **AI risk review** (`runledger receipt --review`, opt-in): Claude Sonnet 5.5 assesses each rule-based risk as confirmed, false positive or uncertain and explains the diff. The rule-based score is never changed.
 - **Insights** tab and `GET /api/insights`: quality trend, model and agent comparison, top recommendations, AI false-positive rate. New run filters `min_quality`, `max_quality`, `ai_verdict`; quality and AI columns in exports and the compliance report.
+- **`runledger guard uninstall`** (`--project PATH` or `--global`) removes the guard hook from Claude Code's
+  `settings.json` and keeps every other setting, including other hooks in the same group. The file is
+  backed up to `settings.json.bak` first.
 
 ### Changed
 
 - AI step summaries default to Claude Haiku 5.5.
+- `runledger list` masks secrets in the first request it prints.
+
+### Security
+
+- **Receipts mask secrets.** The HTML, Markdown and JSON receipt, the payload `push` sends to the team
+  server, and the PR comment no longer show secrets from prompts, commands, URLs, search patterns, file
+  paths, risk reasons and analysis text. The risk rules still score the raw session, so a hardcoded
+  secret is still flagged. A command is masked before it is cut to 120 characters, so the cut cannot
+  keep part of a secret. Receipts pushed by older clients stay as they were stored.
+- **More secret formats are masked** in receipts, the guard log, approval requests and text sent to
+  Claude: Stripe, Google, GitLab, npm and Hugging Face tokens, RunLedger `rl_` keys, JWTs and
+  `Authorization: Basic` values; unquoted assignments such as `export DB_PASSWORD=…` and
+  `?access_token=…`; flags such as `--token …`; and passwords in URLs. See `docs/guard.md`.
+
+**Known limits in 0.3.0**
+
+- Masking is pattern-based. A secret in an unknown format, or a short one, is not masked.
+- The other limits listed for 0.2.0 still apply, except the two about masking.
 
 ## [0.2.0] - 2026-10-08
 
