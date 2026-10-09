@@ -15,6 +15,8 @@ from pathlib import Path
 
 import pytest
 
+from runledger import __version__
+
 ROOT = Path(__file__).resolve().parents[1]
 PYPROJECT = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
 
@@ -123,6 +125,7 @@ def test_pyproject_project_table():
     assert "keywords = [" in project
     assert "Programming Language :: Python :: 3.9" in project
     assert "dependencies = []" in project
+    assert __version__ == _toml_string(project, "version")
     # setuptools rejects License classifiers next to a license expression.
     assert "License ::" not in project
 
@@ -137,14 +140,19 @@ def test_pyproject_urls_scripts_and_packages():
 def test_ci_matrix_has_every_os_and_python():
     ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     assert "os: [ubuntu-latest, windows-latest, macos-latest]" in ci
-    assert 'python: ["3.9", "3.12", "3.13"]' in ci
+    assert 'python: ["3.9", "3.11", "3.12", "3.13"]' in ci
     assert "python -m compileall -q runledger" in ci
     assert "/health" in ci
+    action = (ROOT / "action.yml").read_text(encoding="utf-8")
+    assert 'python-version: "3.11"' in action
 
 
 def test_release_workflow_uses_trusted_publishing_on_version_tags():
     release = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
     assert '- "v*"' in release
+    assert "python -m pytest -q" in release
+    assert "python -m venv .release-smoke" in release
+    assert ".release-smoke/bin/runledger --version" in release
     assert "id-token: write" in release
     assert "pypa/gh-action-pypi-publish@release/v1" in release
 

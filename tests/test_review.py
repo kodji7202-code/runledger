@@ -216,6 +216,21 @@ def test_diff_explanations_only_for_changed_files_once_each(stub, tmp_path):
     assert result["diff_explanations"] == [{"file": "src/prices.py", "explanation": "Adds a cache."}]
 
 
+def test_missing_diff_explanation_gets_a_fallback(stub, tmp_path):
+    stub.queue(body=tool_reply(answer(diffs=[])))
+    result = ai_review(load(tmp_path, [EDIT]), [])
+    assert result["diff_explanations"] == [
+        {"file": "src/prices.py", "explanation": "The reviewer gave no explanation for this file."}]
+
+
+@pytest.mark.parametrize(("path", "cwd", "expected"), [
+    (r"d:\work\app\src\x.py", r"D:\Work\App", r"src\x.py"),
+    ("D:/Work/App/src/x.py", r"D:\Work\App", r"src\x.py"),
+])
+def test_windows_paths_are_made_relative_case_insensitively(path, cwd, expected):
+    assert review._rel(path, cwd) == expected
+
+
 # ---------------------------------------------------------------- the rule score is never changed
 
 def test_rule_score_and_risks_are_unchanged_by_the_review(stub, tmp_path):

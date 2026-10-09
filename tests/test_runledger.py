@@ -53,5 +53,11 @@ def test_formats(tmp_path):
     assert main(["receipt", str(FIX), "-o", str(out), "--fail-on", "50"]) == 2
 
 
+def test_stdout_receipt_still_honours_fail_on(capsys):
+    assert main(["receipt", str(FIX), "--format", "json", "-o", "-", "--fail-on", "50"]) == 2
+    data = json.loads(capsys.readouterr().out)
+    assert data["risk"]["score"] >= 50
+
+
 def test_encode_project_path():
     assert encode_project_path("/home/dev/my.app") == "-home-dev-my-app"

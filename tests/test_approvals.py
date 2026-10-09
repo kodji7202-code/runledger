@@ -7,6 +7,7 @@ import http.client
 import json
 import queue
 import re
+import socket
 import sqlite3
 import threading
 import time
@@ -16,6 +17,7 @@ from urllib.parse import urlsplit
 
 import pytest
 
+from runledger.server import approvals
 from runledger.server.approvals import CREATE_BODY_LIMIT
 from runledger.server.app import make_server
 from runledger.server.dashboard import APPROVAL_HTML, DASHBOARD_HTML
@@ -23,6 +25,12 @@ from runledger.server.db import Database
 
 SESSION = "7f3c2a10-9b1e-4c55-a1d2-0e6f8b3c9d42"
 CSRF = {"X-Requested-With": "runledger"}
+
+
+@pytest.fixture(autouse=True)
+def _local_webhook_test_mode(monkeypatch):
+    """Allow the real local webhook stub only in this test module."""
+    monkeypatch.setenv("RUNLEDGER_ALLOW_LOOPBACK_WEBHOOKS", "1")
 
 
 @contextmanager
@@ -135,6 +143,12 @@ def _create_ok(base, key, body=None):
     return _json(raw)["id"]
 
 
+def _requester_and_admin(srv):
+    team_id, admin = srv.db.create_team("alpha")
+    requester = srv.db.create_key(team_id, "requester", "member", "test")["key"]
+    return requester, admin
+
+
 def _get_view(base, key, approval_id):
     status, _, raw = _http(base, "GET", f"/api/approvals/{approval_id}", headers=_auth(key))
     assert status == 200, raw
@@ -182,15 +196,16 @@ def _stderr_until(capsys, needle, timeout=5.0):
 
 def test_create_poll_and_approve_from_the_dashboard(env):
     srv, base = env
-    _, key = srv.db.create_team("alpha")
-    approval_id = _create_ok(base, key)
+    requester, admin = _requester_and_admin(srv)
+    approval_id = _create_ok(base, requester)
 
-    view = _get_view(base, key, approval_id)
+    view = _get_view(base, admin, approval_id)
     assert view["status"] == "pending" and view["decided_by"] is None and view["decided_at"] is None
     assert view["tool"] == "Bash" and view["summary"] == "rm -rf build/"
     assert view["risks"] == [{"severity": "high", "code": "destructive_delete", "reason": "Deletes a directory tree"}]
+    assert view["requested_by"] == f"api: requester ({requester[:8]})"
 
-    cookie = _cookie_for(base, key)
+    cookie = _cookie_for(base, admin)
     status, _, raw = _decide(
         base, approval_id, {"decision": "approve", "name": "Ana", "reason": "build dir only"},
         {"Cookie": cookie, **CSRF},
@@ -198,56 +213,87 @@ def test_create_poll_and_approve_from_the_dashboard(env):
     assert status == 200
     decided = _json(raw)
     assert decided["status"] == "approved"
-    assert decided["decided_by"] == "dashboard: Ana"
+    assert decided["decided_by"] == f"dashboard: initial ({admin[:8]})"
     assert decided["decided_at"] and decided["reason"] == "build dir only"
 
-    polled = _get_view(base, key, approval_id)
-    assert polled["status"] == "approved" and polled["decided_by"] == "dashboard: Ana"
-    assert _list_ids(base, key, "pending") == []
+    polled = _get_view(base, requester, approval_id)
+    assert polled["status"] == "approved" and polled["decided_by"] == f"dashboard: initial ({admin[:8]})"
+    assert _list_ids(base, requester, "pending") == []
 
 
 def test_bearer_decision_is_recorded_as_api_and_can_deny(env):
     srv, base = env
-    _, key = srv.db.create_team("alpha")
-    approval_id = _create_ok(base, key)
-    status, _, raw = _decide(base, approval_id, {"decision": "deny", "reason": "not on the release branch"}, _auth(key))
+    requester, admin = _requester_and_admin(srv)
+    approval_id = _create_ok(base, requester)
+    status, _, raw = _decide(
+        base,
+        approval_id,
+        {"decision": "deny", "reason": "not on the release branch", "name": "spoofed"},
+        _auth(admin),
+    )
     assert status == 200
     view = _json(raw)
-    assert view["status"] == "denied" and view["decided_by"] == "api" and view["reason"] == "not on the release branch"
+    assert view["status"] == "denied"
+    assert view["decided_by"] == f"api: initial ({admin[:8]})"
+    assert "spoofed" not in view["decided_by"]
+    assert view["reason"] == "not on the release branch"
+
+
+def test_decision_requires_an_independent_admin_and_blocks_self_approval(env):
+    srv, base = env
+    team_id, admin = srv.db.create_team("alpha")
+    requester = srv.db.create_key(team_id, "requester", "member", "test")["key"]
+    other_member = srv.db.create_key(team_id, "other-member", "member", "test")["key"]
+    approval_id = _create_ok(base, requester)
+
+    status, _, raw = _decide(base, approval_id, {"decision": "approve"}, _auth(other_member))
+    assert status == 403 and _json(raw)["error"]["code"] == "forbidden"
+    assert _get_view(base, admin, approval_id)["status"] == "pending"
+
+    self_id = _create_ok(base, admin)
+    status, _, raw = _decide(base, self_id, {"decision": "approve"}, _auth(admin))
+    assert status == 403 and _json(raw)["error"]["code"] == "self_approval"
+
+    reviewer = srv.db.create_key(team_id, "reviewer", "admin", "test")["key"]
+    status, _, raw = _decide(base, self_id, {"decision": "approve", "name": "admin"}, _auth(reviewer))
+    assert status == 200
+    assert _json(raw)["decided_by"] == f"api: reviewer ({reviewer[:8]})"
 
 
 def test_second_decision_is_a_conflict_and_changes_nothing(env):
     srv, base = env
-    _, key = srv.db.create_team("alpha")
-    approval_id = _create_ok(base, key)
-    cookie = _cookie_for(base, key)
+    requester, admin = _requester_and_admin(srv)
+    approval_id = _create_ok(base, requester)
+    cookie = _cookie_for(base, admin)
     assert _decide(base, approval_id, {"decision": "approve"}, {"Cookie": cookie, **CSRF})[0] == 200
 
-    status, _, raw = _decide(base, approval_id, {"decision": "deny", "reason": "changed my mind"}, _auth(key))
+    status, _, raw = _decide(base, approval_id, {"decision": "deny", "reason": "changed my mind"}, _auth(admin))
     assert status == 409 and _json(raw)["error"]["code"] == "already_decided"
     status, _, raw = _decide(base, approval_id, {"decision": "approve"}, {"Cookie": cookie, **CSRF})
     assert status == 409 and _json(raw)["error"]["code"] == "already_decided"
 
-    view = _get_view(base, key, approval_id)
-    assert view["status"] == "approved" and view["decided_by"] == "dashboard" and view["reason"] is None
+    view = _get_view(base, requester, approval_id)
+    assert view["status"] == "approved"
+    assert view["decided_by"] == f"dashboard: initial ({admin[:8]})"
+    assert view["reason"] is None
 
 
 def test_pending_approval_expires_after_the_team_ttl(env):
     srv, base = env
-    _, key = srv.db.create_team("alpha")
-    status, _, raw = _put(base, key, {"approval_ttl_s": 1})
+    requester, admin = _requester_and_admin(srv)
+    status, _, raw = _put(base, admin, {"approval_ttl_s": 1})
     assert status == 200 and _json(raw)["approval_ttl_s"] == 1
 
-    approval_id = _create_ok(base, key)
-    assert _get_view(base, key, approval_id)["status"] == "pending"
+    approval_id = _create_ok(base, requester)
+    assert _get_view(base, admin, approval_id)["status"] == "pending"
     time.sleep(1.2)
 
-    assert _get_view(base, key, approval_id)["status"] == "expired"
-    assert _list_ids(base, key, "pending") == []
-    assert approval_id in _list_ids(base, key, "expired")
-    status, _, raw = _decide(base, approval_id, {"decision": "approve"}, _auth(key))
+    assert _get_view(base, admin, approval_id)["status"] == "expired"
+    assert _list_ids(base, admin, "pending") == []
+    assert approval_id in _list_ids(base, admin, "expired")
+    status, _, raw = _decide(base, approval_id, {"decision": "approve"}, _auth(admin))
     assert status == 409 and _json(raw)["error"]["code"] == "expired"
-    assert _get_view(base, key, approval_id)["decided_by"] is None
+    assert _get_view(base, admin, approval_id)["decided_by"] is None
 
 
 def test_default_ttl_is_600_seconds(env):
@@ -325,16 +371,16 @@ def test_dashboard_cookie_follows_the_role_of_its_key(env):
 
 def test_cookie_decisions_need_the_csrf_header(env):
     srv, base = env
-    _, key = srv.db.create_team("alpha")
-    approval_id = _create_ok(base, key)
-    cookie = _cookie_for(base, key)
+    requester, admin = _requester_and_admin(srv)
+    approval_id = _create_ok(base, requester)
+    cookie = _cookie_for(base, admin)
 
     status, _, raw = _decide(base, approval_id, {"decision": "approve"}, {"Cookie": cookie})
     assert status == 403 and _json(raw)["error"]["code"] == "csrf_required"
     status, _, _ = _decide(base, approval_id, {"decision": "approve"},
                            {"Cookie": cookie, "X-Requested-With": "something-else"})
     assert status == 403
-    assert _get_view(base, key, approval_id)["status"] == "pending"
+    assert _get_view(base, admin, approval_id)["status"] == "pending"
 
     status, _, _ = _decide(base, approval_id, {"decision": "approve"}, {"Cookie": cookie, **CSRF})
     assert status == 200
@@ -415,21 +461,21 @@ def test_decision_validation_and_unknown_ids(env):
 
 def test_list_filters_by_status(env):
     srv, base = env
-    _, key = srv.db.create_team("alpha")
-    pending = _create_ok(base, key)
-    approved = _create_ok(base, key)
-    denied = _create_ok(base, key)
-    assert _decide(base, approved, {"decision": "approve"}, _auth(key))[0] == 200
-    assert _decide(base, denied, {"decision": "deny"}, _auth(key))[0] == 200
+    requester, admin = _requester_and_admin(srv)
+    pending = _create_ok(base, requester)
+    approved = _create_ok(base, requester)
+    denied = _create_ok(base, requester)
+    assert _decide(base, approved, {"decision": "approve"}, _auth(admin))[0] == 200
+    assert _decide(base, denied, {"decision": "deny"}, _auth(admin))[0] == 200
 
-    assert sorted(_list_ids(base, key)) == sorted([pending, approved, denied])
-    assert _list_ids(base, key, "pending") == [pending]
-    assert _list_ids(base, key, "approved") == [approved]
-    assert _list_ids(base, key, "denied") == [denied]
-    assert _list_ids(base, key, "expired") == []
-    assert len(_json(_http(base, "GET", "/api/approvals?limit=1", headers=_auth(key))[2])["approvals"]) == 1
-    assert _http(base, "GET", "/api/approvals?status=bogus", headers=_auth(key))[0] == 400
-    assert _http(base, "GET", "/api/approvals?limit=0", headers=_auth(key))[0] == 400
+    assert sorted(_list_ids(base, admin)) == sorted([pending, approved, denied])
+    assert _list_ids(base, admin, "pending") == [pending]
+    assert _list_ids(base, admin, "approved") == [approved]
+    assert _list_ids(base, admin, "denied") == [denied]
+    assert _list_ids(base, admin, "expired") == []
+    assert len(_json(_http(base, "GET", "/api/approvals?limit=1", headers=_auth(admin))[2])["approvals"]) == 1
+    assert _http(base, "GET", "/api/approvals?status=bogus", headers=_auth(admin))[0] == 400
+    assert _http(base, "GET", "/api/approvals?limit=0", headers=_auth(admin))[0] == 400
 
 
 def test_approval_ids_are_random_and_url_safe(env):
@@ -443,16 +489,16 @@ def test_approval_ids_are_random_and_url_safe(env):
 
 def test_response_shapes_match_the_contract(env):
     srv, base = env
-    _, key = srv.db.create_team("alpha")
-    status, _, raw = _create(base, key)
+    requester, admin = _requester_and_admin(srv)
+    status, _, raw = _create(base, requester)
     assert status == 201
     created = _json(raw)
     assert set(created) == {"id", "status"} and created["status"] == "pending"
 
-    view = _get_view(base, key, created["id"])
+    view = _get_view(base, admin, created["id"])
     assert {"id", "status", "decided_by", "decided_at", "reason"} <= set(view)
     assert view["id"] == created["id"]
-    status, _, raw = _decide(base, created["id"], {"decision": "approve"}, _auth(key))
+    status, _, raw = _decide(base, created["id"], {"decision": "approve"}, _auth(admin))
     assert status == 200
     assert {"id", "status", "decided_by", "decided_at", "reason"} <= set(_json(raw))
 
@@ -547,6 +593,108 @@ def test_webhook_urls_rejected_unless_https_or_loopback(env, value):
     assert status == 400 and _json(raw)["error"]["code"] == "invalid_settings"
     status, _, raw = _http(base, "GET", "/api/team/settings", headers=_auth(key))
     assert _json(raw)["webhook_url"] == "https://hooks.example.com/keep"
+
+
+@pytest.mark.parametrize("value", [
+    "https://127.0.0.1/private", "https://192.168.1.10/hook",
+    "https://10.10.10.10/hook", "https://[::1]/hook",
+    "https://[fc00::1]/hook", "https://169.254.169.254/latest/meta-data/",
+    "https://[fec0::1]/hook", "https://[ff02::1]/hook",
+    "https://[64:ff9b::7f00:1]/hook", "https://[64:ff9b::a9fe:a9fe]/hook",
+    "https://[2002:7f00:1::1]/hook", "https://224.0.0.1/hook",
+    "https://user:pass@hooks.example.com/x", "https://hooks.example.com/x#fragment",
+])
+def test_webhooks_reject_internal_targets_and_credentials(env, value):
+    srv, base = env
+    _, key = srv.db.create_team("alpha")
+    assert _put(base, key, {"webhook_url": value})[0] == 400
+
+
+def test_loopback_webhooks_disabled_by_default(monkeypatch):
+    monkeypatch.delenv("RUNLEDGER_ALLOW_LOOPBACK_WEBHOOKS", raising=False)
+    for url in ("http://127.0.0.1:1234/hook", "http://localhost/hook", "https://localhost/x"):
+        with pytest.raises(approvals.InvalidInput):
+            approvals.check_webhook_url("webhook_url", url)
+
+
+def test_private_or_mixed_dns_response_aborts_delivery_before_connect(monkeypatch):
+    def fake_lookup(host, port, type):
+        assert host == "example.com" and port == 443 and type == socket.SOCK_STREAM
+        return [
+            (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("8.8.8.8", 443)),
+            (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("10.0.0.5", 443)),
+        ]
+
+    monkeypatch.setattr(approvals.socket, "getaddrinfo", fake_lookup)
+    def should_not_connect(*args, **kwargs):
+        raise AssertionError("unsafe DNS address reached the network")
+    monkeypatch.setattr(approvals.socket, "create_connection", should_not_connect)
+    with pytest.raises(ValueError, match="not a public IP"):
+        approvals._post_json("https://example.com/notify", {"hello": "world"})
+
+
+def test_public_dns_is_pinned_for_webhook_connection(monkeypatch):
+    addresses = []
+    monkeypatch.setattr(approvals.socket, "getaddrinfo", lambda *args, **kwargs: [
+        (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("8.8.4.4", 443)),
+    ])
+    def fake_socket(addr, timeout, source_address=None):
+        addresses.append(addr)
+        return object()
+    monkeypatch.setattr(approvals.socket, "create_connection", fake_socket)
+
+    class FakeResponse:
+        status = 200
+        def read(self, size):
+            return b""
+
+    class FakeConnection:
+        def __init__(self, host, port, timeout):
+            assert host == "example.com" and port == 443
+        def request(self, method, path, body, headers):
+            assert method == "POST" and path == "/notify?x=1"
+            self._create_connection(("example.com", 443), timeout=5)
+        def getresponse(self):
+            return FakeResponse()
+        def close(self):
+            pass
+
+    monkeypatch.setattr(approvals.http.client, "HTTPSConnection", FakeConnection)
+    approvals._post_json("https://example.com/notify?x=1", {"hello": "world"})
+    assert addresses == [("8.8.4.4", 443)]
+
+
+def test_webhook_tries_next_checked_address_if_first_tcp_address_is_unreachable(monkeypatch):
+    monkeypatch.setattr(approvals.socket, "getaddrinfo", lambda *args, **kwargs: [
+        (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("8.8.8.8", 443)),
+        (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("1.1.1.1", 443)),
+    ])
+    attempts = []
+    def fake_socket(addr, timeout, source_address=None):
+        attempts.append(addr)
+        if len(attempts) == 1:
+            raise OSError("first destination unavailable")
+        return object()
+    monkeypatch.setattr(approvals.socket, "create_connection", fake_socket)
+
+    class FakeResponse:
+        status = 200
+        def read(self, size):
+            return b""
+
+    class FakeConnection:
+        def __init__(self, host, port, timeout):
+            pass
+        def request(self, method, path, body, headers):
+            self._create_connection(("example.com", 443), timeout=5)
+        def getresponse(self):
+            return FakeResponse()
+        def close(self):
+            pass
+
+    monkeypatch.setattr(approvals.http.client, "HTTPSConnection", FakeConnection)
+    approvals._post_json("https://example.com/notify", {})
+    assert attempts == [("8.8.8.8", 443), ("1.1.1.1", 443)]
 
 
 def test_webhook_urls_can_be_cleared_and_settings_are_partial(env):

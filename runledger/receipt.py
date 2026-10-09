@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from . import __version__
 from .adapters import label as agent_label
 from .guard import redact
-from .parser import Run
+from .parser import Run, Usage
 from .pricing import friendly_model
 from .risk import Risk
 from .summarize import FileChange, file_changes
@@ -383,10 +383,22 @@ def redact_run(run: Run, risks: List[Risk]) -> None:
     """Mask secrets in every text a receipt, a push or a PR comment shows, in place.
     Call it after scoring and analysis: the risk rules need the raw text to find secrets.
     File contents and command output are not shown, so they are left as they are."""
+    run.session_id = redact(run.session_id)
+    run.agent = redact(run.agent)
+    run.cwd = redact(run.cwd) if run.cwd is not None else None
+    run.git_branch = redact(run.git_branch) if run.git_branch is not None else None
+    run.started = redact(run.started) if run.started is not None else None
+    run.ended = redact(run.ended) if run.ended is not None else None
+    redacted_models: Dict[str, Usage] = {}
+    for model, usage in run.models.items():
+        redacted_models.setdefault(redact(model), Usage()).add(usage)
+    run.models = redacted_models
     run.prompts = [redact(p) for p in run.prompts]
     run.overall_summary = redact(run.overall_summary)
     run.final_message = redact(run.final_message)
     for s in run.steps:
+        s.tool = redact(s.tool)
+        s.model = redact(s.model) if s.model is not None else None
         s.summary = redact(s.summary)
         for key in _SHOWN_INPUT_KEYS:
             if isinstance(s.input.get(key), str):

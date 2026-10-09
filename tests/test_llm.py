@@ -102,6 +102,16 @@ def test_system_block_list_is_sent_as_given(stub):
     assert stub.bodies()[0]["system"] == blocks
 
 
+def test_system_block_list_text_is_redacted_without_mutating_the_caller(stub):
+    blocks = [{"type": "text", "text": f"token {GITHUB_TOKEN}", "cache_control": {"type": "ephemeral"}}]
+    stub.queue()
+    llm.call([{"role": "user", "content": "x"}], "claude-haiku-5-5", system=blocks)
+    sent = stub.bodies()[0]["system"]
+    assert GITHUB_TOKEN not in json.dumps(sent)
+    assert "[REDACTED]" in sent[0]["text"]
+    assert GITHUB_TOKEN in blocks[0]["text"]
+
+
 def test_tools_and_tool_choice_pass_through(stub):
     tools = [{"name": "t", "description": "d", "input_schema": SCHEMA}]
     stub.queue()

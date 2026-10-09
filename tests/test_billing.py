@@ -11,6 +11,7 @@ import hmac
 import http.client
 import json
 import re
+import sqlite3
 import threading
 import time
 from contextlib import contextmanager
@@ -375,19 +376,24 @@ def test_unrelated_and_malformed_events_are_acknowledged(env):
 # Seats
 
 
-def test_seats_limit_new_developers_only(env):
+def test_seats_bind_to_authenticated_keys_not_receipt_user(env):
     srv, base, mailer = env
     key = provision(base, mailer, seats=1)
+    team_id = srv.db.key_for_token(key)["team_id"]
+    second = srv.db.create_key(team_id, "second", "member", "test")["key"]
+
     assert push(base, key, "a1", user="alice")[0] == 201
-    status, _, raw = push(base, key, "b1", user="bob")
+    assert push(base, key, "b1", user="bob")[0] == 201  # caller-controlled user cannot consume another seat
+    assert push(base, key, "a1", user="alice")[0] == 201  # exact retry is idempotent
+
+    status, _, raw = push(base, second, "c1", user="alice")
     assert status == 402
     err = _json(raw)["error"]
     assert err["code"] == "seat_limit" and "All 1 seat on this team" in err["message"]
-    assert push(base, key, "a2", user="alice")[0] == 201
-    assert push(base, key, "a1", user="alice")[0] == 201  # re-pushing a run is fine
+    assert _json(_http(base, "GET", "/api/me", headers=_auth(key))[2])["billing"]["seats_used"] == 1
 
     deliver(base, "subscription.updated", subscription(seats=2))
-    assert push(base, key, "b1", user="bob")[0] == 201
+    assert push(base, second, "c1", user="anything")[0] == 201
     status, _, raw = _http(base, "GET", "/api/me", headers=_auth(key))
     assert _json(raw)["billing"]["seats_used"] == 2
 
@@ -395,9 +401,62 @@ def test_seats_limit_new_developers_only(env):
 def test_a_seat_frees_up_after_the_window(env, clock):
     srv, base, mailer = env
     key = provision(base, mailer, seats=1)
+    team_id = srv.db.key_for_token(key)["team_id"]
+    second = srv.db.create_key(team_id, "second", "member", "test")["key"]
     assert push(base, key, "a1", user="alice")[0] == 201
+    assert push(base, second, "b1", user="alice")[0] == 402
     clock.advance(days=billing.SEAT_WINDOW_DAYS + 1)
-    assert push(base, key, "b1", user="bob")[0] == 201
+    assert push(base, second, "b1", user="alice")[0] == 201
+
+
+def test_legacy_user_seats_transition_without_a_window_lockout(env):
+    srv, base, mailer = env
+    key = provision(base, mailer, seats=1)
+    team_id = srv.db.key_for_token(key)["team_id"]
+    second = srv.db.create_key(team_id, "second", "member", "test")["key"]
+    assert push(base, key, "legacy", user="alice")[0] == 201
+
+    # Simulate a row written before authenticated key attribution existed.
+    with sqlite3.connect(str(srv.db.path)) as conn:
+        conn.execute("UPDATE runs SET pushed_by_key_id = NULL WHERE team_id = ? AND id = 'legacy'", (team_id,))
+        conn.commit()
+    assert _json(_http(base, "GET", "/api/me", headers=_auth(key))[2])["billing"]["seats_used"] == 1
+
+    # The first post-upgrade push establishes the key-backed ledger instead of
+    # counting both the legacy user string and this authenticated key.
+    assert push(base, key, "new", user="totally-different")[0] == 201
+    assert _json(_http(base, "GET", "/api/me", headers=_auth(key))[2])["billing"]["seats_used"] == 1
+    assert push(base, second, "blocked", user="alice")[0] == 402
+
+
+def test_concurrent_seat_admission_cannot_oversubscribe(env):
+    srv, base, mailer = env
+    owner = provision(base, mailer, seats=1)
+    team_id = srv.db.key_for_token(owner)["team_id"]
+    key_a = srv.db.create_key(team_id, "a", "member", "test")["key"]
+    key_b = srv.db.create_key(team_id, "b", "member", "test")["key"]
+    barrier = threading.Barrier(3)
+    results = []
+    lock = threading.Lock()
+
+    def attempt(key, run_id):
+        barrier.wait()
+        status = push(base, key, run_id, user="same-spoofed-user")[0]
+        with lock:
+            results.append(status)
+
+    threads = [
+        threading.Thread(target=attempt, args=(key_a, "race-a")),
+        threading.Thread(target=attempt, args=(key_b, "race-b")),
+    ]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join(10)
+
+    assert sorted(results) == [201, 402]
+    assert _json(_http(base, "GET", "/api/me", headers=_auth(owner))[2])["billing"]["seats_used"] == 1
 
 
 # Past due, cancel, end, deletion
@@ -476,9 +535,12 @@ def test_deletion_waits_for_the_period(env):
 # Key recovery
 
 
-def test_recovery_emails_a_new_admin_key(env):
+def test_recovery_key_inherits_an_occupied_admin_seat_without_invalidating_the_old_key(env):
     srv, base, mailer = env
-    old = provision(base, mailer)
+    old = provision(base, mailer, seats=1)
+    old_me = _json(_http(base, "GET", "/api/me", headers=_auth(old))[2])
+    old_id = old_me["key"]["id"]
+    assert push(base, old, "before-recovery", user="owner")[0] == 201
     status, _, raw = _http(base, "POST", "/billing/recover", body={"email": "OWNER@acme.example"}, headers=CSRF)
     assert status == 202 and _json(raw)["message"] == "If that email has a RunLedger Team subscription, " \
         "a new admin key is on its way. Check your inbox in a few minutes."
@@ -488,11 +550,190 @@ def test_recovery_emails_a_new_admin_key(env):
     assert new != old
     assert _http(base, "GET", "/api/me", headers=_auth(new))[0] == 200
     assert _http(base, "GET", "/api/me", headers=_auth(old))[0] == 200
+    new_me = _json(_http(base, "GET", "/api/me", headers=_auth(new))[2])
+    assert new_me["role"] == "admin" and new_me["key"]["id"] != old_id
+    assert push(base, new, "after-recovery", user="spoof-does-not-matter")[0] == 201
+    assert _json(_http(base, "GET", "/api/me", headers=_auth(new))[2])["billing"]["seats_used"] == 1
+    with sqlite3.connect(str(srv.db.path)) as conn:
+        rows = dict(conn.execute(
+            "SELECT id, pushed_by_key_id FROM runs WHERE id IN ('before-recovery', 'after-recovery')"
+        ).fetchall())
+        alias = conn.execute(
+            "SELECT seat_key_id FROM seat_aliases WHERE key_id = ?", (new_me["key"]["id"],)
+        ).fetchone()
+    assert rows == {"before-recovery": old_id, "after-recovery": new_me["key"]["id"]}
+    assert alias == (old_id,)
+
+    outsider = srv.db.create_key(old_me["team"]["id"], "another developer", "member", "test")["key"]
+    status, _, raw = push(base, outsider, "outside-seat", user="owner")
+    assert status == 402 and _json(raw)["error"]["code"] == "seat_limit"
 
     # A second request soon after sends nothing.
     assert _http(base, "POST", "/billing/recover", body={"email": "owner@acme.example"}, headers=CSRF)[0] == 202
     time.sleep(0.2)
     assert len(mailer.sent) == 2
+
+
+def test_repeated_recovery_rotates_one_alias_instead_of_accumulating_free_keys(env):
+    srv, base, mailer = env
+    old = provision(base, mailer, seats=1)
+    assert push(base, old, "seed")[0] == 201
+    assert _http(base, "POST", "/billing/recover", body={"email": "owner@acme.example"}, headers=CSRF)[0] == 202
+    first = KEY_RE.search(mailer.wait_for(2)[-1]["text"]).group(0)
+    first_id = _json(_http(base, "GET", "/api/me", headers=_auth(first))[2])["key"]["id"]
+
+    with sqlite3.connect(str(srv.db.path)) as conn:
+        conn.execute("UPDATE billing_subscriptions SET last_recovery_at = '2000-01-01T00:00:00Z'")
+        conn.commit()
+    assert _http(base, "POST", "/billing/recover", body={"email": "owner@acme.example"}, headers=CSRF)[0] == 202
+    second = KEY_RE.search(mailer.wait_for(3)[-1]["text"]).group(0)
+    second_id = _json(_http(base, "GET", "/api/me", headers=_auth(second))[2])["key"]["id"]
+
+    assert second != first and second_id == first_id
+    assert _http(base, "GET", "/api/me", headers=_auth(first))[0] == 401
+    assert _http(base, "GET", "/api/me", headers=_auth(old))[0] == 200
+    assert push(base, second, "recovered-again")[0] == 201
+    with sqlite3.connect(str(srv.db.path)) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM seat_aliases WHERE team_id = 1").fetchone()[0] == 1
+
+
+def test_recovery_can_reclaim_a_revoked_admins_occupied_seat(env):
+    srv, base, mailer = env
+    old = provision(base, mailer, seats=1)
+    me = _json(_http(base, "GET", "/api/me", headers=_auth(old))[2])
+    team_id, old_id = me["team"]["id"], me["key"]["id"]
+    assert push(base, old, "owner-seat")[0] == 201
+
+    second = _json(_http(
+        base, "POST", "/api/keys", body={"label": "backup admin", "role": "admin"}, headers=_auth(old)
+    )[2])
+    assert _http(base, "POST", f"/api/keys/{old_id}/revoke", headers=_auth(second["key"]))[0] == 200
+    assert _http(base, "GET", "/api/me", headers=_auth(old))[0] == 401
+    assert push(base, second["key"], "backup-blocked")[0] == 402
+
+    assert _http(base, "POST", "/billing/recover", body={"email": "owner@acme.example"}, headers=CSRF)[0] == 202
+    recovered = KEY_RE.search(mailer.wait_for(2)[-1]["text"]).group(0)
+    recovered_id = _json(_http(base, "GET", "/api/me", headers=_auth(recovered))[2])["key"]["id"]
+    assert recovered_id != old_id
+    assert push(base, recovered, "replacement-seat")[0] == 201
+    assert push(base, second["key"], "still-blocked")[0] == 402
+    assert _json(_http(base, "GET", "/api/me", headers=_auth(recovered))[2])["billing"]["seats_used"] == 1
+    with sqlite3.connect(str(srv.db.path)) as conn:
+        assert conn.execute(
+            "SELECT seat_key_id FROM seat_aliases WHERE key_id = ?", (recovered_id,)
+        ).fetchone() == (old_id,)
+
+
+def test_recovery_does_not_alias_a_member_only_seat(env):
+    srv, base, mailer = env
+    owner = provision(base, mailer, seats=1)
+    team_id = _json(_http(base, "GET", "/api/me", headers=_auth(owner))[2])["team"]["id"]
+    member = srv.db.create_key(team_id, "developer", "member", "test")["key"]
+    assert push(base, member, "member-seat")[0] == 201
+
+    assert _http(base, "POST", "/billing/recover", body={"email": "owner@acme.example"}, headers=CSRF)[0] == 202
+    recovered = KEY_RE.search(mailer.wait_for(2)[-1]["text"]).group(0)
+    recovered_id = _json(_http(base, "GET", "/api/me", headers=_auth(recovered))[2])["key"]["id"]
+    status, _, raw = push(base, recovered, "must-not-steal-member-seat")
+    assert status == 402 and _json(raw)["error"]["code"] == "seat_limit"
+    with sqlite3.connect(str(srv.db.path)) as conn:
+        assert conn.execute(
+            "SELECT seat_key_id FROM seat_aliases WHERE key_id = ?", (recovered_id,)
+        ).fetchone() is None
+
+
+def test_rotating_an_occupied_key_keeps_the_same_seat_identity(env):
+    srv, base, mailer = env
+    old = provision(base, mailer, seats=1)
+    me = _json(_http(base, "GET", "/api/me", headers=_auth(old))[2])
+    key_id = me["key"]["id"]
+    assert push(base, old, "before-rotate")[0] == 201
+
+    status, _, raw = _http(base, "POST", f"/api/keys/{key_id}/rotate", headers=_auth(old))
+    assert status == 200
+    rotated = _json(raw)["key"]
+    assert rotated != old
+    assert _http(base, "GET", "/api/me", headers=_auth(old))[0] == 401
+    assert _json(_http(base, "GET", "/api/me", headers=_auth(rotated))[2])["key"]["id"] == key_id
+    assert push(base, rotated, "after-rotate")[0] == 201
+    assert _json(_http(base, "GET", "/api/me", headers=_auth(rotated))[2])["billing"]["seats_used"] == 1
+
+
+def test_recovered_seat_and_new_key_race_cannot_oversubscribe(env):
+    srv, base, mailer = env
+    old = provision(base, mailer, seats=1)
+    team_id = _json(_http(base, "GET", "/api/me", headers=_auth(old))[2])["team"]["id"]
+    assert push(base, old, "race-seed")[0] == 201
+    assert _http(base, "POST", "/billing/recover", body={"email": "owner@acme.example"}, headers=CSRF)[0] == 202
+    recovered = KEY_RE.search(mailer.wait_for(2)[-1]["text"]).group(0)
+    outsider = srv.db.create_key(team_id, "outsider", "member", "test")["key"]
+    barrier = threading.Barrier(3)
+    results = []
+    lock = threading.Lock()
+
+    def attempt(key, run_id):
+        barrier.wait()
+        status = push(base, key, run_id, user="same-user")[0]
+        with lock:
+            results.append((run_id, status))
+
+    threads = [
+        threading.Thread(target=attempt, args=(recovered, "race-recovered")),
+        threading.Thread(target=attempt, args=(outsider, "race-outsider")),
+    ]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join(10)
+
+    assert sorted(results) == [("race-outsider", 402), ("race-recovered", 201)]
+    assert _json(_http(base, "GET", "/api/me", headers=_auth(recovered))[2])["billing"]["seats_used"] == 1
+
+
+def test_run_admission_uses_fresh_seat_count_after_interleaved_subscription_update(env, monkeypatch):
+    srv, base, mailer = env
+    owner = provision(base, mailer, seats=2)
+    team_id = _json(_http(base, "GET", "/api/me", headers=_auth(owner))[2])["team"]["id"]
+    second = srv.db.create_key(team_id, "second", "member", "test")["key"]
+    assert push(base, owner, "occupied")[0] == 201
+
+    original = srv.db.upsert_run
+    changed = [False]
+
+    def interleaved(*args, **kwargs):
+        if not changed[0]:
+            changed[0] = True
+            assert deliver(base, "subscription.updated", subscription(seats=1))[0] == 200
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(srv.db, "upsert_run", interleaved)
+    status, _, raw = push(base, second, "must-see-shrink")
+    assert status == 402 and _json(raw)["error"]["code"] == "seat_limit"
+    assert srv.db.get_run(team_id, "must-see-shrink") is None
+
+
+def test_run_admission_uses_fresh_write_state_after_interleaved_subscription_update(env, monkeypatch):
+    srv, base, mailer = env
+    owner = provision(base, mailer, seats=1)
+    team_id = _json(_http(base, "GET", "/api/me", headers=_auth(owner))[2])["team"]["id"]
+    original = srv.db.upsert_run
+    changed = [False]
+
+    def interleaved(*args, **kwargs):
+        if not changed[0]:
+            changed[0] = True
+            assert deliver(
+                base,
+                "subscription.revoked",
+                subscription(status="canceled", ended_at="2026-10-09T10:00:00Z"),
+            )[0] == 200
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(srv.db, "upsert_run", interleaved)
+    status, _, raw = push(base, owner, "must-see-ended")
+    assert status == 402 and _json(raw)["error"]["code"] == "payment_required"
+    assert srv.db.get_run(team_id, "must-see-ended") is None
 
 
 def test_recovery_answers_the_same_for_unknown_emails(env):

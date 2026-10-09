@@ -26,14 +26,20 @@ your own team and for demos.
 | `canceled`, `unpaid` (ended) | Read only: the dashboard, API reads and exports work; pushes and approval requests get HTTP 402. The customer gets an email with the deletion date. |
 | 30 days after it ended | The team, its keys, runs, approvals and audit log are deleted. The subscription row stays, without the email. |
 
-**Seats.** A seat is a developer (the `user` of a run) who pushed in the last 30 days. When every seat
-is taken, a push from a new developer gets HTTP 402 with a message that names the limit. Developers who
-already pushed are never blocked by the seat count. The customer adds seats in the Polar portal; Polar
-sends `subscription.updated` and the new limit applies at once.
+**Seats.** A seat is attributed to the authenticated API key that pushed a run in the last 30 days,
+not to the editable `user` string in the receipt. When all seats are taken, an additional key's first
+push gets HTTP 402. Teams should assign a separate key to each developer; shared keys cannot prove
+separate human identities, because this release has no individual sign-in or SSO. Receipt `user` remains
+a reporting label. The customer adds seats in the Polar portal; Polar sends `subscription.updated` and
+the new limit applies at once.
 
 **Lost key.** `https://app.runledger.site/recover` emails a new admin key to the subscription's email,
 at most once every 10 minutes per subscription, and five requests per hour per address. The answer is
-the same for unknown emails.
+the same for unknown emails. If an admin key already occupied a paid seat, the recovery key inherits
+that seat without rewriting its historical runs. Other existing keys remain valid, but repeated
+recoveries rotate the same recovery key rather than allowing unlimited active recovery aliases.
+If no admin key occupied a seat and all seats belong to other keys, the recovered admin can manage
+the team but must free an occupied seat by expiry or add seats before pushing a run.
 
 **Events.** The server verifies the Standard Webhooks signature (`webhook-id`, `webhook-timestamp`,
 `webhook-signature`, five minutes of clock tolerance), applies each `webhook-id` once, and ignores events

@@ -29,8 +29,9 @@ cookie instead: `rl_session`, set by `GET /?key=<key>`.
   it, the response is `403 csrf_required`.
 - A valid API key is checked first. The session cookie is used when the request carries no valid key.
 
-**Roles.** Each key has one role: `viewer` (read only), `member` (also pushes runs and handles
-approvals) or `admin` (also manages settings, keys, the audit log, budgets and exports). Each endpoint
+**Roles.** Each key has one role: `viewer` (read only), `member` (also pushes runs and requests
+approvals) or `admin` (also decides approvals, manages settings, keys, the audit log, budgets and exports).
+An approval requires an admin key other than the requesting key. Each endpoint
 below names the minimum role. A higher role always works. See [enterprise.md](enterprise.md#model-teams-keys-and-roles).
 
 **Formats.** Request and response bodies are JSON in UTF-8, except the HTML pages and the exports.
@@ -153,8 +154,12 @@ Response `201`:
 
 Stored fields: `user` defaults to `unknown`; `project` defaults to the last folder name of `cwd`;
 `risk_level` is derived from the score when absent (below 25 low, below 60 medium, otherwise high).
+Runs are immutable: a byte-equivalent/semantically identical re-push is accepted as an idempotent
+retry, while different content for an existing team/session id returns `409 run_conflict`.
+Seat enforcement uses the authenticated key identity, **not** the caller-supplied `user` label.
 
-Errors: `400` `empty_body`, `invalid_json`, `invalid_receipt`; `401`; `403` (viewer); `411`; `413`
+Errors: `400` `empty_body`, `invalid_json`, `invalid_receipt`; `401`; `402` (seat limit or read-only plan);
+`403` (viewer); `409` `run_conflict`; `411`; `413`
 (over 10 MB, "Receipts are limited to 10 MB.").
 
 ### `GET /api/runs`
@@ -264,6 +269,7 @@ Approval fields in responses:
   "decided_by": null,
   "decided_at": null,
   "reason": null,
+  "requested_by": "api: developer (rl_AbCdE)",
   "session_id": "s-approval-1",
   "tool": "Bash",
   "summary": "sudo apt-get update",
@@ -323,7 +329,9 @@ Errors: `401`; `404` `not_found` ("Approval not found.").
 
 ### `POST /api/approvals/{id}/decision`
 
-Role: `member`. Approves or denies a pending approval.
+Role: `admin`. Approves or denies a pending approval; the deciding key must be different from
+the key that requested it, including when both credentials are dashboard sessions.
+Legacy requests with no attested requester identity cannot be approved; submit a new request.
 
 ```json
 {"decision": "approve", "reason": "Checked the package name", "name": "Ana"}
@@ -333,13 +341,16 @@ Role: `member`. Approves or denies a pending approval.
 | --- | --- | --- |
 | `decision` | yes | `approve` or `deny`. |
 | `reason` | no | Up to 500 characters. Stored with the decision and shown on the approval. |
-| `name` | no | Up to 100 characters. Recorded in `decided_by`. |
+| `name` | no | Legacy optional field (up to 100 characters); not trusted for attribution. |
 
-Response `200`: the approval, with `status` set to `approved` or `denied`, and `decided_by` set to
-`api`, `api: NAME`, `dashboard`, or `dashboard: NAME` (for decisions made with a session cookie).
+Response `200`: the approval, with `status` set to `approved` or `denied`, and `decided_by` derived
+from the authenticated key label and prefix, plus `api` or `dashboard` source. The submitted `name`
+cannot impersonate an approver.
 
-Errors: `400` `invalid_decision`; `401`; `403` (viewer); `404` `not_found`; `409` `already_decided`
-("This approval was already approved."); `409` `expired`; `411`; `413` (over 16 KB).
+Errors: `400` `invalid_decision`; `401`; `403` (non-admin or `self_approval`); `404` `not_found`;
+`409` `already_decided` ("This approval was already approved."), `expired`, or
+`legacy_unverifiable` (the original requester cannot be verified; submit a new request);
+`411`; `413` (over 16 KB).
 
 ### `GET /approvals/{id}`
 
@@ -365,11 +376,16 @@ Role: `admin`. Changes only the fields you send.
 
 | Field | Type | Rule |
 | --- | --- | --- |
-| `slack_webhook_url` | string or `null` | `https://` URL, or `http://` for `127.0.0.1` and `localhost` only. `null` or `""` clears it. |
+| `slack_webhook_url` | string or `null` | Public `https://` URL. Private, loopback and link-local destinations are blocked. `null` or `""` clears it. |
 | `webhook_url` | string or `null` | As above. |
 | `approval_ttl_s` | integer | 1 to 604800 (seven days). The time a pending approval stays open. |
 
 Response `200`: the same shape as `GET`, with full URLs.
+
+For local development only, `RUNLEDGER_ALLOW_LOOPBACK_WEBHOOKS=1` permits HTTP webhooks to
+`127.0.0.1` or `localhost`. Do **not** enable this on a publicly accessible or shared server.
+Webhook delivery validates all DNS answers and connects to a checked address to prevent
+internal-network requests and DNS rebinding. Redirects and proxy routing are not followed.
 
 Errors: `400` `invalid_settings` (unknown field, an empty body, a bad URL, a TTL out of range); `401`;
 `403` (not admin); `411`; `413` (over 16 KB).
@@ -647,12 +663,15 @@ A page with a form for the above.
 | 401 | `unauthorized` | No valid API key or session. Sent with `WWW-Authenticate: Bearer realm="RunLedger"`. |
 | 401 | `invalid_signature` | A billing webhook has a bad or missing signature (hosted plan). |
 | 402 | `payment_required` | A billed team is read only: past the payment grace period, or its subscription ended. Reads and exports still work. |
-| 402 | `seat_limit` | A push from a new developer when every seat of a billed team is in use. |
+| 402 | `seat_limit` | A push from an additional authenticated key when all billed seats are in use. |
 | 403 | `forbidden` | The role is too low for the action. The message names the role needed. |
+| 403 | `self_approval` | The same authenticated key requested and attempted to decide an approval. |
 | 403 | `csrf_required` | A cookie-authenticated change lacks `X-Requested-With: runledger`. |
 | 404 | `not_found` | No such endpoint, run, approval or key. |
 | 405 | `method_not_allowed` | The path does not accept this method. The `Allow` header lists the allowed ones. |
 | 409 | `already_decided` | The approval was already approved or denied. |
+| 409 | `legacy_unverifiable` | The approval predates authenticated requester attribution and must be requested again. |
+| 409 | `run_conflict` | A different receipt already exists with this team's session id. |
 | 409 | `expired` | The approval expired before a decision. |
 | 409 | `already_revoked` | The key is already revoked. |
 | 409 | `last_admin` | The team's last active admin key cannot be revoked. |

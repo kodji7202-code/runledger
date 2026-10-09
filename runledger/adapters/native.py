@@ -273,6 +273,14 @@ def _to_run(path: Path, header: _Record, steps: List[_Record], end: Optional[_Re
     default_model = next(iter(models)) if len(models) == 1 else None
     run_steps = [_step(sloc, i, obj, default_model) for i, (sloc, obj) in enumerate(steps, start=1)]
 
+    # When the header omits aggregate model totals, derive them from per-step usage.
+    # This keeps run-level pricing and unknown-model reporting consistent with the
+    # step totals instead of leaving a priced run with models={} and cost=None.
+    if not models:
+        for step in run_steps:
+            if step.usage.total:
+                models.setdefault(step.model or "unknown", Usage()).add(step.usage)
+
     total = Usage()
     for usage in (models.values() if models else (s.usage for s in run_steps)):
         total.add(usage)

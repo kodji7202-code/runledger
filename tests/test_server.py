@@ -170,13 +170,54 @@ def test_same_session_id_in_two_teams_does_not_overwrite(env):
     assert [r["user"] for r in runs_b] == ["bob@example.com"]
 
 
-def test_repushing_a_session_updates_it_instead_of_duplicating(env):
+def test_repushing_is_idempotent_but_cannot_replace_an_existing_receipt(env):
+    srv, base = env
+    team_id, key = srv.db.create_team("alpha")
+    other = srv.db.create_key(team_id, "other-member", "member", "test")["key"]
+    payload = client.build_payload(FIX, user="first@example.com")
+
+    assert _http(base, "POST", "/api/runs", body=payload, headers=_auth(key))[0] == 201
+    assert _http(base, "POST", "/api/runs", body=payload, headers=_auth(key))[0] == 201
+
+    changed = dict(payload)
+    changed["user"] = "second@example.com"
+    status, _, raw = _http(base, "POST", "/api/runs", body=changed, headers=_auth(other))
+    assert status == 409 and _json(raw)["error"]["code"] == "run_conflict"
+
+    runs = _json(_http(base, "GET", "/api/runs", headers=_auth(key))[2])["runs"]
+    assert len(runs) == 1 and runs[0]["user"] == "first@example.com"
+    with closing(sqlite3.connect(str(srv.db.path))) as conn:
+        pushes = conn.execute(
+            "SELECT COUNT(*) FROM audit_log WHERE team_id = ? AND action = 'run.push' AND target = ?",
+            (team_id, SESSION_ID),
+        ).fetchone()[0]
+    assert pushes == 1
+
+
+def test_immutable_receipt_equality_is_type_sensitive_and_duplicate_reply_uses_stored_risk(env):
     srv, base = env
     _, key = srv.db.create_team("alpha")
-    client.push(base, key, FIX, user="first@example.com")
-    client.push(base, key, FIX, user="second@example.com")
-    runs = _json(_http(base, "GET", "/api/runs", headers=_auth(key))[2])["runs"]
-    assert len(runs) == 1 and runs[0]["user"] == "second@example.com"
+    payload = client.build_payload(FIX, user="first@example.com")
+    payload["risk"]["score"] = True
+    assert _http(base, "POST", "/api/runs", body=payload, headers=_auth(key))[0] == 201
+
+    typed_differently = json.loads(json.dumps(payload))
+    typed_differently["risk"]["score"] = 1
+    status, _, raw = _http(base, "POST", "/api/runs", body=typed_differently, headers=_auth(key))
+    assert status == 409 and _json(raw)["error"]["code"] == "run_conflict"
+
+    # An exact retry reports persisted fields, which matters across parser-version
+    # changes where flattened metadata can differ from today's derivation.
+    with closing(sqlite3.connect(str(srv.db.path))) as conn:
+        conn.execute(
+            "UPDATE runs SET risk_score = 77, risk_level = 'high' WHERE team_id = 1 AND id = ?",
+            (SESSION_ID,),
+        )
+        conn.commit()
+    status, _, raw = _http(base, "POST", "/api/runs", body=payload, headers=_auth(key))
+    assert status == 201
+    reply = _json(raw)
+    assert reply["risk_score"] == 77 and reply["risk_level"] == "high"
 
 
 def _session_copy(tmp_path, session_id):
@@ -316,7 +357,7 @@ def test_cli_team_create_then_push(tmp_path, capsys, monkeypatch):
 
         monkeypatch.setenv("RUNLEDGER_SERVER", base)
         monkeypatch.setenv("RUNLEDGER_API_KEY", key)
-        assert main(["push", str(FIX)]) == 0  # server and key come from the environment
+        assert main(["push", str(FIX), "--user", "dev@example.com"]) == 0  # server and key come from the environment
         capsys.readouterr()
 
         assert main(["push", str(FIX), "--server", base, "--key", "rl_wrong"]) == 1
@@ -324,10 +365,9 @@ def test_cli_team_create_then_push(tmp_path, capsys, monkeypatch):
         assert main(["push", str(FIX), "--server", "http://127.0.0.1:9", "--key", key]) == 1
         assert "Could not reach" in capsys.readouterr().err
 
-        # The environment push had no --user, so the developer name fell back to
-        # git user.email (or the OS user) and re-pushed the same session.
+        # The environment push is an idempotent retry of the same immutable receipt.
         runs = srv.db.list_runs(1)
-        assert len(runs) == 1 and runs[0]["user"] == client.default_user()
+        assert len(runs) == 1 and runs[0]["user"] == "dev@example.com"
 
 
 def test_cli_reports_bad_database_path_without_traceback(tmp_path, capsys):

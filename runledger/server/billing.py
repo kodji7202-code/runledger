@@ -16,8 +16,9 @@ A team with a subscription row is a billed team. Its access follows the subscrip
                      are deleted DELETE_AFTER_DAYS after the subscription ended
   incomplete         no team yet (the first payment has not gone through)
 
-A seat is a developer (the run's "user") who pushed a run in the last SEAT_WINDOW_DAYS. A push
-from a new developer when every seat is taken is refused with 402. Teams created with
+A seat is associated with the authenticated API key that pushed a run in the last
+SEAT_WINDOW_DAYS, not the caller-supplied run "user" label. A push with an additional key
+when every seat is taken is refused with 402. Teams created with
 `runledger team create` have no subscription row and none of these limits.
 
 Email goes through the Resend HTTP API. Standard library only.
@@ -334,9 +335,9 @@ def write_refusal(info: Mapping[str, Any]) -> Optional[str]:
 
 
 def seat_refusal(seats: int) -> str:
-    return (f"All {seats} seat{'s' if seats != 1 else ''} on this team are in use (a seat is a developer who "
-            f"pushed a run in the last {SEAT_WINDOW_DAYS} days). Add seats in the billing portal, "
-            "or push as a developer who already has one.")
+    return (f"All {seats} seat{'s' if seats != 1 else ''} on this team are in use "
+            f"(a seat is an authenticated API key that pushed a run in the last {SEAT_WINDOW_DAYS} days). "
+            "Add seats in the billing portal, or push using a key that already occupies a seat.")
 
 
 # Email
@@ -404,7 +405,9 @@ Your admin API key (keep it secret, it is shown only here):
    export RUNLEDGER_API_KEY=<their member key>
    runledger push --latest
 
-A seat is a developer who pushed a run in the last {SEAT_WINDOW_DAYS} days. Run history is kept for 90 days.
+A seat is counted using the authenticated API key that pushed a run within the last
+{SEAT_WINDOW_DAYS} days, not the editable developer name. Give each developer their own key.
+Run history is kept for 90 days.
 Lost this key? Get a new one at {public_url}/recover
 {_footer(config)}
 """

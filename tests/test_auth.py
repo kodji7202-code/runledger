@@ -212,7 +212,7 @@ MATRIX = {
     "settings_put": (200, 403, 403),
     "push_run": (201, 201, 403),
     "create_approval": (201, 201, 403),
-    "decide_approval": (200, 200, 403),
+    "decide_approval": (200, 403, 403),
     "list_keys": (200, 403, 403),
     "create_key": (201, 403, 403),
     "revoke_key": (200, 403, 403),
@@ -256,7 +256,7 @@ def world(env):
     }
     ids = {
         "spare": srv.db.create_key(team_id, "spare", "viewer", "test")["id"],
-        "approval": _approval(base, admin),
+        "approval": _approval(base, keys["member"]),
     }
     client.push(base, admin, FIX, user="dev@example.com")
     return srv, base, team_id, keys, ids
@@ -533,7 +533,8 @@ def test_audit_records_keys_settings_pushes_decisions_and_sign_ins(env):
                                                           "approval_ttl_s": 900},
                  headers=_auth(admin))[0] == 200
     client.push(base, admin, FIX, user="dev@example.com")
-    approval_id = _approval(base, admin)
+    requester = _create_key(base, admin, "requester", "member")
+    approval_id = _approval(base, requester["key"])
     assert _http(base, "POST", f"/api/approvals/{approval_id}/decision", body={"decision": "approve"},
                  headers=_auth(admin))[0] == 200
     _cookie_for(base, admin)
@@ -672,7 +673,7 @@ def test_migration_never_brings_back_a_rotated_or_revoked_key(tmp_path):
     assert _db_rows(path, "SELECT COUNT(*) FROM api_keys WHERE team_id = 1")[0][0] == 1
 
 
-def test_migration_adds_the_agent_column_to_an_old_runs_table(tmp_path):
+def test_migration_adds_run_identity_columns_to_an_old_runs_table(tmp_path):
     path = tmp_path / "old.db"
     with closing(sqlite3.connect(str(path))) as conn:
         conn.executescript(OLD_SCHEMA)
@@ -680,8 +681,55 @@ def test_migration_adds_the_agent_column_to_an_old_runs_table(tmp_path):
                      (hash_key(OLD_KEY),))
         conn.commit()
     with closing(Database(str(path))) as db:
-        assert "agent" in {row[1] for row in _db_rows(path, "PRAGMA table_info(runs)")}
+        columns = {row[1] for row in _db_rows(path, "PRAGMA table_info(runs)")}
+        assert {"agent", "pushed_by_key_id"} <= columns
         assert db.list_runs(1) == []
+
+
+def test_migration_adds_approval_identity_and_legacy_pending_rows_fail_closed(tmp_path):
+    path = tmp_path / "old.db"
+    now = datetime.now(timezone.utc)
+    with closing(sqlite3.connect(str(path))) as conn:
+        conn.executescript(OLD_SCHEMA)
+        conn.execute("INSERT INTO teams (name, api_key_hash, created_at) VALUES ('old', ?, '2026-01-01T00:00:00Z')",
+                     (hash_key(OLD_KEY),))
+        conn.execute(
+            "INSERT INTO approvals (id, team_id, session_id, tool, summary, risks, cwd, status, "
+            "created_at, created_ts) VALUES ('legacy-approval', 1, 's1', 'Bash', 'legacy', '[]', NULL, "
+            "'pending', ?, ?)",
+            (now.strftime(TIME_FORMAT), now.timestamp()),
+        )
+        conn.commit()
+
+    with closing(Database(str(path))) as db:
+        columns = {row[1] for row in _db_rows(path, "PRAGMA table_info(approvals)")}
+        assert {"requester_key_id", "requested_by"} <= columns
+        key_id = db.key_for_token(OLD_KEY)["id"]
+        outcome, view = db.decide_approval(
+            1,
+            "legacy-approval",
+            "approved",
+            "api: initial",
+            None,
+            600,
+            approver_key_id=key_id,
+        )
+        assert outcome == "legacy_unverifiable"
+        assert view["status"] == "pending" and view["requested_by"] is None
+
+    with running(path) as (srv, base):
+        status, _, raw = _http(
+            base,
+            "POST",
+            "/api/approvals/legacy-approval/decision",
+            body={"decision": "approve"},
+            headers=_auth(OLD_KEY),
+        )
+        assert status == 409 and _json(raw)["error"]["code"] == "legacy_unverifiable"
+        view = _json(_http(
+            base, "GET", "/api/approvals/legacy-approval", headers=_auth(OLD_KEY)
+        )[2])
+        assert view["status"] == "pending" and view["decided_by"] is None
 
 
 def test_agent_is_stored_listed_filtered_and_summed_by_stats(env):

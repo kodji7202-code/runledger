@@ -34,6 +34,12 @@ FIXED_NOW = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
 STARTED = "2026-10-05T10:00:00Z"
 
 
+@pytest.fixture(autouse=True)
+def _local_webhook_test_mode(monkeypatch):
+    """Permit local webhook stubs in this module, never as a production default."""
+    monkeypatch.setenv("RUNLEDGER_ALLOW_LOOPBACK_WEBHOOKS", "1")
+
+
 # Helpers
 
 @contextmanager

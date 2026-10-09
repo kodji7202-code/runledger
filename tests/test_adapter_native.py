@@ -9,6 +9,7 @@ import pytest
 
 from runledger import adapters
 from runledger.adapters import native
+from runledger.pricing import apply_costs
 
 FIX_JSON = Path(__file__).parent / "fixtures" / "native_session.json"
 FIX_CLAUDE = Path(__file__).parent / "fixtures" / "sample_session.jsonl"
@@ -114,6 +115,19 @@ def test_run_totals_come_from_steps_when_models_is_absent(tmp_path):
     run = native.parse(_doc(tmp_path, "sum.runledger.json", doc))
     assert run.usage.input_tokens == 15
     assert run.usage.output_tokens == 1
+
+
+def test_models_and_run_cost_are_derived_from_priced_steps_when_header_models_are_absent(tmp_path):
+    doc = {"runledger_format": 1, "steps": [
+        {"tool": "Read", "model": "claude-haiku-5-5", "usage": {"input_tokens": 1_000_000}},
+        {"tool": "Read", "model": "claude-haiku-5-5", "usage": {"output_tokens": 1_000_000}},
+    ]}
+    run = native.parse(_doc(tmp_path, "priced.runledger.json", doc))
+    apply_costs(run)
+
+    assert run.models == {"claude-haiku-5-5": run.usage}
+    assert run.cost == pytest.approx(0.6)
+    assert sum(step.cost or 0 for step in run.steps) == pytest.approx(run.cost)
 
 
 def test_result_text_is_capped_like_the_claude_adapter(tmp_path):

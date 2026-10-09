@@ -261,8 +261,9 @@ runledger team create NAME --db /path/to/runledger.db
 The command prints the team's id and its key. The key is printed once. The database stores only its
 SHA-256 hash.
 
-Each key has one role. Viewers read everything; members also push runs and handle approvals; admins also
-manage team settings, keys, the audit log, budgets and exports. The full matrix is in
+Each key has one role. Viewers read everything; members also push runs and request approvals; admins also
+decide approvals and manage team settings, keys, the audit log, budgets and exports. The key that requested
+an approval cannot decide that same request, even when it is an admin key. The full matrix is in
 [enterprise.md](enterprise.md#model-teams-keys-and-roles).
 
 Keys are managed with these commands. They act on the database file directly, so run them where the
@@ -355,7 +356,7 @@ server again.
 2. Get the new version and rebuild.
 
    - Docker: `git pull`, then `cd deploy && docker compose build --pull && docker compose up -d`.
-   - Bare metal: `sudo /opt/runledger/venv/bin/python -m pip install --upgrade runledger`, then
+   - Bare metal: `sudo /opt/runledger/venv/bin/python -m pip install --upgrade runledger-ai`, then
      `sudo systemctl restart runledger`.
 
 3. Check `CHANGELOG.md` for changes that affect you. Before 1.0, a minor version can change
@@ -376,7 +377,8 @@ roll back, install the older version and restore the backup from before the upgr
       and the audit log use the proxy's address, and `--trust-proxy` honours the forwarded protocol from
       any address.
 - [ ] **Give each person or system their own key, with the lowest role that works.** Viewers can read,
-      members can push and handle approvals, and only admins can manage keys and settings.
+      members can push and request approvals, and admins decide approvals and manage keys and settings.
+      An approval must be decided by an admin key other than the key that requested it.
 - [ ] **Rotate and revoke keys.** Rotate when a person leaves or a key may have leaked, and revoke the
       keys you no longer use. Keys do not expire on their own.
 - [ ] **Protect the database file.** The `team` and `key` commands act on it directly, without roles.

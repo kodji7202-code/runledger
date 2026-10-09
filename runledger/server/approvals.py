@@ -13,12 +13,14 @@ are never written to the log.
 from __future__ import annotations
 
 import json
+import http.client
+import ipaddress
 import math
+import os
 import secrets
+import socket
 import sys
 import threading
-import urllib.error
-import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
@@ -45,6 +47,7 @@ SMALL_BODY_LIMIT = 16 * 1024    # decisions and settings
 
 LOOPBACK_HOSTS = ("127.0.0.1", "localhost")
 WEBHOOK_TIMEOUT_S = 5
+LOOPBACK_OPT_IN = "RUNLEDGER_ALLOW_LOOPBACK_WEBHOOKS"
 
 
 class InvalidInput(ValueError):
@@ -134,7 +137,7 @@ def check_ttl(value: Any) -> int:
 
 
 def check_webhook_url(field: str, value: Any) -> Optional[str]:
-    """Accept an https:// URL, or http:// only for 127.0.0.1 and localhost (tests). None or "" clears it."""
+    """Require public HTTPS endpoints; local HTTP needs an explicit development opt-in."""
     if value is None:
         return None
     if not isinstance(value, str):
@@ -147,16 +150,29 @@ def check_webhook_url(field: str, value: Any) -> Optional[str]:
     try:
         parts = urlsplit(url)
         host = parts.hostname or ""
-        parts.port  # raises ValueError for a malformed port
+        port = parts.port  # raises ValueError for a malformed port
     except ValueError:
         raise InvalidInput(f"'{field}' is not a valid URL.") from None
     if not host:
         raise InvalidInput(f"'{field}' must include a host name.")
+    if parts.username is not None or parts.password is not None or parts.fragment or "%" in host:
+        raise InvalidInput(f"'{field}' must not contain credentials, fragments or encoded hostnames.")
+    if port == 0:
+        raise InvalidInput(f"'{field}' must use a valid port.")
     scheme = parts.scheme.lower()
-    if scheme == "https" or (scheme == "http" and host in LOOPBACK_HOSTS):
+    local = host in LOOPBACK_HOSTS and os.environ.get(LOOPBACK_OPT_IN) == "1"
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        address = None
+    if address is not None and not _public_address(address) and not (local and scheme == "http" and address.is_loopback):
+        raise InvalidInput(f"'{field}' cannot target a private or local address.")
+    if scheme == "https" and host not in LOOPBACK_HOSTS:
+        return url
+    if scheme == "http" and local:
         return url
     raise InvalidInput(
-        f"'{field}' must start with https:// (http:// is accepted only for 127.0.0.1 and localhost)."
+        f"'{field}' must use public https:// (local HTTP requires {LOOPBACK_OPT_IN}=1)."
     )
 
 
@@ -184,35 +200,80 @@ def validate_settings(payload: Any) -> Dict[str, Any]:
 
 # Webhook delivery
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """Do not follow redirects: a webhook URL must answer where it was configured."""
+def _public_address(ip: ipaddress._BaseAddress) -> bool:
+    """Require routable unicast, not just ipaddress.is_global (which includes multicast).
 
-    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
-        return None
+    For IPv6 allow only 2000::/3 global unicast, excluding special/reserved
+    addresses and 6to4 tunnels that could embed private IPv4 destinations.
+    """
+    if not ip.is_global or ip.is_multicast or ip.is_reserved or ip.is_unspecified:
+        return False
+    if isinstance(ip, ipaddress.IPv6Address):
+        return (ip in ipaddress.IPv6Network("2000::/3")
+                and ip not in ipaddress.IPv6Network("2002::/16"))
+    return True
 
 
-_OPENER_DEFAULT = urllib.request.build_opener(_NoRedirect())
-# Loopback targets skip any system proxy, so a local stub or a local receiver is always reached directly.
-_OPENER_DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+def _resolved_ips(host: str, port: int, allow_local: bool) -> List[str]:
+    """Reject non-public DNS answers and pin the transport to validated IPs.
+
+    Resolving only before a conventional URL opener leaves a DNS rebinding window:
+    the opener would resolve a potentially different destination on connection.
+    """
+    addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    if not addresses:
+        raise ValueError("Webhook hostname did not resolve")
+    candidates = []
+    for _, _, _, _, address in addresses:
+        ip = ipaddress.ip_address(address[0])
+        if not (_public_address(ip) or (allow_local and ip.is_loopback)):
+            raise ValueError("Webhook destination is not a public IP")
+        if str(ip) not in candidates:
+            candidates.append(str(ip))
+    return candidates
 
 
 def _post_json(url: str, payload: Any) -> None:
+    # Revalidate older stored settings at the moment the network call is made.
+    check_webhook_url("webhook_url", url)
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    port = parts.port or (443 if parts.scheme.lower() == "https" else 80)
+    allow_local = parts.scheme.lower() == "http" and host in LOOPBACK_HOSTS and os.environ.get(LOOPBACK_OPT_IN) == "1"
+    pinned_ips = _resolved_ips(host, port, allow_local)
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=body,
-        method="POST",
-        headers={"Content-Type": "application/json; charset=utf-8", "User-Agent": "RunLedger"},
-    )
-    host = urlsplit(url).hostname or ""
-    opener = _OPENER_DIRECT if host in LOOPBACK_HOSTS else _OPENER_DEFAULT
-    with opener.open(req, timeout=WEBHOOK_TIMEOUT_S) as resp:
-        resp.read(1024)
+    connection_type = http.client.HTTPSConnection if parts.scheme.lower() == "https" else http.client.HTTPConnection
+    conn = connection_type(host, port, timeout=WEBHOOK_TIMEOUT_S)
+    # HTTPS still uses the original hostname for SNI and certificate verification;
+    # only its TCP socket connects to the pinned, checked destination.
+    def connect_pinned(addr, timeout, source_address=None):
+        last_error = None
+        for pinned_ip in pinned_ips:
+            try:
+                return socket.create_connection(
+                    (pinned_ip, port), timeout=timeout, source_address=source_address
+                )
+            except OSError as exc:
+                last_error = exc
+        raise last_error if last_error is not None else OSError("No validated webhook destination")
+
+    conn._create_connection = connect_pinned
+    path = (parts.path or "/") + ("?" + parts.query if parts.query else "")
+    try:
+        conn.request("POST", path, body=body, headers={
+            "Content-Type": "application/json; charset=utf-8", "User-Agent": "RunLedger",
+        })
+        response = conn.getresponse()
+        response.read(1024)
+        if not 200 <= response.status < 300:
+            raise ValueError(f"Webhook returned HTTP {response.status}")
+    finally:
+        conn.close()
 
 
 def _describe(exc: BaseException) -> str:
-    if isinstance(exc, urllib.error.HTTPError):
-        return f"HTTP {exc.code}"
+    if isinstance(exc, ValueError) and str(exc).startswith("Webhook returned HTTP "):
+        return str(exc).replace("Webhook returned ", "", 1)
     return type(exc).__name__
 
 

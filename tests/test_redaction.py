@@ -115,6 +115,32 @@ def test_pr_comment_does_not_carry_secrets(session):
         assert secret not in comment
 
 
+def test_native_metadata_and_model_ids_are_redacted(tmp_path):
+    doc = {
+        "runledger_format": 1,
+        "agent": GITHUB_TOKEN,
+        "session_id": GITHUB_TOKEN,
+        "cwd": f"/work/{GITHUB_TOKEN}",
+        "git_branch": f"feature/{GITHUB_TOKEN}",
+        "models": {GITHUB_TOKEN: {"input_tokens": 10}},
+        "steps": [{"tool": "Read", "model": GITHUB_TOKEN,
+                   "input": {"file_path": f"/work/{GITHUB_TOKEN}/a.py"},
+                   "usage": {"input_tokens": 10}}],
+    }
+    path = tmp_path / "metadata.runledger.json"
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    run, score, level, risks, _ = build(str(path))
+
+    for fmt in ("html", "md", "json"):
+        rendered = render(run, score, level, risks, fmt)
+        assert GITHUB_TOKEN not in rendered
+        assert "[REDACTED]" in rendered
+    data = json.loads(render(run, score, level, risks, "json"))
+    assert data["session_id"] == "[REDACTED]"
+    assert list(data["models"]) == ["[REDACTED]"]
+    assert data["steps"][0]["model"] == "[REDACTED]"
+
+
 def test_list_does_not_print_secrets(session, tmp_path, capsys, monkeypatch):
     projects = tmp_path / "claude" / "projects" / "-home-dev-shop"
     projects.mkdir(parents=True)

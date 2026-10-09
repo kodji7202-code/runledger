@@ -12,7 +12,9 @@ the list of changed files. Tool results and the agent's final message are not se
 from __future__ import annotations
 
 import json
+import ntpath
 import os
+import posixpath
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from . import llm
@@ -74,12 +76,19 @@ def _clip(text: Any, limit: int) -> str:
 
 
 def _rel(path: str, cwd: Optional[str]) -> str:
-    """A path relative to the working folder when it is inside it (either separator)."""
+    """A path relative to cwd when it is inside it, including Windows case/slash variants."""
     if cwd:
-        base = cwd.rstrip("/\\")
-        for sep in ("/", "\\"):
-            if path.startswith(base + sep):
-                return path[len(base) + 1:]
+        windows = bool(ntpath.splitdrive(path)[0] or ntpath.splitdrive(cwd)[0]
+                       or "\\" in path or "\\" in cwd)
+        mod = ntpath if windows else posixpath
+        try:
+            target, base = mod.normpath(path), mod.normpath(cwd)
+            if mod.isabs(target) and mod.isabs(base):
+                norm = ntpath.normcase if windows else (lambda value: value)
+                if norm(mod.commonpath([target, base])) == norm(base):
+                    return mod.relpath(target, base)
+        except ValueError:
+            pass  # different Windows drives, or otherwise incomparable paths
     return path
 
 
@@ -250,6 +259,9 @@ def _normalise(data: Dict[str, Any], model: str, risks: Sequence[Risk], file_nam
             seen.add(name)
             diffs.append({"file": name, "explanation": _text(item.get("explanation"), FILE_EXPLANATION_CHARS)
                           or "No explanation was given for this file."})
+    for name in file_names:
+        if name not in seen:
+            diffs.append({"file": name, "explanation": "The reviewer gave no explanation for this file."})
 
     return {"model": model, "verdict": verdict, "summary": summary,
             "risk_assessments": assessments, "diff_explanations": diffs}

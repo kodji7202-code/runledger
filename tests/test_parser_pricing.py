@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from runledger import pricing
-from runledger.parser import Run, Usage, encode_project_path, find_sessions
+from runledger.parser import Run, Usage, encode_project_path, find_sessions, parse_session
 from runledger.pricing import cost_of, load_prices, model_key, unknown_models
 
 
@@ -42,6 +42,30 @@ def test_find_sessions_uses_encoded_folder(tmp_path, monkeypatch):
     assert find_sessions("D:\\runledger") == [session]
     assert find_sessions("D:/runledger") == [session]
     assert find_sessions("D:\\missing") == []
+
+
+def test_multi_tool_message_usage_split_keeps_integer_remainders(tmp_path):
+    path = tmp_path / "split.jsonl"
+    path.write_text(json.dumps({
+        "type": "assistant",
+        "message": {
+            "id": "m1", "model": "claude-haiku-5-5",
+            "usage": {"input_tokens": 5, "output_tokens": 3,
+                      "cache_creation_input_tokens": 1, "cache_read_input_tokens": 1},
+            "content": [
+                {"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "a.py"}},
+                {"type": "tool_use", "id": "t2", "name": "Read", "input": {"file_path": "b.py"}},
+            ],
+        },
+    }) + "\n", encoding="utf-8")
+
+    run = parse_session(path)
+    summed = Usage()
+    for step in run.steps:
+        summed.add(step.usage)
+
+    assert summed == run.usage == Usage(5, 3, 1, 1)
+    assert run.steps[0].usage is not run.steps[1].usage
 
 
 # --- model_key ---------------------------------------------------------------

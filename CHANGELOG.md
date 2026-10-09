@@ -7,6 +7,29 @@ change behavior, so read the entry before you upgrade.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Team run integrity:** receipts are immutable after initial upload. Identical retries remain
+  idempotent; conflicting submissions using the same session id now return `409 run_conflict`.
+- **Hosted seat accounting:** billed usage is attributed to authenticated API keys instead of an
+  editable developer name; seat admission and the current subscription state are checked
+  transactionally. A recovered admin key can reuse an occupied admin seat, while repeated recovery
+  rotates the same recovery key. Keys should not be shared.
+- **Approval integrity:** requests record authenticated requester provenance, and only a separate
+  administrator key may decide them. The submitted display name cannot impersonate the approver.
+  Legacy approvals lacking requester provenance must be requested again.
+- **Webhook hardening:** non-public destinations and DNS rebinding are blocked; local HTTP webhooks
+  require an explicit development-only opt-in.
+- **Receipt and guard regressions:** corrected stdout `--fail-on` exit codes, native session costs,
+  token splits, secret redaction, Windows path handling, Java disabled-test detection and shell
+  outside-directory deletion checks.
+- **Release safety:** PyPI releases require passing tests and an installed-wheel smoke check.
+
+### Changed
+
+- The GitHub integration and retention documentation now distinguish sanitized receipts from raw
+  transcripts and explain automatic retention when configured.
+
 ## [0.4.0] - 2026-10-09
 
 ### Added

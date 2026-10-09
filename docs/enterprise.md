@@ -25,12 +25,14 @@ Contents:
 - Access is by **API key**. Each key belongs to one team and has one **role**. There are no
   per-person accounts and no single sign-on: a person's access is the key they hold.
 - Use one key per person, or per system (for example a CI job), with the least role that works.
+- Pending approvals created before requester-key attribution was added cannot prove an independent
+  approver. For safe separation of duties, agents must submit a fresh request after upgrading.
 
 | Role | Can do |
 | --- | --- |
 | **viewer** | Read everything a team member can read: runs, receipts, statistics, approvals, and team settings with webhook URLs masked. Read only. |
-| **member** | Everything a viewer can do, plus push runs, request approvals and decide approvals. |
-| **admin** | Everything a member can do, plus change team settings, manage keys, read the audit log, and (in this release) set budgets and download exports. |
+| **member** | Everything a viewer can do, plus push runs and request approvals. |
+| **admin** | Everything a member can do, plus decide approvals, change team settings, manage keys, read the audit log, set budgets and download exports. An admin cannot decide an approval created with the same key. |
 
 Roles are ranked: viewer < member < admin. A key's role cannot be changed in place. To change it,
 create a key with the new role and revoke the old one.
@@ -43,7 +45,7 @@ Access matrix (HTTP endpoints; see [api.md](api.md)):
 | Read team settings (webhook URLs masked unless admin) | yes | yes | yes |
 | Push runs (`POST /api/runs`) | no | yes | yes |
 | Request approvals (`POST /api/approvals`) | no | yes | yes |
-| Decide approvals (`POST /api/approvals/{id}/decision`) | no | yes | yes |
+| Decide approvals (`POST /api/approvals/{id}/decision`) | no | no | yes, with a different key from requester |
 | Change team settings (`PUT /api/team/settings`) | no | no | yes |
 | List, create, rotate and revoke keys (`/api/keys`) | no | no | yes |
 | Read the audit log (`GET /api/audit`) | no | no | yes |
@@ -128,7 +130,7 @@ target and details. Details never include a key secret or a webhook URL.
 | `key.create` | A key is created, including the team's first key | Key id | label, role, prefix |
 | `key.rotate` | A key's secret is replaced | Key id | label, role, prefix (of the new secret) |
 | `key.revoke` | A key is revoked | Key id | label, role, prefix |
-| `run.push` | A receipt is pushed (also when a session is re-pushed) | Run id | agent, project |
+| `run.push` | A new immutable receipt is stored (identical retries are not new writes) | Run id | agent, project |
 | `approval.decide` | An approval is approved or denied | Approval id | status |
 | `team.settings` | Team settings change | `settings` | the names of the fields changed, and `approval_ttl_s` if it changed. Never the URLs. |
 | `auth.sign_in` | A dashboard sign-in with a key succeeds | Key id | role, and the client address (`ip`) |
@@ -293,13 +295,19 @@ real client. The counter is held in memory, so a restart clears it.
 Team settings can hold a Slack incoming-webhook URL and a generic webhook URL. Both are used for
 approval requests, and for budget alerts in this release.
 
-- URLs must use `https://`. `http://` is accepted only for `127.0.0.1` and `localhost`, for testing.
-- Redirects are not followed, so a URL must answer where it was configured.
+- URLs must use public `https://` destinations. Internal, private, loopback, link-local and
+  non-public DNS answers are blocked, including when public and private answers are mixed.
+- For local testing only, set `RUNLEDGER_ALLOW_LOOPBACK_WEBHOOKS=1` to permit `http://127.0.0.1`
+  or `http://localhost`. Never enable this exception on a shared or Internet-accessible server.
+- DNS addresses are verified on delivery and the socket connects to the verified address
+  (mitigating DNS rebinding). Redirects and environment proxy settings are not followed.
+- Outbound webhooks need directly routable public IPv4 or public unicast IPv6. NAT64/DNS64-only
+  and 6to4 egress are intentionally unsupported by this stricter destination policy.
 - Admins see the full URL. Other roles see only the scheme, host and port, followed by `/[hidden]`,
   because the path of a webhook URL is the secret part.
 - Messages are sent on a background thread, so they never delay the request that caused them. A
   failed delivery is written to the server's log as its kind only (for example `HTTP 500` or
-  `URLError`), never with the URL.
+  `TimeoutError`), never with the URL.
 - URLs are stored as set in the team database, so protect the database file.
 
 ## Data stored and retention
