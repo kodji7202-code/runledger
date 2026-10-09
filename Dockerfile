@@ -3,7 +3,10 @@
 # Build from the repository root:  docker build -t runledger .
 # Or use deploy/docker-compose.yml, which adds Caddy for HTTPS.
 
-FROM python:3.12-slim
+# The official Python image can also be fetched from a registry mirror when
+# Docker Hub rate-limits anonymous CI runners. Default remains Docker Hub.
+ARG PYTHON_BASE_IMAGE=python:3.12-slim
+FROM ${PYTHON_BASE_IMAGE}
 
 LABEL org.opencontainers.image.title="RunLedger" \
       org.opencontainers.image.description="RunLedger team server: collects agent run receipts and serves a dashboard" \
