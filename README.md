@@ -6,7 +6,7 @@ RunLedger reads the session logs of your coding agents and turns each run into a
 changed, what ran, which model did each step, what it cost, and what looked risky. A Claude Code hook
 can stop risky calls before they run, and a small team server collects receipts from the whole team.
 
-Version 0.4.0. Python 3.9 or later, no runtime dependencies.
+Version 0.4.1. Python 3.9 or later, no runtime dependencies.
 
 ## Quickstart
 
@@ -98,7 +98,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: kodji7202-code/runledger@v0.4.0
+      - uses: kodji7202-code/runledger@v0.4.1
         with:
           fail-on: "60"                   # the job fails at 60 or above; "" never fails
 ```

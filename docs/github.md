@@ -41,7 +41,7 @@ RunLedger. The job needs `pull-requests: write` to post the comment.
 
 ```yaml
 - uses: actions/checkout@v4
-- uses: kodji7202-code/runledger@v0.4.0
+- uses: kodji7202-code/runledger@v0.4.1
   with:
     sessions-dir: .runledger/sessions   # default
     fail-on: "60"                        # default; "" never fails the job

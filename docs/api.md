@@ -74,7 +74,7 @@ body. Methods the server does not implement, such as `OPTIONS`, return `501`.
 No authentication. Use it for load balancers and container health checks.
 
 ```json
-{"ok": true, "version": "0.4.0"}
+{"ok": true, "version": "0.4.1"}
 ```
 
 ### `GET /api/me`
@@ -219,7 +219,7 @@ Role: any. One run with its full receipt JSON and its risk reasons.
   "steps": 10, "tokens": 116416, "files_changed": 3, "cost_usd": 0.108408,
   "risk_score": 80, "risk_level": "high", "has_html": true,
   "created_at": "2026-10-08T16:37:34Z", "updated_at": "2026-10-08T16:37:34Z",
-  "receipt": {"runledger_version": "0.4.0", "session_id": "7f3c2a10-...", "...": "..."},
+  "receipt": {"runledger_version": "0.4.1", "session_id": "7f3c2a10-...", "...": "..."},
   "risks": [{"severity": "high", "code": "secret_file", "reason": "Read a secrets file (.env)", "step": 3}]
 }}
 ```

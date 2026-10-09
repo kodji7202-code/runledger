@@ -7,6 +7,8 @@ change behavior, so read the entry before you upgrade.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-10-10
+
 ### Fixed
 
 - **Team run integrity:** receipts are immutable after initial upload. Identical retries remain
@@ -24,6 +26,8 @@ change behavior, so read the entry before you upgrade.
   token splits, secret redaction, Windows path handling, Java disabled-test detection and shell
   outside-directory deletion checks.
 - **Release safety:** PyPI releases require passing tests and an installed-wheel smoke check.
+- **Docker CI reliability:** use the official Python image's public ECR mirror in CI to avoid
+  anonymous Docker Hub rate limiting on shared runners; normal Docker builds keep their original base.
 
 ### Changed
 
