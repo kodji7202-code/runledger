@@ -50,6 +50,7 @@ button:disabled{opacity:.5;cursor:default}
 .notice{display:none;margin:0 0 16px;padding:10px 14px;border-radius:10px;border:1px solid var(--line);background:var(--panel)}
 .notice.show{display:block}
 .notice.error{border-color:var(--red);color:var(--red)}
+.notice.warn{border-color:var(--amber)}
 .msg{margin:6px 0;font-size:13px}
 .msg:empty{margin:0}
 .msg.error{color:var(--red)}
@@ -181,6 +182,8 @@ dialog::backdrop{background:rgba(5,6,8,.6)}
     <button type="button" id="refresh">Refresh</button>
   </div>
 </header>
+
+<div id="billing-notice" class="notice" role="status"></div>
 
 <div class="tabs-wrap">
 <div class="tabs" role="tablist" id="tabs" aria-label="Dashboard sections">
@@ -1575,11 +1578,53 @@ dialog::backdrop{background:rgba(5,6,8,.6)}
     showView(currentRoute());
   }
 
+  function billingMessage(b) {
+    var used = Number(b.seats_used) || 0, seats = Number(b.seats) || 0;
+    if (b.state === "past_due") {
+      return ["warn", "The last payment failed. Update the payment method before " + when(b.grace_until) +
+        ", or the team becomes read only."];
+    }
+    if (b.state === "read_only") {
+      return ["error", "Payment is overdue, so the team is read only: new runs and approval requests are refused. " +
+        "Update the payment method to resume."];
+    }
+    if (b.state === "ended") {
+      return ["error", "The subscription has ended, so the team is read only. Export what you need (Audit log tab) " +
+        "before " + when(b.deletes_at) + ", when the team and its data are deleted."];
+    }
+    if (b.state === "canceling") {
+      return ["warn", "The subscription is canceled and ends on " + when(b.current_period_end) + "."];
+    }
+    if (seats && used >= seats) {
+      return ["warn", "All " + seats + " seats are in use. A developer without a seat cannot push runs until you add seats."];
+    }
+    return null;
+  }
+
+  function showBilling(b) {
+    var box = $("billing-notice");
+    box.textContent = "";
+    var msg = b ? billingMessage(b) : null;
+    box.className = "notice" + (msg ? " show " + msg[0] : "");
+    if (!msg) { return; }
+    box.appendChild(document.createTextNode(msg[1]));
+    if (b.portal_url && /^https:\/\//.test(b.portal_url) && isAdmin()) {
+      box.appendChild(document.createTextNode(" "));
+      var a = document.createElement("a");
+      a.href = b.portal_url;
+      a.rel = "noopener noreferrer";
+      a.target = "_blank";
+      a.textContent = "Open the billing portal";
+      box.appendChild(a);
+    }
+  }
+
   function loadMe() {
     return getJSON("/api/me").then(function (me) {
       state.meLoaded = true;
       state.role = ROLES.indexOf(me && me.role) >= 0 ? me.role : null;
       if (me && me.team && me.team.name) { setTeam(me.team.name); }
+      showBilling(me && me.billing);
       applyRole();
     }, function () {
       // Without /api/me the role is unknown: keep the runs and approvals views, hide admin tabs.

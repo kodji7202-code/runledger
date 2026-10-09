@@ -28,6 +28,15 @@
   GET  /                                      dashboard; sign in once with /?key=API_KEY
   GET  /health                                liveness, no auth
 
+With billing on (RUNLEDGER_POLAR_WEBHOOK_SECRET, see billing.py):
+
+  POST /billing/polar/webhook                 Polar subscription events (Standard Webhooks signature)
+  POST /billing/recover                       {email} -> 202; emails a new admin key to a subscriber
+  GET  /recover                               page for the above
+
+A billed team that is past its payment grace period, or whose subscription ended, gets 402 on
+POST /api/runs and POST /api/approvals; so does a push from a new developer when every seat is taken.
+
 Credentials are "Authorization: Bearer KEY", or the dashboard session cookie. A cookie
 session has the role of the key it was signed in with, and survives a restart. A POST or
 PUT that uses a cookie must also send the header "X-Requested-With: runledger".
@@ -52,14 +61,16 @@ import secrets
 import socket
 import ssl
 import sys
+import threading
+import time
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from .. import __version__
-from . import approvals, budgets, exports, insights
+from . import approvals, billing, budgets, exports, insights
 from .auth import (
     SESSION_TTL_SECONDS,
     FailureLimiter,
@@ -67,6 +78,7 @@ from .auth import (
     InvalidKey,
     allows,
     identity_from_row,
+    key_prefix,
 )
 from .dashboard import APPROVAL_HTML, DASHBOARD_HTML
 from .db import TIME_FORMAT, Database
@@ -81,6 +93,12 @@ PUBLIC_URL_ENV = "RUNLEDGER_PUBLIC_URL"
 SECURE_COOKIES_ENV = "RUNLEDGER_SECURE_COOKIES"
 TRUSTED_PROXIES_ENV = "RUNLEDGER_TRUSTED_PROXIES"
 HSTS_VALUE = "max-age=31536000"
+MAINTENANCE_INTERVAL_S = 3600
+RECOVERY_MAX_REQUESTS = 5
+RECOVERY_WINDOW_S = 3600
+RECOVERY_REPLY = ("If that email has a RunLedger Team subscription, a new admin key is on its way. "
+                  "Check your inbox in a few minutes.")
+WEBHOOK_HEADERS = ("webhook-id", "webhook-timestamp", "webhook-signature")
 EXPORT_ROUTES = {
     "/api/export/runs.csv": "runs",
     "/api/export/audit.csv": "audit",
@@ -163,6 +181,9 @@ class RunLedgerServer(ThreadingHTTPServer):
         secure_cookies: bool = False,
         trust_proxy: bool = False,
         trusted_proxies: Sequence[_IPNetwork] = (),
+        billing_config: Optional[billing.BillingConfig] = None,
+        mailer: Any = None,
+        retention_days: Optional[int] = None,
     ) -> None:
         self.db = db
         self.log_requests = log_requests
@@ -171,6 +192,13 @@ class RunLedgerServer(ThreadingHTTPServer):
         self.trust_proxy = trust_proxy
         self.trusted_proxies: Tuple[_IPNetwork, ...] = tuple(trusted_proxies)
         self.limiter = FailureLimiter()
+        self.recovery_limiter = FailureLimiter(max_failures=RECOVERY_MAX_REQUESTS, window_s=RECOVERY_WINDOW_S)
+        self.billing = billing_config
+        if mailer is None and billing_config is not None:
+            mailer = billing.mailer_for(billing_config)
+        self.mailer = mailer
+        self.retention_days = retention_days
+        self._maintenance_stop = threading.Event()
         super().__init__(address, _Handler)
         # The base URL people see in approval links. The default is the bound address,
         # so set RUNLEDGER_PUBLIC_URL when the server sits behind a reverse proxy.
@@ -189,6 +217,30 @@ class RunLedgerServer(ThreadingHTTPServer):
         if self.tls_context is not None:
             sock = self.tls_context.wrap_socket(sock, server_side=True, do_handshake_on_connect=False)
         return sock, addr
+
+    def start_maintenance(self, interval_s: float = MAINTENANCE_INTERVAL_S) -> bool:
+        """Run billing.run_maintenance now and then every interval_s, on a daemon thread, until
+        server_close(). Does nothing (returns False) when neither billing nor retention is on."""
+        if self.billing is None and not self.retention_days:
+            return False
+
+        def loop() -> None:
+            while True:
+                try:
+                    removed = {k: v for k, v in billing.run_maintenance(self.db, self.retention_days).items() if v}
+                    if removed:
+                        sys.stderr.write(f"RunLedger: maintenance removed {removed}\n")
+                except Exception:
+                    traceback.print_exc()
+                if self._maintenance_stop.wait(interval_s):
+                    return
+
+        threading.Thread(target=loop, name="runledger-maintenance", daemon=True).start()
+        return True
+
+    def server_close(self) -> None:
+        self._maintenance_stop.set()
+        super().server_close()
 
     def handle_error(self, request: Any, client_address: Any) -> None:
         exc = sys.exc_info()[1]
@@ -276,6 +328,9 @@ def make_server(
     secure_cookies: bool = False,
     trust_proxy: bool = False,
     trusted_proxies: Optional[Sequence[str]] = None,
+    billing_config: Optional[billing.BillingConfig] = None,
+    mailer: Any = None,
+    retention_days: Optional[int] = None,
 ) -> RunLedgerServer:
     """Open the database and bind the server. Port 0 picks a free port (see server_address).
     The caller owns the server: call shutdown(), server_close() and db.close() when done.
@@ -285,10 +340,16 @@ def make_server(
     the Secure flag on the session cookie. trust_proxy honours X-Forwarded-Proto from a
     reverse proxy the same way. trusted_proxies (and $RUNLEDGER_TRUSTED_PROXIES, comma
     separated) are the proxy addresses or CIDR ranges whose X-Forwarded-For is believed.
-    Raises ValueError for a bad address or range, before the database is opened."""
+    billing_config and retention_days default to the environment (see billing.py); mailer
+    replaces the Resend sender (tests). Raises ValueError for a bad address or range, and
+    billing.BillingConfigError for half-configured billing, before the database is opened."""
     if bool(tls_cert) != bool(tls_key):
         raise TLSConfigError("--tls-cert and --tls-key must be given together.")
     networks = parse_trusted_proxies(list(trusted_proxies or []) + _env_list(TRUSTED_PROXIES_ENV))
+    if billing_config is None:
+        billing_config = billing.BillingConfig.from_env()
+    if retention_days is None:
+        retention_days = billing.retention_from_env()
     tls_context = make_tls_context(tls_cert, tls_key) if tls_cert else None
     secure = bool(secure_cookies) or _env_flag(SECURE_COOKIES_ENV)
     db = Database(db_path)
@@ -297,7 +358,8 @@ def make_server(
         return cls(
             (host, port), db, log_requests=log_requests, public_url=public_url,
             tls_context=tls_context, secure_cookies=secure, trust_proxy=bool(trust_proxy),
-            trusted_proxies=networks,
+            trusted_proxies=networks, billing_config=billing_config, mailer=mailer,
+            retention_days=retention_days,
         )
     except Exception:
         db.close()
@@ -443,6 +505,17 @@ class _Handler(BaseHTTPRequestHandler):
         elif path in EXPORT_ROUTES:
             self._only(method, ("GET", "HEAD"))
             self._export(EXPORT_ROUTES[path], query, head=method == "HEAD")
+        elif path == "/billing/polar/webhook" and self.server.billing is not None:
+            self._only(method, ("POST",))
+            self._polar_webhook()
+        elif path == "/billing/recover" and self.server.billing is not None:
+            self._only(method, ("POST",))
+            self._recover()
+        elif path == "/recover" and self.server.billing is not None:
+            self._only(method, ("GET",))
+            nonce = secrets.token_urlsafe(16)
+            self._send_html(200, billing.RECOVER_HTML.replace("__CSP_NONCE__", nonce),
+                            {"Content-Security-Policy": _page_csp(nonce)})
         else:
             raise _HttpError(404, "not_found", "No such endpoint.")
 
@@ -583,11 +656,142 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _me(self) -> None:
         ident = self._identify()
-        self._send_json(200, {
+        me: Dict[str, Any] = {
             "team": {"id": ident.team_id, "name": ident.team_name},
             "role": ident.role,
             "key": {"id": ident.key_id, "label": ident.label, "prefix": ident.prefix},
-        })
+        }
+        view = self._billing_view(ident.team_id)
+        if view is not None:  # only billed (hosted) teams have this key
+            me["billing"] = view
+        self._send_json(200, me)
+
+    # Billing (see billing.py)
+
+    def _billing_view(self, team_id: int) -> Optional[Dict[str, Any]]:
+        """The subscription as the dashboard shows it, or None for a team that is not billed."""
+        row = self.server.db.billing_for_team(team_id)
+        if row is None:
+            return None
+        info = billing.access(row)
+        info["seats_used"] = len(self.server.db.seat_users(team_id, _seat_window_start()))
+        info["portal_url"] = self.server.billing.portal_url if self.server.billing else None
+        return info
+
+    def _check_billing(self, ident: Identity, user: Optional[str] = None) -> None:
+        """Refuse a write (402) from a billed team that is read only, or, for a push by `user`,
+        from a developer who would need a seat when every seat is taken."""
+        db = self.server.db
+        row = db.billing_for_team(ident.team_id)
+        if row is None:
+            return
+        info = billing.access(row)
+        refusal = billing.write_refusal(info)
+        if refusal:
+            raise _HttpError(402, "payment_required", refusal)
+        if user is not None:
+            users = db.seat_users(ident.team_id, _seat_window_start())
+            if user not in users and len(users) >= info["seats"]:
+                raise _HttpError(402, "seat_limit", billing.seat_refusal(info["seats"]))
+
+    def _polar_webhook(self) -> None:
+        config = self.server.billing
+        length = self._content_length(billing.WEBHOOK_BODY_LIMIT, "Webhooks")
+        raw = self.rfile.read(length) if length else b""
+        headers = {name: self.headers.get(name) for name in WEBHOOK_HEADERS}
+        try:
+            webhook_id = billing.verify_webhook(config.webhook_secret, headers, raw, time.time())
+        except billing.InvalidSignature as exc:
+            self.server.limiter.record_failure(self._client_ip())
+            sys.stderr.write(f"RunLedger: Polar webhook rejected ({exc})\n")
+            raise _HttpError(401, "invalid_signature", "The webhook signature is not valid.") from None
+        db = self.server.db
+        if db.billing_event_seen(webhook_id):
+            self._send_json(200, {"ok": True, "result": "duplicate"})
+            return
+        try:
+            event = json.loads(raw.decode("utf-8"), parse_constant=_reject_constant)
+        except (UnicodeDecodeError, ValueError, RecursionError):
+            raise _HttpError(400, "invalid_json", "The body must be UTF-8 JSON.") from None
+        event_type = str(event.get("type") or "")[:100] if isinstance(event, dict) else ""
+        outcome = "ignored"
+        if event_type.startswith("subscription."):
+            outcome = self._apply_subscription_event(webhook_id, event.get("data"))
+        # Recorded last: an event that failed part way (503 below) is redelivered and applied again.
+        db.record_billing_event(webhook_id, event_type or "unknown")
+        self._send_json(200, {"ok": True, "result": outcome})
+
+    def _apply_subscription_event(self, webhook_id: str, data: Any) -> str:
+        config = self.server.billing
+        db = self.server.db
+        try:
+            sub = billing.parse_subscription(data)
+        except billing.InvalidEvent as exc:
+            sys.stderr.write(f"RunLedger: Polar event {webhook_id} ignored ({exc})\n")
+            return "ignored"
+        if config.product_ids and sub["product_id"] not in config.product_ids:
+            return "other_product"
+        result = db.apply_subscription(sub)
+        if result["stale"]:
+            return "stale"
+        team_id = result["team_id"]
+        if team_id is None:
+            return "pending"
+        public_url = self.server.public_url
+        status = result["status"]
+        if status in billing.ACTIVE and not result["welcome_sent_at"]:
+            key = result["created_key"] or db.welcome_key(team_id)
+            subject, text = billing.welcome_email(config, public_url, result["team_name"], result["seats"], key)
+            try:
+                self.server.mailer.send(result["email"], subject, text,
+                                        idempotency_key=f"welcome-{sub['id']}-{key_prefix(key)}")
+            except Exception as exc:
+                sys.stderr.write(f"RunLedger: welcome email for {sub['id']} not sent ({exc})\n")
+                raise _HttpError(503, "mail_failed",
+                                 "The welcome email could not be sent. Deliver this event again later.") from None
+            db.mark_welcome_sent(sub["id"])
+            return "provisioned" if result["created_key"] else "welcomed"
+        previous = result["previous_status"]
+        info = billing.access(result)
+        if status in billing.PAST_DUE and previous not in billing.PAST_DUE:
+            billing.send_quietly(self.server.mailer, result["email"],
+                                 billing.past_due_email(config, result["team_name"], info["grace_until"]),
+                                 idempotency_key=f"past-due-{sub['id']}-{result['past_due_since']}")
+        elif status in billing.ENDED and previous is not None and previous not in billing.ENDED:
+            billing.send_quietly(self.server.mailer, result["email"],
+                                 billing.ended_email(config, public_url, result["team_name"], info["deletes_at"]),
+                                 idempotency_key=f"ended-{sub['id']}-{result['ended_at']}")
+        return "updated"
+
+    def _recover(self) -> None:
+        length = self._content_length(approvals.SMALL_BODY_LIMIT, "Requests")
+        raw = self.rfile.read(length) if length else b""
+        # A cross-site form cannot set this header, and a cross-site fetch with it needs CORS, which
+        # this server never grants.
+        if (self.headers.get(CSRF_HEADER) or "").strip() != CSRF_VALUE:
+            raise _HttpError(403, "csrf_required", f"Send the header '{CSRF_HEADER}: {CSRF_VALUE}'.")
+        address = self._client_ip()
+        wait = self.server.recovery_limiter.blocked_for(address)
+        if wait:
+            raise _HttpError(429, "rate_limited", "Too many key requests from this address. Try again later.",
+                             {"Retry-After": str(wait)})
+        self.server.recovery_limiter.record_failure(address)
+        email = billing.valid_email(_json_object(raw).get("email"))
+        if email is None:
+            raise _HttpError(400, "invalid_email", "Send {\"email\": \"you@example.com\"}.")
+        db = self.server.db
+        config = self.server.billing
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=billing.RECOVERY_INTERVAL_S)).strftime(TIME_FORMAT)
+        for sub in db.subscriptions_for_email(email):
+            if not db.claim_recovery(sub["polar_id"], cutoff):
+                continue
+            label = "recovered " + datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            view = db.create_key(sub["team_id"], label, "admin", actor="billing:recover")
+            db.record_audit(sub["team_id"], "billing:recover", "billing.recover", view["id"], {"ip": address})
+            billing.send_quietly(self.server.mailer, email,
+                                 billing.recovery_email(config, self.server.public_url, sub["team_name"], view["key"]))
+        # The same answer whether or not the email is known, so it cannot be used to find customers.
+        self._send_json(202, {"ok": True, "message": RECOVERY_REPLY})
 
     def _create_run(self) -> None:
         length = self._content_length()
@@ -603,6 +807,7 @@ class _Handler(BaseHTTPRequestHandler):
         if not isinstance(payload, dict):
             raise _HttpError(400, "invalid_json", "The body must be a JSON object.")
         run = receipt_to_run(payload)
+        self._check_billing(ident, user=run["user"])
         self.server.db.upsert_run(ident.team_id, run, actor=ident.actor())
         self._check_budget_alerts(ident)
         self._send_json(201, {
@@ -686,6 +891,7 @@ class _Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length) if length else b""
         ident = self._identify()
         self._require(ident, "member", "request approvals", write=True)
+        self._check_billing(ident)
         try:
             fields = approvals.validate_new_approval(_json_object(raw))
         except approvals.InvalidInput as exc:
@@ -890,6 +1096,10 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 # Helpers
+
+
+def _seat_window_start() -> str:
+    return billing.stamp(billing.now() - timedelta(days=billing.SEAT_WINDOW_DAYS))
 
 
 def _page_csp(nonce: str) -> str:

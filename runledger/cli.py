@@ -7,6 +7,8 @@
                   [--tls-cert FILE --tls-key FILE] [--secure-cookies] [--trust-proxy]
                   [--trusted-proxy CIDR ...]
   runledger team create NAME [--db runledger.db]
+  runledger billing list [--db runledger.db]
+  runledger backup [--db runledger.db] [--dir backups] [--keep 14]
   runledger key create --team-id N --label L --role admin|member|viewer [--db runledger.db]
   runledger key list --team-id N [--db runledger.db]
   runledger key revoke ID [--db runledger.db]
@@ -29,7 +31,7 @@ import re
 import sqlite3
 import sys
 import webbrowser
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Optional
 
@@ -198,6 +200,11 @@ def cmd_serve(args) -> int:
         print(f"Trusting X-Forwarded-For from: {shown}")
     if host not in _LOOPBACK and server.tls_context is None:
         print("Warning: listening on a network address. Put it behind HTTPS before sharing it.", file=sys.stderr)
+    if server.billing is not None:
+        print(f"Billing on: Polar webhooks at {server.public_url}/billing/polar/webhook")
+    if server.retention_days:
+        print(f"Retention: runs, approvals and audit events older than {server.retention_days} days are deleted")
+    server.start_maintenance()
     print("Create a team with: runledger team create NAME   (Ctrl+C to stop)")
     try:
         server.serve_forever()
@@ -228,6 +235,62 @@ def cmd_team_create(args) -> int:
     print("API key (shown once, store it safely):")
     print(key)
     print("Push runs with: runledger push --server URL --key KEY")
+    return 0
+
+
+def cmd_billing_list(args) -> int:
+    """The hosted plan's subscriptions in a team database (see server/billing.py)."""
+    from .server import billing
+    from .server.db import Database
+
+    try:
+        db = Database(args.db)
+    except sqlite3.Error as exc:
+        print(f"error: cannot open database {args.db}: {exc}", file=sys.stderr)
+        return 1
+    try:
+        subs = db.list_subscriptions()
+        if not subs:
+            print("No subscriptions.")
+            return 0
+        print(f"{'subscription':<38}  {'team':<6}  {'name':<24}  {'state':<10}  {'seats':>5}  {'used':>4}  email")
+        since = billing.stamp(billing.now() - timedelta(days=billing.SEAT_WINDOW_DAYS))
+        for s in subs:
+            state = billing.access(s)["state"] if s["team_id"] is not None else "deleted"
+            used = len(db.seat_users(s["team_id"], since)) if s["team_id"] is not None else 0
+            print(f"{s['polar_id'][:38]:<38}  {str(s['team_id'] or '-'):<6}  {(s['team_name'] or '-')[:24]:<24}  "
+                  f"{state:<10}  {s['seats']:>5}  {used:>4}  {s['email'] or '-'}")
+        return 0
+    finally:
+        db.close()
+
+
+def cmd_backup(args) -> int:
+    """Copy the team database to DIR/runledger-YYYYmmdd-HHMMSS.db and keep the newest --keep copies."""
+    from .server.db import Database
+
+    folder = Path(args.dir)
+    if args.keep < 1:
+        print("error: --keep must be 1 or more", file=sys.stderr)
+        return 1
+    if not Path(args.db).is_file():
+        print(f"error: no database at {args.db}", file=sys.stderr)
+        return 1
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        target = folder / f"runledger-{datetime.now().strftime('%Y%m%d-%H%M%S')}.db"
+        db = Database(args.db)
+        try:
+            db.backup_to(str(target))
+        finally:
+            db.close()
+    except (OSError, sqlite3.Error) as exc:
+        print(f"error: backup failed: {exc}", file=sys.stderr)
+        return 1
+    old = sorted(folder.glob("runledger-*.db"))[:-args.keep]
+    for path in old:
+        path.unlink()
+    print(f"Backup: {target}  ({target.stat().st_size} bytes; removed {len(old)} older)")
     return 0
 
 
@@ -392,6 +455,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     ptc.add_argument("name")
     ptc.add_argument("--db", default="runledger.db", help="SQLite database file (default runledger.db)")
     ptc.set_defaults(func=cmd_team_create)
+
+    pb = sub.add_parser("billing", help="hosted plan: subscriptions in a team database")
+    bsub = pb.add_subparsers(dest="billing_cmd", required=True)
+    pbl = bsub.add_parser("list", help="list subscriptions, their teams, state and seats")
+    pbl.add_argument("--db", default="runledger.db", help="SQLite database file (default runledger.db)")
+    pbl.set_defaults(func=cmd_billing_list)
+
+    pbk = sub.add_parser("backup", help="copy the team database safely while the server runs")
+    pbk.add_argument("--db", default="runledger.db", help="SQLite database file (default runledger.db)")
+    pbk.add_argument("--dir", default="backups", help="folder for the copies (default backups)")
+    pbk.add_argument("--keep", type=int, default=14, help="how many copies to keep (default 14)")
+    pbk.set_defaults(func=cmd_backup)
 
     pk = sub.add_parser("key", help="manage a team's API keys on a team database")
     ksub = pk.add_subparsers(dest="key_cmd", required=True)

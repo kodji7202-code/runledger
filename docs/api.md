@@ -16,6 +16,7 @@ Contents:
 - [Budgets](#budgets)
 - [Exports](#exports)
 - [Dashboard pages](#dashboard-pages)
+- [Billing (hosted plan only)](#billing-hosted-plan-only)
 - [Error codes](#error-codes)
 
 ## Conventions
@@ -72,7 +73,7 @@ body. Methods the server does not implement, such as `OPTIONS`, return `501`.
 No authentication. Use it for load balancers and container health checks.
 
 ```json
-{"ok": true, "version": "0.3.0"}
+{"ok": true, "version": "0.4.0"}
 ```
 
 ### `GET /api/me`
@@ -86,6 +87,20 @@ Role: any. Returns the caller's team, role and key (never the secret).
   "key": {"id": "0TQATVTcRECFJjNL", "label": "initial", "prefix": "rl_Xk3vN"}
 }
 ```
+
+On the hosted plan, a billed team's response also has `billing` (see [hosted.md](hosted.md)):
+
+```json
+"billing": {
+  "state": "active", "status": "active", "seats": 5, "seats_used": 3,
+  "current_period_end": "2026-11-09T10:00:00Z", "cancel_at_period_end": false,
+  "grace_until": null, "deletes_at": null, "can_write": true,
+  "portal_url": "https://polar.sh/acme/portal"
+}
+```
+
+`state` is `active`, `canceling`, `past_due` (in the grace period), `read_only` (past the grace
+period), `ended` or `pending`. Teams that are not billed have no `billing` key.
 
 Errors: `401`.
 
@@ -199,7 +214,7 @@ Role: any. One run with its full receipt JSON and its risk reasons.
   "steps": 10, "tokens": 116416, "files_changed": 3, "cost_usd": 0.108408,
   "risk_score": 80, "risk_level": "high", "has_html": true,
   "created_at": "2026-10-08T16:37:34Z", "updated_at": "2026-10-08T16:37:34Z",
-  "receipt": {"runledger_version": "0.3.0", "session_id": "7f3c2a10-...", "...": "..."},
+  "receipt": {"runledger_version": "0.4.0", "session_id": "7f3c2a10-...", "...": "..."},
   "risks": [{"severity": "high", "code": "secret_file", "reason": "Read a secrets file (.env)", "step": 3}]
 }}
 ```
@@ -591,6 +606,31 @@ recorded in the audit log as `auth.sign_in`, with the role and the client addres
 
 There is no sign-out endpoint. Revoke or rotate the key to end a session.
 
+## Billing (hosted plan only)
+
+These exist only when `RUNLEDGER_POLAR_WEBHOOK_SECRET` is set; otherwise they are `404`. See
+[hosted.md](hosted.md).
+
+### `POST /billing/polar/webhook`
+
+No API key: the Standard Webhooks signature authenticates Polar. Body limit 1 MB. Answers `200`
+`{"ok": true, "result": "provisioned" | "welcomed" | "updated" | "pending" | "stale" | "duplicate" |
+"other_product" | "ignored"}`. Errors: `401 invalid_signature` (bad or missing signature, or a
+timestamp more than five minutes off); `503 mail_failed` (the welcome email could not be sent; Polar
+redelivers the event).
+
+### `POST /billing/recover`
+
+No authentication. Send `X-Requested-With: runledger` and `{"email": "you@example.com"}`. Always
+`202` with the same message. If the email has a subscription with a team, a new admin key labelled
+`recovered YYYY-MM-DD` is created and emailed, at most once every 10 minutes per subscription.
+Errors: `400 invalid_email`; `403 csrf_required`; `429 rate_limited` (more than five requests an
+hour from one address).
+
+### `GET /recover`
+
+A page with a form for the above.
+
 ## Error codes
 
 | Status | Code | When |
@@ -605,6 +645,9 @@ There is no sign-out endpoint. Revoke or rotate the key to end a session.
 | 400 | `invalid_key` | A key `label` or `role` is missing or invalid. |
 | 400 | `invalid_budget` | A budget value or threshold is invalid (in this release). |
 | 401 | `unauthorized` | No valid API key or session. Sent with `WWW-Authenticate: Bearer realm="RunLedger"`. |
+| 401 | `invalid_signature` | A billing webhook has a bad or missing signature (hosted plan). |
+| 402 | `payment_required` | A billed team is read only: past the payment grace period, or its subscription ended. Reads and exports still work. |
+| 402 | `seat_limit` | A push from a new developer when every seat of a billed team is in use. |
 | 403 | `forbidden` | The role is too low for the action. The message names the role needed. |
 | 403 | `csrf_required` | A cookie-authenticated change lacks `X-Requested-With: runledger`. |
 | 404 | `not_found` | No such endpoint, run, approval or key. |
@@ -619,3 +662,4 @@ There is no sign-out endpoint. Revoke or rotate the key to end a session.
 | 429 | `rate_limited` | Too many failed credentials from this address. Wait for `Retry-After` seconds. |
 | 500 | `internal_error` | An unexpected server error. The details are in the server log. |
 | 501 | `server_error` | The method is not implemented, for example `OPTIONS`. |
+| 503 | `mail_failed` | A billing webhook could not send the welcome email. Polar delivers it again. |
