@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "runledger-ai"
-version = "0.4.0"
+version = "0.4.1"
 description = "A black box recorder for AI coding agents: turn Claude Code runs into shareable receipts."
 readme = "README.md"
 license = "Apache-2.0"
