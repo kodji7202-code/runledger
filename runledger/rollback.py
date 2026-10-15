@@ -28,6 +28,17 @@ class CheckpointError(RuntimeError):
     """A safe-to-display checkpoint or rollback failure."""
 
 
+def _unsupported_reparse_point(path: Path, info: os.stat_result) -> bool:
+    """Detect directory junctions without following them, on old and new Python versions."""
+    if stat.S_ISLNK(info.st_mode):
+        return False  # Git can save symlinks; callers must still avoid walking through them.
+    if (getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+            or getattr(info, "st_reparse_tag", 0)):
+        return True
+    is_junction = getattr(os.path, "isjunction", None)  # Python 3.12+, absent on 3.9
+    return bool(is_junction and is_junction(path))
+
+
 @dataclass
 class Checkpoint:
     id: str
@@ -150,7 +161,7 @@ class Repository:
                     break
                 if stat.S_ISLNK(mode.st_mode):
                     break
-                if getattr(mode, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+                if _unsupported_reparse_point(candidate, mode):
                     raise CheckpointError("Windows junctions and other non-symlink reparse points "
                                           "are not supported.")
                 checked.add(candidate)
@@ -281,7 +292,7 @@ class Repository:
                 except FileNotFoundError:
                     break
                 if (not stat.S_ISDIR(mode.st_mode) or
-                        getattr(mode, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+                        _unsupported_reparse_point(parent, mode)):
                     relative = parent.relative_to(self.root).as_posix()
                     if relative not in removing:
                         raise CheckpointError(f"Unsafe parent blocks rollback: {relative!r}")
@@ -293,8 +304,7 @@ class Repository:
                 mode = path.lstat()
             except FileNotFoundError:
                 continue
-            if (not stat.S_ISLNK(mode.st_mode) and
-                    getattr(mode, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+            if _unsupported_reparse_point(path, mode):
                 raise CheckpointError(f"Windows reparse point blocks rollback: {name!r}")
             if stat.S_ISDIR(mode.st_mode):
                 for folder, dirs, files in os.walk(path, followlinks=False):
@@ -303,8 +313,7 @@ class Repository:
                         relative = candidate.relative_to(self.root).as_posix()
                         self._path(relative)
                         mode = candidate.lstat()
-                        if (not stat.S_ISLNK(mode.st_mode) and
-                                getattr(mode, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+                        if _unsupported_reparse_point(candidate, mode):
                             raise CheckpointError(f"Windows reparse point blocks rollback: {relative!r}")
                         if not stat.S_ISDIR(mode.st_mode):
                             if relative not in removing:
