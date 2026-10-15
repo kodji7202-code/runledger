@@ -7,6 +7,14 @@ change behavior, so read the entry before you upgrade.
 
 ## [Unreleased]
 
+### Changed
+
+- **Safe mode is the default for shareable receipts:** Markdown and JSON receipts written to
+  stdout or inside a Git work tree shorten local paths (repository-relative, `~` for the home
+  folder, `…` for shared or `RUNLEDGER_SAFE_PREFIXES` prefixes) and mask e-mail addresses and URL
+  credentials. HTML and files outside a repository keep full paths. `--safe` and `--no-safe`
+  override the default; JSON receipts add a `safe` key. The GitHub PR comment is always safe.
+
 ### Added
 
 - **Risk for shell and database writes:** files written through the shell get the same path

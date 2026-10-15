@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Optional
 
 from . import llm
@@ -70,6 +70,8 @@ class FileChange:
 
 
 def file_changes(run: Run) -> Dict[str, FileChange]:
+    if run.frozen_changes is not None:
+        return {p: replace(fc) for p, fc in run.frozen_changes.items()}
     changes: Dict[str, FileChange] = {}
     for s in run.steps:
         p = _str(s.input.get("file_path")) or _str(s.input.get("notebook_path"))

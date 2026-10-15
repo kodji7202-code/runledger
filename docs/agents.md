@@ -92,9 +92,14 @@ Droid writes a JSONL transcript and a sibling settings file:
   file's `model`. No model is guessed when both are absent.
 - **Usage.** Per-message usage is counted once when present. The settings file's cumulative
   `tokenUsage` supplies any remaining input, output, cache-creation and cache-read tokens.
-  Thinking tokens, credits, `inclusiveTokenUsage` and `lastCallTokenUsage` are not added again.
+  Thinking tokens, credits and `lastCallTokenUsage` are not added again.
   Without per-message usage, a single-model total is split evenly across steps as an approximation.
-  A mixed-model cumulative total cannot be attributed reliably, so its remainder has an unknown model.
+  A mixed-model cumulative total cannot be attributed reliably, so its remainder is listed as
+  `unattributed`, which has no price.
+- **Sub-agents.** `inclusiveTokenUsage` minus the session's own `tokenUsage` is sub-agent usage.
+  Each child session in `childInclusiveTokenUsageBySessionId` is credited to the model in its own
+  settings file when that file is found; the rest is `unattributed`. An inclusive total smaller
+  than the session's own usage is ignored.
 - **Settings file lookup.** RunLedger reads the sibling `<name>.settings.json` first. If the
   transcript was copied or renamed without it, RunLedger looks for `<session-id>.settings.json`
   under `$FACTORY_HOME/sessions/`, preferring the folder for the session's `cwd`.
@@ -103,8 +108,9 @@ Droid writes a JSONL transcript and a sibling settings file:
   that received an even split. Markdown and HTML receipts add a footer note for estimated
   per-step tokens. When no usage is found, they show token counts as `n/a`, not 0, with a note
   naming the settings file Droid would have written. Other agents leave `usage_source` null.
-- **Cost.** Only token counts with a known model price produce estimates. Unknown models and
-  missing usage leave the run cost unknown. Missing or partially written settings do not prevent
+- **Cost.** Only token counts with a known model price produce estimates. Missing usage, or no
+  priced model at all, leaves the run cost unknown. When some tokens are priced and some are not,
+  the cost is a lower bound: `≥ $X (1 model unpriced)`, with `totals.cost_partial` in JSON. Missing or partially written settings do not prevent
   parsing the transcript.
 
 ## Aider (beta)

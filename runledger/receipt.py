@@ -525,6 +525,7 @@ def to_dict(run: Run, score: int, level: str, risks: List[Risk]) -> Dict:
     changes = file_changes(run)
     data = {
         "runledger_version": __version__,
+        "safe": run.safe,
         "session_id": run.session_id,
         "rollback": _rollback(run),
         "agent": agent_label(run.agent), "agent_id": run.agent,

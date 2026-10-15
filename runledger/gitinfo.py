@@ -29,6 +29,13 @@ def _in_repo(cwd: Optional[str]) -> bool:
     return bool(cwd) and os.path.isdir(cwd) and (_git(cwd, "rev-parse", "--is-inside-work-tree") or "").strip() == "true"
 
 
+def toplevel(cwd: Optional[str]) -> Optional[str]:
+    """The root folder of the work tree that contains `cwd`, or None outside Git."""
+    if not _in_repo(cwd):
+        return None
+    return (_git(cwd, "rev-parse", "--show-toplevel") or "").strip() or None
+
+
 def current_branch(cwd: Optional[str]) -> Optional[str]:
     """The checked-out branch, or None when HEAD is detached or there is no repository."""
     if not _in_repo(cwd):
