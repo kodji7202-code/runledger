@@ -7,6 +7,8 @@ change behavior, so read the entry before you upgrade.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-15
+
 ### Added
 
 - **Factory Droid adapter:** receipts, risk scoring and session discovery with `--agent droid`,
