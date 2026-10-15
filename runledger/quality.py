@@ -16,6 +16,8 @@ Signals and their points:
   failing_then_passing  +5 a failing run followed by a passing run, ending green
   failing_streak        -5 per failing test run beyond the first in a row, at most -15
   test_tampering        -10 per deleted or skipped test file, -5 per weakened one, at most -25
+  test_changes          0: tests replaced by tests that cover the same behaviour, or assertions
+                        changed with no net loss (read from the Git diff, see testdiff.py)
   error_rate            +5 with no errored steps, down 60 points per 100%, at least -15
   retry_loops           -5 per non-test command repeated 3+ times or file edited 5+ times, at most -15
   scope                 -1 per unrelated changed file past the fourth, at most -10 (mild)
@@ -39,6 +41,7 @@ from .advisor import estimated_cost, recommend
 from .parser import Run, Step
 from .risk import Risk, _score as _risk_score
 from .summarize import file_changes
+from .testdiff import analyze as analyze_test_diffs
 
 BASE_SCORE = 70
 WRITE_TOOLS = ("Write", "Edit", "MultiEdit", "NotebookEdit")
@@ -293,6 +296,10 @@ def score_run(run: Run, risks: Optional[Sequence[Risk]] = None) -> Dict[str, Any
         note = ("No test file was deleted, skipped or weakened." if not counted else
                 f"{counted} test change(s) flagged: deleted, skipped or weakened.")
         add("test_tampering", counted, -min(25, points), note)
+
+    neutral = [c for c in analyze_test_diffs(run.test_diffs, run.prompts) if c.verdict in ("replaced", "changed")]
+    if neutral:
+        add("test_changes", len(neutral), 0, " ".join(c.note for c in neutral))
 
     # --- errors and loops
     if run.steps:

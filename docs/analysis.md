@@ -20,6 +20,13 @@ run with no prompts has no scope signal, and a run with no steps has no step-bas
 | `failing_then_passing` | +5 | A failing run was followed by a passing run that ends green. |
 | `failing_streak` | -5 per repeat, max -15 | Consecutive failing test runs beyond the first. |
 | `test_tampering` | -10 per test deleted or skipped, -5 per test weakened, max -25 | Test changes flagged by the risk rules. Low-severity fixture deletions do not count. |
+| `test_changes` | 0 | Neutral note: a test was replaced by one that covers the same behaviour, or assertions changed with no net loss. Read from the Git diff of each changed test file. |
+
+For test files in a Git working tree, the diff against HEAD decides the verdict, however the file
+was written (edit tools, heredocs, scripts): a skip marker added is skipped; tests removed and new
+ones added that share a name word with them (or with the request), with no fewer assertions, is
+replaced; fewer assertions, or a removed test with no replacement, is weakened. When a file has a
+diff verdict, it replaces what the per-step Edit rule said about that file.
 | `error_rate` | +5 down to -15 | Share of steps that returned an error. 0% gives +5, and 100% gives -15 at most. |
 | `retry_loops` | -5 each, max -15 | A non-test command repeated 3+ times, or a file edited 5+ times. |
 | `scope` | -1 per unrelated file past the fourth, max -10 | Changed files that share no word with the prompts. Mild, and only when at least 5 files are unrelated and they are over half of the changes. |

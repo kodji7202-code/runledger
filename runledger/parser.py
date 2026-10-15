@@ -92,6 +92,8 @@ class Run:
     guard: List[Dict[str, Any]] = field(default_factory=list)  # local Guard decisions
     # gitinfo.working_changes for files the run wrote through the shell, keyed relative to cwd
     git_changes: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # gitinfo.file_diffs for changed test files, keyed relative to cwd; read by testdiff, never shown
+    test_diffs: Dict[str, str] = field(default_factory=dict)
 
     @property
     def duration_seconds(self) -> Optional[float]:

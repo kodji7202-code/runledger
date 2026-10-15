@@ -1,16 +1,18 @@
-"""Read-only facts from the run's Git working tree: the branch and the line
-counts of uncommitted changes. Every helper returns nothing when the folder
+"""Read-only facts from the run's Git working tree: the branch, the line
+counts of uncommitted changes and the diffs of chosen files. Every helper returns nothing when the folder
 is missing, is not a repository, or git is not installed."""
 from __future__ import annotations
 
 import os
 import subprocess
-from typing import Dict, Iterable, Optional
+from typing import Dict, Iterable, List, Optional
 
 # The session log names the folder, so its repository config is not trusted:
 # these options keep git from running fsmonitor hooks, external diff tools or textconv filters.
 _SAFE = ["-c", "core.fsmonitor=false", "-c", "core.quotepath=false"]
 _MAX_COUNT_BYTES = 2 * 1024 * 1024
+_MAX_DIFF_CHARS = 512 * 1024  # per file
+_MAX_DIFF_PATHS = 200
 
 
 def _git(cwd: str, *args: str) -> Optional[str]:
@@ -79,3 +81,29 @@ def working_changes(cwd: Optional[str], paths: Optional[Iterable[str]] = None) -
         if path and path not in out and (wanted is None or path in wanted):
             out[path] = {"added": _count_lines(os.path.join(cwd, path)), "removed": 0, "status": "untracked"}
     return out
+
+
+def file_diffs(cwd: Optional[str], paths: Iterable[str]) -> Dict[str, str]:
+    """Unified diffs (no context lines) of `paths` against HEAD, keyed by path relative
+    to cwd. Files with no change, untracked files and a repository without commits
+    give no entry. Each diff is cut at a size limit."""
+    wanted = sorted(set(paths))[:_MAX_DIFF_PATHS]
+    if not wanted or not _in_repo(cwd) or _git(cwd, "rev-parse", "--verify", "-q", "HEAD") is None:
+        return {}
+    text = _git(cwd, "diff", "HEAD", "-U0", "--no-color", "--no-renames", "--relative",
+                "--no-ext-diff", "--no-textconv", "--", *wanted) or ""
+    parts: Dict[str, List[str]] = {}
+    sizes: Dict[str, int] = {}
+    path: Optional[str] = None
+    for line in text.splitlines(keepends=True):
+        if line.startswith("diff --git "):
+            path = None
+        elif path is None and line.startswith(("--- a/", "+++ b/")):
+            path = line[6:].rstrip("\n")
+            if path not in wanted:
+                path = None
+            continue
+        if path is not None and sizes.get(path, 0) < _MAX_DIFF_CHARS:
+            parts.setdefault(path, []).append(line)
+            sizes[path] = sizes.get(path, 0) + len(line)
+    return {p: "".join(lines) for p, lines in parts.items()}

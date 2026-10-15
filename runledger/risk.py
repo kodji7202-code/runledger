@@ -20,6 +20,18 @@ assignments earlier in the same command are expanded; any other variable makes t
 argument unknown, and its path checks are skipped. A "workdir" input outside the working
 folder is a medium risk, and relative path arguments are resolved against it.
 
+Files a Bash command writes (shell_writes: redirects, heredocs, tee, cp, mv, sed -i, Python
+open(..., "w")) get the edit-tool checks: secrets file (high), .git folder (medium), migration
+file (medium) and outside the working folder (low, as for other shell writes). Copying or
+moving a project file into a temp folder is low (temp_copy); other writes to temp are not
+flagged. Changing a local database file (sqlite3 X.db with write SQL or a script on stdin,
+Python sqlite3 code that runs DDL or DML) or running a migration tool (migrate.py, manage.py
+migrate, alembic, prisma, rails/rake, knex, ...) is medium (db_write). Read-only queries are not.
+
+Migration files (migrations/, db/migrate/, alembic/versions/, prisma/migrations/, V<n>__*.sql)
+written by any tool are medium (db_migration). The Git working tree, when known, tells an
+added migration from a changed one.
+
 Delete tool (canonical "Delete" with file_path) is checked like rm of that path.
 Write, Edit, MultiEdit and Delete inside a .git folder are medium (git_internals).
 
@@ -43,6 +55,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .parser import Run, Step
+from .shell_writes import database_writes, shell_writes
+from .testdiff import SKIP_RE, TestChange, analyze as analyze_test_diffs
 
 SEVERITY_POINTS = {"high": 30, "medium": 15, "low": 5}
 MEDIUM_POINTS_CAP = 45  # all medium findings together add at most this many points
@@ -75,6 +89,12 @@ _FIXTURE_DIRS = {"fixtures", "fixture", "testdata", "__snapshots__", "__fixtures
 _DATA_EXTS = (".json", ".jsonl", ".ndjson", ".txt", ".md", ".csv", ".tsv", ".yaml", ".yml", ".xml",
               ".html", ".snap", ".log", ".db", ".sqlite", ".sql", ".toml", ".ini")
 _GIT_DIR_RE = re.compile(r"(^|/)\.git/", re.I)
+# Schema migration files of common tools; __init__.py in a migrations package is not one.
+_MIGRATION_RE = re.compile(
+    r"(^|/)(?:migrations?|db/migrate|alembic/versions|prisma/migrations)/(?:[^/]+/)*"
+    r"(?!__init__\.py$)[^/]+\.(?:sql|py|rb|js|mjs|cjs|ts|go)$"
+    r"|(^|/)V\d+(?:[._]\d+)*__[^/]+\.sql$", re.I)
+_MIGRATION_VERB = re.compile(r"^Wrote a database migration \((.+)\)$")
 
 WRITE_TOOLS = ("Write", "Edit", "MultiEdit", "NotebookEdit")
 DELETE_TOOLS = ("Delete",)
@@ -333,6 +353,11 @@ def _is_test_fixture(path: str) -> bool:
     if any(part in _FIXTURE_DIRS for part in q.lower().split("/")):
         return True
     return name.lower().endswith(_DATA_EXTS)
+
+
+def is_test_source(path: str) -> bool:
+    """A test file with test code in it, not a fixture or data file under a test folder."""
+    return bool(TEST_RE.search(_slashes(path))) and not _is_test_fixture(path)
 
 
 def _test_deleted(path: str, index: int, risks: List[Risk]) -> None:
@@ -729,6 +754,60 @@ def _shell_risks(step: Step, cwd: Optional[str], extra: List["re.Pattern"], risk
                 _check_shell_word(w, name or "", cwd, workdir, extra, assigns, step, risks)
 
 
+def _project_path(path: str, cwd: Optional[str]) -> str:
+    """`path` relative to the working folder when it lies inside it, as receipts list files."""
+    p, base = _slashes(path), _slashes(cwd or "").rstrip("/")
+    if base and p.lower().startswith(base.lower() + "/") and _within(path, cwd):
+        return p[len(base) + 1:]
+    return path
+
+
+def _is_migration(path: str) -> bool:
+    return bool(_MIGRATION_RE.search(_slashes(path)))
+
+
+def _migration_risk(path: str, verb: str, cwd: Optional[str], index: int, risks: List[Risk]) -> None:
+    if _is_migration(path) and not _outside(path, cwd):
+        risks.append(Risk("medium", "db_migration", f"{verb} a database migration ({_project_path(path, cwd)})", index))
+
+
+def _shell_write_risks(step: Step, cwd: Optional[str], extra: List["re.Pattern"], risks: List[Risk]) -> None:
+    """The files a Bash command writes (shell_writes) get the checks edit-tool writes get,
+    and commands that change a database file or run migrations are reported."""
+    cmd = str(step.input.get("command") or "")
+    wd = step.input.get("workdir")
+    base = wd.strip() if isinstance(wd, str) and _is_abs(wd.strip()) else cwd
+    flagged_outside = {_key(r.reason.rsplit("(", 1)[-1].rstrip(")"), False)
+                       for r in risks if r.code == "shell_outside" and r.step == step.index}
+    writes = shell_writes(cmd)
+    moved_away = {w.path for w in writes if w.deleted}
+    for w in writes:
+        target = _resolved(w.path, base)
+        verb = "Deleted" if w.deleted else "Wrote"
+        if _is_secret(w.path, extra):
+            risks.append(Risk("high", "secret_file", f"Touched a secrets file from the shell ({_basename(w.path)})", step.index))
+        if _GIT_DIR_RE.search(_slashes(target)):
+            risks.append(Risk("medium", "git_internals", f"{verb} inside the .git folder ({_basename(target)})", step.index))
+        if not w.deleted:
+            _migration_risk(target, "Wrote", cwd, step.index, risks)
+        if _outside(target, cwd):
+            if _key(target, False) not in flagged_outside:
+                risks.append(Risk("low", "shell_outside", f"Shell command wrote outside the working folder ({target})", step.index))
+        elif w.source and cwd and _is_abs(target) and _in_temp(target):
+            source = _resolved(w.source, base)
+            if not _outside(source, cwd) and not _in_temp(source):
+                how = "Moved" if w.source in moved_away else "Copied"
+                risks.append(Risk("low", "temp_copy", f"{how} a project file outside the project "
+                                  f"({_project_path(source, cwd)} → {target})", step.index))
+    for d in database_writes(cmd):
+        if d.kind == "migrate":
+            shown = d.command if len(d.command) <= 80 else d.command[:77] + "..."
+            risks.append(Risk("medium", "db_write", f"Ran a database migration command ({shown})", step.index))
+        elif d.target:
+            target = _resolved(d.target, base)
+            risks.append(Risk("medium", "db_write", f"Wrote to a local database file ({_project_path(target, cwd)})", step.index))
+
+
 # ---------------------------------------------------------------- policy
 
 def load_policy(cwd: Optional[str]) -> Dict[str, Any]:
@@ -832,12 +911,14 @@ def assess_step(step: Step, cwd: Optional[str], policy: Optional[Dict[str, Any]]
         text = " ".join((e.get("old_string") or "") for e in edits)
         new_text = " ".join((e.get("new_string") or "") for e in edits)
         asserts_removed = len(re.findall(r"\b(assert|expect)\b", text)) - len(re.findall(r"\b(assert|expect)\b", new_text))
-        skip_pattern = r"\.(skip|only)\(|@pytest\.mark\.skip|xit\(|xdescribe\(|@Ignore|@Disabled"
-        skip_added = re.search(skip_pattern, new_text) and not re.search(skip_pattern, text)
+        skip_added = SKIP_RE.search(new_text) and not SKIP_RE.search(text)
         if skip_added:
             risks.append(Risk("high", "test_skipped", f"Disabled or skipped tests in {_basename(paths[0])}", step.index))
         elif asserts_removed >= 2 or (removed - added) >= 15:
             risks.append(Risk("medium", "test_weakened", f"Removed assertions from {_basename(paths[0])}", step.index))
+
+    if tool in ("Write", "Edit", "MultiEdit") and paths:
+        _migration_risk(paths[0], "Wrote" if tool == "Write" else "Changed", cwd, step.index, risks)
 
     if tool in WRITE_TOOLS:
         name = _basename(paths[0]) if paths else "a file"
@@ -847,6 +928,8 @@ def assess_step(step: Step, cwd: Optional[str], policy: Optional[Dict[str, Any]]
 
     if tool in SHELL_TOOLS:
         _shell_risks(step, cwd, extra, risks)
+    if tool == "Bash":
+        _shell_write_risks(step, cwd, extra, risks)
 
     if tool.startswith("mcp__"):
         risks.append(Risk("low", "mcp", f"Called an external MCP tool ({tool.split('__', 2)[-1]})", step.index))
@@ -876,11 +959,65 @@ def _score(risks: List[Risk]) -> int:
     return min(100, total)
 
 
+def _written_paths(step: Step, cwd: Optional[str]) -> List[str]:
+    """Paths a step wrote, relative to cwd when inside it (the keys of Run.test_diffs)."""
+    if step.tool in WRITE_TOOLS:
+        paths = _paths_in_step(step)[:1]
+    elif step.tool == "Bash":
+        paths = [w.path for w in shell_writes(str(step.input.get("command") or "")) if not w.deleted]
+    else:
+        return []
+    out = []
+    for p in paths:
+        p = _project_path(_resolved(p, cwd), cwd)
+        out.append(posixpath.normpath(_slashes(p)) if not _is_abs(p) else p)
+    return out
+
+
+def _apply_test_verdicts(run: Run, changes: List[TestChange], policy: Dict[str, Any]) -> None:
+    """A test file's Git diff verdict replaces what the per-step Edit rule said about it,
+    so one file never reads as both weakened and replaced."""
+    verdicts = {c.path: c for c in changes}
+    if not verdicts:
+        return
+    last_writer: Dict[str, Step] = {}
+    for s in run.steps:
+        written = [p for p in _written_paths(s, run.cwd) if p in verdicts]
+        for p in written:
+            last_writer[p] = s
+        if written and s.tool in ("Edit", "MultiEdit"):
+            s.risks = [r for r in s.risks if r.code not in ("test_weakened", "test_skipped")]
+    for path, change in verdicts.items():
+        step = last_writer.get(path)
+        if step is None:
+            continue
+        name = _basename(path)
+        if change.verdict == "skipped":
+            risk = Risk("high", "test_skipped", f"Disabled or skipped tests in {name}", step.index)
+        elif change.verdict == "weakened" and change.removed_tests:
+            risk = Risk("medium", "test_weakened",
+                        f"Removed {', '.join(change.removed_tests)} from {name} with no replacement", step.index)
+        elif change.verdict == "weakened":
+            risk = Risk("medium", "test_weakened", f"Removed assertions from {name}", step.index)
+        else:
+            continue
+        step.risks.extend(_apply_policy([risk], policy))
+
+
 def assess(run: Run) -> Tuple[int, str, List[Risk]]:
     policy = load_policy(run.cwd)
     all_risks: List[Risk] = []
     for s in run.steps:
         s.risks = assess_step(s, run.cwd, policy)
+        for r in s.risks:
+            # The Git working tree tells a new migration from an edited one.
+            m = _MIGRATION_VERB.match(r.reason) if r.code == "db_migration" else None
+            status = (run.git_changes.get(m.group(1)) or {}).get("status") if m else None
+            if status:
+                verb = "Added" if status == "untracked" else "Changed"
+                r.reason = f"{verb} a database migration ({m.group(1)})"
+    _apply_test_verdicts(run, analyze_test_diffs(run.test_diffs, run.prompts), policy)
+    for s in run.steps:
         all_risks.extend(s.risks)
     score = _score(all_risks)
     level = "Low" if score < 25 else "Medium" if score < 60 else "High"
