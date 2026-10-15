@@ -17,6 +17,11 @@ change behavior, so read the entry before you upgrade.
 
 ### Added
 
+- **JSON receipt contract:** JSON receipts carry `schema_version: 1`. `runledger/receipt.schema.json`
+  ships with the package and `docs/receipt-json.md` describes every key. Within a version,
+  changes are additive only. Markdown receipts on stdout end with
+  `<!-- runledger: safe=... schema=1 -->`.
+
 - **Risk for shell and database writes:** files written through the shell get the same path
   checks as edit-tool writes (secrets files high, `.git` folder medium, outside the project low).
   New rules: `db_migration` (medium) for new or changed migration files, `db_write` (medium) for
@@ -33,6 +38,11 @@ change behavior, so read the entry before you upgrade.
   per-step tokens are an even split of the session total.
 
 ### Fixed
+
+- **Relative working folders:** a session whose log records `cwd` as `.` (seen in Droid) no longer
+  takes the branch, Git line counts and checkpoints from the folder RunLedger runs in, and no longer
+  flags every absolute path as outside the working folder.
+- **Safe mode and path lists:** colon-separated path lists (`a:/home/u/b`) are rewritten path by path.
 
 - **Partial costs:** when some tokens have no price, the run cost reads `≥ $X (N models unpriced)`
   and JSON adds `totals.cost_partial` and `totals.unknown_models`. The cost-per-line quality signal

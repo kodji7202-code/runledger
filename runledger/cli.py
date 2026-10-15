@@ -46,7 +46,7 @@ from .guard_receipt import load_guard_decisions
 from .paths import is_abs
 from .pricing import apply_costs
 from .quality import analyze
-from .receipt import redact_run, render
+from .receipt import md_trailer, redact_run, render
 from .safe import make_safe
 from .risk import assess, is_test_source
 from .review import DEFAULT_REVIEW_MODEL, ai_review
@@ -330,6 +330,8 @@ def cmd_receipt(args) -> int:
     if safe:
         make_safe(run, risks)
     out = render(run, score, level, risks, args.format)
+    if target is None and args.format == "md":
+        out = out.rstrip("\n") + "\n\n" + md_trailer(run)
     if note:
         print(note, file=sys.stderr)
     if target is None:
