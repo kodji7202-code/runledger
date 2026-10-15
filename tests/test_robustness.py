@@ -117,17 +117,20 @@ def test_duration_handles_mixed_and_long_timestamps(start, end, seconds):
 
 
 def test_long_fraction_fallback_works_without_native_support(monkeypatch):
-    # Python 3.9 and 3.10 reject more than 6 fractional digits; force that path on newer versions.
+    # Python 3.9 and 3.10 accept only 3 or 6 fractional digits; force that path on newer versions.
+    import re
     import runledger.parser as parser_module
 
     real = parser_module.datetime
+    odd_fraction = re.compile(r"\.(?!\d{3}(?:\d{3})?(?!\d))\d+")
 
     class Strict(real):
         @classmethod
         def fromisoformat(cls, text):
-            if parser_module._LONG_FRACTION.search(text):
-                raise ValueError("too many digits")
+            if odd_fraction.search(text):
+                raise ValueError("unsupported fraction")
             return real.fromisoformat(text)
 
     monkeypatch.setattr(parser_module, "datetime", Strict)
     assert _ts("2026-01-01T00:00:00.123456789Z").microsecond == 123456
+    assert _ts("2026-01-01T00:01:00.5Z").microsecond == 500000

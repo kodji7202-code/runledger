@@ -115,7 +115,7 @@ class Run:
         return None
 
 
-_LONG_FRACTION = re.compile(r"(\.\d{6})\d+")
+_FRACTION = re.compile(r"\.(\d+)")
 
 
 def _ts(value: Optional[str]) -> Optional[datetime]:
@@ -126,9 +126,10 @@ def _ts(value: Optional[str]) -> Optional[datetime]:
     try:
         parsed = datetime.fromisoformat(text)
     except ValueError:
-        # Python 3.9 and 3.10 reject more than 6 fractional digits (nanosecond stamps).
+        # Python 3.9 and 3.10 accept only 3 or 6 fractional digits (not .5 or nanoseconds).
         try:
-            parsed = datetime.fromisoformat(_LONG_FRACTION.sub(r"\1", text))
+            parsed = datetime.fromisoformat(
+                _FRACTION.sub(lambda m: "." + m.group(1)[:6].ljust(6, "0"), text, count=1))
         except ValueError:
             return None
     if parsed.tzinfo is None:
