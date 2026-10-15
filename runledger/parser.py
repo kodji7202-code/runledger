@@ -87,6 +87,7 @@ class Run:
     quality: Optional[Dict[str, Any]] = None          # quality.py: {"score","grade","signals":[...]}
     recommendations: List[Dict[str, Any]] = field(default_factory=list)  # advisor.py
     ai_review: Optional[Dict[str, Any]] = None        # review.py (Claude Sonnet): verdict + assessments
+    checkpoint_id: Optional[str] = None              # earliest local checkpoint for this session
 
     @property
     def duration_seconds(self) -> Optional[float]:

@@ -7,16 +7,28 @@ change behavior, so read the entry before you upgrade.
 
 ## [Unreleased]
 
+### Added
+
+- **Factory Droid adapter:** receipts, risk scoring and session discovery with `--agent droid`,
+  including model and token usage from local transcripts and their settings files.
+- **Git checkpoints and rollback:** capture tracked and non-ignored untracked files without
+  changing HEAD, branches, staging or stashes; list/prune checkpoints, preview restores, select a
+  run, and undo with mandatory safety checkpoints. Refuse ignored-file, symlink-parent and
+  Windows junction obstructions rather than overwrite or traverse them.
+- **Checkpoint hooks and receipts:** Claude Code installation now includes session-start and
+  pre-prompt checkpoints. Matching HTML, Markdown and JSON receipts carry a rollback command.
+  Droid hook and Codex/manual setup are documented in `docs/rollback.md`.
+
+### Changed
+
+- Removed hosted billing; RunLedger is fully free and open source
+
 ## [0.4.1] - 2026-10-10
 
 ### Fixed
 
 - **Team run integrity:** receipts are immutable after initial upload. Identical retries remain
   idempotent; conflicting submissions using the same session id now return `409 run_conflict`.
-- **Hosted seat accounting:** billed usage is attributed to authenticated API keys instead of an
-  editable developer name; seat admission and the current subscription state are checked
-  transactionally. A recovered admin key can reuse an occupied admin seat, while repeated recovery
-  rotates the same recovery key. Keys should not be shared.
 - **Approval integrity:** requests record authenticated requester provenance, and only a separate
   administrator key may decide them. The submitted display name cannot impersonate the approver.
   Legacy approvals lacking requester provenance must be requested again.
@@ -38,25 +50,14 @@ change behavior, so read the entry before you upgrade.
 
 ### Added
 
-- **Hosted plan billing** (off unless `RUNLEDGER_POLAR_WEBHOOK_SECRET` is set; see `docs/hosted.md`).
-  `POST /billing/polar/webhook` verifies Polar's Standard Webhooks signature and applies each event once,
-  in order. A paid subscription creates a team and an admin key, emailed to the customer through Resend;
-  a failed email is retried with a fresh key. Past due: 7 days of grace, then read only. Ended: read
-  only, deleted after 30 days. The dashboard shows a banner for each state.
-- **Seats** for billed teams: a seat is a developer who pushed in the last 30 days. A push from a new
-  developer when every seat is used gets `402 seat_limit`.
-- **Key recovery**: `/recover` and `POST /billing/recover` email a new admin key to a subscriber.
 - **Retention**: `RUNLEDGER_RETENTION_DAYS` deletes older runs, approvals and audit events every hour.
 - **`runledger backup`** copies the database while the server runs and keeps the newest copies;
-  `deploy/backup.sh` runs it from cron. **`runledger billing list`** shows subscriptions, state and seats.
-- `GET /api/me` includes `billing` for billed teams.
+  `deploy/backup.sh` runs it from cron.
 
 ### Changed
 
-- `deploy/docker-compose.yml` passes the retention, trusted-proxy and billing settings from `deploy/.env`.
+- `deploy/docker-compose.yml` passes the retention and trusted-proxy settings from `deploy/.env`.
   With them empty, the server behaves as before.
-
-Teams created with `runledger team create` are not billed and have no seat limit.
 
 ## [0.3.0] - 2026-10-09
 

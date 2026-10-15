@@ -7,7 +7,6 @@
                   [--tls-cert FILE --tls-key FILE] [--secure-cookies] [--trust-proxy]
                   [--trusted-proxy CIDR ...]
   runledger team create NAME [--db runledger.db]
-  runledger billing list [--db runledger.db]
   runledger backup [--db runledger.db] [--dir backups] [--keep 14]
   runledger key create --team-id N --label L --role admin|member|viewer [--db runledger.db]
   runledger key list --team-id N [--db runledger.db]
@@ -19,9 +18,13 @@
   runledger guard install [--project PATH | --global]
   runledger guard uninstall [--project PATH | --global]
   runledger guard test 'EVENT_JSON'
+  runledger checkpoint [--label TEXT] [--run RUN_ID] [--cwd DIR]
+  runledger checkpoints [--cwd DIR]
+  runledger checkpoints prune --keep N [--cwd DIR]
+  runledger rollback [CHECKPOINT | --run RUN_ID | --last] [--dry-run] [--yes] [--cwd DIR]
 
 SESSION is a session file of any supported agent; the agent is detected from the file.
-AGENT is one of claude-code, codex, aider, native (the RunLedger format, docs/format.md).
+AGENT is one of claude-code, codex, droid, aider, native (the RunLedger format, docs/format.md).
 """
 from __future__ import annotations
 
@@ -31,7 +34,7 @@ import re
 import sqlite3
 import sys
 import webbrowser
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
@@ -45,7 +48,7 @@ from .risk import assess
 from .review import DEFAULT_REVIEW_MODEL, ai_review
 from .summarize import DEFAULT_AI_MODEL, ai_summaries, apply_templates
 
-AGENTS = ("claude-code", "codex", "aider", "native")
+AGENTS = ("claude-code", "codex", "droid", "aider", "native")
 
 
 def build(session_path: str, use_ai: bool = False, ai_model: str = DEFAULT_AI_MODEL,
@@ -58,6 +61,8 @@ def build(session_path: str, use_ai: bool = False, ai_model: str = DEFAULT_AI_MO
     Secrets are masked in everything the receipt shows, after the rules have scored the raw text."""
     path = Path(session_path)
     run = adapters.detect(path).parse(path)
+    from .rollback import checkpoint_for_run
+    run.checkpoint_id = checkpoint_for_run(run.cwd, run.session_id)
     apply_costs(run)
     apply_templates(run)
     notes: List[str] = []
@@ -79,6 +84,88 @@ def build(session_path: str, use_ai: bool = False, ai_model: str = DEFAULT_AI_MO
 
 def _one_line(exc: BaseException) -> str:
     return " ".join(str(exc).split())
+
+
+def cmd_checkpoint(args) -> int:
+    from .rollback import CheckpointError, Repository, hook_main
+    if args.hook:
+        return hook_main()
+    try:
+        run_id = args.run or os.environ.get("RUNLEDGER_RUN_ID") or os.environ.get("RUNLEDGER_SESSION_ID")
+        checkpoint = Repository(args.cwd).create(label=args.label or "", run_id=run_id)
+        print(checkpoint.id)
+        return 0
+    except (CheckpointError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
+def cmd_checkpoints(args) -> int:
+    from .rollback import CheckpointError, Repository
+    try:
+        repo = Repository(args.cwd)
+        if args.checkpoints_cmd == "prune":
+            removed = repo.prune(args.keep)
+            print(f"Pruned {len(removed)} checkpoint(s). Kept the newest {args.keep}.")
+            return 0
+        checkpoints = repo.checkpoints()
+        if not checkpoints:
+            print("No checkpoints. Create one with 'runledger checkpoint'.")
+            return 0
+        tree = repo.snapshot_tree()
+        for cp in checkpoints:
+            plan = repo.plan(cp, tree)
+            label = repr(redact(cp.label))
+            print(f"{cp.id}  {cp.created_at}  {label}  "
+                  f"({len(plan.restore) + len(plan.remove) + len(plan.keep_ignored)} file(s) differ)")
+            for path in plan.restore:
+                print(f"  restore {path!r}")
+            for path in plan.remove:
+                print(f"  remove  {path!r}")
+            for path in plan.keep_ignored:
+                print(f"  keep ignored {path!r}")
+        return 0
+    except (CheckpointError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
+def cmd_rollback(args) -> int:
+    from .rollback import CheckpointError, Repository
+    try:
+        repo = Repository(args.cwd)
+        checkpoint = repo.select(args.checkpoint, run_id=args.run)
+        plan = repo.plan(checkpoint)
+        print(f"Rollback to {checkpoint.id} in {str(repo.root)!r}")
+        for path in plan.restore:
+            print(f"  restore {path!r}")
+        for path in plan.remove:
+            print(f"  remove  {path!r}")
+        for path in plan.keep_ignored:
+            print(f"  keep ignored {path!r}")
+        print(f"{len(plan.restore)} restore, {len(plan.remove)} remove. "
+              "HEAD, branch, and index stay unchanged.")
+        if args.dry_run:
+            print("Dry run. No files restored and no safety checkpoint created.")
+            return 0
+        if not args.yes:
+            if not sys.stdin.isatty():
+                raise CheckpointError("Rollback requires confirmation. Use --dry-run to preview "
+                                      "or --yes to confirm in a non-interactive shell.")
+            try:
+                confirmed = input("Create a safety checkpoint and restore these files? [y/N] ")
+            except (EOFError, KeyboardInterrupt):
+                confirmed = ""
+            if confirmed.strip().lower() not in ("y", "yes"):
+                print("Cancelled. Nothing restored.")
+                return 1
+        safety = repo.rollback(plan)
+        print(f"Restored {checkpoint.id}. Safety checkpoint: {safety.id}")
+        print(f"Undo: runledger rollback {safety.id}")
+        return 0
+    except (CheckpointError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
 
 def _print_notes(notes: List[str]) -> None:
@@ -183,7 +270,7 @@ def cmd_serve(args) -> int:
     except TLSConfigError as exc:  # missing or unusable certificate or key
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    except ValueError as exc:  # a --trusted-proxy (or RUNLEDGER_TRUSTED_PROXIES) entry is not an address or range
+    except ValueError as exc:  # invalid trusted proxy or retention setting
         print(f"error: {exc}", file=sys.stderr)
         return 1
     except OSError as exc:  # port in use, bad address
@@ -200,8 +287,6 @@ def cmd_serve(args) -> int:
         print(f"Trusting X-Forwarded-For from: {shown}")
     if host not in _LOOPBACK and server.tls_context is None:
         print("Warning: listening on a network address. Put it behind HTTPS before sharing it.", file=sys.stderr)
-    if server.billing is not None:
-        print(f"Billing on: Polar webhooks at {server.public_url}/billing/polar/webhook")
     if server.retention_days:
         print(f"Retention: runs, approvals and audit events older than {server.retention_days} days are deleted")
     server.start_maintenance()
@@ -236,33 +321,6 @@ def cmd_team_create(args) -> int:
     print(key)
     print("Push runs with: runledger push --server URL --key KEY")
     return 0
-
-
-def cmd_billing_list(args) -> int:
-    """The hosted plan's subscriptions in a team database (see server/billing.py)."""
-    from .server import billing
-    from .server.db import Database
-
-    try:
-        db = Database(args.db)
-    except sqlite3.Error as exc:
-        print(f"error: cannot open database {args.db}: {exc}", file=sys.stderr)
-        return 1
-    try:
-        subs = db.list_subscriptions()
-        if not subs:
-            print("No subscriptions.")
-            return 0
-        print(f"{'subscription':<38}  {'team':<6}  {'name':<24}  {'state':<10}  {'seats':>5}  {'used':>4}  email")
-        since = billing.stamp(billing.now() - timedelta(days=billing.SEAT_WINDOW_DAYS))
-        for s in subs:
-            state = billing.access(s)["state"] if s["team_id"] is not None else "deleted"
-            used = len(db.seat_users(s["team_id"], since)) if s["team_id"] is not None else 0
-            print(f"{s['polar_id'][:38]:<38}  {str(s['team_id'] or '-'):<6}  {(s['team_name'] or '-')[:24]:<24}  "
-                  f"{state:<10}  {s['seats']:>5}  {used:>4}  {s['email'] or '-'}")
-        return 0
-    finally:
-        db.close()
 
 
 def cmd_backup(args) -> int:
@@ -456,12 +514,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     ptc.add_argument("--db", default="runledger.db", help="SQLite database file (default runledger.db)")
     ptc.set_defaults(func=cmd_team_create)
 
-    pb = sub.add_parser("billing", help="hosted plan: subscriptions in a team database")
-    bsub = pb.add_subparsers(dest="billing_cmd", required=True)
-    pbl = bsub.add_parser("list", help="list subscriptions, their teams, state and seats")
-    pbl.add_argument("--db", default="runledger.db", help="SQLite database file (default runledger.db)")
-    pbl.set_defaults(func=cmd_billing_list)
-
     pbk = sub.add_parser("backup", help="copy the team database safely while the server runs")
     pbk.add_argument("--db", default="runledger.db", help="SQLite database file (default runledger.db)")
     pbk.add_argument("--dir", default="backups", help="folder for the copies (default backups)")
@@ -504,9 +556,34 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help=f"model for --review (default {DEFAULT_REVIEW_MODEL})")
     pp.set_defaults(func=cmd_push)
 
-    pg = sub.add_parser("guard", help="real-time policy guard: Claude Code PreToolUse hook")
+    pc = sub.add_parser("checkpoint", help="snapshot the working tree without changing HEAD or index")
+    pc.add_argument("--label", help="checkpoint description")
+    pc.add_argument("--run", "--session-id", help="associate a run/session id (or $RUNLEDGER_RUN_ID)")
+    pc.add_argument("--cwd", help="Git working tree folder (default: current folder)")
+    pc.add_argument("--hook", action="store_true", help=argparse.SUPPRESS)
+    pc.set_defaults(func=cmd_checkpoint)
+
+    pcs = sub.add_parser("checkpoints", help="list or prune local Git checkpoints")
+    pcs.add_argument("--cwd", help="Git working tree folder (default: current folder)")
+    cssub = pcs.add_subparsers(dest="checkpoints_cmd")
+    prune = cssub.add_parser("prune", help="delete old checkpoint refs, including safety checkpoints")
+    prune.add_argument("--keep", type=int, required=True, help="number of newest checkpoints to keep")
+    prune.add_argument("--cwd", default=argparse.SUPPRESS, help="Git working tree folder")
+    pcs.set_defaults(func=cmd_checkpoints)
+
+    prb = sub.add_parser("rollback", help="preview and restore a checkpoint, saving an undo checkpoint first")
+    target = prb.add_mutually_exclusive_group()
+    target.add_argument("checkpoint", nargs="?", help="checkpoint id (default: latest, including safety checkpoints)")
+    target.add_argument("--run", help="restore the earliest checkpoint for a run/session id")
+    target.add_argument("--last", action="store_true", help="restore the latest checkpoint, including safety checkpoints")
+    prb.add_argument("--dry-run", action="store_true", help="preview without restoring files or creating a ref")
+    prb.add_argument("--yes", action="store_true", help="confirm restoration without a terminal prompt")
+    prb.add_argument("--cwd", help="Git working tree folder (default: current folder)")
+    prb.set_defaults(func=cmd_rollback)
+
+    pg = sub.add_parser("guard", help="real-time policy guard and checkpoint hooks for Claude Code")
     gsub = pg.add_subparsers(dest="guard_cmd", metavar="{install,uninstall,test}")
-    pgi = gsub.add_parser("install", help="add the guard hook to Claude Code settings.json")
+    pgi = gsub.add_parser("install", help="add guard and automatic checkpoint hooks to Claude Code")
     scope = pgi.add_mutually_exclusive_group()
     scope.add_argument("--project", metavar="PATH", help="project folder: writes PATH/.claude/settings.json (default: current folder)")
     scope.add_argument("--global", dest="global_scope", action="store_true", help="writes ~/.claude/settings.json")

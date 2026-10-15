@@ -27,16 +27,22 @@ runledger guard test 'EVENT_JSON'        # print the decision for one event; wri
 ```
 
 `install` adds one entry to `hooks.PreToolUse`, with matcher `*`, command `runledger guard` and a
-`timeout`. It keeps every other setting. Before it changes a file it copies the file to
+`timeout`. It also adds `runledger checkpoint --hook` to `SessionStart` and `UserPromptSubmit`
+so each run and prompt gets a rollback point. These checkpoint hooks require Git and a configured
+Git identity, never block the agent, and do not store prompt text in checkpoint metadata.
+See [rollback.md](rollback.md) for setup, privacy, retention, and undo.
+
+It keeps every other setting. Before it changes a file it copies the file to
 `settings.json.bak`, replacing any earlier backup. If the file already has a guard entry, its
 timeout is updated in place and no second entry is added. If nothing would change, the file is not
 written. If the file is not valid JSON or is not an object, `install` stops with an error and
 changes nothing.
 
-`uninstall` removes every `runledger guard` hook from the chosen settings file and keeps everything
+`uninstall` removes every `runledger guard` hook and both lifecycle checkpoint hooks from the
+chosen settings file and keeps everything
 else, including other hooks in the same group. A group left empty is removed, and so are an empty
-`PreToolUse` list and an empty `hooks` object. The file is copied to `settings.json.bak` first. If
-there is no guard hook, the file is not written. Your policy files and `guard.log` stay where they
+event list and an empty `hooks` object. The file is copied to `settings.json.bak` first. If
+there are no RunLedger hooks, the file is not written. Your policy files, checkpoints and `guard.log` stay where they
 are.
 
 Choose one scope. Each settings file you install into gets its own entry, so installing in both

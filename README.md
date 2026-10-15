@@ -1,12 +1,14 @@
 # RunLedger
 
-**Receipts, cost and a real-time guard for AI coding agents.**
+**Receipts and safe rollback for AI coding agents.**
 
 RunLedger reads the session logs of your coding agents and turns each run into a receipt: what
 changed, what ran, which model did each step, what it cost, and what looked risky. A Claude Code hook
 can stop risky calls before they run, and a small team server collects receipts from the whole team.
+Local Git checkpoints let you restore files from before a run, with a safety checkpoint for undo.
 
-Version 0.4.1. Python 3.9 or later, no runtime dependencies.
+RunLedger is fully free and open source, including the self-hosted team server.
+Version 0.5.0. Python 3.9 or later, no runtime dependencies.
 
 ## Quickstart
 
@@ -24,6 +26,9 @@ More in [docs/quickstart.md](docs/quickstart.md).
 - **Receipts** as HTML, Markdown or JSON: files changed with lines added and removed, every step in
   plain language, the model, tokens and estimated cost for each step, and a risk score from 0 to 100
   with the reason for each finding. Known secret formats are masked.
+- **Safe rollback:** snapshot tracked and non-ignored untracked files without changing HEAD, the
+  index or stash. Preview changes, confirm a restore, and undo with an automatic safety checkpoint.
+  See [docs/rollback.md](docs/rollback.md).
 - **A quality score** (grades A to F) with the signals behind it, and **cost tips** with estimated
   savings, in every receipt. See [docs/analysis.md](docs/analysis.md).
 - **An AI risk review** (`--review`), optional: Claude marks each finding as confirmed, false
@@ -45,12 +50,30 @@ More in [docs/quickstart.md](docs/quickstart.md).
 | --- | --- | --- | --- |
 | Claude Code | `claude-code` | Stable | `~/.claude/projects/<project>/` |
 | Codex CLI | `codex` | Beta | `$CODEX_HOME/sessions/` (default `~/.codex`) |
+| Factory Droid | `droid` | Beta | `$FACTORY_HOME/sessions/<encoded project folder>/` (default `~/.factory`) |
 | Aider | `aider` | Beta | `.aider.chat.history.md` in the project folder |
 | Any agent | `native` | Open format | `<project>/.runledger/runs/` |
 
 Any agent can write the RunLedger format and get receipts, risk scores and pushes without an adapter.
 The specification is in [docs/format.md](docs/format.md). Details per agent are in
 [docs/agents.md](docs/agents.md).
+
+## Checkpoint, restore, undo
+
+```bash
+runledger checkpoint --label "Before agent run"       # prints a checkpoint id
+runledger checkpoints                               # list snapshots and differing files
+runledger rollback CHECKPOINT_ID --dry-run           # preview restored and removed files
+runledger rollback CHECKPOINT_ID                     # confirm, save safety checkpoint, restore
+runledger rollback SAFETY_CHECKPOINT_ID               # undo using the id printed by rollback
+```
+
+Requires Git and an already configured Git identity. Ignored untracked files stay untouched.
+Rollback never changes HEAD, branches, staging, or stashes. Scripts must pass `--yes` to restore;
+use `--dry-run` to preview without restoring.
+Use `--run SESSION_ID` when creating a checkpoint to include its rollback command in the session
+receipt. `guard install` also installs automatic Claude Code session-start and pre-prompt
+checkpoints. [docs/rollback.md](docs/rollback.md) covers Droid hooks, Codex, pruning and limits.
 
 ## Team server in five steps
 
@@ -98,7 +121,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: kodji7202-code/runledger@v0.4.1
+      - uses: kodji7202-code/runledger@v0.5.0
         with:
           fail-on: "60"                   # the job fails at 60 or above; "" never fails
 ```
@@ -136,18 +159,19 @@ session transcript it came from.
   [docs/analysis.md](docs/analysis.md#ai-risk-review).
 - **The guard log** (`.runledger/guard.log`) records tool names, commands and paths, masked the same
   way. Add `.runledger/` to your `.gitignore`.
+- **Checkpoints** store real file contents locally in Git, without secret masking. Ignore sensitive
+  untracked files before enabling automatic checkpoints. Tracked secrets remain included. Do not
+  share checkpoint refs without reviewing their contents.
 - **The team server** stores every pushed receipt, including its HTML, in one SQLite file. Anyone with a
   team key can read all of that team's runs. Keys are stored only as hashes. By default nothing is
   deleted automatically; `RUNLEDGER_RETENTION_DAYS` enables automatic retention. See
   [docs/self-hosting.md](docs/self-hosting.md#configuration).
 
-## Pricing
+## Model cost estimates
 
-Cost figures are estimates from the public Claude API list prices. A subscription is not billed per token,
-so read them as "what this run would cost on the API".
-
-Plans: Free, Team at $15 per developer per month, and Enterprise. Details at
-[runledger.site](https://runledger.site).
+Cost figures estimate LLM token usage from public API list prices, not a charge for RunLedger.
+Read them as "what this run would cost on the API". Optional `--ai` and `--review` calls use
+your Anthropic API key and may incur charges from Anthropic.
 
 ## Documentation
 
@@ -155,11 +179,11 @@ Plans: Free, Team at $15 per developer per month, and Enterprise. Details at
 - [Supported agents](docs/agents.md): where each agent's sessions are, and `--agent`
 - [Session format](docs/format.md): the open format for any agent
 - [Real-time guard](docs/guard.md): policy files, approvals, fail-open and fail-closed, the log
+- [Rollback](docs/rollback.md): Git checkpoints, previews, safety checkpoints, undo and agent hooks
 - [Analysis](docs/analysis.md): the quality score, cost tips and the AI risk review
 - [Enterprise guide](docs/enterprise.md): roles, API keys, audit, budgets, exports, HTTPS
 - [HTTP API](docs/api.md): every endpoint, with examples and error codes
 - [Self-hosting](docs/self-hosting.md): Docker Compose, bare metal, backups, upgrades
-- [Hosted plan operations](docs/hosted.md): Polar billing, seats, email, retention and the server runbook
 - [GitHub pull requests](docs/github.md): the action and the comment format
 - [Contributing](CONTRIBUTING.md)
 

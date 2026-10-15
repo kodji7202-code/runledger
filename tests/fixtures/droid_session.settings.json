@@ -1,0 +1,20 @@
+{
+  "model": "claude-sonnet-4-5",
+  "reasoningEffort": "medium",
+  "tokenUsage": {
+    "inputTokens": 1003,
+    "outputTokens": 203,
+    "cacheCreationTokens": 103,
+    "cacheReadTokens": 503,
+    "thinkingTokens": 30,
+    "factoryCredits": 999
+  },
+  "inclusiveTokenUsage": {
+    "inputTokens": 9000,
+    "outputTokens": 9000
+  },
+  "lastCallTokenUsage": {
+    "inputTokens": 100,
+    "outputTokens": 20
+  }
+}

@@ -19,7 +19,6 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ..pricing import friendly_model
-from .billing import ACTIVE, ENDED, PAST_DUE, access as billing_access, write_refusal as billing_write_refusal
 from .insights import AI_REVIEW_LIKE, QUALITY_LIKE, RECOMMENDATIONS_LIKE, review_fields
 from .auth import (
     INITIAL_KEY_LABEL,
@@ -153,16 +152,6 @@ CREATE TABLE IF NOT EXISTS api_keys (
     revoked_at    TEXT
 );
 CREATE INDEX IF NOT EXISTS api_keys_by_team ON api_keys (team_id);
--- A recovery key may inherit one already-paid seat without rewriting the run
--- that originally occupied it. Only billing recovery creates these aliases.
--- Repeated recoveries rotate the same active alias key, so this cannot grow an
--- unbounded family of simultaneously usable keys for one seat.
-CREATE TABLE IF NOT EXISTS seat_aliases (
-    key_id       TEXT PRIMARY KEY REFERENCES api_keys (id),
-    team_id      INTEGER NOT NULL REFERENCES teams (id),
-    seat_key_id  TEXT NOT NULL REFERENCES api_keys (id)
-);
-CREATE INDEX IF NOT EXISTS seat_aliases_by_team ON seat_aliases (team_id);
 CREATE TABLE IF NOT EXISTS audit_log (
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
     team_id  INTEGER NOT NULL REFERENCES teams (id),
@@ -192,33 +181,6 @@ CREATE TABLE IF NOT EXISTS budget_alerts (
     limit_usd  REAL NOT NULL,
     fired_at   TEXT NOT NULL,
     PRIMARY KEY (team_id, month, scope, threshold)
-);
--- Hosted plan (see billing.py). A team with a row here is billed; team_id is NULL once the
--- team has been deleted, and email is then cleared too.
-CREATE TABLE IF NOT EXISTS billing_subscriptions (
-    polar_id             TEXT PRIMARY KEY,
-    team_id              INTEGER UNIQUE REFERENCES teams (id),
-    customer_id          TEXT,
-    email                TEXT,
-    product_id           TEXT,
-    status               TEXT NOT NULL,
-    seats                INTEGER NOT NULL DEFAULT 1,
-    current_period_end   TEXT,
-    cancel_at_period_end INTEGER NOT NULL DEFAULT 0,
-    past_due_since       TEXT,
-    ended_at             TEXT,
-    source_modified_at   TEXT,
-    welcome_sent_at      TEXT,
-    last_recovery_at     TEXT,
-    created_at           TEXT NOT NULL,
-    updated_at           TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS billing_by_email ON billing_subscriptions (email);
--- Webhook ids already handled, so a redelivered event is applied once.
-CREATE TABLE IF NOT EXISTS billing_events (
-    webhook_id   TEXT PRIMARY KEY,
-    type         TEXT NOT NULL,
-    received_at  TEXT NOT NULL
 );
 """
 
@@ -593,72 +555,6 @@ class Database:
             self._audit(team_id, actor, "key.create", key_id, {"label": label, "role": role, "prefix": prefix})
         return {"id": key_id, "label": label, "role": role, "prefix": prefix, "created_at": now, "key": key}
 
-    def create_recovery_key(
-        self, team_id: int, label: Any, actor: str, seat_since: str
-    ) -> Dict[str, Any]:
-        """Create or rotate the team's billing-recovery admin key.
-
-        If an admin key already occupies a recent billed seat, the recovery key
-        aliases that seat. The original run keeps its original pushed_by_key_id,
-        and the original key remains valid. A later recovery rotates the same
-        active recovery key instead of creating another active alias.
-
-        If no admin key currently occupies a seat, the recovery key is a normal
-        new key and must acquire a seat like any other key.
-        """
-        label = validate_label(label)
-        new_key = generate_key()
-        now = utc_now()
-        with self._lock, self._conn:
-            if self._conn.execute("SELECT 1 FROM teams WHERE id = ?", (team_id,)).fetchone() is None:
-                raise ValueError(f"No team with id {team_id}.")
-
-            existing = self._conn.execute(
-                "SELECT k.id, k.created_at, sa.seat_key_id FROM api_keys k "
-                "JOIN seat_aliases sa ON sa.key_id = k.id "
-                "WHERE k.team_id = ? AND k.revoked_at IS NULL "
-                "ORDER BY k.created_at, k.rowid LIMIT 1",
-                (team_id,),
-            ).fetchone()
-            if existing is not None:
-                prefix = key_prefix(new_key)
-                self._conn.execute(
-                    "UPDATE api_keys SET label = ?, role = 'admin', key_hash = ?, prefix = ? WHERE id = ?",
-                    (label, hash_key(new_key), prefix, existing["id"]),
-                )
-                self._conn.execute("DELETE FROM sessions WHERE key_id = ?", (existing["id"],))
-                self._audit(
-                    team_id,
-                    actor,
-                    "key.rotate",
-                    existing["id"],
-                    {"label": label, "role": "admin", "prefix": prefix},
-                )
-                return {
-                    "id": existing["id"], "label": label, "role": "admin", "prefix": prefix,
-                    "created_at": existing["created_at"], "key": new_key,
-                }
-
-            occupied = self._conn.execute(
-                "SELECT COALESCE(sa.seat_key_id, r.pushed_by_key_id) AS seat_key_id "
-                "FROM runs r JOIN api_keys k ON k.id = r.pushed_by_key_id "
-                "LEFT JOIN seat_aliases sa ON sa.key_id = r.pushed_by_key_id "
-                "WHERE r.team_id = ? AND r.updated_at >= ? AND r.pushed_by_key_id IS NOT NULL "
-                "AND k.role = 'admin' "
-                "ORDER BY r.updated_at DESC, r.rowid DESC LIMIT 1",
-                (team_id, seat_since),
-            ).fetchone()
-
-            key_id = self._insert_key(team_id, label, "admin", new_key, now)
-            if occupied is not None:
-                self._conn.execute(
-                    "INSERT INTO seat_aliases (key_id, team_id, seat_key_id) VALUES (?, ?, ?)",
-                    (key_id, team_id, occupied["seat_key_id"]),
-                )
-            prefix = key_prefix(new_key)
-            self._audit(team_id, actor, "key.create", key_id, {"label": label, "role": "admin", "prefix": prefix})
-        return {"id": key_id, "label": label, "role": "admin", "prefix": prefix, "created_at": now, "key": new_key}
-
     def revoke_key(self, team_id: int, key_id: str, actor: str) -> Tuple[str, Optional[Dict[str, Any]]]:
         """Revoke a key. Returns (outcome, view): "ok", "missing", "already_revoked", or
         "last_admin" (the team's only active admin key cannot be revoked)."""
@@ -752,38 +648,20 @@ class Database:
         actor: Optional[str] = None,
         *,
         key_id: Optional[str] = None,
-        seat_since: Optional[str] = None,
-        enforce_billing: bool = False,
     ) -> Dict[str, Any]:
         """Store one run immutably.
 
         An identical re-push is idempotent. A different receipt with the same
-        team/session id is rejected instead of replacing evidence. When a seat
-        limit is supplied, admission for a new authenticated key and the insert
-        share this lock/transaction, so concurrent pushes cannot oversubscribe
-        a single server process.
+        team/session id is rejected instead of replacing evidence. The check and
+        insert share this lock/transaction, so concurrent pushes cannot replace
+        one another.
 
-        Returns a result dict whose outcome is inserted, duplicate, conflict,
-        payment_required or seat_limit. Billing state and seat count are read
-        under this same lock as the insert, so a concurrent subscription
-        webhook cannot make admission use stale plan data.
+        Returns a result dict whose outcome is inserted, duplicate or conflict.
         """
         now = utc_now()
         models_json = json.dumps(run["models"], sort_keys=True)
         receipt_json = json.dumps(run["receipt"], ensure_ascii=False)
         with self._lock, self._conn:
-            seat_limit: Optional[int] = None
-            if enforce_billing:
-                sub = self._conn.execute(
-                    "SELECT * FROM billing_subscriptions WHERE team_id = ?", (team_id,)
-                ).fetchone()
-                if sub is not None:
-                    info = billing_access(sub)
-                    refusal = billing_write_refusal(info)
-                    if refusal:
-                        return {"outcome": "payment_required", "message": refusal}
-                    seat_limit = int(info["seats"])
-
             existing = self._conn.execute(
                 "SELECT receipt_json, receipt_html, risk_score, risk_level "
                 "FROM runs WHERE team_id = ? AND id = ?",
@@ -801,31 +679,6 @@ class Database:
                         "risk_level": existing["risk_level"],
                     }
                 return {"outcome": "conflict"}
-
-            if key_id is not None and seat_limit is not None and seat_since is not None:
-                rows = self._conn.execute(
-                    "SELECT r.pushed_by_key_id, r.user, sa.seat_key_id FROM runs r "
-                    "LEFT JOIN seat_aliases sa ON sa.key_id = r.pushed_by_key_id "
-                    "WHERE r.team_id = ? AND r.updated_at >= ?",
-                    (team_id, seat_since),
-                ).fetchall()
-                # Legacy rows were attributed from the receipt's caller-supplied
-                # user string, so they cannot be mapped securely to a key during
-                # migration. The first post-upgrade authenticated push starts a
-                # fresh key-backed seat ledger instead of double-counting legacy
-                # rows for the rest of the seat window.
-                identities = {
-                    "key:" + (row["seat_key_id"] or row["pushed_by_key_id"])
-                    for row in rows
-                    if row["pushed_by_key_id"]
-                }
-                alias = self._conn.execute(
-                    "SELECT seat_key_id FROM seat_aliases WHERE key_id = ? AND team_id = ?",
-                    (key_id, team_id),
-                ).fetchone()
-                seat_key_id = alias["seat_key_id"] if alias else key_id
-                if "key:" + seat_key_id not in identities and len(identities) >= int(seat_limit):
-                    return {"outcome": "seat_limit", "seat_limit": seat_limit}
 
             self._conn.execute(
                 """
@@ -1331,211 +1184,7 @@ class Database:
             return "expired", view
         return "conflict", view
 
-    # Billing (see billing.py)
-
-    def billing_event_seen(self, webhook_id: str) -> bool:
-        with self._lock:
-            row = self._conn.execute("SELECT 1 FROM billing_events WHERE webhook_id = ?", (webhook_id,)).fetchone()
-        return row is not None
-
-    def record_billing_event(self, webhook_id: str, event_type: str) -> None:
-        with self._lock, self._conn:
-            self._conn.execute(
-                "INSERT OR IGNORE INTO billing_events (webhook_id, type, received_at) VALUES (?, ?, ?)",
-                (webhook_id, str(event_type)[:100], utc_now()),
-            )
-
-    def apply_subscription(self, sub: Dict[str, Any], actor: str = "billing:polar") -> Dict[str, Any]:
-        """Store a subscription from a webhook (see billing.parse_subscription) and create its team
-        the first time it is active. Returns the stored row plus:
-
-          stale            the event was older than what is stored, or late for a deleted team: ignored
-          previous_status  the status before this event (None for a new subscription)
-          created_key      the new team's admin key, when this event created the team
-          team_name        the team's name, or None
-
-        Polar may deliver events out of order, so an event whose modified_at is older than the one
-        stored is ignored, and "incomplete" never replaces a later status."""
-        now = utc_now()
-        status = sub["status"]
-        with self._lock, self._conn:
-            row = self._conn.execute(
-                "SELECT * FROM billing_subscriptions WHERE polar_id = ?", (sub["id"],)
-            ).fetchone()
-            previous = row["status"] if row else None
-            extra: Dict[str, Any] = {"stale": False, "previous_status": previous, "created_key": None}
-            if row is not None:
-                older = bool(sub["modified_at"] and row["source_modified_at"]
-                             and sub["modified_at"] < row["source_modified_at"])
-                regress = status == "incomplete" and previous != "incomplete"
-                deleted = row["team_id"] is None and row["ended_at"] is not None and status not in ACTIVE
-                if older or regress or deleted:
-                    extra["stale"] = True
-                    return self._billing_result(row, extra)
-            past_due_since = ((row["past_due_since"] if row else None) or now) if status in PAST_DUE else None
-            ended_at = ((row["ended_at"] if row else None) or sub["ended_at"] or now) if status in ENDED else None
-            team_id = row["team_id"] if row else None
-            if team_id is None and status in ACTIVE:
-                team_id, key = self._create_team_locked(self._free_team_name(sub["team_name"]), actor)
-                extra["created_key"] = key
-                self._audit(team_id, actor, "billing.provision", sub["id"], {"seats": sub["seats"]})
-            values = (
-                team_id, sub["customer_id"], sub["email"], sub["product_id"], status, sub["seats"],
-                sub["current_period_end"], int(sub["cancel_at_period_end"]), past_due_since, ended_at,
-                sub["modified_at"], now,
-            )
-            if row is None:
-                self._conn.execute(
-                    "INSERT INTO billing_subscriptions (team_id, customer_id, email, product_id, status, seats, "
-                    "current_period_end, cancel_at_period_end, past_due_since, ended_at, source_modified_at, "
-                    "updated_at, created_at, polar_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    values + (now, sub["id"]),
-                )
-            else:
-                self._conn.execute(
-                    "UPDATE billing_subscriptions SET team_id = ?, customer_id = ?, email = ?, product_id = ?, "
-                    "status = ?, seats = ?, current_period_end = ?, cancel_at_period_end = ?, past_due_since = ?, "
-                    "ended_at = ?, source_modified_at = ?, updated_at = ? WHERE polar_id = ?",
-                    values + (sub["id"],),
-                )
-            changed = row is None or (previous, row["seats"], bool(row["cancel_at_period_end"])) != (
-                status, sub["seats"], bool(sub["cancel_at_period_end"]))
-            if team_id is not None and changed:
-                self._audit(team_id, actor, "billing.subscription", sub["id"], {
-                    "status": status, "seats": sub["seats"],
-                    "cancel_at_period_end": bool(sub["cancel_at_period_end"]),
-                })
-            stored = self._conn.execute(
-                "SELECT * FROM billing_subscriptions WHERE polar_id = ?", (sub["id"],)
-            ).fetchone()
-            return self._billing_result(stored, extra)
-
-    def _billing_result(self, row: sqlite3.Row, extra: Dict[str, Any]) -> Dict[str, Any]:
-        result = dict(row)
-        result.update(extra)
-        result["team_name"] = None
-        if row["team_id"] is not None:
-            name = self._conn.execute("SELECT name FROM teams WHERE id = ?", (row["team_id"],)).fetchone()
-            result["team_name"] = name["name"] if name else None
-        return result
-
-    def _free_team_name(self, base: str) -> str:
-        """`base`, or "base 2", "base 3"... when a team already has that name."""
-        name, n = base, 2
-        while self._conn.execute("SELECT 1 FROM teams WHERE name = ?", (name,)).fetchone() is not None:
-            name = f"{base} {n}"
-            n += 1
-        return name
-
-    def welcome_key(self, team_id: int, actor: str = "billing:polar") -> str:
-        """A fresh secret for the team's first admin key, for a welcome email that has to be sent
-        again (the plaintext of the earlier one is gone). Falls back to a new admin key "owner"."""
-        new_key = generate_key()
-        with self._lock, self._conn:
-            row = self._conn.execute(
-                "SELECT id, label FROM api_keys WHERE team_id = ? AND role = 'admin' AND label = ? "
-                "AND revoked_at IS NULL ORDER BY created_at, rowid LIMIT 1",
-                (team_id, INITIAL_KEY_LABEL),
-            ).fetchone()
-            if row is None:
-                key_id = self._insert_key(team_id, "owner", "admin", new_key, utc_now())
-                self._audit(team_id, actor, "key.create", key_id,
-                            {"label": "owner", "role": "admin", "prefix": key_prefix(new_key)})
-                return new_key
-            self._conn.execute("UPDATE api_keys SET key_hash = ?, prefix = ? WHERE id = ?",
-                               (hash_key(new_key), key_prefix(new_key), row["id"]))
-            self._conn.execute("DELETE FROM sessions WHERE key_id = ?", (row["id"],))
-            self._audit(team_id, actor, "key.rotate", row["id"],
-                        {"label": row["label"], "role": "admin", "prefix": key_prefix(new_key)})
-        return new_key
-
-    def mark_welcome_sent(self, polar_id: str) -> None:
-        with self._lock, self._conn:
-            self._conn.execute("UPDATE billing_subscriptions SET welcome_sent_at = ? WHERE polar_id = ?",
-                               (utc_now(), polar_id))
-
-    def billing_for_team(self, team_id: int) -> Optional[Dict[str, Any]]:
-        """The subscription of a billed team, or None for a team created with `runledger team create`."""
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT * FROM billing_subscriptions WHERE team_id = ?", (team_id,)
-            ).fetchone()
-        return dict(row) if row else None
-
-    def seat_users(self, team_id: int, since: str) -> List[str]:
-        """Authenticated seat identities active since the supplied timestamp.
-
-        New rows count by API key id. Rows created before key attribution was
-        introduced keep counting by their legacy receipt user until they age
-        out of the seat window.
-        """
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT r.pushed_by_key_id, r.user, sa.seat_key_id FROM runs r "
-                "LEFT JOIN seat_aliases sa ON sa.key_id = r.pushed_by_key_id "
-                "WHERE r.team_id = ? AND r.updated_at >= ? "
-                "ORDER BY r.pushed_by_key_id, r.user",
-                (team_id, since),
-            ).fetchall()
-        keyed = {
-            "key:" + (r["seat_key_id"] or r["pushed_by_key_id"])
-            for r in rows if r["pushed_by_key_id"]
-        }
-        if keyed:
-            return sorted(keyed)
-        return sorted({"legacy-user:" + r["user"] for r in rows})
-
-    def subscriptions_for_email(self, email: str) -> List[Dict[str, Any]]:
-        """Subscriptions with a team (not yet deleted) for this customer email."""
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT s.*, t.name AS team_name FROM billing_subscriptions s JOIN teams t ON t.id = s.team_id "
-                "WHERE s.email = ? ORDER BY s.created_at",
-                (email,),
-            ).fetchall()
-        return [dict(r) for r in rows]
-
-    def claim_recovery(self, polar_id: str, cutoff: str) -> bool:
-        """Record a key recovery for this subscription unless one happened after `cutoff`."""
-        with self._lock, self._conn:
-            cur = self._conn.execute(
-                "UPDATE billing_subscriptions SET last_recovery_at = ? WHERE polar_id = ? "
-                "AND (last_recovery_at IS NULL OR last_recovery_at < ?)",
-                (utc_now(), polar_id, cutoff),
-            )
-        return cur.rowcount == 1
-
-    def list_subscriptions(self) -> List[Dict[str, Any]]:
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT s.*, t.name AS team_name FROM billing_subscriptions s "
-                "LEFT JOIN teams t ON t.id = s.team_id ORDER BY s.created_at"
-            ).fetchall()
-        return [dict(r) for r in rows]
-
-    def teams_due_for_deletion(self, ended_before: str) -> List[Dict[str, Any]]:
-        """Billed teams whose subscription ended before `ended_before`."""
-        placeholders = ", ".join("?" for _ in ENDED)
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT polar_id, team_id FROM billing_subscriptions WHERE team_id IS NOT NULL "
-                f"AND status IN ({placeholders}) AND ended_at IS NOT NULL AND ended_at < ?",
-                tuple(ENDED) + (ended_before,),
-            ).fetchall()
-        return [dict(r) for r in rows]
-
-    def delete_team(self, team_id: int) -> None:
-        """Delete a team and everything it owns. Its subscription row stays, for the billing
-        history, without the team and without the customer's email."""
-        with self._lock, self._conn:
-            for table in ("sessions", "risks", "runs", "approvals", "audit_log", "budget_alerts",
-                          "seat_aliases", "api_keys"):
-                self._conn.execute(f"DELETE FROM {table} WHERE team_id = ?", (team_id,))
-            self._conn.execute(
-                "UPDATE billing_subscriptions SET team_id = NULL, email = NULL, updated_at = ? WHERE team_id = ?",
-                (utc_now(), team_id),
-            )
-            self._conn.execute("DELETE FROM teams WHERE id = ?", (team_id,))
+    # Retention
 
     def purge_before(self, cutoff: str) -> Dict[str, int]:
         """Delete, for every team, runs that started (or were pushed) before `cutoff`, and approvals,
@@ -1558,5 +1207,4 @@ class Database:
             counts["budget_alerts"] = self._conn.execute(
                 "DELETE FROM budget_alerts WHERE fired_at < ?", (cutoff,)
             ).rowcount
-            self._conn.execute("DELETE FROM billing_events WHERE received_at < ?", (cutoff,))
         return counts

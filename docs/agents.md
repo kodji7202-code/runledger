@@ -8,6 +8,7 @@ way for every agent.
 | --- | --- | --- | --- |
 | Claude Code | `claude-code` | Stable | `~/.claude/projects/<encoded project folder>/<session>.jsonl` |
 | Codex CLI | `codex` | Beta | `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl` (default `~/.codex`) |
+| Factory Droid | `droid` | Beta | `$FACTORY_HOME/sessions/<encoded project folder>/<session>.jsonl` (default `~/.factory`) |
 | Aider | `aider` | Beta | `.aider.chat.history.md` in the project folder |
 | Any other agent | `native` | Open format | `<project>/.runledger/runs/*.runledger.json` or `*.runledger.jsonl` |
 
@@ -24,21 +25,22 @@ agent in the folder, by file modification time. With it, only that agent's sessi
 runledger list                              # every agent, this folder
 runledger list --agent codex                # Codex sessions for this folder
 runledger receipt --agent aider -o aider.html
+runledger receipt --agent droid --open
 runledger push --agent claude-code --server https://runledger.example.com --key KEY
 ```
 
 - **Folder.** The folder is the current folder unless you pass `--project PATH` (for `list`,
   `receipt` and `push`).
-- **All folders.** `runledger list --all` lists sessions from every folder. It covers Claude Code
-  and Codex only. Aider keeps no global index, and the RunLedger format lives inside each project,
+- **All folders.** `runledger list --all` lists sessions from every folder. It covers Claude Code,
+  Codex and Factory Droid. Aider keeps no global index, and the RunLedger format lives inside each project,
   so `--all` does not list them. Use `--project` with those agents.
 - **An explicit file.** Pass the session file as the argument to skip the folder search:
   `runledger receipt path/to/session.jsonl`. RunLedger detects the agent from the file. If you also
   pass `--agent`, it prints `note: --agent is ignored when a session file is given`.
 - **Limit.** `list` shows 20 sessions by default. Use `--limit N` for more.
 
-Detection for an explicit file uses the file itself: a Codex rollout file, an Aider history file,
-a RunLedger-format file, or else Claude Code's JSONL format.
+Detection for an explicit file uses the file itself: a Codex rollout file, a Droid `session_start`
+header, an Aider history file, a RunLedger-format file, or else Claude Code's JSONL format.
 
 ## Claude Code (stable)
 
@@ -69,6 +71,33 @@ which has no envelope on each line.
 - **Usage.** The run total is the last cumulative token count in the session. Each model call's
   usage is split evenly across the steps issued since the previous count.
 - **Cost.** Estimated from list prices. Codex does not report its own cost.
+
+## Factory Droid (beta)
+
+Droid writes a JSONL transcript and a sibling settings file:
+
+```
+~/.factory/sessions/<cwd-with-path-separators-replaced-by-dashes>/<session-id>.jsonl
+~/.factory/sessions/<cwd-with-path-separators-replaced-by-dashes>/<session-id>.settings.json
+```
+
+- **Config directory.** `FACTORY_HOME` overrides `~/.factory`.
+- **Matching.** The `cwd` in the `session_start` header identifies the project. Sessions are
+  sorted newest first by transcript modification time. `list --all --agent droid` covers all projects.
+- **Messages.** Human text becomes the request; system reminders and hidden context are excluded.
+  Assistant `tool_use` blocks become steps, matched to `tool_result` blocks by id. `Execute` maps
+  to `Bash`, `Create` to `Write`, and `Edit` fields to `old_string` / `new_string`. File searches
+  map to `Search`; `FetchUrl` maps to `WebFetch`. Patch calls become edits, writes or deletions.
+- **Model.** Each assistant message's `modelId` (or `model`) takes precedence over the settings
+  file's `model`. No model is guessed when both are absent.
+- **Usage.** Per-message usage is counted once when present. The settings file's cumulative
+  `tokenUsage` supplies any remaining input, output, cache-creation and cache-read tokens.
+  Thinking tokens, credits, `inclusiveTokenUsage` and `lastCallTokenUsage` are not added again.
+  Without per-message usage, a single-model total is split evenly across steps as an approximation.
+  A mixed-model cumulative total cannot be attributed reliably, so its remainder has an unknown model.
+- **Cost.** Only token counts with a known model price produce estimates. Unknown models and
+  missing usage leave the run cost unknown. Missing or partially written settings do not prevent
+  parsing the transcript.
 
 ## Aider (beta)
 
@@ -106,6 +135,16 @@ push without any code in RunLedger.
   detected as this format when passed on the command line.
 
 The field-by-field specification is [format.md](format.md).
+
+## Checkpoints across agents
+
+`checkpoint`, `checkpoints` and `rollback` work with every agent in a Git working tree.
+`guard install` adds automatic Claude Code session-start and pre-prompt checkpoints. Droid can
+use the same lifecycle command in `.factory/hooks.json`. Codex and other agents can use manual
+commands or their own wrappers. See [rollback.md](rollback.md) for examples and safety limits.
+
+Associate a checkpoint with the transcript's session id using `checkpoint --run SESSION_ID`;
+the matching receipt then includes a local rollback command. Checkpoint contents are not uploaded.
 
 ## Costs across agents
 

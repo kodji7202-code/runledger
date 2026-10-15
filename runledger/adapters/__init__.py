@@ -28,7 +28,7 @@ import importlib
 from pathlib import Path
 from typing import List, Optional
 
-ADAPTER_MODULES = ["claude_code", "codex", "aider", "native"]
+ADAPTER_MODULES = ["claude_code", "codex", "droid", "aider", "native"]
 
 
 def adapters():
