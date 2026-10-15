@@ -26,6 +26,22 @@ def _short(path: str, cwd: Optional[str]) -> str:
     return path
 
 
+COMMAND_LIMIT = 120
+GOAL_LIMIT = 200
+
+
+def shorten(text: str, limit: int) -> str:
+    """Cut at the last space before `limit` and add an ellipsis; one long word is cut hard."""
+    text = " ".join(text.split())
+    if len(text) <= limit:
+        return text
+    head = text[:limit - 1]
+    space = head.rfind(" ")
+    if space >= limit // 2:
+        head = head[:space]
+    return head.rstrip() + "…"
+
+
 def _lines(s: Optional[str]) -> int:
     return len(s.splitlines()) if s else 0
 
@@ -112,8 +128,12 @@ def template_summary(step: Step, cwd: Optional[str]) -> str:
         return f"Edited {p} (+{a} −{r})"
     if t == "Bash":
         desc = i.get("description")
+        lines = str(i.get("command", "")).strip().splitlines() or [""]
         # Redact before cutting, so the 120-character limit cannot keep half of a secret.
-        cmd = llm.redact((str(i.get("command", "")).strip().splitlines() or [""])[0])[:120]
+        # A backtick would close the Markdown code span and split the HTML <code> early.
+        cmd = shorten(llm.redact(lines[0]), COMMAND_LIMIT).replace("`", "'")
+        if len(lines) > 1:
+            cmd += f" (+{len(lines) - 1} line{'s' if len(lines) > 2 else ''})"
         outcome = " — failed" if step.is_error else ""
         m = re.search(r"(\d+)\s+passed", step.result_text)
         f = re.search(r"(\d+)\s+failed", step.result_text)
@@ -152,7 +172,7 @@ def apply_templates(run: Run) -> None:
         s.summary = template_summary(s, run.cwd)
     if not run.overall_summary:
         n_files = len(file_changes(run))
-        goal = llm.redact(run.prompts[0])[:200] if run.prompts else "an unspecified task"
+        goal = shorten(llm.redact(run.prompts[0]), GOAL_LIMIT) if run.prompts else "an unspecified task"
         goal = goal.rstrip(" .")
         run.overall_summary = (f"Asked to: “{goal}”. The agent took {len(run.steps)} steps "
                                f"and changed {n_files} file{'s' if n_files != 1 else ''}.")

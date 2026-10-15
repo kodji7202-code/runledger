@@ -16,7 +16,7 @@ import json
 import os
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -108,54 +108,96 @@ class Run:
         return None
 
 
+_LONG_FRACTION = re.compile(r"(\.\d{6})\d+")
+
+
 def _ts(value: Optional[str]) -> Optional[datetime]:
-    if not value:
+    """Parse an ISO timestamp as UTC; naive values are taken as UTC so they compare with aware ones."""
+    if not value or not isinstance(value, str):
         return None
+    text = value.strip().replace("Z", "+00:00").replace("z", "+00:00")
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(text)
     except ValueError:
-        return None
+        # Python 3.9 and 3.10 reject more than 6 fractional digits (nanosecond stamps).
+        try:
+            parsed = datetime.fromisoformat(_LONG_FRACTION.sub(r"\1", text))
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _count(value: Any) -> int:
+    """A token count from untrusted JSON: non-numbers, negatives, NaN and booleans count as 0."""
+    if isinstance(value, bool):
+        return 0
+    try:
+        number = int(float(value)) if isinstance(value, str) else int(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return max(0, number)
 
 
 def _usage(raw: Optional[Dict[str, Any]]) -> Usage:
-    raw = raw or {}
+    raw = raw if isinstance(raw, dict) else {}
     return Usage(
-        input_tokens=int(raw.get("input_tokens") or 0),
-        output_tokens=int(raw.get("output_tokens") or 0),
-        cache_write_tokens=int(raw.get("cache_creation_input_tokens") or 0),
-        cache_read_tokens=int(raw.get("cache_read_input_tokens") or 0),
+        input_tokens=_count(raw.get("input_tokens")),
+        output_tokens=_count(raw.get("output_tokens")),
+        cache_write_tokens=_count(raw.get("cache_creation_input_tokens")),
+        cache_read_tokens=_count(raw.get("cache_read_input_tokens")),
     )
 
 
-def _text_of(content: Any) -> str:
+def _text_of(content: Any, depth: int = 0) -> str:
     if isinstance(content, str):
         return content
-    if isinstance(content, list):
+    if isinstance(content, list) and depth < 20:
         parts = []
         for block in content:
             if isinstance(block, dict):
                 if block.get("type") == "text":
-                    parts.append(block.get("text", ""))
+                    text = block.get("text")
+                    parts.append(text if isinstance(text, str) else "")
                 elif "content" in block:
-                    parts.append(_text_of(block["content"]))
+                    parts.append(_text_of(block["content"], depth + 1))
             elif isinstance(block, str):
                 parts.append(block)
         return "\n".join(p for p in parts if p)
     return ""
 
 
+_EVENT_TYPES = {"user", "assistant", "system", "summary", "result", "file-history-snapshot",
+                "queue-operation", "progress"}
+
+
+def _str(value: Any) -> str:
+    return value if isinstance(value, str) else ""
+
+
+def _is_event(ev: Dict[str, Any]) -> bool:
+    return _str(ev.get("type")) in _EVENT_TYPES or isinstance(ev.get("sessionId"), str)
+
+
 def parse_session(path: str | os.PathLike) -> Run:
     path = str(path)
     events: List[Dict[str, Any]] = []
-    with open(path, "r", encoding="utf-8") as fh:
+    lines = 0
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
         for line in fh:
             line = line.strip()
             if not line:
                 continue
+            lines += 1
             try:
-                events.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue  # tolerate partial lines from a live session
+                event = json.loads(line)
+            except (ValueError, RecursionError):
+                continue  # tolerate partial lines from a live session, and absurdly deep nesting
+            if isinstance(event, dict):
+                events.append(event)
+    if lines and not any(_is_event(ev) for ev in events):
+        raise ValueError(f"{path}: not a supported session file")
 
     session_id = Path(path).stem
     cwd = git_branch = started = ended = None
@@ -169,14 +211,15 @@ def parse_session(path: str | os.PathLike) -> Run:
 
     for ev in events:
         etype = ev.get("type")
-        ts = ev.get("timestamp")
+        ts = _str(ev.get("timestamp")) or None
         if ts:
             started = started or ts
             ended = ts
-        cwd = cwd or ev.get("cwd")
-        git_branch = git_branch or ev.get("gitBranch")
-        session_id = ev.get("sessionId") or session_id
-        msg = ev.get("message") or {}
+        cwd = cwd or _str(ev.get("cwd")) or None
+        git_branch = git_branch or _str(ev.get("gitBranch")) or None
+        session_id = _str(ev.get("sessionId")) or session_id
+        msg = ev.get("message")
+        msg = msg if isinstance(msg, dict) else {}
 
         if etype == "user":
             content = msg.get("content")
@@ -184,23 +227,23 @@ def parse_session(path: str | os.PathLike) -> Run:
                 if not ev.get("isMeta") and content.strip() and not content.startswith("<command-"):
                     prompts.append(content.strip())
                 continue
-            for block in content or []:
+            for block in content if isinstance(content, list) else []:
                 if not isinstance(block, dict):
                     continue
                 if block.get("type") == "tool_result":
-                    step = by_tool_id.get(block.get("tool_use_id", ""))
+                    step = by_tool_id.get(_str(block.get("tool_use_id")))
                     if step:
                         step.result_text = _text_of(block.get("content"))[:4000]
                         step.is_error = bool(block.get("is_error"))
                         step.has_result = True
                 elif block.get("type") == "text" and not ev.get("isMeta"):
-                    t = block.get("text", "").strip()
+                    t = _str(block.get("text")).strip()
                     if t and not t.startswith("<"):
                         prompts.append(t)
 
         elif etype == "assistant":
-            mid = msg.get("id") or ev.get("uuid") or str(len(seen_msg_ids))
-            model = msg.get("model")
+            mid = _str(msg.get("id")) or _str(ev.get("uuid")) or str(len(seen_msg_ids))
+            model = _str(msg.get("model")) or None
             if model == "<synthetic>":
                 model = None
             if mid not in msg_usage:
@@ -212,22 +255,24 @@ def parse_session(path: str | os.PathLike) -> Run:
                 u = _usage(msg.get("usage"))
                 if u.total > msg_usage[mid].total:
                     msg_usage[mid] = u
-            for block in msg.get("content") or []:
+            content = msg.get("content")
+            for block in content if isinstance(content, list) else []:
                 if not isinstance(block, dict):
                     continue
                 if block.get("type") == "tool_use":
+                    inp = block.get("input")
                     step = Step(
                         index=len(steps) + 1,
-                        tool=block.get("name", "?"),
-                        input=block.get("input") or {},
-                        tool_use_id=block.get("id", ""),
+                        tool=_str(block.get("name")) or "?",
+                        input=inp if isinstance(inp, dict) else {},
+                        tool_use_id=_str(block.get("id")),
                         model=model,
                         timestamp=ts,
                     )
                     steps.append(step)
                     by_tool_id[step.tool_use_id] = step
                     seen_msg_ids[mid].append(step)
-                elif block.get("type") == "text" and block.get("text", "").strip():
+                elif block.get("type") == "text" and _str(block.get("text")).strip():
                     final_message = block["text"].strip()
 
     # Attribute each assistant message's usage to the steps it issued
