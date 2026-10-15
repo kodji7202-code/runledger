@@ -11,7 +11,7 @@ import json
 import os
 import re
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from . import llm
 from .parser import Run, Step, Usage
@@ -42,8 +42,20 @@ def shorten(text: str, limit: int) -> str:
     return head.rstrip() + "…"
 
 
-def _lines(s: Optional[str]) -> int:
-    return len(s.splitlines()) if s else 0
+def _lines(s: Any) -> int:
+    return len(s.splitlines()) if isinstance(s, str) else 0
+
+
+def _str(value: Any) -> str:
+    """A step input field as text; session files may carry any JSON type here."""
+    return value if isinstance(value, str) else ""
+
+
+def _edits(inp: Dict[str, Any]) -> List[Dict[str, Any]]:
+    edits = inp.get("edits")
+    if not isinstance(edits, list) or not edits:
+        return [inp]
+    return [e for e in edits if isinstance(e, dict)]
 
 
 @dataclass
@@ -60,17 +72,17 @@ class FileChange:
 def file_changes(run: Run) -> Dict[str, FileChange]:
     changes: Dict[str, FileChange] = {}
     for s in run.steps:
-        p = s.input.get("file_path") or s.input.get("notebook_path")
+        p = _str(s.input.get("file_path")) or _str(s.input.get("notebook_path"))
         p = _short(p, run.cwd) if p else p
         if s.tool == "Write" and p:
             fc = changes.setdefault(p, FileChange(p))
             if not fc.added and not fc.removed:
-                fc.created = "created" in s.result_text.lower() or not s.result_text
+                fc.created = "created" in _str(s.result_text).lower() or not s.result_text
             fc.added += _lines(s.input.get("content"))
         elif s.tool in ("Edit", "MultiEdit") and p:
             fc = changes.setdefault(p, FileChange(p))
-            for e in s.input.get("edits") or [s.input]:
-                o, n = e.get("old_string") or "", e.get("new_string") or ""
+            for e in _edits(s.input):
+                o, n = e.get("old_string"), e.get("new_string")
                 fc.removed += _lines(o)
                 fc.added += _lines(n)
         elif s.tool == "Delete" and p:
@@ -78,7 +90,7 @@ def file_changes(run: Run) -> Dict[str, FileChange]:
         elif s.tool == "NotebookEdit" and p:
             changes.setdefault(p, FileChange(p)).added += _lines(s.input.get("new_source"))
         elif s.tool == "Bash":
-            cmd = str(s.input.get("command", ""))
+            cmd = _str(s.input.get("command"))
             # Only the arguments of an rm in each simple command count: `rm -rf build/ && pytest -q`
             # deletes build/, not pytest.
             for part in re.split(r"&&|\|\||;|\||\n", cmd):
@@ -112,23 +124,23 @@ def file_changes(run: Run) -> Dict[str, FileChange]:
 
 def template_summary(step: Step, cwd: Optional[str]) -> str:
     i, t = step.input, step.tool
-    p = _short(str(i.get("file_path") or i.get("notebook_path") or i.get("path") or ""), cwd)
+    p = _short(_str(i.get("file_path")) or _str(i.get("notebook_path")) or _str(i.get("path")), cwd)
     if t == "Read":
         return f"Read {p}"
     if t == "Delete":
         return f"Deleted {p}"
     if t == "Search":
-        return f"Searched for '{i.get('pattern', '')}'" + (f" in {p}" if p else "")
+        return f"Searched for '{_str(i.get('pattern'))}'" + (f" in {p}" if p else "")
     if t == "Write":
         return f"Wrote {p} ({_lines(i.get('content'))} lines)"
     if t in ("Edit", "MultiEdit"):
-        edits = i.get("edits") or [i]
+        edits = _edits(i)
         a = sum(_lines(e.get("new_string")) for e in edits)
         r = sum(_lines(e.get("old_string")) for e in edits)
         return f"Edited {p} (+{a} −{r})"
     if t == "Bash":
-        desc = i.get("description")
-        lines = str(i.get("command", "")).strip().splitlines() or [""]
+        desc = _str(i.get("description"))
+        lines = _str(i.get("command")).strip().splitlines() or [""]
         # Redact before cutting, so the 120-character limit cannot keep half of a secret.
         # A backtick would close the Markdown code span and split the HTML <code> early.
         cmd = shorten(llm.redact(lines[0]), COMMAND_LIMIT).replace("`", "'")
@@ -146,19 +158,19 @@ def template_summary(step: Step, cwd: Optional[str]) -> str:
             outcome = " — tests: " + ", ".join(bits)
         return f"{desc or 'Ran'}: `{cmd}`{outcome}" if desc else f"Ran `{cmd}`{outcome}"
     if t == "Grep":
-        return f"Searched the code for “{i.get('pattern', '')}”"
+        return f"Searched the code for “{_str(i.get('pattern'))}”"
     if t == "Glob":
-        return f"Listed files matching {i.get('pattern', '')}"
+        return f"Listed files matching {_str(i.get('pattern'))}"
     if t == "LS":
         return f"Listed folder {p or '.'}"
     if t == "WebFetch":
-        return f"Fetched {i.get('url', '')}"
+        return f"Fetched {_str(i.get('url'))}"
     if t == "WebSearch":
-        return f"Searched the web for “{i.get('query', '')}”"
+        return f"Searched the web for “{_str(i.get('query'))}”"
     if t == "TodoWrite":
         return "Updated its to-do list"
     if t in ("Task", "Agent"):
-        return f"Delegated to a sub-agent: {i.get('description', '')}"
+        return f"Delegated to a sub-agent: {_str(i.get('description'))}"
     if t == "NotebookEdit":
         return f"Edited notebook {p}"
     if t.startswith("mcp__"):

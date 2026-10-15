@@ -106,6 +106,51 @@ def _one_line(exc: BaseException) -> str:
     return " ".join(str(exc).split())
 
 
+def _write_stdout(text: str) -> None:
+    """Receipts are UTF-8 documents, whatever the console encoding (cp1252 on Windows)."""
+    buffer = getattr(sys.stdout, "buffer", None)
+    if buffer is None:
+        sys.stdout.write(text)
+        return
+    sys.stdout.flush()
+    buffer.write(text.encode("utf-8"))
+    buffer.flush()
+
+
+def _tolerant_console() -> None:
+    """Status lines print `·`, `−` and `⚠️`; a console that cannot encode them gets `?` instead of a crash."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(errors="replace")
+            except (ValueError, OSError):
+                pass
+
+
+def _run(args) -> int:
+    try:
+        return args.func(args)
+    except BrokenPipeError:
+        # The reader (`| head`) went away. Point stdout at devnull so the interpreter's
+        # final flush cannot raise a second BrokenPipeError on exit.
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, sys.stdout.fileno())
+        except (OSError, ValueError, AttributeError):
+            pass
+        return 1
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 130
+    except Exception as exc:
+        if os.environ.get("RUNLEDGER_DEBUG") == "1":
+            raise
+        message = _one_line(exc) or type(exc).__name__
+        print(f"error: {message} (set RUNLEDGER_DEBUG=1 for details)", file=sys.stderr)
+        return 1
+
+
 def cmd_checkpoint(args) -> int:
     from .rollback import CheckpointError, Repository, hook_main
     if args.hook:
@@ -241,7 +286,10 @@ def cmd_list(args) -> int:
         except (OSError, ValueError) as exc:
             print(f"skipped: {exc}", file=sys.stderr)
             continue
-        when = datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+        try:
+            when = datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+        except OSError:  # removed after it was listed
+            continue
         first = redact(run.prompts[0] if run.prompts else "").replace("\n", " ")[:60]
         print(f"{when}  {run.session_id[:8]:<8}  {run.agent[:12]:<12}  {len(run.steps):>5} steps  {first}")
         if args.all:
@@ -263,11 +311,15 @@ def cmd_receipt(args) -> int:
     if note:
         print(note, file=sys.stderr)
     if args.output == "-":
-        sys.stdout.write(out)
+        _write_stdout(out)
     else:
         ext = {"html": "html", "md": "md", "json": "json"}[args.format]
         target = Path(args.output or f"runledger-{_file_stem(run.session_id)}.{ext}")
-        target.write_text(out, encoding="utf-8")
+        try:
+            target.write_text(out, encoding="utf-8")
+        except OSError as exc:
+            print(f"error: cannot write {target}: {exc.strerror or _one_line(exc)}", file=sys.stderr)
+            return 1
         print(f"Receipt: {target}  ·  risk {score}/100 ({level})  ·  {len(run.steps)} steps")
         if args.open and args.format == "html":
             webbrowser.open(target.resolve().as_uri())
@@ -616,7 +668,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     pg.set_defaults(func=cmd_guard)
 
     args = p.parse_args(argv)
-    return args.func(args)
+    _tolerant_console()
+    return _run(args)
 
 
 if __name__ == "__main__":

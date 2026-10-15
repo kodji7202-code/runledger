@@ -18,7 +18,7 @@ import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from ..parser import Run, Step, Usage
+from ..parser import Run, Step, Usage, mtime
 
 NAME = "native"
 LABEL = "RunLedger format"
@@ -90,7 +90,7 @@ def find_sessions(project: Optional[str] = None) -> List[Path]:
     if not runs.is_dir():
         return []
     files = [f for f in runs.iterdir() if f.is_file() and _suffix(f)]
-    return sorted(files, key=lambda f: f.stat().st_mtime, reverse=True)
+    return sorted(files, key=mtime, reverse=True)
 
 
 # ---------------------------------------------------------------- reading

@@ -905,11 +905,14 @@ def assess_step(step: Step, cwd: Optional[str], policy: Optional[Dict[str, Any]]
         risks.append(Risk("medium", "git_internals", f"{verb} inside the .git folder ({_basename(paths[0])})", step.index))
 
     if tool in ("Edit", "MultiEdit") and paths and TEST_RE.search(_slashes(paths[0])):
-        edits = step.input.get("edits") or [step.input]
-        removed = sum(len((e.get("old_string") or "").splitlines()) for e in edits)
-        added = sum(len((e.get("new_string") or "").splitlines()) for e in edits)
-        text = " ".join((e.get("old_string") or "") for e in edits)
-        new_text = " ".join((e.get("new_string") or "") for e in edits)
+        edits = step.input.get("edits")
+        edits = [e for e in edits if isinstance(e, dict)] if isinstance(edits, list) and edits else [step.input]
+        olds = [e.get("old_string") if isinstance(e.get("old_string"), str) else "" for e in edits]
+        news = [e.get("new_string") if isinstance(e.get("new_string"), str) else "" for e in edits]
+        removed = sum(len(o.splitlines()) for o in olds)
+        added = sum(len(n.splitlines()) for n in news)
+        text = " ".join(olds)
+        new_text = " ".join(news)
         asserts_removed = len(re.findall(r"\b(assert|expect)\b", text)) - len(re.findall(r"\b(assert|expect)\b", new_text))
         skip_added = SKIP_RE.search(new_text) and not SKIP_RE.search(text)
         if skip_added:

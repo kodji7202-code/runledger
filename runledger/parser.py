@@ -315,6 +315,14 @@ def encode_project_path(project: str) -> str:
     return "".join(ch if ch.isascii() and ch.isalnum() else "-" for ch in project)
 
 
+def mtime(path: Path) -> float:
+    """Modified time, or 0 for a file that vanished after it was listed (live sessions rotate)."""
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
 def find_sessions(project: Optional[str] = None) -> List[Path]:
     root = claude_projects_dir()
     if not root.exists():
@@ -324,4 +332,4 @@ def find_sessions(project: Optional[str] = None) -> List[Path]:
         files = list(d.glob("*.jsonl")) if d.exists() else []
     else:
         files = list(root.glob("*/*.jsonl"))
-    return sorted(files, key=lambda f: f.stat().st_mtime, reverse=True)
+    return sorted(files, key=mtime, reverse=True)

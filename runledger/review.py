@@ -120,7 +120,8 @@ def _compact_step(s: Step, cwd: Optional[str]) -> Dict[str, Any]:
         if inp.get(key):
             out[key] = _clip(inp[key], COMMAND_CHARS)
     if s.tool in ("Edit", "MultiEdit"):
-        edits = inp.get("edits") or [inp]
+        edits = inp.get("edits")
+        edits = edits if isinstance(edits, list) and edits else [inp]
         out["edits"] = [{"old": _clip(e.get("old_string"), EDIT_CHARS),
                          "new": _clip(e.get("new_string"), EDIT_CHARS)}
                         for e in edits[:MAX_EDITS_PER_STEP] if isinstance(e, dict)]
