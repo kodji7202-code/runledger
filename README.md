@@ -8,7 +8,7 @@ can stop risky calls before they run, and a small team server collects receipts 
 Local Git checkpoints let you restore files from before a run, with a safety checkpoint for undo.
 
 RunLedger is fully free and open source, including the self-hosted team server.
-Version 0.5.0. Python 3.9 or later, no runtime dependencies.
+Version 0.5.1. Python 3.9 or later, no runtime dependencies.
 
 ## Quickstart
 
@@ -68,7 +68,7 @@ runledger rollback CHECKPOINT_ID                     # confirm, save safety chec
 runledger rollback SAFETY_CHECKPOINT_ID               # undo using the id printed by rollback
 ```
 
-Requires Git and an already configured Git identity. Ignored untracked files stay untouched.
+Requires Git, but no Git identity setup. Ignored untracked files stay untouched.
 Rollback never changes HEAD, branches, staging, or stashes. Scripts must pass `--yes` to restore;
 use `--dry-run` to preview without restoring.
 Use `--run SESSION_ID` when creating a checkpoint to include its rollback command in the session
@@ -121,7 +121,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: kodji7202-code/runledger@v0.5.0
+      - uses: kodji7202-code/runledger@v0.5.1
         with:
           fail-on: "60"                   # the job fails at 60 or above; "" never fails
 ```

@@ -2,6 +2,8 @@
 import json
 import os
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -290,3 +292,38 @@ def test_receipt_agent_droid_end_to_end(tmp_path, monkeypatch, capsys):
     assert "**Agent:** Factory Droid" in capsys.readouterr().out
     assert main(["list", "--agent", "droid", "--all"]) == 0
     assert "droid" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("source", ["default", "env", "invalid"])
+def test_cli_loads_user_prices_and_handles_invalid_files(tmp_path, source):
+    path = _session(tmp_path, [_message([_call("Read", {"file_path": "example.py"})])],
+                    settings={"model": "openai/GPT-6.1-SOL-latest",
+                              "tokenUsage": {"inputTokens": 1000, "outputTokens": 200}})
+    prices = tmp_path / ".runledger" / "prices.json"
+    prices.parent.mkdir()
+    # Synthetic rates only, not a claim about this model's real price.
+    prices.write_text("{bad" if source == "invalid" else json.dumps({
+        "gpt:6.1-sol": {"input": 1, "output": 2, "cache_read": 0},
+    }), encoding="utf-8")
+    env = dict(os.environ, HOME=str(tmp_path), USERPROFILE=str(tmp_path))
+    env.pop("RUNLEDGER_PRICES", None)
+    if source == "env":
+        explicit = tmp_path / "custom-prices.json"
+        prices.rename(explicit)
+        env["RUNLEDGER_PRICES"] = str(explicit)
+    result = subprocess.run(
+        [sys.executable, "-m", "runledger", "receipt", str(path), "--format", "json", "-o", "-"],
+        cwd=str(Path(__file__).resolve().parents[1]), env=env, capture_output=True, text=True,
+        timeout=30)
+    assert result.returncode == 0, result.stderr
+    receipt = json.loads(result.stdout)
+    assert receipt["totals"]["tokens"] == 1200
+    if source == "invalid":
+        assert "warning: ignoring prices file" in result.stderr
+        assert receipt["totals"]["cost_usd"] is None
+        assert "~/.runledger/prices.json" in receipt["pricing_note"]
+    else:
+        assert result.stderr == ""
+        assert receipt["totals"]["cost_usd"] == pytest.approx(0.0014)
+        assert receipt["steps"][0]["cost_usd"] == pytest.approx(0.0014)
+        assert receipt["pricing_note"] is None

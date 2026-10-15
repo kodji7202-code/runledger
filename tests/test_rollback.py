@@ -71,6 +71,128 @@ def committed_repo(repo):
     return repo
 
 
+@pytest.fixture
+def identity_repo(tmp_path, monkeypatch):
+    home, xdg = tmp_path / "home", tmp_path / "xdg"
+    home.mkdir()
+    xdg.mkdir()
+    for key in list(os.environ):
+        if (key.startswith(("GIT_AUTHOR_", "GIT_COMMITTER_", "GIT_CONFIG_"))
+                or key == "EMAIL"):
+            monkeypatch.delenv(key)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    # Also forbid Git's machine-dependent automatic identity guesses.
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "user.useConfigOnly")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "true")
+    folder = tmp_path / "identity-repo"
+    folder.mkdir()
+    git(folder, "init", "-q")
+    (folder / "file.txt").write_text("before\n", encoding="utf-8")
+    git(folder, "add", ".")
+    return folder
+
+
+def commit_identity(folder, oid):
+    return git(folder, "show", "-s", "--format=%an <%ae>%n%cn <%ce>", oid).decode().splitlines()
+
+
+def test_checkpoint_rollback_and_hook_without_identity(identity_repo, monkeypatch, capsys):
+    folder = identity_repo
+    for role in ("AUTHOR", "COMMITTER"):
+        result = subprocess.run(["git", "-C", str(folder), "var", f"GIT_{role}_IDENT"],
+                                capture_output=True)
+        assert result.returncode != 0
+    config = (folder / ".git" / "config").read_bytes()
+    index = (folder / ".git" / "index").read_bytes()
+    environment = dict(os.environ)
+    calls = []
+    real_run = subprocess.run
+
+    def record(args, **kwargs):
+        if "env" in kwargs:
+            calls.append((args, dict(kwargs["env"])))
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(rollback.subprocess, "run", record)
+    assert main(["checkpoint", "--cwd", str(folder)]) == 0
+    checkpoint_id = capsys.readouterr().out.strip()
+    repo = rollback.Repository(str(folder))
+    cp = repo.select(checkpoint_id)
+    (folder / "file.txt").write_text("after\n", encoding="utf-8")
+    assert main(["rollback", cp.id, "--yes", "--cwd", str(folder)]) == 0
+    capsys.readouterr()
+    assert (folder / "file.txt").read_text(encoding="utf-8") == "before\n"
+    safety = repo.select()
+    assert safety.kind == "safety"
+    assert main(["rollback", safety.id, "--yes", "--cwd", str(folder)]) == 0
+    capsys.readouterr()
+    assert (folder / "file.txt").read_text(encoding="utf-8") == "after\n"
+    event = dict(cwd=str(folder), session_id="no-identity-hook", hook_event_name="SessionStart")
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(event)))
+    assert main(["checkpoint", "--hook"]) == 0
+    output = capsys.readouterr()
+    assert output.out == output.err == ""
+    hook = repo.select(run_id="no-identity-hook")
+    assert hook.label == "SessionStart"
+    for checkpoint in repo.checkpoints():
+        assert commit_identity(folder, checkpoint.oid) == ["RunLedger <runledger@localhost>"] * 2
+    identity = {f"GIT_{role}_{field}": value
+                for role in ("AUTHOR", "COMMITTER")
+                for field, value in (("NAME", "RunLedger"), ("EMAIL", "runledger@localhost"))}
+    for args, env in calls:
+        supplied = {key: env[key] for key in identity if key in env}
+        assert supplied == (identity if "commit-tree" in args else {})
+    assert repo.env == rollback.Repository(str(folder)).env
+    assert os.environ == environment
+    assert (folder / ".git" / "config").read_bytes() == config
+    assert (folder / ".git" / "index").read_bytes() == index
+    assert not list(Path(os.environ["HOME"]).iterdir())
+    assert not list(Path(os.environ["XDG_CONFIG_HOME"]).iterdir())
+    assert git(folder, "rev-parse", "--verify", "HEAD", check=False) == b""
+    assert git(folder, "for-each-ref", "refs/heads", "refs/stash") == b""
+
+
+@pytest.mark.parametrize("config, env, expected", [
+    ({"user.name": "Configured User", "user.email": "user@example.test"}, {},
+     ["Configured User <user@example.test>"] * 2),
+    ({}, {"GIT_AUTHOR_NAME": "Env Author", "GIT_AUTHOR_EMAIL": "author@example.test",
+          "GIT_COMMITTER_NAME": "Env Committer", "GIT_COMMITTER_EMAIL": "committer@example.test"},
+     ["Env Author <author@example.test>", "Env Committer <committer@example.test>"]),
+    ({"user.name": "Configured User"}, {},
+     ["Configured User <runledger@localhost>"] * 2),
+    ({"user.email": "user@example.test"}, {},
+     ["RunLedger <user@example.test>"] * 2),
+    ({}, {"GIT_AUTHOR_NAME": "Env Author", "GIT_AUTHOR_EMAIL": "author@example.test"},
+     ["Env Author <author@example.test>", "RunLedger <runledger@localhost>"]),
+    ({"author.name": "Config Author", "author.email": "author@example.test",
+      "committer.name": "Config Committer", "committer.email": "committer@example.test"}, {},
+     ["Config Author <author@example.test>", "Config Committer <committer@example.test>"]),
+    ({"user.name": "Configured User", "user.email": "user@example.test"},
+     {"GIT_AUTHOR_NAME": "Env Author"},
+     ["Env Author <user@example.test>", "Configured User <user@example.test>"]),
+])
+def test_checkpoint_preserves_configured_and_partial_identity(identity_repo, monkeypatch,
+                                                            config, env, expected):
+    for number, (key, value) in enumerate(config.items(), 1):
+        monkeypatch.setenv(f"GIT_CONFIG_KEY_{number}", key)
+        monkeypatch.setenv(f"GIT_CONFIG_VALUE_{number}", value)
+    monkeypatch.setenv("GIT_CONFIG_COUNT", str(len(config) + 1))
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    original_config = (identity_repo / ".git" / "config").read_bytes()
+    original_env = dict(os.environ)
+    repo = rollback.Repository(str(identity_repo))
+    cp = repo.create()
+    assert commit_identity(identity_repo, cp.oid) == expected
+    assert (identity_repo / ".git" / "config").read_bytes() == original_config
+    assert os.environ == original_env
+
+
 def index_bytes(repo):
     return (repo.root / ".git" / "index").read_bytes()
 

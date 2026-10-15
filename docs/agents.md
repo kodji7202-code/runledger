@@ -151,10 +151,35 @@ the matching receipt then includes a local rollback command. Checkpoint contents
 Costs are estimates from the public Claude API list prices in `runledger/prices.json`, which was
 checked on 2026-10-08. Each message's tokens are multiplied by the list price of its model. Cache
 writes are priced at 1.25 times the input price, and cache reads at the cache-hit rate. A model
-RunLedger does not know shows `n/a` rather than a guess.
+RunLedger does not know shows `n/a` rather than a guess, with a short line explaining how to
+add its price. JSON receipts expose that guidance as `pricing_note`.
 
-To override prices, point `RUNLEDGER_PRICES` at a JSON file with the same shape as `prices.json`.
-The file adds or replaces entries; everything else keeps the built-in values.
+### User prices
+
+Create `~/.runledger/prices.json`, or set `RUNLEDGER_PRICES=/path/to/prices.json` to choose a
+different file. The environment variable takes precedence over the default user file.
+The selected file adds or replaces entries over the bundled table; other bundled entries stay.
+An invalid or unreadable file prints a warning to stderr and is ignored in full. A missing
+default user file is normal and silent. Prices load when RunLedger starts.
+
+Use the same schema as the bundled table: `"family:version"` keys and USD per million tokens
+for `input`, `output`, and `cache_read`. All three rates must be finite, non-negative numbers.
+For example, this entry uses the bundled Sonnet 4.5 list prices:
+
+```json
+{
+  "sonnet:4.5": {"input": 3.0, "output": 15.0, "cache_read": 0.3}
+}
+```
+
+For `gpt-6.1-sol`, add a `"gpt:6.1-sol"` entry with rates from your provider, not guessed rates.
+Likewise, `gpt-5-codex` uses `"gpt:5-codex"`. The optional top-level `checked` date is informational.
+
+Lookup ignores case, provider prefixes such as `anthropic/` and `openai/`, dated suffixes
+(`-20250929` or `-2025-09-29`), deployment suffixes such as `-v1:0`, and `-latest`.
+Claude's dotted and legacy names also match, so `anthropic/Claude-Sonnet-4.5-latest` and
+`claude-sonnet-4-5-20250929` both use `"sonnet:4.5"`. Meaningful variants such as `-sol`,
+`-codex`, and `-mini` keep distinct prices. Normalization never supplies a missing price.
 
 On a Claude subscription you are not billed per token. Read the figure as "what this run would cost
 on the API".

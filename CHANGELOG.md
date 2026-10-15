@@ -7,8 +7,20 @@ change behavior, so read the entry before you upgrade.
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-10-15
+
+### Added
+
+- **User prices:** merge `RUNLEDGER_PRICES` or `~/.runledger/prices.json` over bundled prices.
+  Invalid files warn and are ignored. Unknown-price receipts point to the user file and docs.
+
 ### Fixed
 
+- **Checkpoints without Git identity:** use a subprocess-only fallback for missing author or
+  committer identity, including hooks and rollback safety checkpoints. Preserve configured
+  identity fields and never write Git config.
+- **Model price lookup:** normalize provider prefixes, case, dotted Claude names, dates,
+  deployment versions and `-latest`, while keeping distinct model variants and unknown prices.
 - **Windows rollback checks:** detect junctions using file attributes, reparse tags, or the
   Python 3.12+ junction API. Isolate traversal mocks from temporary-index cleanup so rollback
   tests also pass on Windows Python 3.12 and 3.13.
