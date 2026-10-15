@@ -43,4 +43,4 @@ runledger = "runledger.cli:main"
 packages = ["runledger", "runledger.server", "runledger.adapters"]
 
 [tool.setuptools.package-data]
-runledger = ["prices.json"]
+runledger = ["prices.json", "receipt.schema.json"]

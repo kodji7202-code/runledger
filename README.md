@@ -185,6 +185,7 @@ your Anthropic API key and may incur charges from Anthropic.
 - [Quickstart](docs/quickstart.md): install, first receipt, summaries, CI, hooks, a local team server
 - [Supported agents](docs/agents.md): where each agent's sessions are, and `--agent`
 - [Session format](docs/format.md): the open format for any agent
+- [JSON receipt](docs/receipt-json.md): the versioned receipt contract and its JSON Schema
 - [Real-time guard](docs/guard.md): policy files, approvals, fail-open and fail-closed, the log
 - [Rollback](docs/rollback.md): Git checkpoints, previews, safety checkpoints, undo and agent hooks
 - [Analysis](docs/analysis.md): the quality score, cost tips and the AI risk review

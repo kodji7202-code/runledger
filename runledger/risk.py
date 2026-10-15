@@ -257,8 +257,8 @@ def _outside(path: str, cwd: Optional[str], base: Optional[str] = None) -> bool:
     A relative path is resolved against `base` (a working directory) when given,
     otherwise against `cwd`. Windows-style paths (drive letter on either side) compare
     case-insensitively with either separator; POSIX paths compare exactly."""
-    if not cwd or not path or _is_device(path):
-        return False
+    if not cwd or not path or _is_device(path) or not _is_abs(cwd):
+        return False  # a relative working folder (some logs record ".") cannot place a path
     win = _is_windows_style(cwd)
     path = _msys_to_windows(path, win)
     if base:

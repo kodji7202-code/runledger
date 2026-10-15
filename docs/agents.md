@@ -82,6 +82,9 @@ Droid writes a JSONL transcript and a sibling settings file:
 ```
 
 - **Config directory.** `FACTORY_HOME` overrides `~/.factory`.
+- **Relative `cwd`.** Some Droid versions record `cwd` as `.`. RunLedger never resolves it against
+  the folder it runs in: the branch is unknown, Git line counts are skipped, and paths are not
+  flagged as outside the working folder. Safe receipts shorten absolute paths to `…/<last two parts>`.
 - **Matching.** The `cwd` in the `session_start` header identifies the project. Sessions are
   sorted newest first by transcript modification time. `list --all --agent droid` covers all projects.
 - **Messages.** Human text becomes the request; system reminders and hidden context are excluded.

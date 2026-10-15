@@ -26,7 +26,8 @@ def _git(cwd: str, *args: str) -> Optional[str]:
 
 
 def _in_repo(cwd: Optional[str]) -> bool:
-    return bool(cwd) and os.path.isdir(cwd) and (_git(cwd, "rev-parse", "--is-inside-work-tree") or "").strip() == "true"
+    # A relative cwd from a log (Droid can record ".") would resolve against RunLedger's own folder.
+    return bool(cwd) and os.path.isabs(cwd) and os.path.isdir(cwd) and (_git(cwd, "rev-parse", "--is-inside-work-tree") or "").strip() == "true"
 
 
 def toplevel(cwd: Optional[str]) -> Optional[str]:

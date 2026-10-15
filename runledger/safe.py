@@ -6,6 +6,7 @@ Path rules, applied to path fields and to every absolute path found in free text
   - a prefix listed in RUNLEDGER_SAFE_PREFIXES (os.pathsep-separated): `…` plus the rest
   - temp folders (/tmp, /var/tmp, the system temp dir): kept as they are
   - a path sharing leading folders with the repository root: that prefix becomes `…`
+  - with no known root (a relative cwd), other non-system paths keep their last two parts: `…/a/b`
 Free text then gets the usual secret masking, e-mail addresses become [EMAIL] and the
 `user:pass@` part of URLs becomes [REDACTED]@. Session id, branch and models are kept.
 Every function is idempotent: applying it to its own output changes nothing.
@@ -27,10 +28,11 @@ ELLIPSIS = "…"
 EMAIL = "[EMAIL]"
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 _URL_CREDS_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9+.-]*://)[^\s/@]+@")
-# An absolute path in free text: a POSIX path not glued to a word, URL, `~` or `…`,
-# or a Windows drive path. It ends at whitespace, quotes or shell punctuation.
+# An absolute path in free text: a POSIX path not glued to a word, `~` or `…`, or a Windows
+# drive path. It ends at whitespace, quotes, shell punctuation or `:` (PATH-style lists).
+# `//` is not a path start, so URLs (`https://host/x`) are left alone.
 _TEXT_PATH_RE = re.compile(
-    r"(?<![\w.~:/\\…-])/[^\s'\"`<>|;,(){}\[\]]+"
+    r"(?<![\w.~/\\…-])/(?!/)[^\s'\"`<>|;:,(){}\[\]]+"
     r"|(?<![\w])[A-Za-z]:[\\/][^\s'\"`<>|;,(){}\[\]]*")
 _HOME_RE = re.compile(r"^(?:/home/[^/]+|/Users/[^/]+|/root|[A-Za-z]:/Users/[^/]+)(?=/|$)", re.I)
 _TEMP_PREFIXES = ("/tmp", "/var/tmp", "/private/tmp", "/private/var/folders", "/var/folders")
@@ -72,6 +74,13 @@ def _temp_dirs() -> List[str]:
     return dirs
 
 
+_SYSTEM_PREFIXES = ("/usr", "/bin", "/sbin", "/etc", "/dev", "/proc", "/sys", "/opt/homebrew", "/lib")
+
+
+def _is_system(p: str) -> bool:
+    return any(within(p, prefix) for prefix in _SYSTEM_PREFIXES)
+
+
 def safe_path(path: str, ctx: SafeContext) -> str:
     """One path under the rules above. Relative paths are returned unchanged."""
     if not path or not is_abs(path):
@@ -99,6 +108,12 @@ def safe_path(path: str, ctx: SafeContext) -> str:
             shared += 1
         if shared >= 2:  # at least one folder below the filesystem root or drive is shared
             return ELLIPSIS + "/" + "/".join(a[shared:]) if shared < len(a) else ELLIPSIS
+    elif not _is_system(p):
+        # No known root (the log records a relative cwd): the folder layout cannot be told
+        # apart from the project, so only the last two parts are kept.
+        parts = [x for x in p.split("/") if x]
+        if len(parts) > 2:
+            return ELLIPSIS + "/" + "/".join(parts[-2:])
     return path
 
 

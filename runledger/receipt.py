@@ -521,9 +521,20 @@ def _rollback(run: Run) -> Optional[Dict[str, str]]:
             "command": f"runledger rollback {run.checkpoint_id}"}
 
 
+# JSON receipt contract (receipt.schema.json, docs/receipt-json.md). Within a version, changes
+# are additive only; removing a key or changing its type needs a new version.
+SCHEMA_VERSION = 1
+
+
+def md_trailer(run: Run) -> str:
+    """A last line that records the mode in a Markdown receipt without showing it."""
+    return f"<!-- runledger: safe={'true' if run.safe else 'false'} schema={SCHEMA_VERSION} -->\n"
+
+
 def to_dict(run: Run, score: int, level: str, risks: List[Risk]) -> Dict:
     changes = file_changes(run)
     data = {
+        "schema_version": SCHEMA_VERSION,
         "runledger_version": __version__,
         "safe": run.safe,
         "session_id": run.session_id,

@@ -57,6 +57,12 @@ def test_free_text_paths_emails_urls_and_tokens():
     assert out.endswith("Done in src.")
 
 
+def test_colon_separated_paths_are_each_rewritten():
+    text = f"RUNLEDGER_CORPUS={ROOT}/a.jsonl:/home/ana/b.jsonl:/srv/work/acme/c.jsonl"
+    assert safe_text(text, CTX) == "RUNLEDGER_CORPUS=a.jsonl:~/b.jsonl:…/c.jsonl"
+    assert safe_text("see https://example.com/home/ana/x", CTX) == "see https://example.com/home/ana/x"
+
+
 @pytest.mark.parametrize("text", [
     f"wrote {ROOT}/a.py and /home/ana/b and /srv/work/acme/lib/c and /mnt/corp/d",
     "user@example.org at https://u:p@h.example/x",
@@ -113,3 +119,25 @@ def test_make_safe_rewrites_everything_shown_and_keeps_file_counts():
     assert repr((run.prompts, run.final_message, run.overall_summary, [s.summary for s in run.steps],
                  [s.input for s in run.steps], [r.reason for r in risks], run.guard, run.quality)) == snapshot
     assert list(file_changes(run)) == ["a.py", "b.txt", "~/scratch.py"]
+
+
+def test_without_a_known_root_paths_keep_only_their_last_parts():
+    ctx = SafeContext(root=None, home="/home/ana")
+    assert safe_path("/srv/work/acme/app/src/a.py", ctx) == "…/src/a.py"
+    assert safe_path("/usr/bin/python3", ctx) == "/usr/bin/python3"
+    assert safe_path("/tmp/x/y/z", ctx) == "/tmp/x/y/z"
+    assert safe_path("/home/ana/p/q", ctx) == "~/p/q"
+    assert context(".").root is None  # a relative cwd is never resolved against RunLedger's folder
+
+
+def test_relative_cwd_is_not_resolved_against_the_current_folder(tmp_path, monkeypatch):
+    import subprocess
+    import shutil as _shutil
+    from runledger.gitinfo import current_branch, toplevel
+    from runledger.risk import _outside
+    if _shutil.which("git"):
+        subprocess.run(["git", "init", "-q", "-b", "here", str(tmp_path)], check=True)
+        monkeypatch.chdir(tmp_path)
+        assert toplevel(str(tmp_path)) is not None
+    assert current_branch(".") is None and toplevel(".") is None
+    assert not _outside("/srv/elsewhere/a.py", ".")
