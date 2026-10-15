@@ -28,6 +28,8 @@ import importlib
 from pathlib import Path
 from typing import List, Optional
 
+from ..parser import mtime
+
 ADAPTER_MODULES = ["claude_code", "codex", "droid", "aider", "native"]
 
 
@@ -71,4 +73,4 @@ def find_sessions(project: Optional[str] = None, agent: Optional[str] = None) ->
     found: List[Path] = []
     for a in chosen:
         found.extend(a.find_sessions(project))
-    return sorted(set(found), key=lambda f: f.stat().st_mtime, reverse=True)
+    return sorted(set(found), key=mtime, reverse=True)
