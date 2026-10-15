@@ -7,7 +7,7 @@
 # The copy is taken by the running server's image with SQLite's online backup, so the server
 # keeps running. Copies land in the data volume under /data/backups (14 kept), and the newest
 # is also copied to ./backups on the host. Copy that folder off the machine as well (see
-# docs/hosted.md, "Backups").
+# docs/self-hosting.md, "Backups").
 set -eu
 
 docker compose exec -T runledger runledger backup --db /data/runledger.db --dir /data/backups --keep 14

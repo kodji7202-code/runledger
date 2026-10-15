@@ -837,7 +837,7 @@ def _group_has_guard(group: Any) -> bool:
 
 
 def install_hook(path: Path, approval_timeout_s: Optional[float] = None) -> Tuple[bool, Optional[Path]]:
-    """Add the PreToolUse guard entry to a settings.json, keeping everything else.
+    """Add the guard and lifecycle checkpoint entries, keeping everything else.
 
     The entry's "timeout" is hook_timeout_for(approval_timeout_s). An existing guard
     hook (any matcher) gets its timeout updated in place; a second entry is never added.
@@ -870,6 +870,26 @@ def install_hook(path: Path, approval_timeout_s: Optional[float] = None) -> Tupl
     if not found:
         pre.append(hook_entry(want))
         changed = True
+    from .rollback import HOOK_COMMAND as checkpoint_command, HOOK_EVENTS, is_checkpoint_hook
+    for event in HOOK_EVENTS:
+        groups = hooks.get(event)
+        groups = [] if groups is None else groups
+        if not isinstance(groups, list):
+            raise InstallError(f"'hooks.{event}' in {path} must be a list. Nothing was changed.")
+        found_checkpoint = False
+        for group in groups:
+            entries = group.get("hooks") if isinstance(group, dict) else None
+            for h in entries if isinstance(entries, list) else []:
+                if is_checkpoint_hook(h):
+                    if group.get("matcher") in (None, "", "*"):
+                        found_checkpoint = True
+                    if h.get("timeout") != 120:
+                        h["timeout"] = 120
+                        changed = True
+        if not found_checkpoint:
+            groups.append({"hooks": [{"type": "command", "command": checkpoint_command, "timeout": 120}]})
+            changed = True
+        hooks[event] = groups
     if not changed:
         return False, None
 
@@ -879,7 +899,7 @@ def install_hook(path: Path, approval_timeout_s: Optional[float] = None) -> Tupl
 
 
 def uninstall_hook(path: Path) -> Tuple[bool, Optional[Path]]:
-    """Remove every RunLedger guard hook from a settings.json, keeping everything else.
+    """Remove guard and checkpoint hooks from settings.json, keeping everything else.
 
     Other hooks in the same PreToolUse group stay. A group left with no hooks is removed,
     then an empty PreToolUse list and an empty hooks object. Returns (changed, backup);
@@ -888,25 +908,34 @@ def uninstall_hook(path: Path) -> Tuple[bool, Optional[Path]]:
     path = Path(path)
     existed, settings = _read_settings(path)
     hooks = settings.get("hooks")
-    pre = hooks.get("PreToolUse") if isinstance(hooks, dict) else None
-    if not isinstance(pre, list):
+    if not isinstance(hooks, dict):
         return False, None
-    kept: List[Any] = []
+    from .rollback import HOOK_EVENTS, is_checkpoint_hook
     removed = False
-    for group in pre:
-        if not _group_has_guard(group):
-            kept.append(group)
+    for event in ("PreToolUse", *HOOK_EVENTS):
+        groups = hooks.get(event)
+        if not isinstance(groups, list):
             continue
-        removed = True
-        rest = [h for h in group["hooks"] if not _is_guard_hook(h)]
-        if rest:
-            kept.append(dict(group, hooks=rest))
+        kept: List[Any] = []
+        for group in groups:
+            entries = group.get("hooks") if isinstance(group, dict) else None
+            if not isinstance(entries, list):
+                kept.append(group)
+                continue
+            rest = [h for h in entries if not (
+                _is_guard_hook(h) if event == "PreToolUse" else is_checkpoint_hook(h))]
+            if len(rest) == len(entries):
+                kept.append(group)
+            else:
+                removed = True
+                if rest:
+                    kept.append(dict(group, hooks=rest))
+        if kept:
+            hooks[event] = kept
+        elif groups:
+            del hooks[event]
     if not removed:
         return False, None
-    if kept:
-        hooks["PreToolUse"] = kept
-    else:
-        del hooks["PreToolUse"]
     if not hooks:
         del settings["hooks"]
     return True, _write_settings(path, settings, existed)
@@ -959,11 +988,11 @@ def cmd_install(project: Optional[str] = None, global_scope: bool = False,
         return 1
     hook_s = hook_timeout_for(timeout_s)
     if changed:
-        print(f"Installed or updated the RunLedger guard hook in {target} (hook timeout {hook_s} s)")
+        print(f"Installed or updated the RunLedger guard hook and checkpoint hooks in {target} (hook timeout {hook_s} s)")
         if backup is not None:
             print(f"Backup of the previous file: {backup}")
     else:
-        print(f"The RunLedger guard hook in {target} is already up to date (hook timeout {hook_s} s). Nothing changed.")
+        print(f"The RunLedger guard hook and checkpoint hooks in {target} are already up to date (hook timeout {hook_s} s). Nothing changed.")
     return 0
 
 
@@ -980,9 +1009,9 @@ def cmd_uninstall(project: Optional[str] = None, global_scope: bool = False,
         print(f"error: cannot update {target}: {exc}", file=sys.stderr)
         return 1
     if not changed:
-        print(f"No RunLedger guard hook in {target}. Nothing changed.")
+        print(f"No RunLedger guard or checkpoint hooks in {target}. Nothing changed.")
         return 0
-    print(f"Removed the RunLedger guard hook from {target}")
+    print(f"Removed the RunLedger guard hook and checkpoint hooks from {target}")
     if backup is not None:
         print(f"Backup of the previous file: {backup}")
     print("Policy files (.runledger.json, ~/.runledger/config.json) and .runledger/guard.log were left as they are.")

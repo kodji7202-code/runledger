@@ -327,8 +327,8 @@ The team database (one SQLite file) holds:
 budget alerts older than that, at start and every hour. The period applies to every team on the
 server. To erase all data, stop the server, keep any backup you need, and delete the database file
 along with its `-wal` and `-shm` files. That removes every team in the database. See
-[self-hosting.md](self-hosting.md) for backups and restores. On the hosted plan, history is kept for
-90 days and a team is deleted 30 days after its subscription ends ([hosted.md](hosted.md)).
+[self-hosting.md](self-hosting.md) for backups and restores. Retention removes history only;
+teams and API keys remain available.
 
 ## What RunLedger does not do
 

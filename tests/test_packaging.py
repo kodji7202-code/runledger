@@ -83,8 +83,10 @@ def test_wheel_contains_modules_and_package_data(wheel):
     names = _wheel_names(wheel)
     for required in (
         "runledger/cli.py",
+        "runledger/rollback.py",
         "runledger/server/app.py",
         "runledger/adapters/codex.py",
+        "runledger/adapters/droid.py",
         "runledger/prices.json",
     ):
         assert required in names, f"{required} is missing from {wheel.name}"

@@ -938,3 +938,71 @@ def test_bad_tls_files_are_reported_without_a_traceback(tmp_path, tls_files, cap
         make_server(str(tmp_path / "c.db"), port=0, tls_cert=str(cert))
     assert main(["serve", "--db", str(tmp_path / "d.db"), "--port", "0", "--tls-cert", str(cert)]) == 1
     assert "must be given together" in capsys.readouterr().err
+
+
+def test_obsolete_service_settings_cannot_enable_removed_routes(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("RUNLEDGER_POLAR_WEBHOOK_SECRET", "unused-test-value")
+    monkeypatch.delenv("RUNLEDGER_RESEND_API_KEY", raising=False)
+    with running(tmp_path / "free.db") as (srv, base):
+        team_id, admin = srv.db.create_team("free")
+        for method, path in [
+            ("POST", "/billing/polar/webhook"), ("POST", "/billing/recover"), ("GET", "/recover"),
+        ]:
+            assert _http(base, method, path, body={})[0] == 404
+        status, _, raw = _http(base, "GET", "/api/me", headers=_auth(admin))
+        assert status == 200
+        assert set(_json(raw)) == {"team", "role", "key"}
+        with sqlite3.connect(srv.db.path) as conn:
+            tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        assert "billing_subscriptions" not in tables
+        assert "billing_events" not in tables
+        assert "seat_aliases" not in tables
+        assert srv.db.team_name(team_id) == "free"
+    with pytest.raises(SystemExit) as exc:
+        main(["--help"])
+    assert exc.value.code == 0
+    assert "billing" not in capsys.readouterr().out
+
+
+def test_existing_team_data_remains_writable_after_upgrade(tmp_path):
+    from runledger.server import maintenance
+
+    path = tmp_path / "existing.db"
+    db = Database(str(path))
+    try:
+        team_id, admin = db.create_team("existing")
+    finally:
+        db.close()
+    # An old database can retain obsolete extension tables. They must not gate
+    # writes or trigger deletion, even when their old state would have done so.
+    with sqlite3.connect(str(path)) as conn:
+        conn.executescript("""
+            CREATE TABLE billing_subscriptions (
+                polar_id TEXT PRIMARY KEY, team_id INTEGER REFERENCES teams(id),
+                status TEXT, seats INTEGER, ended_at TEXT, past_due_since TEXT,
+                cancel_at_period_end INTEGER, current_period_end TEXT
+            );
+        """)
+        conn.execute(
+            "INSERT INTO billing_subscriptions VALUES ('old', ?, 'canceled', 1, "
+            "'2020-01-01T00:00:00Z', NULL, 0, NULL)", (team_id,),
+        )
+    with running(path) as (srv, base):
+        for index in range(3):
+            member = srv.db.create_key(team_id, "member-" + str(index), "member", "test")
+            payload = {
+                "session_id": "run-" + str(index),
+                "html": "<h1>Receipt</h1>",
+                "totals": {"cost_usd": 0.25, "tokens": 100},
+            }
+            status, _, raw = _http(base, "POST", "/api/runs", body=payload, headers=_auth(member["key"]))
+            assert status == 201
+            url = _json(raw)["url"]
+            assert _http(base, "GET", url, headers=_auth(admin))[2] == b"<h1>Receipt</h1>"
+            assert _http(base, "POST", "/api/approvals", body=APPROVAL, headers=_auth(member["key"]))[0] == 201
+        assert len(srv.db.list_runs(team_id)) == 3
+        assert len(srv.db.list_approvals(team_id, None, 600)) == 3
+        assert maintenance.run_maintenance(srv.db, None) == {}
+        assert maintenance.run_maintenance(srv.db, 90)["runs"] == 0
+        assert srv.db.team_name(team_id) == "existing"
+        assert _http(base, "GET", "/api/me", headers=_auth(admin))[0] == 200

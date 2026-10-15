@@ -2,6 +2,7 @@
 
 The team server collects receipts that developers push with `runledger push`, stores them in one
 SQLite database, and serves a shared dashboard, the approval API, team budgets and compliance exports.
+All features are free and open source.
 This guide covers three setups:
 
 - **Docker Compose with HTTPS** (recommended): the server, plus Caddy, which gets and renews the
@@ -299,7 +300,6 @@ Keys do not expire. Rotate a key when a person leaves or when a key may have lea
 | `--trusted-proxy CIDR` (repeatable), or `RUNLEDGER_TRUSTED_PROXIES` (comma-separated) | `runledger serve`, environment | The addresses or ranges of your reverse proxies, for example `127.0.0.1` or `172.20.0.0/16`. The client address is read from `X-Forwarded-For` only for these peers. It is used for the failed-sign-in limit and the audit log. |
 | `RUNLEDGER_PUBLIC_URL` | environment | Public base URL used in approval links. Set it whenever the server is behind a proxy. |
 | `RUNLEDGER_RETENTION_DAYS` | environment | Delete runs, approvals, audit events and budget alerts older than this many days. Checked at start and every hour. Unset keeps everything. |
-| `RUNLEDGER_POLAR_WEBHOOK_SECRET` and the other billing settings | environment | Only for running the paid hosted plan. See [hosted.md](hosted.md). Leave unset. |
 
 The database is upgraded automatically when the server starts. Missing columns are added, so an old
 database keeps working. A database from before roles existed keeps its one key as an admin key labelled

@@ -25,13 +25,14 @@ UNPRICED = {"runledger_format": 1, "agent": "lab-bot", "session_id": "lab-run-1"
 
 @pytest.fixture(autouse=True)
 def isolated_agent_dirs(tmp_path, monkeypatch):
-    """No real Claude Code or Codex sessions may leak into these tests."""
+    """No real agent sessions may leak into these tests."""
     claude_dir = tmp_path / "claude-config"
     codex_dir = tmp_path / "codex-home"
     claude_dir.mkdir()
     codex_dir.mkdir()
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_dir))
     monkeypatch.setenv("CODEX_HOME", str(codex_dir))
+    monkeypatch.setenv("FACTORY_HOME", str(tmp_path / "factory-home"))
     for name in ("GITHUB_REPOSITORY", "GITHUB_EVENT_PATH", "GITHUB_API_URL", "GITHUB_TOKEN",
                  "GITHUB_STEP_SUMMARY", "GITHUB_OUTPUT", "RUNLEDGER_SERVER", "RUNLEDGER_API_KEY"):
         monkeypatch.delenv(name, raising=False)

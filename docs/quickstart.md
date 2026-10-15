@@ -130,7 +130,12 @@ The second command prints `"permissionDecision": "deny"` for the `rm -rf` call. 
 policy files, approvals, fail-open and fail-closed, monitor mode and the log is in
 [guard.md](guard.md).
 
-## 7. A team server (local trial)
+The installer also adds Git checkpoints at session start and before each prompt. Configure your
+Git identity and ignore sensitive untracked files first. Preview and undo restores with
+`runledger rollback CHECKPOINT_ID --dry-run` and the safety checkpoint printed after restoration.
+See [rollback.md](rollback.md) for manual use, Droid hooks, Codex, pruning and safety limits.
+
+## 7. A self-hosted team server
 
 The team server collects receipts that developers push, stores them in one SQLite file, and serves
 a shared dashboard.
