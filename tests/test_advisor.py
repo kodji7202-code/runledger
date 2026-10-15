@@ -264,3 +264,21 @@ def test_price_table_has_the_current_model_ids():
     assert cost_of(_usage(inp=1_000_000), HAIKU) == pytest.approx(0.1)
     assert cost_of(_usage(inp=1_000_000), SONNET) == pytest.approx(2.0)
     assert cost_of(_usage(inp=1_000_000), OPUS) == pytest.approx(4.0)
+
+
+# ---------------------------------------------------------------- unknown step usage
+
+def test_steps_without_token_data_are_left_out_of_the_downgrade_estimate():
+    known = _read(1, model=SONNET, usage=_usage(inp=1_000_000))
+    unknown = _read(2, path="src/b.py", model=SONNET)
+    unknown.usage_known = False
+    rec = _rec(_run([known, unknown]), "model_downgrade")
+    assert rec["steps"] == [1]
+    assert rec["est_savings_usd"] == pytest.approx(1.9, abs=1e-4)
+    assert "1 matching step(s) have no token data" in rec["detail"]
+
+
+def test_missing_usage_source_gives_no_priced_recommendation():
+    run = _run([_read(1, model=SONNET, usage=_usage(inp=1_000_000))])
+    run.usage_source = "missing"
+    assert not _recs(run, "model_downgrade")

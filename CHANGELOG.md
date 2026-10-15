@@ -26,6 +26,14 @@ change behavior, so read the entry before you upgrade.
 
 ### Fixed
 
+- **Partial costs:** when some tokens have no price, the run cost reads `≥ $X (N models unpriced)`
+  and JSON adds `totals.cost_partial` and `totals.unknown_models`. The cost-per-line quality signal
+  is skipped for partial costs, and advisor savings leave out steps with no token data.
+- **Droid sub-agents and mixed models:** sub-agent tokens from `inclusiveTokenUsage` are counted,
+  credited to the child session's model when its settings file is found. Tokens that cannot be
+  credited to one model are listed as `unattributed` and no longer trigger the "add a price" help.
+- **Large sessions:** shell commands are parsed once per receipt instead of several times, so a
+  5,000-step session renders about twice as fast.
 - **Droid tokens for copied transcripts:** when a transcript has no sibling `.settings.json`,
   RunLedger finds the session's settings file by id under `$FACTORY_HOME/sessions/`.
 - **Droid receipts without usage:** token counts show `n/a` instead of 0, with a note naming the
