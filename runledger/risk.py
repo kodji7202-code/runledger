@@ -166,6 +166,69 @@ _WRAPPERS = {"sudo", "nohup", "time", "command", "builtin", "exec", "env", "nice
 _POSIX_ROOT_NAMES = {"tmp", "etc", "var", "usr", "bin", "sbin", "opt", "home", "mnt", "srv", "lib",
                      "lib64", "run", "sys", "boot", "root", "dev", "proc", "private", "media", "snap"}
 
+
+@dataclass(frozen=True)
+class _ArgSpec:
+    """Which options of a search or stream-editing command take a pattern/script ("pattern"),
+    a file to read ("file") or some other value ("value"). Unlisted options are flags."""
+    short: Dict[str, str]
+    long: Dict[str, str]
+    positional_pattern: bool = True  # the first operand is the pattern unless -e/-f gave one
+    skip_assigns: bool = False       # awk: NAME=value operands are variable assignments
+
+
+_GREP_SPEC = _ArgSpec(
+    short={"e": "pattern", "f": "file", "A": "value", "B": "value", "C": "value", "m": "value",
+           "d": "value", "D": "value"},
+    long={"--regexp": "pattern", "--file": "file", "--exclude-from": "file",
+          "--after-context": "value", "--before-context": "value", "--context": "value",
+          "--max-count": "value", "--include": "value", "--exclude": "value",
+          "--exclude-dir": "value", "--label": "value", "--binary-files": "value",
+          "--devices": "value", "--directories": "value", "--group-separator": "value"})
+_RG_SPEC = _ArgSpec(
+    short={"e": "pattern", "f": "file", "A": "value", "B": "value", "C": "value", "m": "value",
+           "g": "value", "t": "value", "T": "value", "E": "value", "j": "value", "M": "value",
+           "r": "value", "d": "value"},
+    long={"--regexp": "pattern", "--file": "file", "--ignore-file": "file",
+          "--after-context": "value", "--before-context": "value", "--context": "value",
+          "--max-count": "value", "--glob": "value", "--iglob": "value", "--type": "value",
+          "--type-not": "value", "--type-add": "value", "--type-clear": "value",
+          "--encoding": "value", "--threads": "value", "--max-columns": "value",
+          "--replace": "value", "--max-depth": "value", "--max-filesize": "value",
+          "--sort": "value", "--sortr": "value", "--color": "value", "--colors": "value",
+          "--engine": "value", "--path-separator": "value", "--pre": "value",
+          "--pre-glob": "value", "--context-separator": "value",
+          "--field-match-separator": "value", "--field-context-separator": "value"})
+_AG_SPEC = _ArgSpec(
+    short={"A": "value", "B": "value", "C": "value", "m": "value", "G": "value", "g": "value",
+           "p": "file"},
+    long={"--after": "value", "--before": "value", "--context": "value", "--max-count": "value",
+          "--file-search-regex": "value", "--ignore": "value", "--ignore-dir": "value",
+          "--path-to-ignore": "file", "--depth": "value", "--match": "pattern",
+          "--type": "value", "--type-set": "value", "--type-add": "value", "--output": "value"})
+_GIT_GREP_SPEC = _ArgSpec(
+    short={"e": "pattern", "f": "file", "A": "value", "B": "value", "C": "value", "m": "value"},
+    long={"--file": "file", "--after-context": "value", "--before-context": "value",
+          "--context": "value", "--max-count": "value", "--max-depth": "value",
+          "--threads": "value"})
+_SED_SPEC = _ArgSpec(
+    short={"e": "pattern", "f": "file", "l": "value"},
+    long={"--expression": "pattern", "--file": "file", "--line-length": "value"})
+_AWK_SPEC = _ArgSpec(
+    short={"f": "file", "e": "pattern", "v": "value", "F": "value"},
+    long={"--file": "file", "--source": "pattern", "--assign": "value",
+          "--field-separator": "value"},
+    skip_assigns=True)
+_SEARCH_SPECS = {"grep": _GREP_SPEC, "egrep": _GREP_SPEC, "fgrep": _GREP_SPEC, "zgrep": _GREP_SPEC,
+                 "rg": _RG_SPEC, "ag": _AG_SPEC, "ack": _AG_SPEC}
+_SCRIPT_SPECS = {"sed": _SED_SPEC, "gsed": _SED_SPEC, "awk": _AWK_SPEC, "gawk": _AWK_SPEC,
+                 "mawk": _AWK_SPEC, "nawk": _AWK_SPEC}
+_FIND_PATTERN_OPTS = {"-name", "-iname", "-path", "-ipath", "-wholename", "-iwholename",
+                      "-regex", "-iregex", "-lname", "-ilname"}
+_PERL_CODE_RE = re.compile(r"^-[A-Za-z]*[eE]$")
+# Quoted text with regex-only syntax (alternation, anchors, .*, groups) is a pattern, not a path.
+_REGEX_TEXT_RE = re.compile(r"\||^\^|\.\*|\(\?|\[\^")
+
 # Hardcoded secrets in written content. Only the kind is reported, never the value.
 _CONTENT_SECRET_RULES = [
     (re.compile(r"(?<![A-Za-z0-9])sk-ant-[A-Za-z0-9_-]{20,}"), "Anthropic API key"),
@@ -524,6 +587,46 @@ def _mark_message_args(words: List[_Word]) -> None:
             take = True
 
 
+def _mark_pattern_args(words: List[_Word], spec: _ArgSpec, pattern_role: str) -> None:
+    """Give the pattern or script of grep/rg/ag/git grep/sed/awk `pattern_role` and other
+    option values "skip", so only operands in file positions are checked as paths."""
+    roles = {"pattern": pattern_role, "value": "skip", "file": "word"}
+    have_pattern = False
+    options = True
+    i = 0
+    while i < len(words):
+        w = words[i]
+        v = w.value
+        kind: Optional[str] = None
+        attached = False
+        if options and v == "--":
+            options = False
+        elif options and v.startswith("--") and len(v) > 2:
+            key, eq, _ = v.partition("=")
+            kind = spec.long.get(key)
+            attached = bool(eq)
+        elif options and v.startswith("-") and len(v) > 1:
+            for k in range(1, len(v)):
+                kind = spec.short.get(v[k])
+                if kind:
+                    attached = k + 1 < len(v)
+                    break
+        elif spec.skip_assigns and have_pattern and _ASSIGN_RE.match(v):
+            w.role = "skip"
+        elif spec.positional_pattern and not have_pattern:
+            w.role = pattern_role
+            have_pattern = True
+        if kind:
+            have_pattern = have_pattern or kind in ("pattern", "file")
+            if attached:
+                if kind != "file":
+                    w.role = roles[kind]
+            elif i + 1 < len(words):
+                words[i + 1].role = roles[kind]
+                i += 1
+        i += 1
+
+
 def _join_base(current: Optional[str], value: str) -> str:
     """Apply a git -C/work-tree path to the current git base without using host OS semantics."""
     if _is_abs(value) or not current:
@@ -590,6 +693,14 @@ def _plan(words: List[_Word], ps: bool) -> Optional[str]:
                 w.base = git_base
         elif sub in ("commit", "tag"):
             _mark_message_args(plain[sub_at + 1:])
+        elif sub == "grep":
+            _mark_pattern_args(plain[sub_at + 1:], _GIT_GREP_SPEC, "text")
+    elif name in _SEARCH_SPECS:
+        _mark_pattern_args(rest, _SEARCH_SPECS[name], "text")
+    elif name in _SCRIPT_SPECS:
+        # Not "text": a sed or awk script can run commands, so the dangerous-command rules
+        # still read it.
+        _mark_pattern_args(rest, _SCRIPT_SPECS[name], "skip")
     elif name == "find" and any(w.value == "-delete" for w in rest):
         # `find ROOT... -delete` recursively removes matches below its search roots.
         # Mark only the starting paths; expressions beginning with '-' do not name files.
@@ -602,8 +713,12 @@ def _plan(words: List[_Word], ps: bool) -> Optional[str]:
         for w in rest:
             if take:
                 w.role, take = "text", False
-            elif w.value in _CODE_FLAGS:
+            elif w.value in _CODE_FLAGS or (name in ("perl", "ruby") and _PERL_CODE_RE.match(w.value)):
                 take = True
+    if name == "find":
+        for q, w in enumerate(rest[:-1]):
+            if w.value in _FIND_PATTERN_OPTS:
+                rest[q + 1].role = "skip"
     if delete_from is None:
         for q in range(j + 1, len(plain) - 1):
             if plain[q].value in ("-exec", "-execdir", "-ok") and _name(plain[q + 1].value) in _DELETE_CMDS:
@@ -654,6 +769,8 @@ def _check_shell_word(w: _Word, name: str, cwd: Optional[str], workdir: Optional
         return
     if name in ("sed", "perl") and _SED_RE.match(raw) and raw.count(raw[1]) >= 3:
         return  # s/old/new/ expression, not a path
+    if mode == "read" and w.quoted and _REGEX_TEXT_RE.search(raw):
+        return  # a quoted regex for a command not listed in _SEARCH_SPECS
     exp = _expand(raw, assigns)
     texts = list(dict.fromkeys(t for t in (exp, raw) if t is not None))
     for t in texts:

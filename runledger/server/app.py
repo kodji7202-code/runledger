@@ -54,12 +54,12 @@ import ssl
 import sys
 import threading
 import traceback
-from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from .. import __version__
+from ..parser import _ts as _parse_ts
 from . import approvals, budgets, exports, insights, maintenance
 from .auth import (
     SESSION_TTL_SECONDS,
@@ -1120,15 +1120,8 @@ def _money(value: Any) -> Optional[float]:
 
 
 def _iso(value: Any) -> Optional[str]:
-    if not isinstance(value, str) or not value:
-        return None
-    try:
-        when = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if when.tzinfo is None:
-        when = when.replace(tzinfo=timezone.utc)
-    return when.astimezone(timezone.utc).strftime(TIME_FORMAT)
+    when = _parse_ts(value)
+    return when.strftime(TIME_FORMAT) if when else None
 
 
 def _level_for(score: int) -> str:

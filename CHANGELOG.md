@@ -7,6 +7,8 @@ change behavior, so read the entry before you upgrade.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-15
+
 ### Changed
 
 - **Safe mode is the default for shareable receipts:** Markdown and JSON receipts written to
@@ -21,7 +23,6 @@ change behavior, so read the entry before you upgrade.
   ships with the package and `docs/receipt-json.md` describes every key. Within a version,
   changes are additive only. Markdown receipts on stdout end with
   `<!-- runledger: safe=... schema=1 -->`.
-
 - **Risk for shell and database writes:** files written through the shell get the same path
   checks as edit-tool writes (secrets files high, `.git` folder medium, outside the project low).
   New rules: `db_migration` (medium) for new or changed migration files, `db_write` (medium) for
@@ -43,12 +44,16 @@ change behavior, so read the entry before you upgrade.
   `% pwd` context, the settings file, the tool paths' Git work tree or the encoded session folder,
   so these receipts get the branch, repo-relative files and Git line counts. JSON receipts add
   `cwd_source`. `list` and `--latest` find these sessions by their folder name.
-
+- **Search patterns are not paths:** the patterns and scripts of `grep`, `rg`, `ag`, `git grep`,
+  `sed`, `awk` and `perl -pe`, and `find -name`/`-path` values, no longer count as paths, so
+  `rg '/workspace|/home' src` is no longer flagged `shell_outside`. Only operands in file
+  positions are checked (`grep root /etc/passwd` is still flagged), and other quoted regexes
+  with `|`, `^`, `.*` or groups are skipped. Quoted grep patterns no longer trigger the
+  dangerous-command rules (`grep 'rm -rf /' .`).
 - **Relative working folders:** a session whose log records `cwd` as `.` (seen in Droid) no longer
   takes the branch, Git line counts and checkpoints from the folder RunLedger runs in, and no longer
   flags every absolute path as outside the working folder.
 - **Safe mode and path lists:** colon-separated path lists (`a:/home/u/b`) are rewritten path by path.
-
 - **Partial costs:** when some tokens have no price, the run cost reads `≥ $X (N models unpriced)`
   and JSON adds `totals.cost_partial` and `totals.unknown_models`. The cost-per-line quality signal
   is skipped for partial costs, and advisor savings leave out steps with no token data.
@@ -59,6 +64,8 @@ change behavior, so read the entry before you upgrade.
   5,000-step session renders about twice as fast.
 - **Droid tokens for copied transcripts:** when a transcript has no sibling `.settings.json`,
   RunLedger finds the session's settings file by id under `$FACTORY_HOME/sessions/`.
+- **Timestamps on Python 3.9 and 3.10:** fractions with other than 3 or 6 digits (`00:01:00.5Z`)
+  no longer make the run duration or a pushed run's time unknown.
 - **Droid receipts without usage:** token counts show `n/a` instead of 0, with a note naming the
   missing settings file. Cost stays unknown.
 
