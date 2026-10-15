@@ -175,7 +175,8 @@ def test_mixed_model_snapshot_cannot_be_priced_as_the_last_model(tmp_path):
 
 
 @pytest.mark.parametrize("settings_text", [None, "{partial", "[]", '{"model":"claude-sonnet-4-5"}'])
-def test_missing_usage_or_unreadable_settings_never_fabricate_run_cost(tmp_path, settings_text):
+def test_missing_usage_or_unreadable_settings_never_fabricate_run_cost(tmp_path, monkeypatch, settings_text):
+    monkeypatch.setenv("FACTORY_HOME", str(tmp_path / "factory"))
     path = _session(tmp_path, [_message([_call("Read", {"file_path": "a.py"})])])
     if settings_text is not None:
         path.with_suffix(".settings.json").write_text(settings_text, encoding="utf-8")
@@ -183,6 +184,106 @@ def test_missing_usage_or_unreadable_settings_never_fabricate_run_cost(tmp_path,
     apply_costs(run)
     assert run.usage == Usage()
     assert run.cost is None
+
+
+SHELL_FIX = FIXTURES / "droid_shell_edits.jsonl"
+SHELL_ID = "4f081969-21df-49b2-9272-75a305796c06"
+SHELL_MODEL = "claude-sonnet-5-5"
+
+
+def _receipt(capsys, path, fmt):
+    assert main(["receipt", str(path), "--format", fmt, "-o", "-"]) == 0
+    out = capsys.readouterr().out
+    return json.loads(out) if fmt == "json" else out
+
+
+def test_settings_total_is_split_evenly_and_marked_estimated(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("FACTORY_HOME", str(tmp_path / "factory"))
+    run = droid.parse(SHELL_FIX)
+    assert run.usage == Usage(12, 3451, 13726, 92818)
+    assert run.usage.total == 110007
+    assert run.models == {SHELL_MODEL: run.usage}
+    assert [s.usage.total for s in run.steps] == [22004, 22002, 22001, 22000, 22000]
+    assert all(s.usage_estimated for s in run.steps)
+    assert (run.usage_source, run.usage_file) == ("settings", "droid_shell_edits.settings.json")
+    apply_costs(run)
+    assert run.cost == pytest.approx(cost_of(run.usage, SHELL_MODEL))
+    assert run.cost == pytest.approx(0.0781, abs=1e-4)
+
+    data = _receipt(capsys, SHELL_FIX, "json")
+    assert data["totals"]["tokens"] == 110007
+    assert data["totals"]["usage_source"] == "settings"
+    assert all(s["tokens_estimated"] for s in data["steps"])
+    note = ("Per-step tokens are estimated: an even split of the session total "
+            "in droid_shell_edits.settings.json.")
+    assert note in _receipt(capsys, SHELL_FIX, "md")
+    assert note in _receipt(capsys, SHELL_FIX, "html")
+
+
+def test_settings_are_found_by_session_id_when_the_transcript_was_copied(tmp_path, monkeypatch):
+    home = tmp_path / "factory"
+    monkeypatch.setenv("FACTORY_HOME", str(home))
+    copy = tmp_path / "copies" / "renamed.jsonl"
+    copy.parent.mkdir()
+    shutil.copyfile(SHELL_FIX, copy)
+    cwd = droid.parse(SHELL_FIX).cwd
+    other = home / "sessions" / "-somewhere-else" / f"{SHELL_ID}.settings.json"
+    other.parent.mkdir(parents=True)
+    other.write_text(json.dumps({"tokenUsage": {"inputTokens": 7}}), encoding="utf-8")
+
+    run = droid.parse(copy)
+    assert (run.usage, run.usage_source) == (Usage(7), "settings")
+
+    own = home / "sessions" / cwd.replace("/", "-") / f"{SHELL_ID}.settings.json"
+    own.parent.mkdir(parents=True)
+    shutil.copyfile(SHELL_FIX.with_suffix(".settings.json"), own)
+    run = droid.parse(copy)
+    assert run.usage.total == 110007  # the folder for the session's cwd wins
+    assert run.usage_file == own.name
+
+
+@pytest.mark.parametrize("sid", ["../escape", "*", "a/b", ""])
+def test_unsafe_session_ids_are_never_used_to_search(tmp_path, monkeypatch, sid):
+    monkeypatch.setenv("FACTORY_HOME", str(tmp_path))
+    (tmp_path / "sessions" / "x").mkdir(parents=True)
+    (tmp_path / "sessions" / "x" / "anything.settings.json").write_text(
+        json.dumps({"tokenUsage": {"inputTokens": 7}}), encoding="utf-8")
+    path = tmp_path / "s.jsonl"
+    path.write_text(json.dumps({"type": "session_start", "id": sid, "cwd": "/demo"}) + "\n",
+                    encoding="utf-8")
+    assert droid._settings_path(path, droid._header(path)) is None
+
+
+def test_missing_settings_show_na_and_a_note_and_no_cost(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("FACTORY_HOME", str(tmp_path / "factory"))
+    path = tmp_path / f"{SHELL_ID}.jsonl"
+    shutil.copyfile(SHELL_FIX, path)
+    run = droid.parse(path)
+    apply_costs(run)
+    assert (run.usage, run.usage_source, run.cost) == (Usage(), "missing", None)
+    assert not any(s.usage_estimated for s in run.steps)
+
+    data = _receipt(capsys, path, "json")
+    assert data["totals"]["usage_source"] == "missing"
+    assert data["totals"]["cost_usd"] is None
+    note = (f"Token usage not found: Droid keeps it in {SHELL_ID}.settings.json "
+            "next to the session file.")
+    md = _receipt(capsys, path, "md")
+    assert note in md and "**Tokens:** n/a" in md and ", n/a tok," in md
+    page = _receipt(capsys, path, "html")
+    assert note in page and "<span>Tokens</span><b>n/a</b>" in page
+
+
+def test_per_message_usage_is_exact_and_has_no_note(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("FACTORY_HOME", str(tmp_path / "factory"))
+    path = _session(tmp_path, [_message([_call("Read", {"file_path": "a.py"})], modelId=MODEL,
+                                        usage={"input_tokens": 10, "output_tokens": 5})])
+    run = droid.parse(path)
+    assert (run.usage_source, run.usage_file) == ("messages", None)
+    assert not run.steps[0].usage_estimated
+    md = _receipt(capsys, path, "md")
+    assert "estimated" not in md and "Token usage not found" not in md
+    assert _receipt(capsys, path, "json")["steps"][0]["tokens_estimated"] is False
 
 
 def test_partial_lines_bad_shapes_and_context_are_ignored(tmp_path):

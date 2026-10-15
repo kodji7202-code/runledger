@@ -7,6 +7,30 @@ change behavior, so read the entry before you upgrade.
 
 ## [Unreleased]
 
+### Added
+
+- **Risk for shell and database writes:** files written through the shell get the same path
+  checks as edit-tool writes (secrets files high, `.git` folder medium, outside the project low).
+  New rules: `db_migration` (medium) for new or changed migration files, `db_write` (medium) for
+  migration runners and `sqlite3`/Python commands that change a local database, and `temp_copy`
+  (low) for copying a project file into a temp folder. Read-only queries and scratch writes to
+  temp folders stay unflagged.
+- **Test changes from the Git diff:** each changed test file gets one verdict from its diff
+  against HEAD, however it was written: skipped, replaced, weakened or changed. Skipped and
+  weakened files add risk and count toward `test_tampering`. Replaced and changed files appear in
+  a neutral quality signal, `test_changes`. A diff verdict replaces the per-step Edit rule for
+  that file, so a receipt no longer calls one file both weakened and replaced.
+- **Droid usage source:** JSON receipts include `totals.usage_source` (`messages`, `settings` or
+  `missing`) and `tokens_estimated` on each step. Markdown and HTML add a footer note when
+  per-step tokens are an even split of the session total.
+
+### Fixed
+
+- **Droid tokens for copied transcripts:** when a transcript has no sibling `.settings.json`,
+  RunLedger finds the session's settings file by id under `$FACTORY_HOME/sessions/`.
+- **Droid receipts without usage:** token counts show `n/a` instead of 0, with a note naming the
+  missing settings file. Cost stays unknown.
+
 ## [0.5.2] - 2026-10-15
 
 ### Added

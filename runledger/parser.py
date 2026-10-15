@@ -65,6 +65,7 @@ class Step:
     summary: str = ""
     risks: List["Risk"] = field(default_factory=list)  # filled by risk module
     has_result: bool = False  # an empty tool_result still confirms the call ran
+    usage_estimated: bool = False  # usage is an even share of a session total, not a per-call count
 
 
 @dataclass
@@ -94,6 +95,9 @@ class Run:
     git_changes: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     # gitinfo.file_diffs for changed test files, keyed relative to cwd; read by testdiff, never shown
     test_diffs: Dict[str, str] = field(default_factory=dict)
+    # Droid only: "messages", "settings" or "missing"; None for adapters with usage in every message
+    usage_source: Optional[str] = None
+    usage_file: Optional[str] = None  # file name (no folder) of the settings file that supplied usage
 
     @property
     def duration_seconds(self) -> Optional[float]:

@@ -95,6 +95,14 @@ Droid writes a JSONL transcript and a sibling settings file:
   Thinking tokens, credits, `inclusiveTokenUsage` and `lastCallTokenUsage` are not added again.
   Without per-message usage, a single-model total is split evenly across steps as an approximation.
   A mixed-model cumulative total cannot be attributed reliably, so its remainder has an unknown model.
+- **Settings file lookup.** RunLedger reads the sibling `<name>.settings.json` first. If the
+  transcript was copied or renamed without it, RunLedger looks for `<session-id>.settings.json`
+  under `$FACTORY_HOME/sessions/`, preferring the folder for the session's `cwd`.
+- **Where usage came from.** JSON receipts include `totals.usage_source`: `messages` (per-message
+  usage), `settings` (the settings file's total) or `missing`, and `tokens_estimated` on each step
+  that received an even split. Markdown and HTML receipts add a footer note for estimated
+  per-step tokens. When no usage is found, they show token counts as `n/a`, not 0, with a note
+  naming the settings file Droid would have written. Other agents leave `usage_source` null.
 - **Cost.** Only token counts with a known model price produce estimates. Unknown models and
   missing usage leave the run cost unknown. Missing or partially written settings do not prevent
   parsing the transcript.
