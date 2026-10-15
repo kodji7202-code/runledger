@@ -153,7 +153,8 @@ def test_detached_head_has_no_branch(repo):
 def test_repository_without_commits(tmp_path):
     _git(tmp_path, "init", "-q", "-b", "main")
     (tmp_path / "a.txt").write_text("1\n2\n")
-    assert gitinfo.working_changes(str(tmp_path)) == {"a.txt": {"added": 2, "removed": 0, "status": "untracked"}}
+    assert gitinfo.working_changes(str(tmp_path)) == {"a.txt": {"added": 2, "removed": 0, "status": "untracked",
+                                                        "binary": False}}
     assert gitinfo.current_branch(str(tmp_path)) == "main"
 
 

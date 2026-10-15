@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import os
 import subprocess
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 # The session log names the folder, so its repository config is not trusted:
 # these options keep git from running fsmonitor hooks, external diff tools or textconv filters.
@@ -36,22 +36,63 @@ def current_branch(cwd: Optional[str]) -> Optional[str]:
     return (_git(cwd, "symbolic-ref", "--short", "-q", "HEAD") or "").strip() or None
 
 
-def _count_lines(path: str) -> int:
+def _count_lines(path: str) -> Tuple[int, bool]:
+    """(line count, is binary) of a file; a file too large to read counts 0 lines."""
     try:
         if os.path.getsize(path) > _MAX_COUNT_BYTES:
-            return 0
+            return 0, False
         with open(path, "rb") as fh:
             data = fh.read()
     except OSError:
-        return 0
+        return 0, False
     if b"\0" in data:
-        return 0  # binary
-    return len(data.splitlines())
+        return 0, True
+    return len(data.splitlines()), False
+
+
+_ESCAPES = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13, '"': 34, "\\": 92}
+
+
+def _unquote(name: str) -> str:
+    """Decode a C-quoted path from a diff header ("a/x\\ty" or octal UTF-8 bytes)."""
+    if len(name) < 2 or not (name.startswith('"') and name.endswith('"')):
+        return name
+    body, out, i = name[1:-1], bytearray(), 0
+    while i < len(body):
+        c = body[i]
+        if c == "\\" and i + 1 < len(body):
+            octal = body[i + 1:i + 4]
+            if len(octal) == 3 and all(d in "01234567" for d in octal):
+                out.append(int(octal, 8) & 0xFF)
+                i += 4
+                continue
+            nxt = body[i + 1]
+            if nxt in _ESCAPES:
+                out.append(_ESCAPES[nxt])
+            else:
+                out += nxt.encode("utf-8")
+            i += 2
+            continue
+        out += c.encode("utf-8")
+        i += 1
+    return out.decode("utf-8", errors="replace")
+
+
+def _header_path(line: str) -> Optional[str]:
+    """The path in a `--- a/x` or `+++ b/x` line. Git adds a tab after names with spaces."""
+    name = line[4:].rstrip("\n")
+    if name.endswith("\t"):
+        name = name[:-1]
+    name = _unquote(name)
+    if name.startswith(("a/", "b/")):
+        return name[2:]
+    return None
 
 
 def working_changes(cwd: Optional[str], paths: Optional[Iterable[str]] = None) -> Dict[str, Dict[str, object]]:
     """Uncommitted changes against HEAD, keyed by path relative to cwd:
-    {"added": int, "removed": int, "status": "modified" | "deleted" | "untracked"}.
+    {"added": int, "removed": int, "status": "modified" | "deleted" | "untracked",
+    "binary": bool}. Binary files count 0 lines.
     With `paths`, only those paths are reported."""
     if not _in_repo(cwd):
         return {}
@@ -72,14 +113,16 @@ def working_changes(cwd: Optional[str], paths: Optional[Iterable[str]] = None) -
             exists = os.path.lexists(os.path.join(cwd, path))
             out[path] = {"added": int(added) if added.isdigit() else 0,
                          "removed": int(removed) if removed.isdigit() else 0,
-                         "status": "modified" if exists else "deleted"}
+                         "status": "modified" if exists else "deleted",
+                         "binary": added == "-" and removed == "-"}
         untracked = _git(cwd, "ls-files", "--others", "--exclude-standard", "-z") or ""
     else:
         # No commit yet: every file in the index or the tree is new.
         untracked = _git(cwd, "ls-files", "--cached", "--others", "--exclude-standard", "-z") or ""
     for path in untracked.split("\0"):
         if path and path not in out and (wanted is None or path in wanted):
-            out[path] = {"added": _count_lines(os.path.join(cwd, path)), "removed": 0, "status": "untracked"}
+            lines, binary = _count_lines(os.path.join(cwd, path))
+            out[path] = {"added": lines, "removed": 0, "status": "untracked", "binary": binary}
     return out
 
 
@@ -98,8 +141,8 @@ def file_diffs(cwd: Optional[str], paths: Iterable[str]) -> Dict[str, str]:
     for line in text.splitlines(keepends=True):
         if line.startswith("diff --git "):
             path = None
-        elif path is None and line.startswith(("--- a/", "+++ b/")):
-            path = line[6:].rstrip("\n")
+        elif path is None and line.startswith(("--- ", "+++ ")):
+            path = _header_path(line)
             if path not in wanted:
                 path = None
             continue

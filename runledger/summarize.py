@@ -15,15 +15,14 @@ from typing import Any, Dict, List, Optional
 
 from . import llm
 from .parser import Run, Step, Usage
-from .shell_writes import shell_writes
+from .paths import is_abs, relative
+from .shell_writes import shell_deletes, shell_writes
 
 DEFAULT_AI_MODEL = os.environ.get("RUNLEDGER_SUMMARY_MODEL", "claude-haiku-5-5")
 
 
 def _short(path: str, cwd: Optional[str]) -> str:
-    if cwd and path.startswith(cwd.rstrip("/") + "/"):
-        return path[len(cwd.rstrip("/")) + 1:]
-    return path
+    return relative(path, cwd)
 
 
 COMMAND_LIMIT = 120
@@ -67,6 +66,7 @@ class FileChange:
     deleted: bool = False
     shell: bool = False      # written by a shell command, so the line counts may be incomplete
     verified: bool = False   # line counts come from the Git working tree
+    binary: bool = False     # Git sees a binary file, so there are no line counts
 
 
 def file_changes(run: Run) -> Dict[str, FileChange]:
@@ -91,22 +91,15 @@ def file_changes(run: Run) -> Dict[str, FileChange]:
             changes.setdefault(p, FileChange(p)).added += _lines(s.input.get("new_source"))
         elif s.tool == "Bash":
             cmd = _str(s.input.get("command"))
-            # Only the arguments of an rm in each simple command count: `rm -rf build/ && pytest -q`
-            # deletes build/, not pytest.
-            for part in re.split(r"&&|\|\||;|\||\n", cmd):
-                m = re.match(r"^\s*(git\s+rm|rm)\s+(?:-\S+\s+)*(.+)$", part)
-                if not m:
-                    continue
-                for t in m.group(2).split():
-                    if ">" in t or "<" in t:
-                        break  # redirection target, not a deleted file
-                    if t.startswith(("-", "$")) or "&" in t:
-                        continue
-                    fc = changes.setdefault(t, FileChange(t))
-                    fc.deleted = fc.shell = True
+            for target in shell_deletes(cmd):
+                p = _short(target, run.cwd)
+                if run.cwd and is_abs(p):
+                    continue  # outside the project, such as a scratch file in /tmp
+                fc = changes.setdefault(p, FileChange(p))
+                fc.deleted = fc.shell = True
             for w in shell_writes(cmd):
                 p = _short(w.path, run.cwd)
-                if run.cwd and p.startswith("/"):
+                if run.cwd and is_abs(p):
                     continue  # outside the project, such as a backup in /tmp
                 fc = changes.setdefault(p, FileChange(p))
                 fc.shell = True
@@ -119,6 +112,7 @@ def file_changes(run: Run) -> Dict[str, FileChange]:
             fc.created = git.get("status") == "untracked"
             fc.deleted = git.get("status") == "deleted"
             fc.verified = True
+            fc.binary = bool(git.get("binary"))
     return changes
 
 

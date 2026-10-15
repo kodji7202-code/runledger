@@ -43,6 +43,7 @@ from . import adapters
 from .gitinfo import current_branch, file_diffs, working_changes
 from .guard import redact
 from .guard_receipt import load_guard_decisions
+from .paths import is_abs
 from .pricing import apply_costs
 from .quality import analyze
 from .receipt import redact_run, render
@@ -97,7 +98,7 @@ def reconcile_git(run) -> None:
     if shell_paths:
         run.git_changes = working_changes(run.cwd, shell_paths)
     test_paths = [p for p, fc in changes.items()
-                  if not fc.deleted and not p.startswith("/") and is_test_source(p)]
+                  if not fc.deleted and not is_abs(p) and is_test_source(p)]
     if test_paths:
         run.test_diffs = file_diffs(run.cwd, test_paths)
 
