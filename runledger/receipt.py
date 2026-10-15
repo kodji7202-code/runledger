@@ -388,6 +388,7 @@ def redact_run(run: Run, risks: List[Risk]) -> None:
     run.agent = redact(run.agent)
     run.cwd = redact(run.cwd) if run.cwd is not None else None
     run.git_branch = redact(run.git_branch) if run.git_branch is not None else None
+    run.git_changes = {redact(p): c for p, c in run.git_changes.items()}
     run.started = redact(run.started) if run.started is not None else None
     run.ended = redact(run.ended) if run.ended is not None else None
     redacted_models: Dict[str, Usage] = {}
