@@ -149,7 +149,7 @@ def unknown_models(run: Run) -> List[str]:
 
 def apply_costs(run: Run) -> None:
     for s in run.steps:
-        s.cost = cost_of(s.usage, s.model)
+        s.cost = cost_of(s.usage, s.model) if s.usage_known else None
     total = 0.0
     known = False
     for model, u in run.models.items():

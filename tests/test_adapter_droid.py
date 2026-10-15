@@ -274,6 +274,61 @@ def test_missing_settings_show_na_and_a_note_and_no_cost(tmp_path, monkeypatch, 
     assert note in page and "<span>Tokens</span><b>n/a</b>" in page
 
 
+def test_missing_settings_steps_show_na_cost_and_null_json(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("FACTORY_HOME", str(tmp_path / "factory"))
+    path = tmp_path / f"{SHELL_ID}.jsonl"
+    shutil.copyfile(SHELL_FIX, path)
+    run = droid.parse(path)
+    apply_costs(run)
+    assert not any(s.usage_known for s in run.steps)
+    assert all(s.cost is None for s in run.steps)
+
+    md = _receipt(capsys, path, "md")
+    steps = [line for line in md.splitlines() if " tok, " in line]
+    assert steps and all(line.endswith("n/a tok, n/a") for line in steps)
+    assert "$0.0000" not in md
+    data = _receipt(capsys, path, "json")
+    assert all(s["cost_usd"] is None and s["tokens_known"] is False for s in data["steps"])
+    assert "$0.0000" not in _receipt(capsys, path, "html")
+
+
+def test_steps_without_attributed_usage_are_unknown_not_zero(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("FACTORY_HOME", str(tmp_path / "factory"))
+    usage = {"input_tokens": 100, "output_tokens": 20}
+    rows = [
+        _message([_call("Read", {"file_path": "a.py"}, "one")], modelId=MODEL, usage=usage),
+        _message([_call("Read", {"file_path": "b.py"}, "two")], mid="two", modelId=MODEL),
+    ]
+    # The snapshot equals the per-message usage, so nothing is left to give the second step.
+    path = _session(tmp_path, rows, settings={"model": MODEL, "tokenUsage": {"inputTokens": 100, "outputTokens": 20}})
+    run = droid.parse(path)
+    apply_costs(run)
+    assert [s.usage_known for s in run.steps] == [True, False]
+    assert run.steps[0].cost == pytest.approx(cost_of(Usage(100, 20), MODEL))
+    assert run.steps[1].cost is None
+    assert run.usage_source == "messages"
+    data = _receipt(capsys, path, "json")
+    assert [(s["tokens_known"], s["cost_usd"] is None) for s in data["steps"]] == [(True, False), (False, True)]
+    assert _receipt(capsys, path, "md").splitlines().count("2. Read b.py — Sonnet 4.5, n/a tok, n/a") == 1
+
+
+def test_mixed_model_remainder_leaves_unattributed_steps_unknown(tmp_path):
+    run = droid.parse(_session(tmp_path, [
+        _message([_call("Read", {"file_path": "a.py"}, "one")], modelId=MODEL),
+        _message([_call("Read", {"file_path": "b.py"}, "two")], mid="two", modelId="claude-haiku-4-5"),
+    ], settings={"model": "claude-haiku-4-5", "tokenUsage": {"inputTokens": 100}}))
+    apply_costs(run)
+    assert [(s.usage_known, s.cost) for s in run.steps] == [(False, None), (False, None)]
+
+
+def test_settings_split_marks_steps_known(tmp_path, monkeypatch):
+    monkeypatch.setenv("FACTORY_HOME", str(tmp_path / "factory"))
+    run = droid.parse(SHELL_FIX)
+    apply_costs(run)
+    assert all(s.usage_known and s.cost is not None for s in run.steps)
+    assert sum(s.usage.total for s in run.steps) == run.usage.total
+
+
 def test_per_message_usage_is_exact_and_has_no_note(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("FACTORY_HOME", str(tmp_path / "factory"))
     path = _session(tmp_path, [_message([_call("Read", {"file_path": "a.py"})], modelId=MODEL,

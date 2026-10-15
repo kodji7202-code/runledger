@@ -10,7 +10,7 @@ from . import __version__
 from .adapters import label as agent_label
 from .guard import redact
 from .guard_receipt import guard_counts, guard_summary
-from .parser import Run, Usage
+from .parser import Run, Step, Usage
 from .pricing import PRICING_HELP, friendly_model, unknown_models
 from .risk import Risk
 from .summarize import FileChange, file_changes
@@ -29,6 +29,14 @@ def _tok(n: int) -> str:
 def _run_tok(run: Run, n: int) -> str:
     """Show unknown usage as n/a, so a missing settings file never reads as zero tokens."""
     return "n/a" if run.usage_source == "missing" else _tok(n)
+
+
+def _step_known(run: Run, step: Step) -> bool:
+    return step.usage_known and run.usage_source != "missing"
+
+
+def _step_tok(run: Run, step: Step) -> str:
+    return _tok(step.usage.total) if _step_known(run, step) else "n/a"
 
 
 def _usage_note(run: Run) -> str:
@@ -498,7 +506,8 @@ def to_dict(run: Run, score: int, level: str, risks: List[Risk]) -> Dict:
         "pricing_note": PRICING_HELP if unknown_models(run) else None,
         "files": [asdict(c) for c in changes.values()],
         "steps": [{"n": s.index, "tool": s.tool, "summary": s.summary, "model": s.model,
-                   "tokens": s.usage.total, "tokens_estimated": s.usage_estimated,
+                   "tokens": s.usage.total, "tokens_known": _step_known(run, s),
+                   "tokens_estimated": s.usage_estimated,
                    "cost_usd": s.cost, "error": s.is_error,
                    "risks": [asdict(r) for r in s.risks]} for s in run.steps],
         "quality": run.quality,
@@ -544,7 +553,7 @@ def to_markdown(run: Run, score: int, level: str, risks: List[Risk]) -> str:
     out.append("## Steps")
     for s in run.steps:
         flag = " ⚠️" if s.risks else ""
-        out.append(f"{s.index}. {s.summary}{flag} — {friendly_model(s.model)}, {_run_tok(run, s.usage.total)} tok, {_money(s.cost)}")
+        out.append(f"{s.index}. {s.summary}{flag} — {friendly_model(s.model)}, {_step_tok(run, s)} tok, {_money(s.cost)}")
     note = _usage_note(run)
     if note:
         out += ["", _md_text(note)]
@@ -618,7 +627,7 @@ def to_html(run: Run, score: int, level: str, risks: List[Risk]) -> str:
             + ("".join(f" <span class='sev {r.severity}'>{e(r.reason)}</span>" for r in s.risks))
             + ("" if not s.is_error else " <span class='pill'>error</span>")
             + f"</td><td><span class='pill'>{e(friendly_model(s.model))}</span></td>"
-            f"<td class='num'>{_run_tok(run, s.usage.total)}</td><td class='num'>{_money(s.cost)}</td></tr>"
+            f"<td class='num'>{_step_tok(run, s)}</td><td class='num'>{_money(s.cost)}</td></tr>"
         )
     models = ", ".join(f"{friendly_model(m)} ({_tok(u.total)})" for m, u in run.models.items())
     request = e(run.prompts[0][:400]) if run.prompts else "—"
