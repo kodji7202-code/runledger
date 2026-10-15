@@ -69,8 +69,8 @@ The output is an object with `decision` (the full decision, including `risks` an
 event's `cwd` and your user file. If an approval server is configured and the decision is ask,
 `test` sends a real approval request and waits for an answer, as the hook does.
 
-The event format is the one Claude Code sends: `session_id`, `cwd`, `tool_name` and `tool_input`.
-Other fields are ignored.
+The event format is the one Claude Code sends: `session_id`, `cwd`, `tool_name`, `tool_input`
+and `tool_use_id`. The tool id links the decision to its step in the receipt.
 
 ## What the guard looks at
 
@@ -257,7 +257,7 @@ Each project's decisions go to `<project>/.runledger/guard.log`, where `<project
 the event's `cwd`. Each line is a JSON object:
 
 ```json
-{"ts": "2026-10-08T16:39:27+00:00", "session_id": "s1", "tool": "Bash", "mode": "monitor", "decision": "allow", "policy_decision": "deny", "codes": ["command"], "approval": null, "summary": "rm -rf /", "reason": "Monitor mode, not enforced. Blocked by RunLedger guard: Recursive force delete (rm -rf)"}
+{"ts": "2026-10-08T16:39:27+00:00", "session_id": "s1", "tool_use_id": "toolu-1", "tool": "Bash", "mode": "monitor", "decision": "allow", "policy_decision": "deny", "codes": ["command"], "approval": null, "summary": "rm -rf /", "reason": "Monitor mode, not enforced. Blocked by RunLedger guard: Recursive force delete (rm -rf)"}
 ```
 
 - `decision` is what happened (`allow`, `ask`, `deny`, or `error`). `policy_decision` is what the
@@ -266,6 +266,41 @@ the event's `cwd`. Each line is a JSON object:
   asked for, otherwise `null`.
 - A line with `"decision": "warning"` records a project setting the guard ignored.
 - A line with `"decision": "error"` records an evaluation error.
+- Every decision is logged, including plain allows, server approvals and monitor-mode
+  decisions. Receipts omit plain allows; the audit log retains them.
+
+### Guard decisions in receipts
+
+HTML, Markdown and JSON receipts read the log from the run's recorded working folder, not the
+folder where you invoke `receipt`. Only the run's `session_id` is included. The log is streamed;
+missing or unreadable files, corrupt lines and oversized lines (over 64 KiB of text) are skipped.
+
+The **Guard decisions** section shows the tool, summary, decision, outcome, reason, codes and
+timestamp. It links to a step by `tool_use_id`. Older records without an id match the tool and
+Guard summary in transcript order. Records with no matching step remain visible as **unmatched**.
+A blocked call is a requested step, not evidence that the tool executed.
+
+| Decision | Receipt outcome |
+| --- | --- |
+| Deny | **Blocked by Guard** |
+| Ask, with a normal tool result (including an empty result or a tool execution error) | **Approved by user** |
+| Ask, with Claude Code's user-rejection/permission-denial message, or no result | **Rejected by user** |
+| Approval status `approved` or `denied` | **Approved by approval server** or **Denied by approval server**, regardless of the local result |
+| Monitor mode | **Would have been blocked (monitor mode)** or **Would have been asked (monitor mode)** |
+
+An expired approval or a timeout that denies the call is **Blocked by Guard**. If the server is
+unavailable or times out and falls back to a local ask, the tool result determines the outcome.
+An ask with no result is reported as rejected even if the session is still in progress.
+
+The summary includes counts such as `Guard: 1 blocked, 2 asked (2 approved)`. Server-approved and
+server-denied requests count as asked; monitor counts are separate from enforced decisions.
+JSON adds a `guard` list of `{step, tool, summary, decision, outcome, reason, codes, ts}` objects,
+where `step` is the one-based step index or `null`, plus counts under `totals.guard`
+(`blocked`, `asked`, `approved`, `rejected`, `monitor_blocked`, `monitor_asked`).
+`decision` retains the hook's final decision, so a monitor record can say `allow`.
+The section, JSON key and counts are omitted when no relevant records exist. Plain allows,
+warnings and evaluation errors are not shown in this section. Summaries and reasons are masked
+again before inclusion in a receipt.
 
 The log records the tool name, the **summary**, the codes and the reason. For shell tools the
 summary is the command. For file tools it is the path. Write and Edit bodies, file contents and MCP

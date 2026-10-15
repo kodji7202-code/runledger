@@ -140,7 +140,9 @@ What a receipt contains:
 - the prompts (the first three, in full, in the JSON receipt);
 - each step: the first line of a command (up to 120 characters), file paths and line counts, search
   patterns and URLs, and the step's model, tokens and cost;
-- the risk findings and their reasons.
+- the risk findings and their reasons;
+- Guard decisions when available: blocked calls, user and server approvals or rejections,
+  monitor-only outcomes, and summary counts. See [the Guard log](docs/guard.md#guard-decisions-in-receipts).
 
 A receipt does **not** contain file contents or command output (only test pass and fail counts).
 **Secrets are masked** in everything a receipt shows, and so in what `push` sends and in the PR

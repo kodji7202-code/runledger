@@ -537,7 +537,7 @@ def decide(event: dict, policy: dict, approver: Optional[ApproverFn] = None) -> 
     is configured, or when an approver is passed in.
 
     Returns a dict with: decision (allow|deny|ask, after monitor mode and approval),
-    policy_decision (before them), mode, tool, session_id, cwd, reason, codes,
+    policy_decision (before them), mode, tool, tool_use_id, session_id, cwd, reason, codes,
     risks [{severity, code, reason}], approval (None or the server status), summary,
     and warnings (project settings that were ignored). Nothing here touches the log
     or stdout."""
@@ -589,6 +589,7 @@ def decide(event: dict, policy: dict, approver: Optional[ApproverFn] = None) -> 
         "policy_decision": policy_decision,
         "mode": cfg["mode"],
         "tool": tool,
+        "tool_use_id": step.tool_use_id,
         "session_id": session_id,
         "cwd": cwd,
         "reason": clean(reason, 500),
@@ -703,6 +704,7 @@ def _append_log(cwd: str, fields: Dict[str, Any]) -> None:
 def _log_decision(decision: dict) -> None:
     _append_log(decision["cwd"], {
         "session_id": decision["session_id"], "tool": decision["tool"], "mode": decision["mode"],
+        "tool_use_id": decision.get("tool_use_id", ""),
         "decision": decision["decision"], "policy_decision": decision["policy_decision"],
         "codes": decision["codes"], "approval": decision["approval"],
         "summary": decision["summary"], "reason": decision["reason"],
@@ -757,6 +759,7 @@ def _on_error(event: Any, policy: Dict[str, Any], exc: BaseException) -> Optiona
         session = str(event.get("session_id") or "")
         _log_quietly(lambda: _append_log(cwd, {
             "session_id": session, "tool": tool, "mode": cfg["mode"], "decision": "error",
+            "tool_use_id": str(event.get("tool_use_id") or ""),
             "codes": [], "reason": msg}))
     if cfg["mode"] == "monitor":
         return None

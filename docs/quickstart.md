@@ -48,6 +48,14 @@ Choose a session explicitly with a file path:
 runledger receipt path/to/session.jsonl --open
 ```
 
+If the run has Guard records in `<run cwd>/.runledger/guard.log`, every format includes a
+**Guard decisions** section and summary counts. It distinguishes blocked calls, user approval
+or rejection, server approval or denial, and monitor-only decisions. Old records without a tool
+id are matched in order; unmatched records are still listed. JSON exposes the decisions as
+`guard` and the counts as `totals.guard`. Missing or corrupt logs do not prevent a receipt;
+no Guard section or keys appear when there are no relevant records.
+See [Guard decisions in receipts](guard.md#guard-decisions-in-receipts) for outcome rules.
+
 Try it on the sample session that ships with the repository:
 
 ```bash

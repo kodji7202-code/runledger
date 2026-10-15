@@ -1,0 +1,16 @@
+{"ts":"2026-10-15T09:00:01Z","session_id":"other-session","tool_use_id":"blocked","tool":"Bash","decision":"deny","summary":"rm -rf build"}
+{"ts":"2026-10-15T09:00:02Z","session_id":"guard-session","tool_use_id":"blocked","tool":"Bash","decision":"deny","policy_decision":"deny","summary":"rm -rf build","reason":"Recursive force delete","codes":["command"]}
+{"ts":"2026-10-15T09:00:03Z","session_id":"guard-session","tool_use_id":"approved","tool":"Read","decision":"ask","policy_decision":"ask","summary":".env","reason":"Read a secrets file","codes":["secret_file"]}
+{"ts":"2026-10-15T09:00:04Z","session_id":"guard-session","tool_use_id":"rejected","tool":"Bash","decision":"ask","summary":"sudo apt-get update","reason":"Ran a command with sudo","codes":["command"]}
+{"ts":"2026-10-15T09:00:05Z","session_id":"guard-session","tool_use_id":"server-approved","tool":"Bash","decision":"allow","policy_decision":"ask","approval":"approved","summary":"sudo systemctl restart demo","reason":"Approved in RunLedger","codes":["command"]}
+{"ts":"2026-10-15T09:00:06Z","session_id":"guard-session","tool":"Bash","decision":"allow","summary":"sudo legacy","reason":"Old plain allow"}
+{"ts":"2026-10-15T09:00:07Z","session_id":"guard-session","tool":"Bash","decision":"ask","summary":"sudo legacy","reason":"Legacy confirmation","codes":["command"]}
+{"ts":"2026-10-15T09:00:08Z","session_id":"guard-session","tool":"Bash","decision":"ask","summary":"sudo legacy","reason":"Second legacy confirmation","codes":["command"]}
+{"ts":"2026-10-15T09:00:09Z","session_id":"guard-session","tool_use_id":"no-result","tool":"Read","decision":"ask","summary":"credentials.json","reason":"Read credentials","codes":["secret_file"]}
+{"ts":"2026-10-15T09:00:10Z","session_id":"guard-session","tool_use_id":"server-denied","tool":"Bash","decision":"deny","policy_decision":"ask","approval":"denied","summary":"sudo reboot","reason":"Denied in approval queue","codes":["command"]}
+{"ts":"2026-10-15T09:00:11Z","session_id":"guard-session","tool_use_id":"monitor-deny","tool":"Bash","decision":"allow","policy_decision":"deny","mode":"monitor","summary":"rm -rf cache","reason":"Monitor mode, not enforced","codes":["command"]}
+{"ts":"2026-10-15T09:00:12Z","session_id":"guard-session","tool_use_id":"monitor-ask","tool":"Read","decision":"allow","policy_decision":"ask","mode":"monitor","summary":".env.local","reason":"Monitor mode, not enforced","codes":["secret_file"]}
+{"ts":"2026-10-15T09:00:13Z","session_id":"guard-session","tool":"Bash","decision":"deny","summary":"old missing command","reason":"No transcript step","codes":["command"]}
+{"ts":"2026-10-15T09:00:14Z","session_id":"guard-session","tool_use_id":"unknown-id","tool":"Bash","decision":"ask","summary":"rm -rf build","reason":"Must not fall back when an id is present","codes":[]}
+{"session_id":"guard-session","decision":"warning","reason":"Ignored setting"}
+{"session_id":"guard-session","decision":"error","reason":"Evaluation failed"}
