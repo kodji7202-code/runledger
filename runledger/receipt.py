@@ -76,6 +76,7 @@ _SIGNAL_LABELS = {
     "failing_then_passing": "Fixed after failing tests",
     "failing_streak": "Longest failing streak",
     "test_tampering": "Tests deleted, skipped or weakened",
+    "test_changes": "Tests replaced or changed",
     "error_rate": "Steps with errors",
     "retry_loops": "Repeated commands and edits",
     "scope": "Changes unrelated to the request",

@@ -25,11 +25,32 @@ _PY_OPEN = re.compile(r"\bopen\(\s*" + _PY_TARGET + r"\s*,\s*(?:mode\s*=\s*)?(['
 _PY_PATH = re.compile(r"\bPath\(\s*" + _PY_TARGET + r"\s*\)\s*\.\s*write_(?:text|bytes)\(")
 
 
+_DB_FILE = re.compile(r"\.(?:db|sqlite3?|db3)$", re.I)
+_WRITE_SQL = re.compile(
+    r"\b(?:insert\s+(?:or\s+\w+\s+)?into|update\s+[\w\"'`.]+\s+set|delete\s+from|replace\s+into"
+    r"|alter\s+table|create\s+(?:unique\s+|temp(?:orary)?\s+|virtual\s+)?(?:table|index|view|trigger)"
+    r"|drop\s+(?:table|index|view|trigger)|vacuum)\b"
+    r"|^\s*\.(?:read|import|restore)\b", re.I | re.M)
+_PY_CONNECT = re.compile(r"\bsqlite3\.connect\(\s*" + _PY_TARGET)
+_SQLITE_VALUE_OPTS = ("-cmd", "-init", "-separator", "-newline", "-nullvalue", "-mmap", "-vfs",
+                      "-lookaside", "-pagecache", "-heap", "-maxsize")
+_RUNNERS = {"npx", "pnpx", "bunx", "bundle", "poetry", "pipenv", "uv"}
+_MIGRATE_SCRIPT = re.compile(r"^migrat(?:e|ions?)(?:[_-]\w+)?(?:\.(?:py|js|mjs|cjs|ts|sh|rb))?$", re.I)
+
+
 @dataclass
 class ShellWrite:
     path: str
     added: int = 0
     deleted: bool = False
+    source: Optional[str] = None  # what cp, mv or install copied to `path`
+
+
+@dataclass
+class DbWrite:
+    kind: str                     # "write": changes a database file; "migrate": runs a migration tool
+    command: str                  # the simple command, as written
+    target: Optional[str] = None  # the database file, when the command names one
 
 
 def _heredocs(command: str) -> Tuple[str, List[str]]:
@@ -71,9 +92,10 @@ def _is_operator(token: str) -> bool:
 
 
 def _commands(tokens: List[str], bodies: List[str]):
-    """Yield (words, redirect_targets, heredoc_body) for each simple command."""
+    """Yield (words, redirect_targets, heredoc_body, input_files) for each simple command."""
     words: List[str] = []
     targets: List[str] = []
+    inputs: List[str] = []
     body: Optional[str] = None
     i = 0
     while i < len(tokens):
@@ -95,12 +117,14 @@ def _commands(tokens: List[str], bodies: List[str]):
         elif "<" in tok or tok == ">&":
             if tok == ">&" and words and words[-1].isdigit():
                 words.pop()
+            if tok == "<" and nxt is not None and not _is_operator(nxt):
+                inputs.append(nxt)
             i += 2
         else:
-            yield words, targets, body
-            words, targets, body = [], [], None
+            yield words, targets, body, inputs
+            words, targets, inputs, body = [], [], [], None
             i += 1
-    yield words, targets, body
+    yield words, targets, body, inputs
 
 
 def _positional(args: List[str], with_value: Tuple[str, ...] = ()) -> List[str]:
@@ -179,7 +203,7 @@ def _command_writes(words: List[str], targets: List[str], body: Optional[str]) -
             dest, sources = paths[-1], paths[:-1]
             for src in sources:
                 target = posixpath.join(dest, posixpath.basename(src)) if dest.endswith("/") or len(sources) > 1 else dest
-                out.append(ShellWrite(target))
+                out.append(ShellWrite(target, source=src))
                 if name == "mv":
                     out.append(ShellWrite(src, deleted=True))
     elif name == "sed":
@@ -195,33 +219,141 @@ def _command_writes(words: List[str], targets: List[str], body: Optional[str]) -
     return out
 
 
-def shell_writes(command: str) -> List[ShellWrite]:
-    """Files the command writes or moves away. Paths stay as the command names
-    them, joined to any directory the command `cd`s into first."""
+def _walk(command: str):
+    """Yield (resolve, words, targets, body, inputs) for each simple command that is not a cd.
+    `resolve(path)` joins a path to the directory the command `cd`s into first, or
+    returns None when the path cannot be known."""
     text, bodies = _heredocs(command)
     tokens = _tokens(text)
     if tokens is None:
-        return []
-    out: List[ShellWrite] = []
-    cwd: Optional[str] = None
-    lost = False  # after an unresolvable cd, relative paths point nowhere known
-    for words, targets, body in _commands(tokens, bodies):
+        return
+    state = {"cwd": None, "lost": False}  # after an unresolvable cd, relative paths point nowhere known
+
+    def resolve(path: Optional[str]) -> Optional[str]:
+        if not path or path == "-" or _UNRESOLVED.search(path):
+            return None
+        if state["lost"] and not path.startswith("/"):
+            return None
+        cwd = state["cwd"]
+        return posixpath.normpath(posixpath.join(cwd, path) if cwd else path)
+
+    for words, targets, body, inputs in _commands(tokens, bodies):
         stripped = [w for w in words if not re.match(r"^\w+=", w)]
         if stripped and stripped[0] in ("cd", "pushd"):
             dest = _positional(stripped[1:])
             if len(dest) == 1 and dest[0] != "-" and not _UNRESOLVED.search(dest[0]):
-                cwd = posixpath.normpath(posixpath.join(cwd, dest[0]) if cwd else dest[0])
-                lost = lost and not cwd.startswith("/")
+                cwd = state["cwd"]
+                state["cwd"] = posixpath.normpath(posixpath.join(cwd, dest[0]) if cwd else dest[0])
+                state["lost"] = state["lost"] and not state["cwd"].startswith("/")
             else:
-                lost = True
+                state["lost"] = True
             continue
+        yield resolve, words, targets, body, inputs
+
+
+def shell_writes(command: str) -> List[ShellWrite]:
+    """Files the command writes or moves away. Paths stay as the command names
+    them, joined to any directory the command `cd`s into first."""
+    out: List[ShellWrite] = []
+    for resolve, words, targets, body, _ in _walk(command):
         for w in _command_writes(words, targets, body):
-            if not w.path or w.path == "-" or _UNRESOLVED.search(w.path):
+            path = resolve(w.path)
+            if path is None or path == "/dev" or path.startswith("/dev/"):
                 continue
-            if lost and not w.path.startswith("/"):
+            out.append(ShellWrite(path, w.added, w.deleted, resolve(w.source) if w.source else None))
+    return out
+
+
+def _python_db_writes(source: str) -> List[str]:
+    """Database files a Python snippet opens with sqlite3 when it also runs SQL that changes data."""
+    if not (_WRITE_SQL.search(source) or ".executescript(" in source):
+        return []
+    assigns = [(m.start(), m.group(1), m.group(3)) for m in _PY_ASSIGN.finditer(source)]
+    found = []
+    for m in _PY_CONNECT.finditer(source):
+        path = m.group(2)
+        if not path:
+            for pos, name, literal in assigns:
+                if pos > m.start():
+                    break
+                if name == m.group(3):
+                    path = literal
+        if path and _DB_FILE.search(path):
+            found.append(path)
+    return found
+
+
+def _is_migration_command(words: List[str]) -> bool:
+    words = [w.lower() for w in words]
+    while words and words[0] in _RUNNERS | {"run", "exec"}:
+        words = words[1:]
+    if not words:
+        return False
+    name, args = posixpath.basename(words[0]), words[1:]
+    joined = " ".join(args)
+    if _PYTHON.match(name) or name in ("node", "bash", "sh", "ruby", "deno", "bun", "ts-node", "tsx"):
+        if args[:1] == ["-m"]:
+            return _is_migration_command(args[1:])
+        script = next((a for a in args if not a.startswith("-")), "")
+        base = posixpath.basename(script)
+        if base == "manage.py":
+            return "migrate" in args
+        return bool(_MIGRATE_SCRIPT.match(base))
+    if _MIGRATE_SCRIPT.match(name) and words[0] != name:  # ./migrate.sh, scripts/migrate
+        return True
+    checks = {
+        "alembic": r"\b(upgrade|downgrade)\b",
+        "flask": r"\bdb\s+(upgrade|downgrade|migrate)\b",
+        "rails": r"\bdb:(migrate|rollback|schema:load|setup|reset)\b",
+        "rake": r"\bdb:(migrate|rollback|schema:load|setup|reset)\b",
+        "prisma": r"\bmigrate\s+(dev|deploy|reset)\b|\bdb\s+push\b",
+        "knex": r"\bmigrate:(latest|up|down|rollback)\b",
+        "sequelize": r"\bdb:migrate\b",
+        "sequelize-cli": r"\bdb:migrate\b",
+        "flyway": r"\bmigrate\b",
+        "goose": r"\b(up|down|redo|reset)\b",
+        "dbmate": r"\b(up|migrate|rollback|down)\b",
+        "migrate": r"\b(up|down|goto|force)\b",
+        "diesel": r"\bmigration\s+run\b",
+        "sqlx": r"\bmigrate\s+run\b",
+    }
+    if name in checks:
+        return bool(re.search(checks[name], joined))
+    if name in ("npm", "pnpm", "yarn", "bun"):
+        script = [a for a in args if a not in ("run", "run-script") and not a.startswith("-")]
+        return bool(script) and bool(re.match(r"^(db:)?migrat", script[0]))
+    return False
+
+
+def database_writes(command: str) -> List[DbWrite]:
+    """Commands that change a local database file (sqlite3 with write SQL or an SQL
+    script on stdin, Python sqlite3 code that runs DDL or DML) or run a migration tool.
+    Read-only queries are not reported."""
+    out: List[DbWrite] = []
+    for resolve, words, _targets, body, inputs in _walk(command):
+        while words and (words[0] in _WRAPPERS or re.match(r"^\w+=", words[0])):
+            words = words[1:]
+        if not words:
+            continue
+        text = " ".join(words)
+        name = posixpath.basename(words[0])
+        if name == "sqlite3":
+            args = _positional(words[1:], _SQLITE_VALUE_OPTS)
+            if not args or not _DB_FILE.search(args[0]):
                 continue
-            path = posixpath.normpath(posixpath.join(cwd, w.path) if cwd else w.path)
-            if path == "/dev" or path.startswith("/dev/"):
-                continue
-            out.append(ShellWrite(path, w.added, w.deleted))
+            cmds = [words[i + 1] for i, w in enumerate(words[:-1]) if w == "-cmd"]
+            sql = "\n".join(args[1:] + cmds + ([body] if body else []))
+            if inputs or _WRITE_SQL.search(sql):
+                out.append(DbWrite("write", text, resolve(args[0]) or args[0]))
+        elif _PYTHON.match(name):
+            sources = [body] if body else []
+            if "-c" in words and words.index("-c") + 1 < len(words):
+                sources.append(words[words.index("-c") + 1])
+            for src in sources:
+                for path in _python_db_writes(src):
+                    out.append(DbWrite("write", words[0], resolve(path) or path))
+            if not sources and _is_migration_command(words):
+                out.append(DbWrite("migrate", text))
+        elif _is_migration_command(words):
+            out.append(DbWrite("migrate", text))
     return out
