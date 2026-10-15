@@ -75,6 +75,54 @@ def index_bytes(repo):
     return (repo.root / ".git" / "index").read_bytes()
 
 
+def normalized_path(path):
+    return os.path.normcase(os.path.realpath(os.fspath(path)))
+
+
+@pytest.fixture(params=["attributes", "tag", "junction-api"])
+def junction_probe(request, monkeypatch):
+    # Isolate RunLedger's OS mocks: tempfile/shutil must keep the real os.walk.
+    local_os = SimpleNamespace(**vars(os))
+    local_os.path = SimpleNamespace(**vars(os.path))
+    local_os.path.isjunction = None
+    monkeypatch.setattr(rollback, "os", local_os)
+
+    def mark(junction):
+        target = normalized_path(junction)
+        if request.param == "junction-api":
+            local_os.path.isjunction = lambda path: normalized_path(path) == target
+            return
+        real_lstat = Path.lstat
+
+        def lstat(candidate, *args, **kwargs):
+            info = real_lstat(candidate, *args, **kwargs)
+            if normalized_path(candidate) == target:
+                return SimpleNamespace(
+                    st_mode=info.st_mode,
+                    st_file_attributes=(stat.FILE_ATTRIBUTE_REPARSE_POINT
+                                        if request.param == "attributes" else 0),
+                    # IO_REPARSE_TAG_MOUNT_POINT; the named constant is Windows-only.
+                    st_reparse_tag=(0xA0000003 if request.param == "tag" else 0))
+            return info
+
+        monkeypatch.setattr(Path, "lstat", lstat)
+
+    return mark
+
+
+@pytest.fixture(params=[False, True], ids=["native-cleanup", "windows-312-cleanup"])
+def index_cleanup_walk(request, monkeypatch):
+    if request.param:
+        real_cleanup = rollback.tempfile.TemporaryDirectory.cleanup
+
+        def cleanup(temporary):
+            # Windows Python 3.12+ shutil.rmtree also walks temporary index folders.
+            list(os.walk(temporary.name, topdown=False))
+            return real_cleanup(temporary)
+
+        monkeypatch.setattr(rollback.tempfile.TemporaryDirectory, "cleanup", cleanup)
+
+
 def test_checkpoint_publication_plumbing_without_supplying_identity(repo, monkeypatch):
     """Verify commit/ref arguments without attempting a commit when identity is absent."""
     real_git = repo._git
@@ -256,7 +304,8 @@ def test_ignored_contents_block_directory_replacement(repo, tree_safety):
     assert (path / "known").exists()
 
 
-def test_ignored_junction_is_refused_before_directory_traversal(repo, tree_safety, monkeypatch):
+def test_ignored_junction_is_refused_before_directory_traversal(
+        repo, tree_safety, monkeypatch, junction_probe, index_cleanup_walk):
     path = repo.root / "shape"
     path.write_bytes(b"snapshot")
     cp = tree_checkpoint(repo)
@@ -265,55 +314,86 @@ def test_ignored_junction_is_refused_before_directory_traversal(repo, tree_safet
     junction = path / ".secret"
     junction.mkdir()
     plan = repo.plan(cp)
-    real_lstat, real_walk = Path.lstat, os.walk
+    real_walk = os.walk
     visited = []
-
-    def lstat(candidate, *args, **kwargs):
-        mode = real_lstat(candidate, *args, **kwargs)
-        if candidate == junction:
-            return SimpleNamespace(st_mode=mode.st_mode,
-                                   st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT)
-        return mode
+    junction_probe(junction)
 
     def walk(*args, **kwargs):
         for entry in real_walk(*args, **kwargs):
-            visited.append(Path(entry[0]))
+            visited.append(normalized_path(entry[0]))
             yield entry
 
-    monkeypatch.setattr(Path, "lstat", lstat)
-    monkeypatch.setattr(os, "walk", walk)
+    monkeypatch.setattr(rollback.os, "walk", walk)
     with pytest.raises(rollback.CheckpointError, match="reparse point blocks rollback"):
         repo.rollback(plan)
-    assert visited == [path]
+    assert visited == [normalized_path(path)]
     assert tree_safety == []
     assert junction.is_dir()
 
 
-def test_junction_at_restore_destination_is_not_traversed(repo, tree_safety, monkeypatch):
+def test_junction_at_restore_destination_is_not_traversed(
+        repo, tree_safety, monkeypatch, junction_probe, index_cleanup_walk):
     path = repo.root / "shape"
     path.write_bytes(b"snapshot")
     cp = tree_checkpoint(repo)
     path.unlink()
     path.mkdir()
     plan = repo.plan(cp)
-    real_lstat = Path.lstat
-
-    def lstat(candidate, *args, **kwargs):
-        mode = real_lstat(candidate, *args, **kwargs)
-        if candidate == path:
-            return SimpleNamespace(st_mode=mode.st_mode,
-                                   st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT)
-        return mode
+    junction_probe(path)
 
     def walk(*args, **kwargs):
         pytest.fail("Rollback must not traverse a junction at a restore destination")
 
-    monkeypatch.setattr(Path, "lstat", lstat)
-    monkeypatch.setattr(os, "walk", walk)
+    monkeypatch.setattr(rollback.os, "walk", walk)
     with pytest.raises(rollback.CheckpointError, match="reparse point blocks rollback"):
         repo.rollback(plan)
     assert tree_safety == []
     assert path.is_dir()
+
+
+def test_junction_parent_blocks_restore(repo, tree_safety, junction_probe):
+    parent = repo.root / "shape"
+    parent.mkdir()
+    child = parent / "child"
+    child.write_bytes(b"snapshot")
+    cp = tree_checkpoint(repo)
+    child.unlink()
+    plan = repo.plan(cp)
+    junction_probe(parent)
+    with pytest.raises(rollback.CheckpointError, match="Unsafe parent blocks rollback"):
+        repo.rollback(plan)
+    assert tree_safety == []
+    assert parent.is_dir()
+
+
+def test_snapshot_refuses_junction_before_git_add(repo, monkeypatch, junction_probe):
+    junction = repo.root / "junction"
+    junction.mkdir()
+    (junction / "child").write_bytes(b"must not be staged through a junction")
+    junction_probe(junction)
+    # Exercise the Windows snapshot scan even when running these tests on Linux.
+    monkeypatch.setattr(rollback.os, "name", "nt")
+    real_git = repo._git
+    commands = []
+
+    def run(*args, **kwargs):
+        commands.append(args[0])
+        return real_git(*args, **kwargs)
+
+    monkeypatch.setattr(repo, "_git", run)
+    with pytest.raises(rollback.CheckpointError, match="reparse points"):
+        repo.snapshot_tree()
+    assert "add" not in commands
+
+
+def test_reparse_detection_preserves_git_symlinks(repo, junction_probe):
+    # Synthetic metadata avoids requiring Windows symlink privileges.
+    link = repo.root / "link"
+    junction_probe(link)
+    info = SimpleNamespace(st_mode=stat.S_IFLNK,
+                           st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT,
+                           st_reparse_tag=0xA000000C)  # IO_REPARSE_TAG_SYMLINK
+    assert not rollback._unsupported_reparse_point(link, info)
 
 
 def test_ignored_untracked_file_blocks_overwrite(repo, tree_safety):

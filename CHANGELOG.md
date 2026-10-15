@@ -7,6 +7,12 @@ change behavior, so read the entry before you upgrade.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Windows rollback checks:** detect junctions using file attributes, reparse tags, or the
+  Python 3.12+ junction API. Isolate traversal mocks from temporary-index cleanup so rollback
+  tests also pass on Windows Python 3.12 and 3.13.
+
 ## [0.5.0] - 2026-10-15
 
 ### Added
