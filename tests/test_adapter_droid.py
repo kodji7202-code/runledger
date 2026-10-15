@@ -511,3 +511,123 @@ def test_cli_loads_user_prices_and_handles_invalid_files(tmp_path, source):
         assert receipt["totals"]["cost_usd"] == pytest.approx(0.0014)
         assert receipt["steps"][0]["cost_usd"] == pytest.approx(0.0014)
         assert receipt["pricing_note"] is None
+
+
+# ---------------------------------------------------------------- relative cwd recovery
+
+def _relative_session(folder, rows=(), cwd=".", settings=None, name="rel.jsonl"):
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / name
+    header = {"type": "session_start", "id": "rel-session", "cwd": cwd, "version": 2}
+    path.write_text("\n".join(json.dumps(r) for r in [header, *rows]) + "\n", encoding="utf-8")
+    if settings is not None:
+        path.with_suffix(".settings.json").write_text(json.dumps(settings), encoding="utf-8")
+    return path
+
+
+def _context(pwd):
+    reminder = (f"<system-reminder>The `% pwd` output below is the session working directory.\n\n"
+                f"% pwd\n{pwd}\n\n</system-reminder>Fix the bug.")
+    return _message([{"type": "text", "text": reminder}], role="user", mid="u1")
+
+
+def _git_repo(path):
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q", "-b", "work", str(path)], check=True)
+    return path
+
+
+needs_git = pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
+
+
+def test_absolute_header_cwd_is_kept(tmp_path):
+    run = droid.parse(_relative_session(tmp_path / "s", cwd="/demo/widget"))
+    assert (run.cwd, run.cwd_source) == ("/demo/widget", "header")
+
+
+def test_pwd_in_the_session_context_wins(tmp_path):
+    project = tmp_path / "proj"
+    run = droid.parse(_relative_session(tmp_path / "s", [_context(str(project))],
+                                        settings={"cwd": "/somewhere/else"}))
+    assert (run.cwd, run.cwd_source) == (str(project), "session")
+    assert run.prompts == ["Fix the bug."]
+
+
+def test_settings_field_is_the_next_source(tmp_path):
+    run = droid.parse(_relative_session(tmp_path / "s", settings={"workingDirectory": "/srv/app"}))
+    assert (run.cwd, run.cwd_source) == ("/srv/app", "settings")
+
+
+def test_a_relative_cwd_is_resolved_against_the_recovered_base(tmp_path):
+    run = droid.parse(_relative_session(tmp_path / "s", [_context("/srv/app")], cwd="pkg"))
+    assert run.cwd == "/srv/app/pkg"
+    run = droid.parse(_relative_session(tmp_path / "t", [_context("/srv/app/pkg")], cwd="pkg"))
+    assert run.cwd == "/srv/app/pkg"
+
+
+@needs_git
+def test_tool_paths_in_one_git_work_tree_give_the_project(tmp_path):
+    repo = _git_repo(tmp_path / "my-repo")
+    (repo / "src").mkdir()
+    rows = [_message([_call("Read", {"file_path": str(repo / "src" / "a.py")}, "one"),
+                      _call("Create", {"file_path": str(repo / "src" / "new" / "b.py"), "content": "x"}, "two"),
+                      _call("Read", {"file_path": "/etc/hosts"}, "three")])]
+    run = droid.parse(_relative_session(tmp_path / "s", rows))
+    assert (run.cwd, run.cwd_source) == (str(repo), "session")
+
+
+@needs_git
+def test_tool_paths_without_a_majority_work_tree_are_not_trusted(tmp_path):
+    repo = _git_repo(tmp_path / "repo")
+    rows = [_message([_call("Read", {"file_path": str(repo / "a.py")}, "one"),
+                      _call("Read", {"file_path": "/etc/hosts"}, "two"),
+                      _call("Read", {"file_path": "/etc/passwd"}, "three")])]
+    run = droid.parse(_relative_session(tmp_path / "s", rows))
+    assert (run.cwd, run.cwd_source) == (".", "unknown")
+
+
+def test_encoded_session_folder_is_decoded_against_the_filesystem(tmp_path):
+    target = tmp_path / "work" / "my-app" / "sub-dir"
+    target.mkdir(parents=True)
+    (tmp_path / "work" / "my").mkdir()  # a decoy: "my" exists, "my/app" does not
+    (tmp_path / "work" / "my-app-sub").mkdir()  # a longer decoy with no "dir" below it
+    folder = tmp_path / "sessions" / droid._encode(str(target))
+    run = droid.parse(_relative_session(folder))
+    assert (run.cwd, run.cwd_source) == (str(target), "session_dir")
+
+
+def test_a_decoded_folder_that_does_not_exist_stays_unknown(tmp_path):
+    folder = tmp_path / "sessions" / droid._encode(str(tmp_path / "gone" / "with-hyphens"))
+    run = droid.parse(_relative_session(folder))
+    assert (run.cwd, run.cwd_source) == (".", "unknown")
+    assert droid._decode_folder("not-encoded") is None
+
+
+def test_unknown_cwd_never_uses_the_current_folder(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    run = droid.parse(_relative_session(tmp_path / "plain"))
+    assert (run.cwd, run.cwd_source) == (".", "unknown")
+
+
+def test_find_sessions_matches_relative_cwd_by_folder_name(tmp_path, monkeypatch):
+    monkeypatch.setenv("FACTORY_HOME", str(tmp_path / "factory"))
+    project = tmp_path / "my-proj"
+    project.mkdir()
+    folder = tmp_path / "factory" / "sessions" / droid._encode(str(project))
+    path = _relative_session(folder)
+    _relative_session(tmp_path / "factory" / "sessions" / "-other", name="other.jsonl")
+    assert droid.find_sessions(str(project)) == [path]
+
+
+@needs_git
+def test_receipt_for_a_recovered_cwd_has_branch_and_relative_files(tmp_path, capsys):
+    repo = _git_repo(tmp_path / "repo")
+    rows = [_context(str(repo)),
+            _message([_call("Create", {"file_path": str(repo / "a.py"), "content": "x\ny\n"}, "one"),
+                      _call("Read", {"file_path": str(repo / "a.py")}, "two")])]
+    path = _relative_session(tmp_path / "s", rows)
+    assert main(["receipt", str(path), "--format", "json", "-o", "-", "--no-safe"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert (data["cwd"], data["cwd_source"], data["git_branch"]) == (str(repo), "session", "work")
+    assert [f["path"] for f in data["files"]] == ["a.py"]
+    assert not [r for r in data["risk"]["reasons"] if r["code"] == "read_outside"]

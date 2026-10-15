@@ -26,6 +26,12 @@ _CONTEXT = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
 _DRIVE = re.compile(r"^[A-Za-z]:[\\/]")
 # The header id becomes part of a glob, so it must not carry separators or glob syntax.
 _SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+# Droid's session context lists `% pwd` and its output, the absolute session folder, on the next line.
+_PWD = re.compile(r"^% pwd[ \t]*\r?\n[ \t]*((?:/|[A-Za-z]:[\\/])[^\r\n]*?)[ \t]*$", re.M)
+_SETTINGS_CWD_KEYS = ("cwd", "workingDirectory", "workspaceRoot", "projectRoot", "projectPath")
+_PATH_KEYS = ("file_path", "notebook_path", "path")
+_MAX_PROBED_DIRS = 50
+_MAX_DECODE_PROBES = 2000
 
 
 def factory_home() -> Path:
@@ -71,6 +77,15 @@ def _norm(path: str) -> str:
     return path.lower() if sys.platform == "win32" or _DRIVE.match(path) else path
 
 
+def _is_absolute(path: str) -> bool:
+    return path.startswith(("/", "\\")) or bool(_DRIVE.match(path))
+
+
+def _encode(cwd: str) -> str:
+    """The session folder name Droid uses for a working folder."""
+    return cwd.replace("\\", "-").replace("/", "-")
+
+
 def _mtime(path: Path) -> float:
     try:
         return path.stat().st_mtime
@@ -89,8 +104,11 @@ def find_sessions(project: Optional[str] = None) -> List[Path]:
         if not _is_header(header):
             continue
         # Encoding is lossy: /demo/a-b and /demo/a/b share a directory.
-        if wanted and _norm(header["cwd"]) != _norm(wanted):
+        cwd = header["cwd"]
+        if wanted and _is_absolute(cwd) and _norm(cwd) != _norm(wanted):
             continue
+        if wanted and not _is_absolute(cwd) and path.parent.name != _encode(_norm(wanted)):
+            continue  # `droid exec --cwd .` records ".": the folder name is the only clue
         found.append(path)
     return sorted(found, key=_mtime, reverse=True)
 
@@ -182,7 +200,7 @@ def _settings_path(path: Path, header: Dict[str, Any]) -> Optional[Path]:
     name = f"{sid}.settings.json"
     root = factory_home() / "sessions"
     cwd = header.get("cwd")
-    folder = cwd.replace("\\", "-").replace("/", "-") if isinstance(cwd, str) else ""
+    folder = _encode(cwd) if isinstance(cwd, str) else ""
     if folder not in ("", ".", ".."):
         preferred = root / folder / name
         if preferred.is_file():
@@ -239,6 +257,98 @@ def _child_usage(settings: Dict[str, Any], own: Usage, settings_path: Optional[P
     return out
 
 
+def _decode_folder(name: str) -> Optional[str]:
+    """The existing directory an encoded session folder name stands for, or None.
+    A '-' is either a separator or part of a name, so the filesystem decides: longer names
+    are tried first, and only a candidate that exists as a directory is accepted."""
+    if name.startswith("-"):
+        root, rest = "/", name[1:]
+    elif re.match(r"^[A-Za-z]:-", name):
+        root, rest = name[:2] + "\\", name[3:]
+    else:
+        return None
+    tokens = rest.split("-")
+    if not rest or len(tokens) > 64:
+        return None
+    probes = [0]
+
+    def walk(base: str, i: int) -> Optional[str]:
+        if i == len(tokens):
+            return base
+        for j in range(len(tokens), i, -1):
+            part = "-".join(tokens[i:j])
+            if not part or part in (".", ".."):
+                continue
+            probes[0] += 1
+            if probes[0] > _MAX_DECODE_PROBES:
+                return None
+            candidate = os.path.join(base, part)
+            if os.path.isdir(candidate):
+                found = walk(candidate, j)
+                if found:
+                    return found
+        return None
+
+    return walk(root, 0)
+
+
+def _tool_root(steps: List[Step]) -> Optional[str]:
+    """The Git work tree that most absolute tool paths lie in, when it holds a majority of them."""
+    from ..gitinfo import toplevel
+    paths = [step.input.get(k) for step in steps for k in _PATH_KEYS]
+    paths = [p for p in paths if isinstance(p, str) and _is_absolute(p)]
+    if not paths:
+        return None
+    roots: Dict[str, Optional[str]] = {}
+    votes: Dict[str, int] = {}
+    for p in paths:
+        key = p if os.path.isdir(p) else os.path.dirname(p)
+        if key not in roots:
+            if len(roots) >= _MAX_PROBED_DIRS:
+                continue
+            folder = key
+            while folder and not os.path.isdir(folder) and os.path.dirname(folder) != folder:
+                folder = os.path.dirname(folder)  # a file the run deleted, or a new folder
+            roots[key] = toplevel(folder) if os.path.isdir(folder) else None
+        top = roots.get(key)
+        if top:
+            votes[top] = votes.get(top, 0) + 1
+    if not votes:
+        return None
+    best, count = max(votes.items(), key=lambda kv: kv[1])
+    return best if count * 2 > len(paths) else None
+
+
+def _resolve(base: str, relative: str) -> str:
+    """`relative` (the recorded cwd) joined to `base`, unless `base` already ends with it."""
+    rel = posixpath.normpath(relative.replace("\\", "/"))
+    if rel in (".", ""):
+        return base
+    if _norm(base).endswith("/" + _norm(rel).strip("/")):
+        return base
+    return os.path.normpath(os.path.join(base, rel))
+
+
+def _recover_cwd(run: Run, recorded: str, pwd: Optional[str], settings: Dict[str, Any],
+                 folder_name: str) -> Tuple[Optional[str], str]:
+    """(cwd, source) for a log that records a relative working folder. Sources, in order:
+    the session's own `% pwd` output, a settings field, the Git work tree of the tool paths,
+    then the encoded session folder name. Nothing is resolved against RunLedger's own folder."""
+    if pwd and _is_absolute(pwd):
+        return _resolve(pwd, recorded), "session"
+    for key in _SETTINGS_CWD_KEYS:
+        value = settings.get(key)
+        if isinstance(value, str) and _is_absolute(value):
+            return _resolve(value, recorded), "settings"
+    root = _tool_root(run.steps)
+    if root:
+        return _resolve(root, recorded), "session"
+    decoded = _decode_folder(folder_name)
+    if decoded:
+        return _resolve(decoded, recorded), "session_dir"
+    return recorded or None, "unknown"
+
+
 def parse(path: Path) -> Run:
     p = Path(path)
     settings_path = _settings_path(p, _header(p))
@@ -257,6 +367,7 @@ def parse(path: Path) -> Run:
     message_models: Dict[str, str] = {}
     observed_models = set()
     header_seen = False
+    pwd: Optional[str] = None
 
     for obj in _objects(p):
         ts = _text(obj.get("timestamp")) or None
@@ -273,6 +384,9 @@ def parse(path: Path) -> Run:
         msg = obj["message"]
         content = msg.get("content")
         blocks = content if isinstance(content, list) else [{"type": "text", "text": content}]
+        if msg.get("role") == "user" and pwd is None:
+            found = _PWD.search(_text(content))
+            pwd = found.group(1) if found else None
         if msg.get("role") == "user" and msg.get("visibility") != "llm_only":
             prompt = _CONTEXT.sub("", _text(content)).strip()
             if prompt and not prompt.startswith(("<command-", "<environment_context>", "<user_instructions>")):
@@ -315,6 +429,10 @@ def parse(path: Path) -> Run:
                 exit_code = re.search(r"\[Process exited with code (-?\d+)\]", text)
                 results[result_id] = (text[:RESULT_LIMIT], failed or bool(exit_code and int(exit_code[1]) != 0))
 
+    if run.cwd and _is_absolute(run.cwd):
+        run.cwd_source = "header"
+    else:
+        run.cwd, run.cwd_source = _recover_cwd(run, run.cwd or "", pwd, settings, p.parent.name)
     for call_id, steps in calls.items():
         if call_id in results:
             for step in steps:

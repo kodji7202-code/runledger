@@ -540,7 +540,7 @@ def to_dict(run: Run, score: int, level: str, risks: List[Risk]) -> Dict:
         "session_id": run.session_id,
         "rollback": _rollback(run),
         "agent": agent_label(run.agent), "agent_id": run.agent,
-        "cwd": run.cwd, "git_branch": run.git_branch,
+        "cwd": run.cwd, "cwd_source": run.cwd_source, "git_branch": run.git_branch,
         "started": run.started, "ended": run.ended,
         "duration_seconds": run.duration_seconds,
         "request": run.prompts[:3],
