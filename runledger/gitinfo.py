@@ -1,10 +1,11 @@
 """Read-only facts from the run's Git working tree: the branch, the line
-counts of uncommitted changes and the diffs of chosen files. Every helper returns nothing when the folder
+counts of changes and the diffs of chosen files, against HEAD or the session's base commit. Every helper returns nothing when the folder
 is missing, is not a repository, or git is not installed."""
 from __future__ import annotations
 
 import os
 import subprocess
+from datetime import datetime, timezone
 from typing import Dict, Iterable, List, Optional, Tuple
 
 # The session log names the folder, so its repository config is not trusted:
@@ -42,6 +43,25 @@ def current_branch(cwd: Optional[str]) -> Optional[str]:
     if not _in_repo(cwd):
         return None
     return (_git(cwd, "symbolic-ref", "--short", "-q", "HEAD") or "").strip() or None
+
+
+def session_base(cwd: Optional[str], started: Optional[datetime]) -> Optional[str]:
+    """The short sha of the last commit reachable from HEAD that was committed at or before
+    `started`, when HEAD itself is newer: the run's changes were committed after it began, so
+    they must be compared with that commit rather than HEAD. None when HEAD is not newer, or no
+    such commit exists (no start time, no commits, a shallow clone)."""
+    if started is None or not _in_repo(cwd):
+        return None
+    head_time = (_git(cwd, "log", "-1", "--format=%ct", "HEAD") or "").strip()
+    if not head_time.isdigit():
+        return None
+    start = started.astimezone(timezone.utc)
+    if int(head_time) <= int(start.timestamp()):
+        return None
+    base = (_git(cwd, "rev-list", "-1", f"--before={start:%Y-%m-%d %H:%M:%S} +0000", "HEAD") or "").strip()
+    if not base:
+        return None
+    return (_git(cwd, "rev-parse", "--short", base) or "").strip() or None
 
 
 def _count_lines(path: str) -> Tuple[int, bool]:
@@ -97,10 +117,11 @@ def _header_path(line: str) -> Optional[str]:
     return None
 
 
-def working_changes(cwd: Optional[str], paths: Optional[Iterable[str]] = None) -> Dict[str, Dict[str, object]]:
-    """Uncommitted changes against HEAD, keyed by path relative to cwd:
-    {"added": int, "removed": int, "status": "modified" | "deleted" | "untracked",
-    "binary": bool}. Binary files count 0 lines.
+def working_changes(cwd: Optional[str], paths: Optional[Iterable[str]] = None,
+                    base: Optional[str] = None) -> Dict[str, Dict[str, object]]:
+    """Changes of the working tree against `base` (default HEAD), keyed by path relative to cwd:
+    {"added": int, "removed": int, "status": "modified" | "deleted" | "added" | "untracked",
+    "binary": bool}. "added" is a tracked file that `base` does not have. Binary files count 0 lines.
     With `paths`, only those paths are reported."""
     if not _in_repo(cwd):
         return {}
@@ -108,9 +129,14 @@ def working_changes(cwd: Optional[str], paths: Optional[Iterable[str]] = None) -
     if wanted is not None and not wanted:
         return {}
     out: Dict[str, Dict[str, object]] = {}
-    if _git(cwd, "rev-parse", "--verify", "-q", "HEAD") is not None:
-        numstat = _git(cwd, "diff", "HEAD", "--numstat", "-z", "--no-renames", "--relative",
+    rev = base or "HEAD"
+    if _git(cwd, "rev-parse", "--verify", "-q", rev) is not None:
+        numstat = _git(cwd, "diff", rev, "--numstat", "-z", "--no-renames", "--relative",
                        "--no-ext-diff", "--no-textconv") or ""
+        new = set()
+        if base:
+            new = set((_git(cwd, "diff", rev, "--name-only", "-z", "--no-renames", "--relative",
+                            "--diff-filter=A") or "").split("\0"))
         for record in numstat.split("\0"):
             parts = record.split("\t", 2)
             if len(parts) != 3 or not parts[2]:
@@ -121,7 +147,7 @@ def working_changes(cwd: Optional[str], paths: Optional[Iterable[str]] = None) -
             exists = os.path.lexists(os.path.join(cwd, path))
             out[path] = {"added": int(added) if added.isdigit() else 0,
                          "removed": int(removed) if removed.isdigit() else 0,
-                         "status": "modified" if exists else "deleted",
+                         "status": "deleted" if not exists else "added" if path in new else "modified",
                          "binary": added == "-" and removed == "-"}
         untracked = _git(cwd, "ls-files", "--others", "--exclude-standard", "-z") or ""
     else:
@@ -134,14 +160,15 @@ def working_changes(cwd: Optional[str], paths: Optional[Iterable[str]] = None) -
     return out
 
 
-def file_diffs(cwd: Optional[str], paths: Iterable[str]) -> Dict[str, str]:
-    """Unified diffs (no context lines) of `paths` against HEAD, keyed by path relative
-    to cwd. Files with no change, untracked files and a repository without commits
-    give no entry. Each diff is cut at a size limit."""
+def file_diffs(cwd: Optional[str], paths: Iterable[str], base: Optional[str] = None) -> Dict[str, str]:
+    """Unified diffs (no context lines) of `paths` in the working tree against `base` (default
+    HEAD), keyed by path relative to cwd. Files with no change, untracked files and a repository
+    without commits give no entry. Each diff is cut at a size limit."""
     wanted = sorted(set(paths))[:_MAX_DIFF_PATHS]
-    if not wanted or not _in_repo(cwd) or _git(cwd, "rev-parse", "--verify", "-q", "HEAD") is None:
+    rev = base or "HEAD"
+    if not wanted or not _in_repo(cwd) or _git(cwd, "rev-parse", "--verify", "-q", rev) is None:
         return {}
-    text = _git(cwd, "diff", "HEAD", "-U0", "--no-color", "--no-renames", "--relative",
+    text = _git(cwd, "diff", rev, "-U0", "--no-color", "--no-renames", "--relative",
                 "--no-ext-diff", "--no-textconv", "--", *wanted) or ""
     parts: Dict[str, List[str]] = {}
     sizes: Dict[str, int] = {}

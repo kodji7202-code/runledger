@@ -1,4 +1,5 @@
 """Test-file verdicts from Git diffs (runledger.testdiff), their risks and the quality note."""
+import os
 import shutil
 import subprocess
 
@@ -9,6 +10,7 @@ from runledger.cli import reconcile_git
 from runledger.parser import Run, Step, Usage
 from runledger.quality import score_run
 from runledger.risk import assess
+from runledger.summarize import file_changes
 from runledger.testdiff import analyze, classify
 
 needs_git = pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
@@ -188,3 +190,79 @@ def test_file_diffs_skip_unchanged_untracked_and_unwanted(repo):
 def test_file_diffs_without_repository(tmp_path):
     assert gitinfo.file_diffs(str(tmp_path), ["tests/test_a.py"]) == {}
     assert gitinfo.file_diffs(None, ["tests/test_a.py"]) == {}
+
+
+# ------------------------------------------------- changes committed after the session start
+
+def _commit_at(repo, when, message):
+    env = {**os.environ, "GIT_AUTHOR_DATE": when, "GIT_COMMITTER_DATE": when}
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True, env=env)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", message], check=True,
+                   capture_output=True, env=env)
+
+
+@pytest.fixture
+def dated_repo(tmp_path):
+    _git(tmp_path, "init", "-q", "-b", "main")
+    _git(tmp_path, "config", "user.email", "t@example.com")
+    _git(tmp_path, "config", "user.name", "T")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_api.py").write_text(OLD)
+    _commit_at(tmp_path, "2026-10-01T09:00:00+00:00", "init")
+    return tmp_path
+
+
+def _session(repo, started, steps):
+    run = _run(repo, steps)
+    run.started = started
+    return run
+
+
+def _shell_writes(repo):
+    return Step(1, "Bash", {"command": f"cd {repo} && python3 - <<'EOF'\n"
+                                       "open('tests/test_api.py','w').write(s)\n"
+                                       "open('notes.txt','w').write(n)\nEOF"}, "b1", None, None)
+
+
+@needs_git
+def test_changes_committed_after_the_session_start(dated_repo):
+    base = subprocess.run(["git", "-C", str(dated_repo), "rev-parse", "--short", "HEAD"],
+                          check=True, capture_output=True, text=True).stdout.strip()
+    (dated_repo / "tests" / "test_api.py").write_text(NEW)
+    (dated_repo / "notes.txt").write_text("a\nb\nc\n")
+    _commit_at(dated_repo, "2026-10-01T11:00:00+00:00", "agent work")
+    run = _session(dated_repo, "2026-10-01T10:00:00.500Z", [_shell_writes(dated_repo)])
+    reconcile_git(run)
+    assert run.git_base == base
+    assert list(run.test_diffs) == ["tests/test_api.py"]
+    assert run.git_changes["notes.txt"] == {"added": 3, "removed": 0, "status": "added", "binary": False}
+    assert (run.git_changes["tests/test_api.py"]["added"], run.git_changes["tests/test_api.py"]["removed"]) == (5, 4)
+    _, _, risks = assess(run)
+    signals = {s["name"]: s for s in score_run(run, risks)["signals"]}
+    assert signals["test_changes"]["note"].startswith(
+        "tests/test_api.py: test_delete_user_removes_tasks replaced by test_delete_user_is_soft_and_keeps_tasks")
+    files = file_changes(run)
+    assert files["notes.txt"].created and files["notes.txt"].verified
+
+
+@needs_git
+def test_uncommitted_changes_still_compare_with_head(dated_repo):
+    (dated_repo / "tests" / "test_api.py").write_text(NEW)
+    run = _session(dated_repo, "2026-10-01T10:00:00Z", [_shell_writes(dated_repo)])
+    reconcile_git(run)
+    assert run.git_base is None
+    assert list(run.test_diffs) == ["tests/test_api.py"]
+    assert run.git_changes["tests/test_api.py"]["status"] == "modified"
+
+
+@needs_git
+@pytest.mark.parametrize("started", [None, "2026-09-01T10:00:00Z", "not a time"])
+def test_no_base_keeps_head(dated_repo, started):
+    # No start time, or every commit is newer than the start (as in a shallow clone).
+    (dated_repo / "tests" / "test_api.py").write_text(NEW)
+    _commit_at(dated_repo, "2026-10-01T11:00:00+00:00", "agent work")
+    run = _session(dated_repo, started, [_shell_writes(dated_repo)])
+    reconcile_git(run)
+    assert run.git_base is None
+    assert run.test_diffs == {}
+    assert gitinfo.session_base(str(dated_repo), None) is None

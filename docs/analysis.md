@@ -26,7 +26,9 @@ For test files in a Git working tree, the diff against HEAD decides the verdict,
 was written (edit tools, heredocs, scripts): a skip marker added is skipped; tests removed and new
 ones added that share a name word with them (or with the request), with no fewer assertions, is
 replaced; fewer assertions, or a removed test with no replacement, is weakened. When a file has a
-diff verdict, it replaces what the per-step Edit rule said about that file.
+diff verdict, it replaces what the per-step Edit rule said about that file. When HEAD is newer
+than the session start (the changes were committed before the receipt ran), the diff is taken
+against the last commit before the session start instead, recorded as `git_base` in JSON.
 | `error_rate` | +5 down to -15 | Share of steps that returned an error. 0% gives +5, and 100% gives -15 at most. |
 | `retry_loops` | -5 each, max -15 | A non-test command repeated 3+ times, or a file edited 5+ times. |
 | `scope` | -1 per unrelated file past the fourth, max -10 | Changed files that share no word with the prompts. Mild, and only when at least 5 files are unrelated and they are over half of the changes. |

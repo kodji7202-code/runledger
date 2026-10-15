@@ -111,7 +111,7 @@ def file_changes(run: Run) -> Dict[str, FileChange]:
         git = run.git_changes.get(p) if fc.shell else None
         if git:
             fc.added, fc.removed = int(git.get("added") or 0), int(git.get("removed") or 0)
-            fc.created = git.get("status") == "untracked"
+            fc.created = git.get("status") in ("untracked", "added")
             fc.deleted = git.get("status") == "deleted"
             fc.verified = True
             fc.binary = bool(git.get("binary"))

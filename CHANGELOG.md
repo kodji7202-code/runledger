@@ -34,6 +34,11 @@ change behavior, so read the entry before you upgrade.
   weakened files add risk and count toward `test_tampering`. Replaced and changed files appear in
   a neutral quality signal, `test_changes`. A diff verdict replaces the per-step Edit rule for
   that file, so a receipt no longer calls one file both weakened and replaced.
+- **Receipts after the commit:** when HEAD is newer than the session start (the run's changes
+  were committed before `runledger receipt` ran), Git line counts and test verdicts compare the
+  working tree with the last commit before the session start instead of HEAD. JSON receipts
+  record that commit as `git_base` (null when HEAD was used, including shallow clones and logs
+  without a start time).
 - **Droid usage source:** JSON receipts include `totals.usage_source` (`messages`, `settings` or
   `missing`) and `tokens_estimated` on each step. Markdown and HTML add a footer note when
   per-step tokens are an even split of the session total.

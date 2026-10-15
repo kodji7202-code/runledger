@@ -97,6 +97,8 @@ class Run:
     git_changes: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     # gitinfo.file_diffs for changed test files, keyed relative to cwd; read by testdiff, never shown
     test_diffs: Dict[str, str] = field(default_factory=dict)
+    # gitinfo.session_base: short sha the Git facts were compared with, None when that was HEAD
+    git_base: Optional[str] = None
     # Droid only: "messages", "settings" or "missing"; None for adapters with usage in every message
     usage_source: Optional[str] = None
     usage_file: Optional[str] = None  # file name (no folder) of the settings file that supplied usage
