@@ -15,6 +15,7 @@ from typing import Dict, List, Optional
 
 from . import llm
 from .parser import Run, Step, Usage
+from .shell_writes import shell_writes
 
 DEFAULT_AI_MODEL = os.environ.get("RUNLEDGER_SUMMARY_MODEL", "claude-haiku-5-5")
 
@@ -36,6 +37,8 @@ class FileChange:
     removed: int = 0
     created: bool = False
     deleted: bool = False
+    shell: bool = False      # written by a shell command, so the line counts may be incomplete
+    verified: bool = False   # line counts come from the Git working tree
 
 
 def file_changes(run: Run) -> Dict[str, FileChange]:
@@ -71,7 +74,23 @@ def file_changes(run: Run) -> Dict[str, FileChange]:
                         break  # redirection target, not a deleted file
                     if t.startswith(("-", "$")) or "&" in t:
                         continue
-                    changes.setdefault(t, FileChange(t)).deleted = True
+                    fc = changes.setdefault(t, FileChange(t))
+                    fc.deleted = fc.shell = True
+            for w in shell_writes(cmd):
+                p = _short(w.path, run.cwd)
+                if run.cwd and p.startswith("/"):
+                    continue  # outside the project, such as a backup in /tmp
+                fc = changes.setdefault(p, FileChange(p))
+                fc.shell = True
+                fc.deleted = w.deleted
+                fc.added += w.added
+    for p, fc in changes.items():
+        git = run.git_changes.get(p) if fc.shell else None
+        if git:
+            fc.added, fc.removed = int(git.get("added") or 0), int(git.get("removed") or 0)
+            fc.created = git.get("status") == "untracked"
+            fc.deleted = git.get("status") == "deleted"
+            fc.verified = True
     return changes
 
 

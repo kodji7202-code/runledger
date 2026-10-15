@@ -40,6 +40,7 @@ from typing import List, Optional
 
 from . import __version__
 from . import adapters
+from .gitinfo import current_branch, working_changes
 from .guard import redact
 from .guard_receipt import load_guard_decisions
 from .pricing import apply_costs
@@ -47,7 +48,7 @@ from .quality import analyze
 from .receipt import redact_run, render
 from .risk import assess
 from .review import DEFAULT_REVIEW_MODEL, ai_review
-from .summarize import DEFAULT_AI_MODEL, ai_summaries, apply_templates
+from .summarize import DEFAULT_AI_MODEL, ai_summaries, apply_templates, file_changes
 
 AGENTS = ("claude-code", "codex", "droid", "aider", "native")
 
@@ -62,6 +63,7 @@ def build(session_path: str, use_ai: bool = False, ai_model: str = DEFAULT_AI_MO
     Secrets are masked in everything the receipt shows, after the rules have scored the raw text."""
     path = Path(session_path)
     run = adapters.detect(path).parse(path)
+    reconcile_git(run)
     run.guard = load_guard_decisions(run)
     from .rollback import checkpoint_for_run
     run.checkpoint_id = checkpoint_for_run(run.cwd, run.session_id)
@@ -82,6 +84,16 @@ def build(session_path: str, use_ai: bool = False, ai_model: str = DEFAULT_AI_MO
             notes.append(f"AI risk review skipped: {_one_line(exc)}")
     redact_run(run, risks)
     return run, score, level, risks, "\n".join(notes) or None
+
+
+def reconcile_git(run) -> None:
+    """Fill what the session log leaves out from the run's Git working tree: the
+    branch when none was recorded, and line counts for files written through the shell."""
+    if not run.git_branch:
+        run.git_branch = current_branch(run.cwd)
+    shell_paths = [p for p, fc in file_changes(run).items() if fc.shell]
+    if shell_paths:
+        run.git_changes = working_changes(run.cwd, shell_paths)
 
 
 def _one_line(exc: BaseException) -> str:

@@ -90,6 +90,8 @@ class Run:
     ai_review: Optional[Dict[str, Any]] = None        # review.py (Claude Sonnet): verdict + assessments
     checkpoint_id: Optional[str] = None              # earliest local checkpoint for this session
     guard: List[Dict[str, Any]] = field(default_factory=list)  # local Guard decisions
+    # gitinfo.working_changes for files the run wrote through the shell, keyed relative to cwd
+    git_changes: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     @property
     def duration_seconds(self) -> Optional[float]:
