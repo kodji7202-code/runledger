@@ -334,6 +334,15 @@ def test_cost_signal_needs_a_known_price():
     assert _sig(score_run(_run([step]), []), "cost_efficiency") is None
 
 
+def test_cost_signal_is_skipped_when_the_cost_is_partial():
+    priced = _write(1, "src/a.py", lines=10)
+    priced.usage = Usage(input_tokens=50_000)
+    unpriced = _write(2, "src/b.py", lines=10)
+    unpriced.model = "claude-mystery-9"
+    unpriced.usage = Usage(input_tokens=1_000_000)
+    assert _sig(score_run(_run([priced, unpriced]), []), "cost_efficiency") is None
+
+
 @pytest.mark.parametrize("risks, level, impact", [
     ([], "Low", 0),
     ([Risk("medium", "git_internals", "Wrote inside .git", 1)], "Low", 0),          # 15

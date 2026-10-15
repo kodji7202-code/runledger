@@ -39,6 +39,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .advisor import estimated_cost, recommend
 from .parser import Run, Step
+from .pricing import unpriced
 from .risk import Risk, _score as _risk_score
 from .summarize import file_changes
 from .testdiff import analyze as analyze_test_diffs
@@ -343,7 +344,8 @@ def score_run(run: Run, risks: Optional[Sequence[Risk]] = None) -> Dict[str, Any
             add("unfinished", 0, 0, "The final message reports no unfinished work.")
 
     # --- cost per changed line
-    cost = estimated_cost(run)
+    # A partial cost (some tokens unpriced) would make the run look cheaper than it was.
+    cost = None if unpriced(run) else estimated_cost(run)
     lines = sum(c.added + c.removed for c in changes.values())
     if cost and cost > 0 and lines > 0:
         per_line = cost / lines

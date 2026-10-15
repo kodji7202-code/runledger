@@ -12,6 +12,7 @@ import posixpath
 import re
 import shlex
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import List, Optional, Tuple
 
 _HEREDOC = re.compile(r"(?<!<)<<(-?)[ \t]*(['\"]?)([A-Za-z_][\w.-]*)\2")
@@ -36,9 +37,13 @@ _SQLITE_VALUE_OPTS = ("-cmd", "-init", "-separator", "-newline", "-nullvalue", "
                       "-lookaside", "-pagecache", "-heap", "-maxsize")
 _RUNNERS = {"npx", "pnpx", "bunx", "bundle", "poetry", "pipenv", "uv"}
 _MIGRATE_SCRIPT = re.compile(r"^migrat(?:e|ions?)(?:[_-]\w+)?(?:\.(?:py|js|mjs|cjs|ts|sh|rb))?$", re.I)
+# Every receipt reads each command several times (file changes, risk, quality, each renderer),
+# so parses are cached. Longer commands are parsed each time to keep the cache's memory bounded.
+_CACHE_MAX_CHARS = 64_000
+_CACHE_ENTRIES = 4096
 
 
-@dataclass
+@dataclass(frozen=True)
 class ShellWrite:
     path: str
     added: int = 0
@@ -219,41 +224,57 @@ def _command_writes(words: List[str], targets: List[str], body: Optional[str]) -
     return out
 
 
-def _walk(command: str):
-    """Yield (resolve, words, targets, body, inputs) for each simple command that is not a cd.
-    `resolve(path)` joins a path to the directory the command `cd`s into first, or
-    returns None when the path cannot be known."""
+_Parsed = Tuple[Tuple[Optional[str], bool, Tuple[str, ...], Tuple[str, ...], Optional[str], Tuple[str, ...]], ...]
+
+
+def _parse(command: str) -> _Parsed:
+    """(cwd, lost, words, targets, body, inputs) for each simple command that is not a cd.
+    `cwd` is the directory the command `cd`s into first; `lost` is true after an
+    unresolvable cd, when relative paths point nowhere known."""
     text, bodies = _heredocs(command)
     tokens = _tokens(text)
     if tokens is None:
-        return
-    state = {"cwd": None, "lost": False}  # after an unresolvable cd, relative paths point nowhere known
-
-    def resolve(path: Optional[str]) -> Optional[str]:
-        if not path or path == "-" or _UNRESOLVED.search(path):
-            return None
-        if state["lost"] and not path.startswith("/"):
-            return None
-        cwd = state["cwd"]
-        return posixpath.normpath(posixpath.join(cwd, path) if cwd else path)
-
+        return ()
+    cwd: Optional[str] = None
+    lost = False
+    out = []
     for words, targets, body, inputs in _commands(tokens, bodies):
         stripped = [w for w in words if not re.match(r"^\w+=", w)]
         if stripped and stripped[0] in ("cd", "pushd"):
             dest = _positional(stripped[1:])
             if len(dest) == 1 and dest[0] != "-" and not _UNRESOLVED.search(dest[0]):
-                cwd = state["cwd"]
-                state["cwd"] = posixpath.normpath(posixpath.join(cwd, dest[0]) if cwd else dest[0])
-                state["lost"] = state["lost"] and not state["cwd"].startswith("/")
+                cwd = posixpath.normpath(posixpath.join(cwd, dest[0]) if cwd else dest[0])
+                lost = lost and not cwd.startswith("/")
             else:
-                state["lost"] = True
+                lost = True
             continue
-        yield resolve, words, targets, body, inputs
+        out.append((cwd, lost, tuple(words), tuple(targets), body, tuple(inputs)))
+    return tuple(out)
 
 
-def shell_writes(command: str) -> List[ShellWrite]:
-    """Files the command writes or moves away. Paths stay as the command names
-    them, joined to any directory the command `cd`s into first."""
+_parse_cached = lru_cache(maxsize=_CACHE_ENTRIES)(_parse)
+
+
+def _resolver(cwd: Optional[str], lost: bool):
+    def resolve(path: Optional[str]) -> Optional[str]:
+        if not path or path == "-" or _UNRESOLVED.search(path):
+            return None
+        if lost and not path.startswith("/"):
+            return None
+        return posixpath.normpath(posixpath.join(cwd, path) if cwd else path)
+    return resolve
+
+
+def _walk(command: str):
+    """Yield (resolve, words, targets, body, inputs) for each simple command that is not a cd.
+    `resolve(path)` joins a path to the directory the command `cd`s into first, or
+    returns None when the path cannot be known."""
+    parsed = _parse_cached(command) if len(command) <= _CACHE_MAX_CHARS else _parse(command)
+    for cwd, lost, words, targets, body, inputs in parsed:
+        yield _resolver(cwd, lost), list(words), list(targets), body, list(inputs)
+
+
+def _shell_writes(command: str) -> Tuple[ShellWrite, ...]:
     out: List[ShellWrite] = []
     for resolve, words, targets, body, _ in _walk(command):
         for w in _command_writes(words, targets, body):
@@ -261,7 +282,18 @@ def shell_writes(command: str) -> List[ShellWrite]:
             if path is None or path == "/dev" or path.startswith("/dev/"):
                 continue
             out.append(ShellWrite(path, w.added, w.deleted, resolve(w.source) if w.source else None))
-    return out
+    return tuple(out)
+
+
+_shell_writes_cached = lru_cache(maxsize=_CACHE_ENTRIES)(_shell_writes)
+
+
+def shell_writes(command: str) -> List[ShellWrite]:
+    """Files the command writes or moves away. Paths stay as the command names
+    them, joined to any directory the command `cd`s into first."""
+    if len(command) > _CACHE_MAX_CHARS:
+        return list(_shell_writes(command))
+    return list(_shell_writes_cached(command))
 
 
 def _python_db_writes(source: str) -> List[str]:

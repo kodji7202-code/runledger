@@ -12,7 +12,8 @@ from .adapters import label as agent_label
 from .guard import redact
 from .guard_receipt import guard_counts, guard_summary
 from .parser import Run, Step, Usage
-from .pricing import PRICING_HELP, friendly_model, unknown_models
+from .pricing import (PRICING_HELP, UNATTRIBUTED, UNATTRIBUTED_NOTE, friendly_model, partial_note,
+                      unknown_models, unpriced)
 from .risk import Risk
 from .summarize import FileChange, file_changes
 
@@ -59,12 +60,18 @@ def _dur(sec: Optional[float]) -> str:
     return f"{h}h {m}m" if h else f"{m}m {s}s"
 
 
+def _run_money(run: Run) -> str:
+    """The run estimate; a lower bound reads `≥ $X (N models unpriced)`."""
+    note = partial_note(run)
+    return f"≥ {_money(run.cost)} ({note})" if note else _money(run.cost)
+
+
 def _cost_text(run: Run) -> str:
     """Estimate from list prices, the agent's own figure, or both."""
     if run.cost is not None and run.reported_cost is not None:
-        return f"{_money(run.cost)} est. · {_money(run.reported_cost)} reported by agent"
+        return f"{_run_money(run)} est. · {_money(run.reported_cost)} reported by agent"
     if run.cost is not None:
-        return _money(run.cost)
+        return _run_money(run)
     if run.reported_cost is not None:
         return f"{_money(run.reported_cost)} reported by agent"
     return "n/a"
@@ -76,6 +83,8 @@ def _cost_card(run: Run) -> str:
     if run.cost is not None:
         note = (f"<small>est. · reported by agent {_money(run.reported_cost)}</small>"
                 if run.reported_cost is not None else "")
+        if run.cost_partial:
+            note = f"<small>at least · {_e(partial_note(run))}</small>" + note
         return f'<div class="card"><span>Cost</span><b>{_money(run.cost)}</b>{note}</div>'
     return (f'<div class="card"><span>Cost</span><b>{_money(run.reported_cost)}</b>'
             "<small>reported by agent</small></div>")
@@ -531,6 +540,7 @@ def to_dict(run: Run, score: int, level: str, risks: List[Risk]) -> Dict:
                    "cache_write_tokens": run.usage.cache_write_tokens,
                    "cache_read_tokens": run.usage.cache_read_tokens,
                    "cost_usd": run.cost, "reported_cost_usd": run.reported_cost,
+                   "cost_partial": run.cost_partial, "unknown_models": unknown_models(run),
                    "files_changed": len(changes), "usage_source": run.usage_source},
         "models": {m: {"tokens": u.total} for m, u in run.models.items()},
         "pricing_note": PRICING_HELP if unknown_models(run) else None,
@@ -559,6 +569,8 @@ def to_markdown(run: Run, score: int, level: str, risks: List[Risk]) -> str:
         out.append(f"- **Guard:** {guard_summary(run.guard)}")
     if unknown_models(run):
         out.append(f"- **Unknown model price:** {PRICING_HELP}")
+    if UNATTRIBUTED in unpriced(run):
+        out.append(f"- **Unattributed tokens:** {UNATTRIBUTED_NOTE}")
     rollback = _rollback(run)
     if rollback:
         out.append(f"- **Rollback:** `{rollback['command']}` (creates a safety checkpoint; run in this repository)")
@@ -668,6 +680,8 @@ def to_html(run: Run, score: int, level: str, risks: List[Risk]) -> str:
     usage_note = f" {e(usage_note)}" if usage_note else ""
     pricing_note = (f'<div class="meta">Unknown model price. {e(PRICING_HELP)}</div>'
                     if unknown_models(run) else "")
+    if UNATTRIBUTED in unpriced(run):
+        pricing_note += f'<div class="meta">Unattributed tokens. {e(UNATTRIBUTED_NOTE)}</div>'
     rollback = _rollback(run)
     rollback_html = (
         f'<div class="meta">Rollback: <code>{e(rollback["command"])}</code> '

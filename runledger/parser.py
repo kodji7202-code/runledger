@@ -83,6 +83,7 @@ class Run:
     usage: Usage
     models: Dict[str, Usage]
     cost: Optional[float] = None
+    cost_partial: bool = False  # cost covers only the priced models; others had tokens but no price
     overall_summary: str = ""
     agent: str = "claude-code"            # adapter NAME that produced this run
     reported_cost: Optional[float] = None  # cost reported by the agent itself, if any

@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from ..parser import Run, Step, Usage, _split_usage
+from ..pricing import UNATTRIBUTED
 from .codex import patch_to_steps
 
 NAME = "droid"
@@ -195,6 +196,49 @@ def _settings_path(path: Path, header: Dict[str, Any]) -> Optional[Path]:
     return None
 
 
+def _minus(a: Usage, b: Usage) -> Usage:
+    return Usage(*(max(0, getattr(a, f) - getattr(b, f)) for f in _USAGE_FIELDS))
+
+
+def _child_model(settings_path: Optional[Path], child_id: Any) -> Optional[str]:
+    if settings_path is None or not isinstance(child_id, str) or not _SESSION_ID.fullmatch(child_id):
+        return None
+    try:
+        child = json.loads((settings_path.parent / f"{child_id}.settings.json").read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError, RecursionError):
+        return None
+    if not isinstance(child, dict):
+        return None
+    return _text(child.get("model")) or None
+
+
+def _child_usage(settings: Dict[str, Any], own: Usage, settings_path: Optional[Path]) -> Dict[str, Usage]:
+    """Sub-agent usage: inclusiveTokenUsage minus the session's own tokenUsage. Each child
+    session is credited to the model in its own settings file when that file is found;
+    the rest is unattributed, never priced as the parent's model."""
+    raw = settings.get("inclusiveTokenUsage")
+    if not isinstance(raw, dict):
+        return {}
+    inclusive = _usage(raw)
+    if any(getattr(inclusive, f) < getattr(own, f) for f in _USAGE_FIELDS):
+        return {}  # an inclusive total below the session's own usage is not a superset; ignore it
+    extra = _minus(inclusive, own)
+    if not extra.total:
+        return {}
+    out: Dict[str, Usage] = {}
+    by_child = settings.get("childInclusiveTokenUsageBySessionId")
+    for child_id, child_raw in (by_child.items() if isinstance(by_child, dict) else []):
+        model = _child_model(settings_path, child_id)
+        if not model or not isinstance(child_raw, dict):
+            continue
+        share = Usage(*(min(getattr(_usage(child_raw), f), getattr(extra, f)) for f in _USAGE_FIELDS))
+        out.setdefault(model, Usage()).add(share)
+        extra = _minus(extra, share)
+    if extra.total:
+        out.setdefault(UNATTRIBUTED, Usage()).add(extra)
+    return out
+
+
 def parse(path: Path) -> Run:
     p = Path(path)
     settings_path = _settings_path(p, _header(p))
@@ -284,24 +328,29 @@ def parse(path: Path) -> Run:
         for step, share in zip(issued[mid], _split_usage(usage, len(issued[mid])) if issued[mid] else []):
             step.usage = share
     from_settings = False
-    raw_total = settings.get("tokenUsage")
-    if isinstance(raw_total, dict):
-        total = _usage(raw_total)
-        remainder = Usage(*(max(0, getattr(total, f) - getattr(run.usage, f)) for f in _USAGE_FIELDS))
+    raw_own = settings.get("tokenUsage")
+    if isinstance(raw_own, dict):
+        own = _usage(raw_own)
+        remainder = _minus(own, run.usage)
         if remainder.total or not message_usage:
             # A cumulative snapshot cannot identify how much each model used.
             # Never price a mixed-model remainder as the last selected model.
             model = next(iter(observed_models)) if len(observed_models) == 1 else (
-                "unknown" if observed_models else default_model)
+                UNATTRIBUTED if observed_models else default_model)
             run.usage.add(remainder)
             run.models.setdefault(model, Usage()).add(remainder)
             from_settings = remainder.total > 0
             pending = [step for mid, steps in issued.items() if mid not in message_usage for step in steps]
-            if model != "unknown" and pending:
+            if model not in (UNATTRIBUTED, "unknown") and pending:
                 for step, share in zip(pending, _split_usage(remainder, len(pending))):
                     step.usage = share
                     step.usage_estimated = from_settings
                     step.usage_known = from_settings
+        children = _child_usage(settings, own, settings_path)
+        for model, usage in children.items():
+            run.usage.add(usage)
+            run.models.setdefault(model, Usage()).add(usage)
+            from_settings = from_settings or usage.total > 0
     if not run.usage.total:
         run.usage_source = "missing"
     elif from_settings:

@@ -142,9 +142,32 @@ def cost_of(usage: Usage, model: Optional[str]) -> Optional[float]:
             + usage.cache_read_tokens * cache_read) / 1_000_000
 
 
+UNATTRIBUTED = "unattributed"  # session-total tokens that no single model can be credited with
+UNATTRIBUTED_NOTE = ("Some tokens come from a session total that cannot be credited to one model "
+                     "(several models or sub-agents), so they have no price.")
+
+
 def unknown_models(run: Run) -> List[str]:
-    """Model ids used in the run that have no price, so their cost is unknown."""
-    return [model for model in run.models if price_for(model) is None]
+    """Model ids used in the run that have no price, so their cost is unknown.
+    The unattributed bucket is not a model: adding a price cannot fix it."""
+    return [model for model in run.models if model != UNATTRIBUTED and price_for(model) is None]
+
+
+def unpriced(run: Run) -> List[str]:
+    """Buckets with tokens but no price, including unattributed tokens."""
+    return [m for m, u in run.models.items() if u.total > 0 and price_for(m) is None]
+
+
+def partial_note(run: Run) -> str:
+    """Why a cost is a lower bound, e.g. "1 model unpriced"; empty when the cost is complete."""
+    if not run.cost_partial:
+        return ""
+    missing = unpriced(run)
+    models = [m for m in missing if m != UNATTRIBUTED]
+    parts = [f"{len(models)} model{'s' if len(models) != 1 else ''} unpriced"] if models else []
+    if UNATTRIBUTED in missing:
+        parts.append("unattributed tokens unpriced")
+    return ", ".join(parts)
 
 
 def apply_costs(run: Run) -> None:
@@ -158,3 +181,4 @@ def apply_costs(run: Run) -> None:
             total += c
             known = True
     run.cost = total if known else None
+    run.cost_partial = known and bool(unpriced(run))

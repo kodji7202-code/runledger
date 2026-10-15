@@ -169,9 +169,37 @@ def test_mixed_model_snapshot_cannot_be_priced_as_the_last_model(tmp_path):
         _message([_call("Read", {"file_path": "a.py"}, "one")], modelId=MODEL),
         _message([_call("Read", {"file_path": "b.py"}, "two")], mid="two", modelId="claude-haiku-4-5"),
     ], settings={"model": "claude-haiku-4-5", "tokenUsage": {"inputTokens": 100}}))
-    assert run.models == {"unknown": Usage(100)}
+    assert run.models == {"unattributed": Usage(100)}
     apply_costs(run)
     assert run.cost is None
+    assert unknown_models(run) == []  # adding a price cannot fix unattributed tokens
+
+
+def test_sub_agent_usage_is_credited_to_the_child_model(tmp_path):
+    (tmp_path / "child-1.settings.json").write_text(json.dumps({"model": "claude-haiku-4-5"}), encoding="utf-8")
+    run = droid.parse(_session(tmp_path, [
+        _message([_call("Read", {"file_path": "a.py"})], modelId=MODEL, usage={"inputTokens": 100}),
+    ], settings={"model": MODEL, "tokenUsage": {"inputTokens": 100},
+                 "inclusiveTokenUsage": {"inputTokens": 400, "outputTokens": 50},
+                 "childInclusiveTokenUsageBySessionId": {
+                     "child-1": {"inputTokens": 250, "outputTokens": 50},
+                     "child-gone": {"inputTokens": 50}}}))
+    assert run.usage == Usage(400, 50)
+    assert run.models == {MODEL: Usage(100), "claude-haiku-4-5": Usage(250, 50), "unattributed": Usage(50)}
+    assert run.steps[0].usage == Usage(100)  # sub-agent tokens are not charged to parent steps
+    apply_costs(run)
+    assert run.cost_partial
+    assert run.cost == pytest.approx(cost_of(Usage(100), MODEL) + cost_of(Usage(250, 50), "claude-haiku-4-5"))
+
+
+def test_inclusive_usage_without_children_is_unattributed(tmp_path):
+    run = droid.parse(_session(tmp_path, [
+        _message([_call("Read", {"file_path": "a.py"})], modelId=MODEL),
+    ], settings={"model": MODEL, "tokenUsage": {"inputTokens": 100},
+                 "inclusiveTokenUsage": {"inputTokens": 160}}))
+    assert run.usage == Usage(160)
+    assert run.models == {MODEL: Usage(100), "unattributed": Usage(60)}
+    assert run.usage_source == "settings"
 
 
 @pytest.mark.parametrize("settings_text", [None, "{partial", "[]", '{"model":"claude-sonnet-4-5"}'])

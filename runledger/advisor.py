@@ -3,8 +3,8 @@
 Every figure is an estimate. A step's cost comes from the list prices in pricing.py
 applied to the tokens that step was charged for. A saving is the difference between
 what the step cost and what the same tokens would cost on a cheaper model or with
-prompt caching. Steps whose model has no price contribute nothing, so every
-estimate is a lower bound; unknown_pricing reports the missing prices themselves.
+prompt caching. Steps whose model has no price, and steps with no token data, contribute
+nothing, so every estimate is a lower bound; unknown_pricing reports the missing prices.
 
 A recommendation is kept only when it is material: its estimated saving is at least
 $0.01, or at least 20% of the run's estimated cost. A run that costs less than one
@@ -64,6 +64,16 @@ def _steps_text(indices: List[int]) -> str:
     return ", ".join(str(i) for i in indices)
 
 
+def _usage_known(run: Run, step: Step) -> bool:
+    """False when no source gave this step tokens; its zero usage is then not a real figure."""
+    return step.usage_known and run.usage_source != "missing"
+
+
+def _unmeasured(count: int) -> str:
+    return (f" {count} matching step(s) have no token data and are not counted."
+            if count else "")
+
+
 def estimated_cost(run: Run) -> Optional[float]:
     """Estimated run cost from the list prices. None when no model has a price."""
     total, known = 0.0, False
@@ -120,7 +130,8 @@ def _is_expensive(model: Optional[str]) -> bool:
 
 
 def _model_downgrade(run: Run, run_cost: Optional[float]) -> Optional[Dict[str, Any]]:
-    picked = [s for s in run.steps if _is_expensive(s.model) and _is_read_only(s)]
+    candidates = [s for s in run.steps if _is_expensive(s.model) and _is_read_only(s)]
+    picked = [s for s in candidates if _usage_known(run, s)]
     if not picked:
         return None
     actual = cheap = 0.0
@@ -137,7 +148,7 @@ def _model_downgrade(run: Run, run_cost: Optional[float]) -> Optional[Dict[str, 
     detail = (f"{len(picked)} of {len(run.steps)} steps were reads, searches, listings or simple "
               f"shell commands, and ran on {models}. At {friendly_model(HAIKU)} list prices the same "
               f"tokens would cost about {_usd(cheap)} instead of {_usd(actual)}. "
-              f"Estimated saving: {_usd(saving)}.")
+              f"Estimated saving: {_usd(saving)}.{_unmeasured(len(candidates) - len(picked))}")
     return _rec("model_downgrade", f"Run read-only steps on {friendly_model(HAIKU)}", detail, saving,
                 [s.index for s in picked])
 
@@ -186,10 +197,14 @@ def _retry_loop(run: Run, run_cost: Optional[float]) -> Optional[Dict[str, Any]]
     if not repeated:
         return None
     wasted = 0.0
+    unmeasured = 0
     steps: List[int] = []
     for group in repeated.values():
         steps += [s.index for s in group]
         for s in group[1:]:  # the first failure is the one that taught something
+            if not _usage_known(run, s):
+                unmeasured += 1
+                continue
             c = cost_of(s.usage, s.model)
             wasted += c or 0.0
     if not _material(wasted, run_cost):
@@ -198,7 +213,7 @@ def _retry_loop(run: Run, run_cost: Optional[float]) -> Optional[Dict[str, Any]]
     detail = (f"{len(repeated)} shell command(s) failed more than once. The most repeated "
               f"(“{_short(worst_cmd)}”) failed {len(worst)} times. Retries after the first failure cost "
               f"about {_usd(wasted)} (estimate). Read the error once and change the approach instead of "
-              f"running the same command again.")
+              f"running the same command again.{_unmeasured(unmeasured)}")
     return _rec("retry_loop", "Repeated failing commands", detail, wasted, sorted(set(steps)))
 
 
@@ -217,7 +232,11 @@ def _large_reads(run: Run, run_cost: Optional[float]) -> Optional[Dict[str, Any]
     if not redundant and not big:
         return None
     total = 0.0
+    unmeasured = 0
     for s in redundant:
+        if not _usage_known(run, s):
+            unmeasured += 1
+            continue
         total += cost_of(s.usage, s.model) or 0.0
     steps_total = len(run.steps)
     for s in big:
@@ -231,7 +250,7 @@ def _large_reads(run: Run, run_cost: Optional[float]) -> Optional[Dict[str, Any]
     detail = (f"{len(repeated_files)} file(s) were read {READ_REPEAT_MIN} or more times, and {len(big)} "
               f"Read result(s) were {LARGE_RESULT_CHARS:,}+ characters. Reading only the lines needed "
               f"(offset and limit) keeps the context that every later step carries. "
-              f"Estimated saving: {_usd(total)}.")
+              f"Estimated saving: {_usd(total)}.{_unmeasured(unmeasured)}")
     steps = sorted({s.index for s in redundant} | {s.index for s in big})
     return _rec("large_reads", "Large or repeated file reads", detail, total, steps)
 

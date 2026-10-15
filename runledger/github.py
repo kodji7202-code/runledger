@@ -31,7 +31,7 @@ from . import __version__
 from .adapters import label as agent_label
 from .cli import build
 from .parser import Run
-from .pricing import friendly_model
+from .pricing import friendly_model, partial_note
 from .risk import Risk
 from .summarize import file_changes
 
@@ -116,7 +116,8 @@ def _agent_model(run: Run) -> str:
 def _cost_cell(run: Run) -> str:
     """The estimate when there is one; otherwise the figure the agent reported."""
     if run.cost is not None:
-        return _money(run.cost)
+        note = partial_note(run)
+        return f"≥ {_money(run.cost)} ({note})" if note else _money(run.cost)
     if run.reported_cost is not None:
         return f"{_money(run.reported_cost)} reported"
     return "n/a"
