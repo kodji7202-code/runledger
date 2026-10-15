@@ -23,6 +23,7 @@
     "cwd": {"type": ["string", "null"]},
     "cwd_source": {"type": ["string", "null"], "enum": ["header", "session", "settings", "session_dir", "unknown", null]},
     "git_branch": {"type": ["string", "null"]},
+    "git_base": {"type": ["string", "null"]},
     "started": {"type": ["string", "null"]},
     "ended": {"type": ["string", "null"]},
     "duration_seconds": {"type": ["number", "null"], "minimum": 0},

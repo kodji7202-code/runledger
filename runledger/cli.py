@@ -40,9 +40,10 @@ from typing import List, Optional
 
 from . import __version__
 from . import adapters
-from .gitinfo import current_branch, file_diffs, toplevel, working_changes
+from .gitinfo import current_branch, file_diffs, session_base, toplevel, working_changes
 from .guard import redact
 from .guard_receipt import load_guard_decisions
+from .parser import _ts
 from .paths import is_abs
 from .pricing import apply_costs
 from .quality import analyze
@@ -91,17 +92,19 @@ def build(session_path: str, use_ai: bool = False, ai_model: str = DEFAULT_AI_MO
 def reconcile_git(run) -> None:
     """Fill what the session log leaves out from the run's Git working tree: the
     branch when none was recorded, line counts for files written through the shell, and
-    the diffs of changed test files."""
+    the diffs of changed test files. When the run's changes were committed after it began,
+    both compare the working tree with the last commit before the session start (run.git_base)."""
     if not run.git_branch:
         run.git_branch = current_branch(run.cwd)
+    run.git_base = session_base(run.cwd, _ts(run.started))
     changes = file_changes(run)
     shell_paths = [p for p, fc in changes.items() if fc.shell]
     if shell_paths:
-        run.git_changes = working_changes(run.cwd, shell_paths)
+        run.git_changes = working_changes(run.cwd, shell_paths, run.git_base)
     test_paths = [p for p, fc in changes.items()
                   if not fc.deleted and not is_abs(p) and is_test_source(p)]
     if test_paths:
-        run.test_diffs = file_diffs(run.cwd, test_paths)
+        run.test_diffs = file_diffs(run.cwd, test_paths, run.git_base)
 
 
 def _one_line(exc: BaseException) -> str:

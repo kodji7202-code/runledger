@@ -1113,7 +1113,7 @@ def assess(run: Run) -> Tuple[int, str, List[Risk]]:
             m = _MIGRATION_VERB.match(r.reason) if r.code == "db_migration" else None
             status = (run.git_changes.get(m.group(1)) or {}).get("status") if m else None
             if status:
-                verb = "Added" if status == "untracked" else "Changed"
+                verb = "Added" if status in ("untracked", "added") else "Changed"
                 r.reason = f"{verb} a database migration ({m.group(1)})"
     _apply_test_verdicts(run, analyze_test_diffs(run.test_diffs, run.prompts), policy)
     for s in run.steps:
