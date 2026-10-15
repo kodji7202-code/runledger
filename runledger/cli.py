@@ -41,6 +41,7 @@ from typing import List, Optional
 from . import __version__
 from . import adapters
 from .guard import redact
+from .guard_receipt import load_guard_decisions
 from .pricing import apply_costs
 from .quality import analyze
 from .receipt import redact_run, render
@@ -61,6 +62,7 @@ def build(session_path: str, use_ai: bool = False, ai_model: str = DEFAULT_AI_MO
     Secrets are masked in everything the receipt shows, after the rules have scored the raw text."""
     path = Path(session_path)
     run = adapters.detect(path).parse(path)
+    run.guard = load_guard_decisions(run)
     from .rollback import checkpoint_for_run
     run.checkpoint_id = checkpoint_for_run(run.cwd, run.session_id)
     apply_costs(run)

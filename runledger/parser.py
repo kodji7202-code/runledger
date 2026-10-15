@@ -64,6 +64,7 @@ class Step:
     is_error: bool = False
     summary: str = ""
     risks: List["Risk"] = field(default_factory=list)  # filled by risk module
+    has_result: bool = False  # an empty tool_result still confirms the call ran
 
 
 @dataclass
@@ -88,6 +89,7 @@ class Run:
     recommendations: List[Dict[str, Any]] = field(default_factory=list)  # advisor.py
     ai_review: Optional[Dict[str, Any]] = None        # review.py (Claude Sonnet): verdict + assessments
     checkpoint_id: Optional[str] = None              # earliest local checkpoint for this session
+    guard: List[Dict[str, Any]] = field(default_factory=list)  # local Guard decisions
 
     @property
     def duration_seconds(self) -> Optional[float]:
@@ -181,6 +183,7 @@ def parse_session(path: str | os.PathLike) -> Run:
                     if step:
                         step.result_text = _text_of(block.get("content"))[:4000]
                         step.is_error = bool(block.get("is_error"))
+                        step.has_result = True
                 elif block.get("type") == "text" and not ev.get("isMeta"):
                     t = block.get("text", "").strip()
                     if t and not t.startswith("<"):

@@ -398,9 +398,12 @@ def _last_log(cwd):
 
 
 def test_log_is_jsonl_with_the_decision_fields(tmp_path):
-    guard.handle(json.dumps(bash_event(tmp_path, "rm -rf /", session="sess-9")))
+    event = bash_event(tmp_path, "rm -rf /", session="sess-9")
+    event["tool_use_id"] = "toolu-guard-9"
+    guard.handle(json.dumps(event))
     rec = _last_log(tmp_path)
     assert rec["session_id"] == "sess-9"
+    assert rec["tool_use_id"] == "toolu-guard-9"
     assert rec["tool"] == "Bash" and rec["decision"] == "deny"
     assert "command" in rec["codes"]
     assert rec["ts"].endswith("+00:00")
@@ -414,6 +417,45 @@ def test_log_redacts_secrets_and_truncates_the_command(tmp_path):
     rec = _last_log(tmp_path)
     assert "[REDACTED]" in rec["summary"]
     assert len(rec["summary"]) <= 200
+
+
+def test_plain_allow_is_logged_but_not_shown_in_receipt(tmp_path, capsys):
+    event = bash_event(tmp_path, "ls")
+    event["tool_use_id"] = "toolu-plain-allow"
+    assert guard.handle(json.dumps(event)) is None
+    record = _last_log(tmp_path)
+    assert record["decision"] == record["policy_decision"] == "allow"
+    assert record["session_id"] == event["session_id"]
+    assert record["tool_use_id"] == event["tool_use_id"]
+    assert record["tool"] == "Bash" and record["summary"] == "ls"
+    assert record["approval"] is None
+
+    session = tmp_path / "session.jsonl"
+    session.write_text(json.dumps({
+        "type": "assistant", "sessionId": event["session_id"], "cwd": str(tmp_path),
+        "message": {"id": "plain-allow-message", "content": [{
+            "type": "tool_use", "id": event["tool_use_id"], "name": "Bash",
+            "input": {"command": "ls"},
+        }]},
+    }) + "\n", encoding="utf-8")
+    for fmt in ("html", "md", "json"):
+        assert cli_main(["receipt", str(session), "--format", fmt, "-o", "-"]) == 0
+        output = capsys.readouterr().out
+        if fmt == "json":
+            data = json.loads(output)
+            assert "guard" not in data and "guard" not in data["totals"]
+        else:
+            assert "Guard decisions" not in output and "Guard:" not in output
+
+
+def test_server_approved_allow_is_logged_with_tool_id(tmp_path):
+    event = bash_event(tmp_path, "sudo apt-get update")
+    event["tool_use_id"] = "toolu-approved"
+    decision = guard.decide(event, {}, approver=FakeApprover("approved"))
+    guard._log_decision(decision)
+    record = _last_log(tmp_path)
+    assert record["decision"] == "allow" and record["approval"] == "approved"
+    assert record["tool_use_id"] == "toolu-approved"
 
 
 @pytest.mark.parametrize("sample", [

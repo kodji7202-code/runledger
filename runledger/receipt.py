@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from . import __version__
 from .adapters import label as agent_label
 from .guard import redact
+from .guard_receipt import guard_counts, guard_summary
 from .parser import Run, Usage
 from .pricing import PRICING_HELP, friendly_model, unknown_models
 from .risk import Risk
@@ -409,9 +410,43 @@ def redact_run(run: Run, risks: List[Risk]) -> None:
     run.quality = _redact_value(run.quality)
     run.recommendations = _redact_value(run.recommendations)
     run.ai_review = _redact_value(run.ai_review)
+    run.guard = _redact_value(run.guard)
 
 
 # ---------------------------------------------------------------- output formats
+
+def _guard_html(run: Run) -> str:
+    if not run.guard:
+        return ""
+    cards = []
+    for decision in run.guard:
+        step = f'step {decision["step"]}' if decision["step"] is not None else "unmatched"
+        codes = ", ".join(decision["codes"])
+        cards.append(
+            f'<div class="card"><span>{_e(decision["decision"].upper())} · '
+            f'{_e(decision["tool"])} · {step}</span>'
+            f'<div><strong>{_e(decision["outcome"])}</strong></div>'
+            f'<div><code>{_e(decision["summary"])}</code></div>'
+            f'<div>{_e(decision["reason"])}</div>'
+            f'<small>{_e(codes)} · {_e(decision["ts"] or "")}</small></div>'
+        )
+    return '<h2>Guard decisions</h2><div class="guard-decisions">' + "".join(cards) + "</div>"
+
+
+def _guard_md(run: Run) -> List[str]:
+    if not run.guard:
+        return []
+    out = ["## Guard decisions", "",
+           "| Step | Tool | Summary | Decision | Outcome | Reason | Codes | Timestamp |",
+           "| --- | --- | --- | --- | --- | --- | --- | --- |"]
+    for decision in run.guard:
+        cells = [decision["step"] if decision["step"] is not None else "unmatched",
+                 decision["tool"], decision["summary"], decision["decision"],
+                 decision["outcome"], decision["reason"], ", ".join(decision["codes"]),
+                 decision["ts"] or ""]
+        out.append("| " + " | ".join(_md_cell(_e(str(c))) for c in cells) + " |")
+    return out + [""]
+
 
 def _rollback(run: Run) -> Optional[Dict[str, str]]:
     from .rollback import ID_RE
@@ -423,7 +458,7 @@ def _rollback(run: Run) -> Optional[Dict[str, str]]:
 
 def to_dict(run: Run, score: int, level: str, risks: List[Risk]) -> Dict:
     changes = file_changes(run)
-    return {
+    data = {
         "runledger_version": __version__,
         "session_id": run.session_id,
         "rollback": _rollback(run),
@@ -451,6 +486,10 @@ def to_dict(run: Run, score: int, level: str, risks: List[Risk]) -> Dict:
         "recommendations": _recs_list(run),
         "ai_review": run.ai_review if run.ai_review else None,
     }
+    if run.guard:
+        data["guard"] = run.guard
+        data["totals"]["guard"] = guard_counts(run.guard)
+    return data
 
 
 def to_markdown(run: Run, score: int, level: str, risks: List[Risk]) -> str:
@@ -458,6 +497,8 @@ def to_markdown(run: Run, score: int, level: str, risks: List[Risk]) -> str:
     out = [f"# Run receipt · {run.session_id[:8]}", ""]
     out.append(f"- **Agent:** {agent_label(run.agent)}  ·  **Folder:** `{run.cwd}`  ·  **Branch:** `{run.git_branch or '-'}`  ·  **Duration:** {_dur(run.duration_seconds)}")
     out.append(f"- **Risk:** {score}/100 ({level})  ·  **Cost:** {_cost_text(run)}  ·  **Tokens:** {_tok(run.usage.total)}  ·  **Files changed:** {len(changes)}")
+    if run.guard:
+        out.append(f"- **Guard:** {guard_summary(run.guard)}")
     if unknown_models(run):
         out.append(f"- **Unknown model price:** {PRICING_HELP}")
     rollback = _rollback(run)
@@ -474,6 +515,7 @@ def to_markdown(run: Run, score: int, level: str, risks: List[Risk]) -> str:
         out.append("")
     out += _ai_md(ai, risks)
     out += _recs_md(run)
+    out += _guard_md(run)
     if changes:
         out.append("## Files changed")
         for c in changes.values():
@@ -511,6 +553,7 @@ tr.flag td:first-child{box-shadow:inset 3px 0 var(--amber)}tr.flag.high td:first
 code{font:13px ui-monospace,monospace;background:var(--line);padding:1px 5px;border-radius:5px;word-break:break-all}
 .add{color:var(--accent)}.rem{color:var(--red)}
 .card small{display:block;color:var(--muted);font-size:12px;margin-top:4px}
+.guard-decisions{display:grid;gap:12px}
 footer{margin-top:40px;color:var(--muted);font-size:12px}
 """
 
@@ -565,6 +608,8 @@ def to_html(run: Run, score: int, level: str, risks: List[Risk]) -> str:
         f'<div class="meta">Rollback: <code>{e(rollback["command"])}</code> '
         '(creates a safety checkpoint; run in this repository)</div>'
     ) if rollback else ""
+    guard_note = (f'<div class="meta">Guard: {_e(guard_summary(run.guard))}</div>'
+                  if run.guard else "")
 
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -582,9 +627,11 @@ def to_html(run: Run, score: int, level: str, risks: List[Risk]) -> str:
  <div class="card"><span>Files changed</span><b>{len(changes)}</b></div>
  <div class="card"><span>Duration</span><b>{_dur(run.duration_seconds)}</b></div>
 </div>
+{guard_note}
 {pricing_note}
 <h2>Overview</h2><div class="overview">{e(run.overall_summary)}</div>{quality_html}
 <h2>Risk · {level}</h2><div class="overview">{risk_html}</div>{ai_html}{recs_html}
+{_guard_html(run)}
 <h2>Files changed</h2><table>{files_html}</table>
 <h2>Steps</h2><table><tr><th>#</th><th>What happened</th><th>Model</th><th style="text-align:right">Tokens</th><th style="text-align:right">Cost</th></tr>{''.join(rows)}</table>
 <footer>Models: {e(models or 'n/a')}. Costs estimate model token usage from public API list prices, not actual charges.{reported_note}

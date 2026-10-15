@@ -7,6 +7,21 @@ change behavior, so read the entry before you upgrade.
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-10-15
+
+### Added
+
+- **Guard decisions in receipts:** HTML, Markdown and JSON now show blocked calls, local
+  approvals and rejections, approval-server outcomes and monitor-only decisions, with summary
+  counts. Stream the run's local Guard log, match by tool-use id or legacy tool and summary,
+  keep unmatched decisions visible, and mask summaries and reasons. Missing or corrupt logs
+  do not prevent receipts.
+
+### Changed
+
+- Guard decision records include `tool_use_id`. The audit log continues to record every
+  decision, including plain allows; only receipts filter plain allows from display.
+
 ## [0.5.1] - 2026-10-15
 
 ### Added
