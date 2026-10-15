@@ -116,6 +116,19 @@ def test_cost_of_unknown_model_is_none():
     assert cost_of(Usage(input_tokens=10), "claude-mystery-9") is None
 
 
+def test_apply_costs_leaves_steps_with_unknown_usage_unpriced():
+    from runledger.parser import Step
+    known = Step(1, "Read", {}, "a", "claude-opus-5-5", None, usage=Usage(input_tokens=1000))
+    unknown = Step(2, "Read", {}, "b", "claude-opus-5-5", None, usage_known=False)
+    run = Run("s", "/x.jsonl", None, None, None, None, [], [known, unknown], "",
+              Usage(input_tokens=1000), {"claude-opus-5-5": Usage(input_tokens=1000)})
+    pricing.apply_costs(run)
+    assert known.cost == pytest.approx(cost_of(Usage(input_tokens=1000), "claude-opus-5-5"))
+    assert unknown.cost is None
+    md = render(run, 0, "Low", [], "md")
+    assert "n/a tok, n/a" in md and "$0.0000" not in md
+
+
 @pytest.mark.parametrize("model", [
     "ANTHROPIC/CLAUDE-SONNET-4-5",
     "anthropic/claude-sonnet-4.5-latest",

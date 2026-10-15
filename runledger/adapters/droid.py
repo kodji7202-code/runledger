@@ -275,6 +275,9 @@ def parse(path: Path) -> Run:
         if call_id in results:
             for step in steps:
                 step.result_text, step.is_error = results[call_id]
+    for mid, steps in issued.items():
+        for step in steps:
+            step.usage_known = mid in message_usage
     for mid, usage in message_usage.items():
         run.usage.add(usage)
         run.models.setdefault(message_models[mid], Usage()).add(usage)
@@ -298,6 +301,7 @@ def parse(path: Path) -> Run:
                 for step, share in zip(pending, _split_usage(remainder, len(pending))):
                     step.usage = share
                     step.usage_estimated = from_settings
+                    step.usage_known = from_settings
     if not run.usage.total:
         run.usage_source = "missing"
     elif from_settings:

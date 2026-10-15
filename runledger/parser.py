@@ -66,6 +66,7 @@ class Step:
     risks: List["Risk"] = field(default_factory=list)  # filled by risk module
     has_result: bool = False  # an empty tool_result still confirms the call ran
     usage_estimated: bool = False  # usage is an even share of a session total, not a per-call count
+    usage_known: bool = True  # False when no source attributed usage to this step; usage is then 0, not real
 
 
 @dataclass
