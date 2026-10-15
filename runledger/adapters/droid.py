@@ -23,6 +23,8 @@ RESULT_LIMIT = 4000
 _USAGE_FIELDS = ("input_tokens", "output_tokens", "cache_write_tokens", "cache_read_tokens")
 _CONTEXT = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
 _DRIVE = re.compile(r"^[A-Za-z]:[\\/]")
+# The header id becomes part of a glob, so it must not carry separators or glob syntax.
+_SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 
 def factory_home() -> Path:
@@ -167,10 +169,37 @@ def _tools(name: str, inp: Dict[str, Any], depth: int = 0) -> List[Tuple[str, Di
     return [(name, inp)]
 
 
+def _settings_path(path: Path, header: Dict[str, Any]) -> Optional[Path]:
+    """The sibling settings file, or the one Droid keeps for this session id under FACTORY_HOME.
+    The fallback covers transcripts that were copied or renamed without their settings file."""
+    sibling = path.with_suffix(".settings.json")
+    if sibling.is_file():
+        return sibling
+    sid = header.get("id")
+    if not isinstance(sid, str) or not _SESSION_ID.fullmatch(sid):
+        return None
+    name = f"{sid}.settings.json"
+    root = factory_home() / "sessions"
+    cwd = header.get("cwd")
+    folder = cwd.replace("\\", "-").replace("/", "-") if isinstance(cwd, str) else ""
+    if folder not in ("", ".", ".."):
+        preferred = root / folder / name
+        if preferred.is_file():
+            return preferred
+    try:
+        for candidate in sorted(root.glob(f"*/{name}")):
+            if candidate.is_file():
+                return candidate
+    except OSError:
+        pass
+    return None
+
+
 def parse(path: Path) -> Run:
     p = Path(path)
+    settings_path = _settings_path(p, _header(p))
     try:
-        settings = json.loads(p.with_suffix(".settings.json").read_text(encoding="utf-8-sig"))
+        settings = json.loads(settings_path.read_text(encoding="utf-8-sig")) if settings_path else {}
     except (OSError, ValueError, RecursionError):
         settings = {}
     if not isinstance(settings, dict):
@@ -251,6 +280,7 @@ def parse(path: Path) -> Run:
         run.models.setdefault(message_models[mid], Usage()).add(usage)
         for step, share in zip(issued[mid], _split_usage(usage, len(issued[mid])) if issued[mid] else []):
             step.usage = share
+    from_settings = False
     raw_total = settings.get("tokenUsage")
     if isinstance(raw_total, dict):
         total = _usage(raw_total)
@@ -262,8 +292,17 @@ def parse(path: Path) -> Run:
                 "unknown" if observed_models else default_model)
             run.usage.add(remainder)
             run.models.setdefault(model, Usage()).add(remainder)
+            from_settings = remainder.total > 0
             pending = [step for mid, steps in issued.items() if mid not in message_usage for step in steps]
             if model != "unknown" and pending:
                 for step, share in zip(pending, _split_usage(remainder, len(pending))):
                     step.usage = share
+                    step.usage_estimated = from_settings
+    if not run.usage.total:
+        run.usage_source = "missing"
+    elif from_settings:
+        run.usage_source = "settings"
+        run.usage_file = settings_path.name if settings_path else None
+    else:
+        run.usage_source = "messages"
     return run
