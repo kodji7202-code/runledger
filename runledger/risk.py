@@ -54,6 +54,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from . import paths
 from .parser import Run, Step
 from .shell_writes import database_writes, shell_writes
 from .testdiff import SKIP_RE, TestChange, analyze as analyze_test_diffs
@@ -217,29 +218,10 @@ def _slashes(p: str) -> str:
     return p.replace("\\", "/")
 
 
-def _is_windows_style(*paths: Optional[str]) -> bool:
-    return any(bool(p) and bool(_WIN_DRIVE_RE.match(p)) for p in paths)
-
-
-def _is_abs(p: str) -> bool:
-    return bool(_WIN_ABS_RE.match(p)) or p.startswith(("/", "\\"))
-
-
-def _key(p: str, win: bool) -> str:
-    """Comparable form of a path: '/' separators, no '.' or '..' segments and,
-    for Windows-style paths, lowercase (Windows names are case-insensitive)."""
-    if win:
-        return ntpath.normpath(p.replace("/", "\\")).replace("\\", "/").lower()
-    return posixpath.normpath(p)
-
-
-def _within(path: str, base: str) -> bool:
-    """True if `path` equals `base` or lies under it. Both must be absolute.
-    A drive letter on either side makes the comparison Windows-style."""
-    win = _is_windows_style(path, base)
-    p = _key(path, win)
-    b = _key(base, win).rstrip("/")
-    return p == b or p.startswith(b + "/")
+_is_windows_style = paths.is_windows_style
+_is_abs = paths.is_abs
+_key = paths.key
+_within = paths.within
 
 
 def _in_temp(target: str) -> bool:
@@ -756,10 +738,7 @@ def _shell_risks(step: Step, cwd: Optional[str], extra: List["re.Pattern"], risk
 
 def _project_path(path: str, cwd: Optional[str]) -> str:
     """`path` relative to the working folder when it lies inside it, as receipts list files."""
-    p, base = _slashes(path), _slashes(cwd or "").rstrip("/")
-    if base and p.lower().startswith(base.lower() + "/") and _within(path, cwd):
-        return p[len(base) + 1:]
-    return path
+    return paths.relative(path, cwd)
 
 
 def _is_migration(path: str) -> bool:

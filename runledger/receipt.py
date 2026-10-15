@@ -578,7 +578,8 @@ def to_markdown(run: Run, score: int, level: str, risks: List[Risk]) -> str:
         out.append("## Files changed")
         for c in changes.values():
             tag = " (deleted)" if c.deleted else " (new)" if c.created else ""
-            out.append(f"- {_md_code(c.path)}{tag} +{c.added} −{c.removed}")
+            counts = "(binary)" if c.binary else f"+{c.added} −{c.removed}"
+            out.append(f"- {_md_code(c.path)}{tag} {counts}")
         out.append("")
     out.append("## Steps")
     for s in run.steps:
@@ -640,7 +641,8 @@ def to_html(run: Run, score: int, level: str, risks: List[Risk]) -> str:
 
     files_html = "".join(
         f"<tr><td><code>{e(c.path)}</code>{' <span class=pill>deleted</span>' if c.deleted else ' <span class=pill>new</span>' if c.created else ''}</td>"
-        f'<td class="num"><span class="add">+{c.added}</span> <span class="rem">−{c.removed}</span></td></tr>'
+        + ('<td class="num">(binary)</td></tr>' if c.binary else
+           f'<td class="num"><span class="add">+{c.added}</span> <span class="rem">−{c.removed}</span></td></tr>')
         for c in changes.values()
     ) or '<tr><td colspan="2" class="meta">No files changed.</td></tr>'
 

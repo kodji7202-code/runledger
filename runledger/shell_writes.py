@@ -357,3 +357,33 @@ def database_writes(command: str) -> List[DbWrite]:
         elif _is_migration_command(words):
             out.append(DbWrite("migrate", text))
     return out
+
+
+def _rm_targets(words: List[str]) -> List[str]:
+    """Files an rm, unlink or `git rm` removes from the working tree."""
+    while words and (words[0] in _WRAPPERS or re.match(r"^\w+=", words[0])):
+        words = words[1:]
+    name = posixpath.basename(words[0]) if words else ""
+    if name in ("rm", "unlink"):
+        return _positional(words[1:])
+    if name == "git":
+        args, base = words[1:], ""
+        while args and args[0].startswith("-"):  # git -C dir / -c k=v take a value
+            if args[0] == "-C" and len(args) > 1:
+                base = posixpath.join(base, args[1])
+            args = args[2:] if args[0] in ("-C", "-c") else args[1:]
+        if args and args[0] == "rm" and "--cached" not in args:
+            return [posixpath.join(base, t) if base else t for t in _positional(args[1:])]
+    return []
+
+
+def shell_deletes(command: str) -> List[str]:
+    """Paths the command deletes with rm, unlink or `git rm` (not `git rm --cached`),
+    joined to any directory the command `cd`s into first. Globs and variables are skipped."""
+    out: List[str] = []
+    for resolve, words, _, _, _ in _walk(command):
+        for target in _rm_targets(words):
+            path = resolve(target)
+            if path is not None and not path.startswith("/dev/"):
+                out.append(path)
+    return out
