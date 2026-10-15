@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import html
 import json
+import re
 from dataclasses import asdict
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -325,6 +326,35 @@ def _md_text(text: Any) -> str:
     return str(text).replace("\r", " ").replace("\n", " ").replace("`", "'")
 
 
+def _md_angles(text: str) -> str:
+    """Stop raw HTML tags; unlike html.escape, `&` stays readable in Markdown."""
+    return text.replace("<", "&lt;").replace(">", "&gt;")
+
+
+_MD_LINE_START = re.compile(r"^(\s*)([#+=*-]|\d+[.)])")
+
+
+def _md_inline(text: Any, line_start: bool = True) -> str:
+    """One line of free text that cannot open a heading, list, block quote or HTML tag."""
+    text = _md_angles(re.sub(r"\s+", " ", _md_text(text)))
+    if not line_start:
+        return text
+    return _MD_LINE_START.sub(lambda m: m.group(1) + "\\" + m.group(2), text)
+
+
+def _md_summary(text: Any) -> str:
+    """A step summary: code spans from the templates stay, text around them is escaped."""
+    parts = re.sub(r"\s+", " ", str(text)).split("`")
+    if len(parts) % 2 == 0:  # unpaired backtick from an AI summary
+        return _md_inline(text)
+    return "".join(f"`{p}`" if i % 2 else _md_inline(p, i == 0) if p.strip() else p
+                   for i, p in enumerate(parts))
+
+
+def _md_code(text: Any) -> str:
+    return "`" + _md_text(text) + "`"
+
+
 def _quality_md(quality: Any) -> List[str]:
     if not isinstance(quality, dict):
         return []
@@ -470,7 +500,7 @@ def _guard_md(run: Run) -> List[str]:
                  decision["tool"], decision["summary"], decision["decision"],
                  decision["outcome"], decision["reason"], ", ".join(decision["codes"]),
                  decision["ts"] or ""]
-        out.append("| " + " | ".join(_md_cell(_e(str(c))) for c in cells) + " |")
+        out.append("| " + " | ".join(_md_cell(_md_angles(str(c))) for c in cells) + " |")
     return out + [""]
 
 
@@ -523,7 +553,7 @@ def to_dict(run: Run, score: int, level: str, risks: List[Risk]) -> Dict:
 def to_markdown(run: Run, score: int, level: str, risks: List[Risk]) -> str:
     changes = file_changes(run)
     out = [f"# Run receipt · {run.session_id[:8]}", ""]
-    out.append(f"- **Agent:** {agent_label(run.agent)}  ·  **Folder:** `{run.cwd}`  ·  **Branch:** `{run.git_branch or '-'}`  ·  **Duration:** {_dur(run.duration_seconds)}")
+    out.append(f"- **Agent:** {agent_label(run.agent)}  ·  **Folder:** {_md_code(run.cwd) if run.cwd else '-'}  ·  **Branch:** {_md_code(run.git_branch or '-')}  ·  **Duration:** {_dur(run.duration_seconds)}")
     out.append(f"- **Risk:** {score}/100 ({level})  ·  **Cost:** {_cost_text(run)}  ·  **Tokens:** {_run_tok(run, run.usage.total)}  ·  **Files changed:** {len(changes)}")
     if run.guard:
         out.append(f"- **Guard:** {guard_summary(run.guard)}")
@@ -532,14 +562,14 @@ def to_markdown(run: Run, score: int, level: str, risks: List[Risk]) -> str:
     rollback = _rollback(run)
     if rollback:
         out.append(f"- **Rollback:** `{rollback['command']}` (creates a safety checkpoint; run in this repository)")
-    out += ["", "## Overview", run.overall_summary, ""]
+    out += ["", "## Overview", _md_inline(run.overall_summary), ""]
     out += _quality_md(run.quality)
     ai = _ai_dict(run)
     ai_map = _ai_map(ai) if ai else {}
     if risks:
         out.append("## Why it was flagged")
         for r in risks:
-            out.append(f"- **{r.severity.upper()}** · step {r.step}: {r.reason}{_ai_md_suffix(r, ai_map)}")
+            out.append(f"- **{r.severity.upper()}** · step {r.step}: {_md_inline(r.reason)}{_ai_md_suffix(r, ai_map)}")
         out.append("")
     out += _ai_md(ai, risks)
     out += _recs_md(run)
@@ -548,12 +578,12 @@ def to_markdown(run: Run, score: int, level: str, risks: List[Risk]) -> str:
         out.append("## Files changed")
         for c in changes.values():
             tag = " (deleted)" if c.deleted else " (new)" if c.created else ""
-            out.append(f"- `{c.path}`{tag} +{c.added} −{c.removed}")
+            out.append(f"- {_md_code(c.path)}{tag} +{c.added} −{c.removed}")
         out.append("")
     out.append("## Steps")
     for s in run.steps:
         flag = " ⚠️" if s.risks else ""
-        out.append(f"{s.index}. {s.summary}{flag} — {friendly_model(s.model)}, {_step_tok(run, s)} tok, {_money(s.cost)}")
+        out.append(f"{s.index}. {_md_summary(s.summary)}{flag} — {friendly_model(s.model)}, {_step_tok(run, s)} tok, {_money(s.cost)}")
     note = _usage_note(run)
     if note:
         out += ["", _md_text(note)]
