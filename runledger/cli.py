@@ -40,13 +40,14 @@ from typing import List, Optional
 
 from . import __version__
 from . import adapters
-from .gitinfo import current_branch, file_diffs, working_changes
+from .gitinfo import current_branch, file_diffs, toplevel, working_changes
 from .guard import redact
 from .guard_receipt import load_guard_decisions
 from .paths import is_abs
 from .pricing import apply_costs
 from .quality import analyze
 from .receipt import redact_run, render
+from .safe import make_safe
 from .risk import assess, is_test_source
 from .review import DEFAULT_REVIEW_MODEL, ai_review
 from .summarize import DEFAULT_AI_MODEL, ai_summaries, apply_templates, file_changes
@@ -298,6 +299,21 @@ def cmd_list(args) -> int:
     return 0
 
 
+def default_safe(fmt: str, target: Optional[Path]) -> bool:
+    """md and json receipts are pasted into PRs and committed, so they are safe when they go to
+    stdout or to a file inside a Git work tree. HTML and files outside any repository are
+    personal copies, where full paths help debugging."""
+    if fmt == "html":
+        return False
+    if target is None:
+        return True
+    try:
+        folder = target.resolve().parent
+    except (OSError, RuntimeError):
+        return True
+    return toplevel(str(folder)) is not None
+
+
 def cmd_receipt(args) -> int:
     path = _session_path(args)
     if path is None:
@@ -308,20 +324,25 @@ def cmd_receipt(args) -> int:
     except (OSError, ValueError) as exc:  # missing file, or a session file that does not validate
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    ext = {"html": "html", "md": "md", "json": "json"}[args.format]
+    target = None if args.output == "-" else Path(args.output or f"runledger-{_file_stem(run.session_id)}.{ext}")
+    safe = args.safe if args.safe is not None else default_safe(args.format, target)
+    if safe:
+        make_safe(run, risks)
     out = render(run, score, level, risks, args.format)
     if note:
         print(note, file=sys.stderr)
-    if args.output == "-":
+    if target is None:
         _write_stdout(out)
     else:
-        ext = {"html": "html", "md": "md", "json": "json"}[args.format]
-        target = Path(args.output or f"runledger-{_file_stem(run.session_id)}.{ext}")
         try:
             target.write_text(out, encoding="utf-8")
         except OSError as exc:
             print(f"error: cannot write {target}: {exc.strerror or _one_line(exc)}", file=sys.stderr)
             return 1
         print(f"Receipt: {target}  ·  risk {score}/100 ({level})  ·  {len(run.steps)} steps")
+        print("Safe mode: on (paths shortened, e-mails masked; --no-safe shows them)" if safe
+              else "Safe mode: off (full local paths; --safe hides them)", file=sys.stderr)
         if args.open and args.format == "html":
             webbrowser.open(target.resolve().as_uri())
     return 2 if (args.fail_on is not None and score >= args.fail_on) else 0
@@ -562,6 +583,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help=f"model for --review (default {DEFAULT_REVIEW_MODEL})")
     pr.add_argument("--open", action="store_true", help="open the HTML receipt in a browser")
     pr.add_argument("--fail-on", type=int, metavar="SCORE", help="exit with code 2 if risk score >= SCORE (for CI/hooks)")
+    safe = pr.add_mutually_exclusive_group()
+    safe.add_argument("--safe", dest="safe", action="store_true", default=None,
+                      help="shorten local paths and mask e-mails (default for md/json to stdout or inside a Git repo)")
+    safe.add_argument("--no-safe", dest="safe", action="store_false",
+                      help="keep full local paths and e-mail addresses")
     pr.set_defaults(func=cmd_receipt)
 
     ps = sub.add_parser("serve", help="run the team server (collects pushed runs, serves the dashboard)")

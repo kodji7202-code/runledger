@@ -33,6 +33,7 @@ from .cli import build
 from .parser import Run
 from .pricing import friendly_model, partial_note
 from .risk import Risk
+from .safe import make_safe
 from .summarize import file_changes
 
 MARKER = "<!-- runledger-receipt -->"
@@ -433,6 +434,7 @@ def cmd_comment(args: argparse.Namespace) -> int:
     for path in paths:
         try:
             run, score, level, risks, _note = build(str(path))
+            make_safe(run, risks)  # a PR comment is public to everyone who can read the PR
         except (OSError, ValueError) as exc:
             _error(f"cannot read session {path}: {exc}")
             return EXIT_ERROR

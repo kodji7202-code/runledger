@@ -100,6 +100,9 @@ class Run:
     # Droid only: "messages", "settings" or "missing"; None for adapters with usage in every message
     usage_source: Optional[str] = None
     usage_file: Optional[str] = None  # file name (no folder) of the settings file that supplied usage
+    safe: bool = False  # safe.make_safe rewrote paths and masked e-mails for sharing
+    # safe.make_safe: the changed files computed before paths were rewritten (summarize.FileChange values)
+    frozen_changes: Optional[Dict[str, Any]] = None
 
     @property
     def duration_seconds(self) -> Optional[float]:
