@@ -3,6 +3,7 @@
   RUNLEDGER_CORPUS         session files, separated by os.pathsep
   RUNLEDGER_CORPUS_EXPECT  optional JSON file kept outside the repo:
                            {"<session file name>": {"score": 35, "level": "Medium", "files": 4,
+                                                    "cwd_source": "session", "branch": "main",
                                                     "run_cwd": "/folder/to/run/from"}}
   RUNLEDGER_CORPUS_OUT     optional folder that keeps the receipts written by the run
 
@@ -189,7 +190,8 @@ def test_corpus_session(session, tmp_path, capsys, monkeypatch):
             problems.append("mixed models with an unpriced one, but cost_partial is false")
 
     for key, got in (("score", data["risk"]["score"]), ("level", data["risk"]["level"]),
-                     ("files", data["totals"]["files_changed"])):
+                     ("files", data["totals"]["files_changed"]), ("cwd_source", data.get("cwd_source")),
+                     ("branch", data["git_branch"])):
         if key in expect and expect[key] != got:
             problems.append(f"{key} {got} != expected {expect[key]}")
 

@@ -21,6 +21,7 @@
     "agent": {"type": "string"},
     "agent_id": {"type": "string"},
     "cwd": {"type": ["string", "null"]},
+    "cwd_source": {"type": ["string", "null"], "enum": ["header", "session", "settings", "session_dir", "unknown", null]},
     "git_branch": {"type": ["string", "null"]},
     "started": {"type": ["string", "null"]},
     "ended": {"type": ["string", "null"]},

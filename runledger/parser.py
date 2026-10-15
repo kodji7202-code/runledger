@@ -100,6 +100,9 @@ class Run:
     # Droid only: "messages", "settings" or "missing"; None for adapters with usage in every message
     usage_source: Optional[str] = None
     usage_file: Optional[str] = None  # file name (no folder) of the settings file that supplied usage
+    # Droid only: where cwd came from. "header" (the log), "session" (`% pwd` output or the tool
+    # paths' Git work tree), "settings", "session_dir" (the encoded session folder) or "unknown"
+    cwd_source: Optional[str] = None
     safe: bool = False  # safe.make_safe rewrote paths and masked e-mails for sharing
     # safe.make_safe: the changed files computed before paths were rewritten (summarize.FileChange values)
     frozen_changes: Optional[Dict[str, Any]] = None

@@ -39,6 +39,11 @@ change behavior, so read the entry before you upgrade.
 
 ### Fixed
 
+- **Droid sessions run with `--cwd .`:** the real project folder is recovered from the session's
+  `% pwd` context, the settings file, the tool paths' Git work tree or the encoded session folder,
+  so these receipts get the branch, repo-relative files and Git line counts. JSON receipts add
+  `cwd_source`. `list` and `--latest` find these sessions by their folder name.
+
 - **Relative working folders:** a session whose log records `cwd` as `.` (seen in Droid) no longer
   takes the branch, Git line counts and checkpoints from the folder RunLedger runs in, and no longer
   flags every absolute path as outside the working folder.

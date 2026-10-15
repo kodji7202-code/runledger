@@ -28,6 +28,7 @@ schema = resources.files("runledger").joinpath("receipt.schema.json").read_text(
 | `rollback` | object or null | `checkpoint_id` and `command` when a local checkpoint exists |
 | `agent`, `agent_id` | string | display name (`Factory Droid`) and adapter id (`droid`) |
 | `cwd` | string or null | the run folder. In safe mode: repository name plus subfolder, such as `app/src` |
+| `cwd_source` | string or null | Droid only: `header` (the log), `session` (`% pwd` context or the tool paths' Git work tree), `settings`, `session_dir` (the encoded session folder) or `unknown`. Null for other agents |
 | `git_branch` | string or null | branch at the time of the receipt, when the log does not record one |
 | `started`, `ended` | string or null | ISO 8601 timestamps from the log |
 | `duration_seconds` | number or null | null when a timestamp is missing or unreadable |

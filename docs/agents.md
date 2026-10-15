@@ -82,10 +82,18 @@ Droid writes a JSONL transcript and a sibling settings file:
 ```
 
 - **Config directory.** `FACTORY_HOME` overrides `~/.factory`.
-- **Relative `cwd`.** Some Droid versions record `cwd` as `.`. RunLedger never resolves it against
-  the folder it runs in: the branch is unknown, Git line counts are skipped, and paths are not
-  flagged as outside the working folder. Safe receipts shorten absolute paths to `…/<last two parts>`.
-- **Matching.** The `cwd` in the `session_start` header identifies the project. Sessions are
+- **Relative `cwd`.** `droid exec --cwd .` records `cwd` as `.`. RunLedger recovers the real folder
+  from, in order: the session's own `% pwd` context, a folder field in the settings file, the Git
+  work tree that a majority of the absolute tool paths lie in, and the encoded session folder name.
+  A `-` in that name can be a separator or part of a folder name, so it is decoded against the
+  filesystem and accepted only when the folder exists. The recorded relative path is then
+  resolved against the recovered folder. JSON receipts record the source as `cwd_source`
+  (`header`, `session`, `settings`, `session_dir` or `unknown`). When nothing works, the folder
+  stays unknown and is never resolved against the folder RunLedger runs in: the branch is unknown,
+  Git line counts are skipped, paths are not flagged as outside the working folder, and safe
+  receipts shorten absolute paths to `…/<last two parts>`.
+- **Matching.** The `cwd` in the `session_start` header identifies the project. When it is
+  relative, the session folder name (the project path with separators replaced by `-`) is used. Sessions are
   sorted newest first by transcript modification time. `list --all --agent droid` covers all projects.
 - **Messages.** Human text becomes the request; system reminders and hidden context are excluded.
   Assistant `tool_use` blocks become steps, matched to `tool_result` blocks by id. `Execute` maps
