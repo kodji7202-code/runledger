@@ -130,8 +130,8 @@ The second command prints `"permissionDecision": "deny"` for the `rm -rf` call. 
 policy files, approvals, fail-open and fail-closed, monitor mode and the log is in
 [guard.md](guard.md).
 
-The installer also adds Git checkpoints at session start and before each prompt. Configure your
-Git identity and ignore sensitive untracked files first. Preview and undo restores with
+The installer also adds Git checkpoints at session start and before each prompt. No Git identity
+setup is needed for checkpoints; ignore sensitive untracked files first. Preview and undo restores with
 `runledger rollback CHECKPOINT_ID --dry-run` and the safety checkpoint printed after restoration.
 See [rollback.md](rollback.md) for manual use, Droid hooks, Codex, pruning and safety limits.
 

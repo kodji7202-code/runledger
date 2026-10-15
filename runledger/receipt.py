@@ -10,7 +10,7 @@ from . import __version__
 from .adapters import label as agent_label
 from .guard import redact
 from .parser import Run, Usage
-from .pricing import friendly_model
+from .pricing import PRICING_HELP, friendly_model, unknown_models
 from .risk import Risk
 from .summarize import FileChange, file_changes
 
@@ -442,6 +442,7 @@ def to_dict(run: Run, score: int, level: str, risks: List[Risk]) -> Dict:
                    "cost_usd": run.cost, "reported_cost_usd": run.reported_cost,
                    "files_changed": len(changes)},
         "models": {m: {"tokens": u.total} for m, u in run.models.items()},
+        "pricing_note": PRICING_HELP if unknown_models(run) else None,
         "files": [asdict(c) for c in changes.values()],
         "steps": [{"n": s.index, "tool": s.tool, "summary": s.summary, "model": s.model,
                    "tokens": s.usage.total, "cost_usd": s.cost, "error": s.is_error,
@@ -457,6 +458,8 @@ def to_markdown(run: Run, score: int, level: str, risks: List[Risk]) -> str:
     out = [f"# Run receipt · {run.session_id[:8]}", ""]
     out.append(f"- **Agent:** {agent_label(run.agent)}  ·  **Folder:** `{run.cwd}`  ·  **Branch:** `{run.git_branch or '-'}`  ·  **Duration:** {_dur(run.duration_seconds)}")
     out.append(f"- **Risk:** {score}/100 ({level})  ·  **Cost:** {_cost_text(run)}  ·  **Tokens:** {_tok(run.usage.total)}  ·  **Files changed:** {len(changes)}")
+    if unknown_models(run):
+        out.append(f"- **Unknown model price:** {PRICING_HELP}")
     rollback = _rollback(run)
     if rollback:
         out.append(f"- **Rollback:** `{rollback['command']}` (creates a safety checkpoint; run in this repository)")
@@ -555,6 +558,8 @@ def to_html(run: Run, score: int, level: str, risks: List[Risk]) -> str:
     models = ", ".join(f"{friendly_model(m)} ({_tok(u.total)})" for m, u in run.models.items())
     request = e(run.prompts[0][:400]) if run.prompts else "—"
     reported_note = " Reported cost comes from the agent itself." if run.reported_cost is not None else ""
+    pricing_note = (f'<div class="meta">Unknown model price. {e(PRICING_HELP)}</div>'
+                    if unknown_models(run) else "")
     rollback = _rollback(run)
     rollback_html = (
         f'<div class="meta">Rollback: <code>{e(rollback["command"])}</code> '
@@ -577,6 +582,7 @@ def to_html(run: Run, score: int, level: str, risks: List[Risk]) -> str:
  <div class="card"><span>Files changed</span><b>{len(changes)}</b></div>
  <div class="card"><span>Duration</span><b>{_dur(run.duration_seconds)}</b></div>
 </div>
+{pricing_note}
 <h2>Overview</h2><div class="overview">{e(run.overall_summary)}</div>{quality_html}
 <h2>Risk · {level}</h2><div class="overview">{risk_html}</div>{ai_html}{recs_html}
 <h2>Files changed</h2><table>{files_html}</table>

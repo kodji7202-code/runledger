@@ -86,8 +86,11 @@ class Repository:
             raise CheckpointError("Sparse checkouts are not supported; use a full working tree.")
 
     def _git(self, *args: str, index: Optional[str] = None,
-             data: Optional[bytes] = None, check: bool = True) -> subprocess.CompletedProcess:
+             data: Optional[bytes] = None, check: bool = True,
+             extra_env: Optional[Dict[str, str]] = None) -> subprocess.CompletedProcess:
         env = dict(self.env)
+        if extra_env:
+            env.update(extra_env)
         if index is not None:
             env["GIT_INDEX_FILE"] = index
         options = ["-c", "core.splitIndex=false", "-c", "core.fsmonitor=false"] if index else []
@@ -99,13 +102,31 @@ class Repository:
         except (OSError, subprocess.SubprocessError):
             raise CheckpointError("Git could not finish the checkpoint operation.") from None
         if check and result.returncode:
-            if b"identity unknown" in result.stderr or b"unable to auto-detect email" in result.stderr:
-                raise CheckpointError("Git author/committer identity is not configured. "
-                                      "Configure your Git identity before creating checkpoints.")
             # Do not echo arbitrary filter output, which may contain file content.
             raise CheckpointError(f"Git {args[0]} failed. Check repository permissions, "
                                   "Git filters, and whether another Git operation is running.")
         return result
+
+    def _checkpoint_identity(self) -> Dict[str, str]:
+        """Fill missing identities only for commit-tree, without changing Git config."""
+        env = {}
+        for role in ("AUTHOR", "COMMITTER"):
+            if self._git("var", f"GIT_{role}_IDENT", check=False).returncode == 0:
+                continue
+            for field, fallback in (("NAME", "RunLedger"), ("EMAIL", "runledger@localhost")):
+                key = f"GIT_{role}_{field}"
+                value = self.env.get(key)
+                if value is None:
+                    for section in (role.lower(), "user"):
+                        result = self._git("config", "--get", f"{section}.{field.lower()}",
+                                           check=False)
+                        if result.returncode == 0:
+                            value = os.fsdecode(result.stdout).strip()
+                            break
+                if value is None and field == "EMAIL":
+                    value = self.env.get("EMAIL")
+                env[key] = value or fallback
+        return env
 
     @contextmanager
     def _index(self, tree: Optional[str] = None) -> Iterator[str]:
@@ -212,7 +233,8 @@ class Repository:
         head = self._git("rev-parse", "--verify", "HEAD", check=False)
         if head.returncode == 0:
             args += ["-p", head.stdout.decode("ascii").strip()]
-        oid = self._git(*args, data=message).stdout.decode("ascii").strip()
+        oid = self._git(*args, data=message,
+                        extra_env=self._checkpoint_identity()).stdout.decode("ascii").strip()
         checkpoint = Checkpoint(checkpoint_id, oid, tree, metadata["created_at"], label, run_id, kind)
         # Empty old value means "create only", never overwrite an existing ref.
         self._git("update-ref", "--no-deref", checkpoint.ref, oid, "")

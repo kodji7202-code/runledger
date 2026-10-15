@@ -4,8 +4,11 @@ Checkpoints save your Git working tree before an agent changes it. They include 
 their unstaged contents, and untracked files that Git does not ignore. They do not change HEAD,
 your branch, the real index (including staged changes), or your stash.
 
-Git must be on PATH, with your author and committer identity already configured. RunLedger does
-not supply an identity. No Python dependencies, server, account, or network access are needed.
+Git must be on PATH. Checkpoints use your Git author and committer identity when available.
+If an identity is missing, RunLedger supplies `RunLedger <runledger@localhost>` only in the
+`commit-tree` subprocess environment, preserving any configured name or email. This also covers
+hooks and rollback safety checkpoints. RunLedger never writes Git config or changes your normal
+commit identity. No Python dependencies, server, account, or network access are needed.
 
 ## Save, preview, restore, undo
 

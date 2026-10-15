@@ -28,8 +28,8 @@ runledger guard test 'EVENT_JSON'        # print the decision for one event; wri
 
 `install` adds one entry to `hooks.PreToolUse`, with matcher `*`, command `runledger guard` and a
 `timeout`. It also adds `runledger checkpoint --hook` to `SessionStart` and `UserPromptSubmit`
-so each run and prompt gets a rollback point. These checkpoint hooks require Git and a configured
-Git identity, never block the agent, and do not store prompt text in checkpoint metadata.
+so each run and prompt gets a rollback point. These checkpoint hooks require Git, but no identity
+setup. They never block the agent and do not store prompt text in checkpoint metadata.
 See [rollback.md](rollback.md) for setup, privacy, retention, and undo.
 
 It keeps every other setting. Before it changes a file it copies the file to
