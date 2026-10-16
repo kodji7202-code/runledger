@@ -7,6 +7,7 @@ blocks; settings.tokenUsage holds cumulative counts, not per-call usage.
 from __future__ import annotations
 
 import json
+import ntpath
 import os
 import posixpath
 import re
@@ -15,6 +16,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from ..parser import Run, Step, Usage, _split_usage
+from ..paths import _norm as _norm_style, join as _join
 from ..pricing import UNATTRIBUTED
 from .codex import patch_to_steps
 
@@ -82,8 +84,25 @@ def _is_absolute(path: str) -> bool:
 
 
 def _encode(cwd: str) -> str:
-    """The session folder name Droid uses for a working folder."""
+    """The session folder name Droid uses for a working folder. A colon cannot be part of a
+    Windows file name, so the drive of 'C:\\x' is written 'C-' and the folder is 'C--x'."""
+    if _DRIVE.match(cwd):
+        cwd = cwd[0] + "-" + cwd[2:]
     return cwd.replace("\\", "-").replace("/", "-")
+
+
+def _is_project_folder(name: str, project: str) -> bool:
+    """True if a session folder `name` stands for the absolute folder `project`. Windows names
+    are compared without case, and besides 'C--x' the drive may be written 'C:-x' (a session
+    folder made on a POSIX host) or left out ('-x')."""
+    win = sys.platform == "win32" or bool(_DRIVE.match(project))
+    norm = _norm_style(project, win)
+    names = {_encode(norm)}
+    if _DRIVE.match(norm):
+        names.update((norm[:2] + _encode(norm[2:]), _encode(norm[2:])))
+    if win:
+        return name.lower() in {n.lower() for n in names}
+    return name in names
 
 
 def _mtime(path: Path) -> float:
@@ -107,7 +126,7 @@ def find_sessions(project: Optional[str] = None) -> List[Path]:
         cwd = header["cwd"]
         if wanted and _is_absolute(cwd) and _norm(cwd) != _norm(wanted):
             continue
-        if wanted and not _is_absolute(cwd) and path.parent.name != _encode(_norm(wanted)):
+        if wanted and not _is_absolute(cwd) and not _is_project_folder(path.parent.name, wanted):
             continue  # `droid exec --cwd .` records ".": the folder name is the only clue
         found.append(path)
     return sorted(found, key=_mtime, reverse=True)
@@ -262,9 +281,9 @@ def _decode_folder(name: str) -> Optional[str]:
     A '-' is either a separator or part of a name, so the filesystem decides: longer names
     are tried first, and only a candidate that exists as a directory is accepted."""
     if name.startswith("-"):
-        root, rest = "/", name[1:]
-    elif re.match(r"^[A-Za-z]:-", name):
-        root, rest = name[:2] + "\\", name[3:]
+        root, rest, pathmod = "/", name[1:], posixpath
+    elif re.match(r"^[A-Za-z][:-]-", name):
+        root, rest, pathmod = name[0] + ":\\", name[3:], ntpath
     else:
         return None
     tokens = rest.split("-")
@@ -282,7 +301,7 @@ def _decode_folder(name: str) -> Optional[str]:
             probes[0] += 1
             if probes[0] > _MAX_DECODE_PROBES:
                 return None
-            candidate = os.path.join(base, part)
+            candidate = pathmod.join(base, part)
             if os.path.isdir(candidate):
                 found = walk(candidate, j)
                 if found:
@@ -326,7 +345,7 @@ def _resolve(base: str, relative: str) -> str:
         return base
     if _norm(base).endswith("/" + _norm(rel).strip("/")):
         return base
-    return os.path.normpath(os.path.join(base, rel))
+    return _join(base, rel)
 
 
 def _recover_cwd(run: Run, recorded: str, pwd: Optional[str], settings: Dict[str, Any],

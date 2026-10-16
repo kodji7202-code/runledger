@@ -266,3 +266,25 @@ def test_no_base_keeps_head(dated_repo, started):
     assert run.git_base is None
     assert run.test_diffs == {}
     assert gitinfo.session_base(str(dated_repo), None) is None
+
+
+def test_shell_written_tests_in_a_windows_session_are_diffed_by_repo_path(monkeypatch):
+    from runledger import cli
+    repo = "C:\\Users\\runneradmin\\AppData\\Local\\Temp\\pytest-0\\repo"
+    asked = {}
+
+    def working_changes(cwd, paths, base):
+        asked["shell"] = paths
+        return {}
+
+    def file_diffs(cwd, paths, base):
+        return {p: "diff" for p in paths}
+
+    monkeypatch.setattr(cli, "current_branch", lambda cwd: "main")
+    monkeypatch.setattr(cli, "session_base", lambda cwd, ts: None)
+    monkeypatch.setattr(cli, "working_changes", working_changes)
+    monkeypatch.setattr(cli, "file_diffs", file_diffs)
+    run = _session(repo, None, [_shell_writes(repo)])
+    reconcile_git(run)
+    assert sorted(asked["shell"]) == ["notes.txt", "tests/test_api.py"]
+    assert list(run.test_diffs) == ["tests/test_api.py"]

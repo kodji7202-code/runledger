@@ -631,3 +631,40 @@ def test_receipt_for_a_recovered_cwd_has_branch_and_relative_files(tmp_path, cap
     assert (data["cwd"], data["cwd_source"], data["git_branch"]) == (str(repo), "session", "work")
     assert [f["path"] for f in data["files"]] == ["a.py"]
     assert not [r for r in data["risk"]["reasons"] if r["code"] == "read_outside"]
+
+
+# ---------------------------------------------------------------- Windows sessions on any host
+
+def test_a_relative_cwd_is_resolved_against_a_windows_base(tmp_path):
+    run = droid.parse(_relative_session(tmp_path / "s", [_context("C:\\srv\\app")], cwd="pkg"))
+    assert (run.cwd, run.cwd_source) == ("C:\\srv\\app\\pkg", "session")
+    run = droid.parse(_relative_session(tmp_path / "t", [_context("C:\\srv\\app\\pkg")], cwd="pkg"))
+    assert run.cwd == "C:\\srv\\app\\pkg"
+    run = droid.parse(_relative_session(tmp_path / "u", settings={"cwd": "D:/work/app"}, cwd="sub\\pkg"))
+    assert (run.cwd, run.cwd_source) == ("D:\\work\\app\\sub\\pkg", "settings")
+
+
+def test_windows_folders_are_encoded_without_a_colon():
+    assert droid._encode("C:\\Users\\dev\\my-app") == "C--Users-dev-my-app"
+    assert droid._encode("C:/Users/dev") == "C--Users-dev"
+    assert droid._encode("/home/dev/my-app") == "-home-dev-my-app"
+
+
+@pytest.mark.parametrize("name", ["C--Users-dev-my-app-sub-dir", "C:-Users-dev-my-app-sub-dir"])
+def test_windows_session_folder_is_decoded_with_its_drive(monkeypatch, name):
+    existing = {"C:\\Users", "C:\\Users\\dev", "C:\\Users\\dev\\my", "C:\\Users\\dev\\my-app",
+                "C:\\Users\\dev\\my-app\\sub-dir"}
+    monkeypatch.setattr(droid.os.path, "isdir", lambda p: p in existing)
+    assert droid._decode_folder(name) == "C:\\Users\\dev\\my-app\\sub-dir"
+
+
+def test_find_sessions_matches_a_windows_project_by_folder_name(tmp_path, monkeypatch):
+    monkeypatch.setenv("FACTORY_HOME", str(tmp_path / "factory"))
+    sessions = tmp_path / "factory" / "sessions"
+    names = ["C--Users-dev-My-Proj", "-Users-dev-My-Proj"]
+    if os.name != "nt":
+        names.append("C:-Users-dev-My-Proj")  # a colon is not valid in a Windows file name
+    expected = {_relative_session(sessions / n, name=f"{i}.jsonl") for i, n in enumerate(names)}
+    _relative_session(sessions / "C--Users-dev-other", name="other.jsonl")
+    assert set(droid.find_sessions("C:\\Users\\dev\\My-Proj")) == expected
+    assert set(droid.find_sessions("c:/users/dev/my-proj")) == expected

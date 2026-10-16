@@ -8,6 +8,7 @@ line counts are known only for heredoc bodies written with cat or tee.
 """
 from __future__ import annotations
 
+import ntpath
 import posixpath
 import re
 import shlex
@@ -15,9 +16,13 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import List, Optional, Tuple
 
+from .paths import is_abs, is_windows_style, join
+
 _HEREDOC = re.compile(r"(?<!<)<<(-?)[ \t]*(['\"]?)([A-Za-z_][\w.-]*)\2")
 _WRITE_OPS = (">", ">>", ">|", "&>", "&>>", "<>")
 _UNRESOLVED = re.compile(r"[$`*?\[{]|^~")
+_WORD_BREAKS = " \t\r\n();<>|&"
+_WIN_WORD = re.compile(r"[A-Za-z]:\\[^\s();<>|&'\"]*")
 _WRAPPERS = {"sudo", "env", "command", "nohup", "time", "exec", "builtin"}
 _PYTHON = re.compile(r"^python(\d+(\.\d+)?)?$")
 _PY_ASSIGN = re.compile(r"^[ \t]*(\w+)[ \t]*=[ \t]*(['\"])([^'\"\n]+)\2[ \t]*(?:#.*)?$", re.M)
@@ -82,8 +87,42 @@ def _heredocs(command: str) -> Tuple[str, List[str]]:
     return "\n".join(kept), bodies
 
 
+def _keep_windows_paths(text: str) -> str:
+    """Double the backslashes of unquoted words that start with a drive ('C:\\x'), so POSIX
+    tokenizing keeps them: on Windows they are separators, not escapes."""
+    if ":\\" not in text:
+        return text
+    out: List[str] = []
+    quote: Optional[str] = None
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if quote:
+            if c == quote:
+                quote = None
+            elif c == "\\" and quote == '"' and i + 1 < n:
+                out.append(text[i:i + 2])
+                i += 2
+                continue
+        elif c in "'\"":
+            quote = c
+        elif c == "\\" and i + 1 < n:
+            out.append(text[i:i + 2])
+            i += 2
+            continue
+        elif i == 0 or text[i - 1] in _WORD_BREAKS:
+            m = _WIN_WORD.match(text, i)
+            if m:
+                out.append(m.group().replace("\\", "\\\\"))
+                i = m.end()
+                continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
 def _tokens(text: str) -> Optional[List[str]]:
-    lex = shlex.shlex(text, posix=True, punctuation_chars="();<>|&\n")
+    lex = shlex.shlex(_keep_windows_paths(text), posix=True, punctuation_chars="();<>|&\n")
     lex.whitespace = " \t\r"
     lex.whitespace_split = True
     try:
@@ -207,7 +246,9 @@ def _command_writes(words: List[str], targets: List[str], body: Optional[str]) -
         if len(paths) >= 2:
             dest, sources = paths[-1], paths[:-1]
             for src in sources:
-                target = posixpath.join(dest, posixpath.basename(src)) if dest.endswith("/") or len(sources) > 1 else dest
+                into = dest.endswith(("/", "\\") if is_windows_style(dest) else "/") or len(sources) > 1
+                name_of = ntpath.basename if is_windows_style(src) else posixpath.basename
+                target = join(dest, name_of(src)) if into else dest
                 out.append(ShellWrite(target, source=src))
                 if name == "mv":
                     out.append(ShellWrite(src, deleted=True))
@@ -243,8 +284,8 @@ def _parse(command: str) -> _Parsed:
         if stripped and stripped[0] in ("cd", "pushd"):
             dest = _positional(stripped[1:])
             if len(dest) == 1 and dest[0] != "-" and not _UNRESOLVED.search(dest[0]):
-                cwd = posixpath.normpath(posixpath.join(cwd, dest[0]) if cwd else dest[0])
-                lost = lost and not cwd.startswith("/")
+                cwd = join(cwd, dest[0])
+                lost = lost and not is_abs(cwd)
             else:
                 lost = True
             continue
@@ -259,9 +300,9 @@ def _resolver(cwd: Optional[str], lost: bool):
     def resolve(path: Optional[str]) -> Optional[str]:
         if not path or path == "-" or _UNRESOLVED.search(path):
             return None
-        if lost and not path.startswith("/"):
+        if lost and not is_abs(path):
             return None
-        return posixpath.normpath(posixpath.join(cwd, path) if cwd else path)
+        return join(cwd, path)
     return resolve
 
 
