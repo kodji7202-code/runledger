@@ -487,6 +487,64 @@ def test_heredoc_body_and_echo_text_are_not_analysed():
     assert _reasons(_risks("Bash", command='echo "cat .env && rm tests/test_x.py"')) == []
 
 
+WS_CWD = "/workspace/proj"
+
+
+@pytest.mark.parametrize("cmd", [
+    "rg '/workspace|/home' src",
+    "rg -n --hidden '/workspace/[a-z]+|/home/[^/]+' .",
+    'grep -rnE "/home/[a-z]+|/workspace/" .',
+    "egrep '/opt|/srv' notes.txt",
+    "grep -C 3 /home/dev src",
+    "grep -rl -- '/home/dev' .",
+    "grep -r --include='*.py' '/usr/lib' .",
+    "grep -e /home/dev -e /workspace/other src",
+    "rg -e /etc/hosts src",
+    "rg --regexp=/home/dev .",
+    "rg -g '!/home/**' needle",
+    "ag '/opt/x|/workspace/y' .",
+    "git grep -e '/home/dev' -- src",
+    "git grep -nE '/home|/workspace' -- src",
+    "cat log.txt | grep '/var/log|/tmp'",
+    "find . -name '*.py' | xargs grep -l '/home|/opt'",
+    "sed -n 's#/home/dev#/tmp#p' file.txt",
+    "sed -e '/\\/home\\//d' file.txt",
+    "awk '/\\/home\\//{print}' log.txt",
+    "awk -F/ -v root=/home '{print $2}' paths.txt",
+    "perl -pe 's|/home/a|/b|' f.txt",
+    "find . -path '/home/*'",
+    "Select-String -Pattern '/home|/workspace' -Path notes.txt",
+])
+def test_search_patterns_are_not_paths(cmd):
+    assert not any(r.code == "shell_outside" for r in _risks("Bash", cwd=WS_CWD, command=cmd))
+
+
+@pytest.mark.parametrize("cmd, shown", [
+    ("cat /etc/passwd", "/etc/passwd"),
+    ("cp x /outside", "/outside"),
+    ("grep root /etc/passwd", "/etc/passwd"),
+    ("rg -n '/home|/workspace' /etc", "/etc"),
+    ("grep -e /home/dev /etc/hosts", "/etc/hosts"),
+    ("grep -f /etc/patterns src", "/etc/patterns"),
+    ("git grep -e foo -- /opt/other", "/opt/other"),
+    ("sed -e 's/a/b/' /etc/hosts", "/etc/hosts"),
+    ("awk -F: '{print $1}' /etc/passwd", "/etc/passwd"),
+    ("awk -f /opt/prog.awk in.txt", "/opt/prog.awk"),
+])
+def test_files_in_path_positions_of_search_commands_are_still_outside(cmd, shown):
+    outside = [r for r in _risks("Bash", cwd=WS_CWD, command=cmd) if r.code == "shell_outside"]
+    assert outside and shown in outside[0].reason
+
+
+def test_grep_pattern_text_is_not_a_dangerous_command():
+    assert _reasons(_risks("Bash", cwd=WS_CWD, command="grep -rn 'rm -rf /' .")) == []
+
+
+def test_awk_script_is_still_read_by_dangerous_command_rules():
+    risks = _risks("Bash", cwd=WS_CWD, command="awk 'BEGIN{system(\"sudo reboot\")}'")
+    assert "Ran a command with sudo" in _reasons(risks)
+
+
 def test_env_var_in_temp_is_not_outside(tmp_path, monkeypatch):
     monkeypatch.setenv("TEMP", str(tmp_path))
     assert _reasons(_risks("Bash", command='rm -f "$TEMP/e2e.db"')) == []

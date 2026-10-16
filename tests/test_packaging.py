@@ -88,6 +88,7 @@ def test_wheel_contains_modules_and_package_data(wheel):
         "runledger/adapters/codex.py",
         "runledger/adapters/droid.py",
         "runledger/prices.json",
+        "runledger/receipt.schema.json",
     ):
         assert required in names, f"{required} is missing from {wheel.name}"
 
@@ -136,7 +137,7 @@ def test_pyproject_urls_scripts_and_packages():
     assert 'Homepage = "https://runledger.site"' in _section("[project.urls]")
     assert 'runledger = "runledger.cli:main"' in _section("[project.scripts]")
     assert 'packages = ["runledger", "runledger.server", "runledger.adapters"]' in _section("[tool.setuptools]")
-    assert 'runledger = ["prices.json"]' in _section("[tool.setuptools.package-data]")
+    assert 'runledger = ["prices.json", "receipt.schema.json"]' in _section("[tool.setuptools.package-data]")
 
 
 def test_ci_matrix_has_every_os_and_python():
@@ -164,7 +165,10 @@ def test_container_runs_as_non_root_on_port_8787():
     assert "ARG PYTHON_BASE_IMAGE=python:3.12-slim" in dockerfile
     assert "FROM ${PYTHON_BASE_IMAGE}" in dockerfile
     ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-    assert "--build-arg PYTHON_BASE_IMAGE=public.ecr.aws/docker/library/python:3.12-slim" in ci
+    assert '--build-arg PYTHON_BASE_IMAGE="$base"' in ci
+    for mirror in ("public.ecr.aws/docker/library/python:3.12-slim",
+                   "mirror.gcr.io/library/python:3.12-slim"):
+        assert mirror in ci
     assert "pip install --no-cache-dir ." in dockerfile
     assert "USER runledger" in dockerfile
     assert "EXPOSE 8787" in dockerfile

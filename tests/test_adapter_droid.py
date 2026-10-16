@@ -169,13 +169,42 @@ def test_mixed_model_snapshot_cannot_be_priced_as_the_last_model(tmp_path):
         _message([_call("Read", {"file_path": "a.py"}, "one")], modelId=MODEL),
         _message([_call("Read", {"file_path": "b.py"}, "two")], mid="two", modelId="claude-haiku-4-5"),
     ], settings={"model": "claude-haiku-4-5", "tokenUsage": {"inputTokens": 100}}))
-    assert run.models == {"unknown": Usage(100)}
+    assert run.models == {"unattributed": Usage(100)}
     apply_costs(run)
     assert run.cost is None
+    assert unknown_models(run) == []  # adding a price cannot fix unattributed tokens
+
+
+def test_sub_agent_usage_is_credited_to_the_child_model(tmp_path):
+    (tmp_path / "child-1.settings.json").write_text(json.dumps({"model": "claude-haiku-4-5"}), encoding="utf-8")
+    run = droid.parse(_session(tmp_path, [
+        _message([_call("Read", {"file_path": "a.py"})], modelId=MODEL, usage={"inputTokens": 100}),
+    ], settings={"model": MODEL, "tokenUsage": {"inputTokens": 100},
+                 "inclusiveTokenUsage": {"inputTokens": 400, "outputTokens": 50},
+                 "childInclusiveTokenUsageBySessionId": {
+                     "child-1": {"inputTokens": 250, "outputTokens": 50},
+                     "child-gone": {"inputTokens": 50}}}))
+    assert run.usage == Usage(400, 50)
+    assert run.models == {MODEL: Usage(100), "claude-haiku-4-5": Usage(250, 50), "unattributed": Usage(50)}
+    assert run.steps[0].usage == Usage(100)  # sub-agent tokens are not charged to parent steps
+    apply_costs(run)
+    assert run.cost_partial
+    assert run.cost == pytest.approx(cost_of(Usage(100), MODEL) + cost_of(Usage(250, 50), "claude-haiku-4-5"))
+
+
+def test_inclusive_usage_without_children_is_unattributed(tmp_path):
+    run = droid.parse(_session(tmp_path, [
+        _message([_call("Read", {"file_path": "a.py"})], modelId=MODEL),
+    ], settings={"model": MODEL, "tokenUsage": {"inputTokens": 100},
+                 "inclusiveTokenUsage": {"inputTokens": 160}}))
+    assert run.usage == Usage(160)
+    assert run.models == {MODEL: Usage(100), "unattributed": Usage(60)}
+    assert run.usage_source == "settings"
 
 
 @pytest.mark.parametrize("settings_text", [None, "{partial", "[]", '{"model":"claude-sonnet-4-5"}'])
-def test_missing_usage_or_unreadable_settings_never_fabricate_run_cost(tmp_path, settings_text):
+def test_missing_usage_or_unreadable_settings_never_fabricate_run_cost(tmp_path, monkeypatch, settings_text):
+    monkeypatch.setenv("FACTORY_HOME", str(tmp_path / "factory"))
     path = _session(tmp_path, [_message([_call("Read", {"file_path": "a.py"})])])
     if settings_text is not None:
         path.with_suffix(".settings.json").write_text(settings_text, encoding="utf-8")
@@ -183,6 +212,161 @@ def test_missing_usage_or_unreadable_settings_never_fabricate_run_cost(tmp_path,
     apply_costs(run)
     assert run.usage == Usage()
     assert run.cost is None
+
+
+SHELL_FIX = FIXTURES / "droid_shell_edits.jsonl"
+SHELL_ID = "4f081969-21df-49b2-9272-75a305796c06"
+SHELL_MODEL = "claude-sonnet-5-5"
+
+
+def _receipt(capsys, path, fmt):
+    assert main(["receipt", str(path), "--format", fmt, "-o", "-"]) == 0
+    out = capsys.readouterr().out
+    return json.loads(out) if fmt == "json" else out
+
+
+def test_settings_total_is_split_evenly_and_marked_estimated(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("FACTORY_HOME", str(tmp_path / "factory"))
+    run = droid.parse(SHELL_FIX)
+    assert run.usage == Usage(12, 3451, 13726, 92818)
+    assert run.usage.total == 110007
+    assert run.models == {SHELL_MODEL: run.usage}
+    assert [s.usage.total for s in run.steps] == [22004, 22002, 22001, 22000, 22000]
+    assert all(s.usage_estimated for s in run.steps)
+    assert (run.usage_source, run.usage_file) == ("settings", "droid_shell_edits.settings.json")
+    apply_costs(run)
+    assert run.cost == pytest.approx(cost_of(run.usage, SHELL_MODEL))
+    assert run.cost == pytest.approx(0.0781, abs=1e-4)
+
+    data = _receipt(capsys, SHELL_FIX, "json")
+    assert data["totals"]["tokens"] == 110007
+    assert data["totals"]["usage_source"] == "settings"
+    assert all(s["tokens_estimated"] for s in data["steps"])
+    note = ("Per-step tokens are estimated: an even split of the session total "
+            "in droid_shell_edits.settings.json.")
+    assert note in _receipt(capsys, SHELL_FIX, "md")
+    assert note in _receipt(capsys, SHELL_FIX, "html")
+
+
+def test_settings_are_found_by_session_id_when_the_transcript_was_copied(tmp_path, monkeypatch):
+    home = tmp_path / "factory"
+    monkeypatch.setenv("FACTORY_HOME", str(home))
+    copy = tmp_path / "copies" / "renamed.jsonl"
+    copy.parent.mkdir()
+    shutil.copyfile(SHELL_FIX, copy)
+    cwd = droid.parse(SHELL_FIX).cwd
+    other = home / "sessions" / "-somewhere-else" / f"{SHELL_ID}.settings.json"
+    other.parent.mkdir(parents=True)
+    other.write_text(json.dumps({"tokenUsage": {"inputTokens": 7}}), encoding="utf-8")
+
+    run = droid.parse(copy)
+    assert (run.usage, run.usage_source) == (Usage(7), "settings")
+
+    own = home / "sessions" / cwd.replace("/", "-") / f"{SHELL_ID}.settings.json"
+    own.parent.mkdir(parents=True)
+    shutil.copyfile(SHELL_FIX.with_suffix(".settings.json"), own)
+    run = droid.parse(copy)
+    assert run.usage.total == 110007  # the folder for the session's cwd wins
+    assert run.usage_file == own.name
+
+
+@pytest.mark.parametrize("sid", ["../escape", "*", "a/b", ""])
+def test_unsafe_session_ids_are_never_used_to_search(tmp_path, monkeypatch, sid):
+    monkeypatch.setenv("FACTORY_HOME", str(tmp_path))
+    (tmp_path / "sessions" / "x").mkdir(parents=True)
+    (tmp_path / "sessions" / "x" / "anything.settings.json").write_text(
+        json.dumps({"tokenUsage": {"inputTokens": 7}}), encoding="utf-8")
+    path = tmp_path / "s.jsonl"
+    path.write_text(json.dumps({"type": "session_start", "id": sid, "cwd": "/demo"}) + "\n",
+                    encoding="utf-8")
+    assert droid._settings_path(path, droid._header(path)) is None
+
+
+def test_missing_settings_show_na_and_a_note_and_no_cost(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("FACTORY_HOME", str(tmp_path / "factory"))
+    path = tmp_path / f"{SHELL_ID}.jsonl"
+    shutil.copyfile(SHELL_FIX, path)
+    run = droid.parse(path)
+    apply_costs(run)
+    assert (run.usage, run.usage_source, run.cost) == (Usage(), "missing", None)
+    assert not any(s.usage_estimated for s in run.steps)
+
+    data = _receipt(capsys, path, "json")
+    assert data["totals"]["usage_source"] == "missing"
+    assert data["totals"]["cost_usd"] is None
+    note = (f"Token usage not found: Droid keeps it in {SHELL_ID}.settings.json "
+            "next to the session file.")
+    md = _receipt(capsys, path, "md")
+    assert note in md and "**Tokens:** n/a" in md and ", n/a tok," in md
+    page = _receipt(capsys, path, "html")
+    assert note in page and "<span>Tokens</span><b>n/a</b>" in page
+
+
+def test_missing_settings_steps_show_na_cost_and_null_json(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("FACTORY_HOME", str(tmp_path / "factory"))
+    path = tmp_path / f"{SHELL_ID}.jsonl"
+    shutil.copyfile(SHELL_FIX, path)
+    run = droid.parse(path)
+    apply_costs(run)
+    assert not any(s.usage_known for s in run.steps)
+    assert all(s.cost is None for s in run.steps)
+
+    md = _receipt(capsys, path, "md")
+    steps = [line for line in md.splitlines() if " tok, " in line]
+    assert steps and all(line.endswith("n/a tok, n/a") for line in steps)
+    assert "$0.0000" not in md
+    data = _receipt(capsys, path, "json")
+    assert all(s["cost_usd"] is None and s["tokens_known"] is False for s in data["steps"])
+    assert "$0.0000" not in _receipt(capsys, path, "html")
+
+
+def test_steps_without_attributed_usage_are_unknown_not_zero(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("FACTORY_HOME", str(tmp_path / "factory"))
+    usage = {"input_tokens": 100, "output_tokens": 20}
+    rows = [
+        _message([_call("Read", {"file_path": "a.py"}, "one")], modelId=MODEL, usage=usage),
+        _message([_call("Read", {"file_path": "b.py"}, "two")], mid="two", modelId=MODEL),
+    ]
+    # The snapshot equals the per-message usage, so nothing is left to give the second step.
+    path = _session(tmp_path, rows, settings={"model": MODEL, "tokenUsage": {"inputTokens": 100, "outputTokens": 20}})
+    run = droid.parse(path)
+    apply_costs(run)
+    assert [s.usage_known for s in run.steps] == [True, False]
+    assert run.steps[0].cost == pytest.approx(cost_of(Usage(100, 20), MODEL))
+    assert run.steps[1].cost is None
+    assert run.usage_source == "messages"
+    data = _receipt(capsys, path, "json")
+    assert [(s["tokens_known"], s["cost_usd"] is None) for s in data["steps"]] == [(True, False), (False, True)]
+    assert _receipt(capsys, path, "md").splitlines().count("2. Read b.py — Sonnet 4.5, n/a tok, n/a") == 1
+
+
+def test_mixed_model_remainder_leaves_unattributed_steps_unknown(tmp_path):
+    run = droid.parse(_session(tmp_path, [
+        _message([_call("Read", {"file_path": "a.py"}, "one")], modelId=MODEL),
+        _message([_call("Read", {"file_path": "b.py"}, "two")], mid="two", modelId="claude-haiku-4-5"),
+    ], settings={"model": "claude-haiku-4-5", "tokenUsage": {"inputTokens": 100}}))
+    apply_costs(run)
+    assert [(s.usage_known, s.cost) for s in run.steps] == [(False, None), (False, None)]
+
+
+def test_settings_split_marks_steps_known(tmp_path, monkeypatch):
+    monkeypatch.setenv("FACTORY_HOME", str(tmp_path / "factory"))
+    run = droid.parse(SHELL_FIX)
+    apply_costs(run)
+    assert all(s.usage_known and s.cost is not None for s in run.steps)
+    assert sum(s.usage.total for s in run.steps) == run.usage.total
+
+
+def test_per_message_usage_is_exact_and_has_no_note(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("FACTORY_HOME", str(tmp_path / "factory"))
+    path = _session(tmp_path, [_message([_call("Read", {"file_path": "a.py"})], modelId=MODEL,
+                                        usage={"input_tokens": 10, "output_tokens": 5})])
+    run = droid.parse(path)
+    assert (run.usage_source, run.usage_file) == ("messages", None)
+    assert not run.steps[0].usage_estimated
+    md = _receipt(capsys, path, "md")
+    assert "estimated" not in md and "Token usage not found" not in md
+    assert _receipt(capsys, path, "json")["steps"][0]["tokens_estimated"] is False
 
 
 def test_partial_lines_bad_shapes_and_context_are_ignored(tmp_path):
@@ -327,3 +511,160 @@ def test_cli_loads_user_prices_and_handles_invalid_files(tmp_path, source):
         assert receipt["totals"]["cost_usd"] == pytest.approx(0.0014)
         assert receipt["steps"][0]["cost_usd"] == pytest.approx(0.0014)
         assert receipt["pricing_note"] is None
+
+
+# ---------------------------------------------------------------- relative cwd recovery
+
+def _relative_session(folder, rows=(), cwd=".", settings=None, name="rel.jsonl"):
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / name
+    header = {"type": "session_start", "id": "rel-session", "cwd": cwd, "version": 2}
+    path.write_text("\n".join(json.dumps(r) for r in [header, *rows]) + "\n", encoding="utf-8")
+    if settings is not None:
+        path.with_suffix(".settings.json").write_text(json.dumps(settings), encoding="utf-8")
+    return path
+
+
+def _context(pwd):
+    reminder = (f"<system-reminder>The `% pwd` output below is the session working directory.\n\n"
+                f"% pwd\n{pwd}\n\n</system-reminder>Fix the bug.")
+    return _message([{"type": "text", "text": reminder}], role="user", mid="u1")
+
+
+def _git_repo(path):
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q", "-b", "work", str(path)], check=True)
+    return path
+
+
+needs_git = pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
+
+
+def test_absolute_header_cwd_is_kept(tmp_path):
+    run = droid.parse(_relative_session(tmp_path / "s", cwd="/demo/widget"))
+    assert (run.cwd, run.cwd_source) == ("/demo/widget", "header")
+
+
+def test_pwd_in_the_session_context_wins(tmp_path):
+    project = tmp_path / "proj"
+    run = droid.parse(_relative_session(tmp_path / "s", [_context(str(project))],
+                                        settings={"cwd": "/somewhere/else"}))
+    assert (run.cwd, run.cwd_source) == (str(project), "session")
+    assert run.prompts == ["Fix the bug."]
+
+
+def test_settings_field_is_the_next_source(tmp_path):
+    run = droid.parse(_relative_session(tmp_path / "s", settings={"workingDirectory": "/srv/app"}))
+    assert (run.cwd, run.cwd_source) == ("/srv/app", "settings")
+
+
+def test_a_relative_cwd_is_resolved_against_the_recovered_base(tmp_path):
+    run = droid.parse(_relative_session(tmp_path / "s", [_context("/srv/app")], cwd="pkg"))
+    assert run.cwd == "/srv/app/pkg"
+    run = droid.parse(_relative_session(tmp_path / "t", [_context("/srv/app/pkg")], cwd="pkg"))
+    assert run.cwd == "/srv/app/pkg"
+
+
+@needs_git
+def test_tool_paths_in_one_git_work_tree_give_the_project(tmp_path):
+    repo = _git_repo(tmp_path / "my-repo")
+    (repo / "src").mkdir()
+    rows = [_message([_call("Read", {"file_path": str(repo / "src" / "a.py")}, "one"),
+                      _call("Create", {"file_path": str(repo / "src" / "new" / "b.py"), "content": "x"}, "two"),
+                      _call("Read", {"file_path": "/etc/hosts"}, "three")])]
+    run = droid.parse(_relative_session(tmp_path / "s", rows))
+    assert (run.cwd, run.cwd_source) == (str(repo), "session")
+
+
+@needs_git
+def test_tool_paths_without_a_majority_work_tree_are_not_trusted(tmp_path):
+    repo = _git_repo(tmp_path / "repo")
+    rows = [_message([_call("Read", {"file_path": str(repo / "a.py")}, "one"),
+                      _call("Read", {"file_path": "/etc/hosts"}, "two"),
+                      _call("Read", {"file_path": "/etc/passwd"}, "three")])]
+    run = droid.parse(_relative_session(tmp_path / "s", rows))
+    assert (run.cwd, run.cwd_source) == (".", "unknown")
+
+
+def test_encoded_session_folder_is_decoded_against_the_filesystem(tmp_path):
+    target = tmp_path / "work" / "my-app" / "sub-dir"
+    target.mkdir(parents=True)
+    (tmp_path / "work" / "my").mkdir()  # a decoy: "my" exists, "my/app" does not
+    (tmp_path / "work" / "my-app-sub").mkdir()  # a longer decoy with no "dir" below it
+    folder = tmp_path / "sessions" / droid._encode(str(target))
+    run = droid.parse(_relative_session(folder))
+    assert (run.cwd, run.cwd_source) == (str(target), "session_dir")
+
+
+def test_a_decoded_folder_that_does_not_exist_stays_unknown(tmp_path):
+    folder = tmp_path / "sessions" / droid._encode(str(tmp_path / "gone" / "with-hyphens"))
+    run = droid.parse(_relative_session(folder))
+    assert (run.cwd, run.cwd_source) == (".", "unknown")
+    assert droid._decode_folder("not-encoded") is None
+
+
+def test_unknown_cwd_never_uses_the_current_folder(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    run = droid.parse(_relative_session(tmp_path / "plain"))
+    assert (run.cwd, run.cwd_source) == (".", "unknown")
+
+
+def test_find_sessions_matches_relative_cwd_by_folder_name(tmp_path, monkeypatch):
+    monkeypatch.setenv("FACTORY_HOME", str(tmp_path / "factory"))
+    project = tmp_path / "my-proj"
+    project.mkdir()
+    folder = tmp_path / "factory" / "sessions" / droid._encode(str(project))
+    path = _relative_session(folder)
+    _relative_session(tmp_path / "factory" / "sessions" / "-other", name="other.jsonl")
+    assert droid.find_sessions(str(project)) == [path]
+
+
+@needs_git
+def test_receipt_for_a_recovered_cwd_has_branch_and_relative_files(tmp_path, capsys):
+    repo = _git_repo(tmp_path / "repo")
+    rows = [_context(str(repo)),
+            _message([_call("Create", {"file_path": str(repo / "a.py"), "content": "x\ny\n"}, "one"),
+                      _call("Read", {"file_path": str(repo / "a.py")}, "two")])]
+    path = _relative_session(tmp_path / "s", rows)
+    assert main(["receipt", str(path), "--format", "json", "-o", "-", "--no-safe"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert (data["cwd"], data["cwd_source"], data["git_branch"]) == (str(repo), "session", "work")
+    assert [f["path"] for f in data["files"]] == ["a.py"]
+    assert not [r for r in data["risk"]["reasons"] if r["code"] == "read_outside"]
+
+
+# ---------------------------------------------------------------- Windows sessions on any host
+
+def test_a_relative_cwd_is_resolved_against_a_windows_base(tmp_path):
+    run = droid.parse(_relative_session(tmp_path / "s", [_context("C:\\srv\\app")], cwd="pkg"))
+    assert (run.cwd, run.cwd_source) == ("C:\\srv\\app\\pkg", "session")
+    run = droid.parse(_relative_session(tmp_path / "t", [_context("C:\\srv\\app\\pkg")], cwd="pkg"))
+    assert run.cwd == "C:\\srv\\app\\pkg"
+    run = droid.parse(_relative_session(tmp_path / "u", settings={"cwd": "D:/work/app"}, cwd="sub\\pkg"))
+    assert (run.cwd, run.cwd_source) == ("D:\\work\\app\\sub\\pkg", "settings")
+
+
+def test_windows_folders_are_encoded_without_a_colon():
+    assert droid._encode("C:\\Users\\dev\\my-app") == "C--Users-dev-my-app"
+    assert droid._encode("C:/Users/dev") == "C--Users-dev"
+    assert droid._encode("/home/dev/my-app") == "-home-dev-my-app"
+
+
+@pytest.mark.parametrize("name", ["C--Users-dev-my-app-sub-dir", "C:-Users-dev-my-app-sub-dir"])
+def test_windows_session_folder_is_decoded_with_its_drive(monkeypatch, name):
+    existing = {"C:\\Users", "C:\\Users\\dev", "C:\\Users\\dev\\my", "C:\\Users\\dev\\my-app",
+                "C:\\Users\\dev\\my-app\\sub-dir"}
+    monkeypatch.setattr(droid.os.path, "isdir", lambda p: p in existing)
+    assert droid._decode_folder(name) == "C:\\Users\\dev\\my-app\\sub-dir"
+
+
+def test_find_sessions_matches_a_windows_project_by_folder_name(tmp_path, monkeypatch):
+    monkeypatch.setenv("FACTORY_HOME", str(tmp_path / "factory"))
+    sessions = tmp_path / "factory" / "sessions"
+    names = ["C--Users-dev-My-Proj", "-Users-dev-My-Proj"]
+    if os.name != "nt":
+        names.append("C:-Users-dev-My-Proj")  # a colon is not valid in a Windows file name
+    expected = {_relative_session(sessions / n, name=f"{i}.jsonl") for i, n in enumerate(names)}
+    _relative_session(sessions / "C--Users-dev-other", name="other.jsonl")
+    assert set(droid.find_sessions("C:\\Users\\dev\\My-Proj")) == expected
+    assert set(droid.find_sessions("c:/users/dev/my-proj")) == expected

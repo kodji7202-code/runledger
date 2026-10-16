@@ -40,14 +40,18 @@ from typing import List, Optional
 
 from . import __version__
 from . import adapters
+from .gitinfo import current_branch, file_diffs, session_base, toplevel, working_changes
 from .guard import redact
 from .guard_receipt import load_guard_decisions
+from .parser import _ts
+from .paths import is_abs
 from .pricing import apply_costs
 from .quality import analyze
-from .receipt import redact_run, render
-from .risk import assess
+from .receipt import md_trailer, redact_run, render
+from .safe import make_safe
+from .risk import assess, is_test_source
 from .review import DEFAULT_REVIEW_MODEL, ai_review
-from .summarize import DEFAULT_AI_MODEL, ai_summaries, apply_templates
+from .summarize import DEFAULT_AI_MODEL, ai_summaries, apply_templates, file_changes
 
 AGENTS = ("claude-code", "codex", "droid", "aider", "native")
 
@@ -62,6 +66,7 @@ def build(session_path: str, use_ai: bool = False, ai_model: str = DEFAULT_AI_MO
     Secrets are masked in everything the receipt shows, after the rules have scored the raw text."""
     path = Path(session_path)
     run = adapters.detect(path).parse(path)
+    reconcile_git(run)
     run.guard = load_guard_decisions(run)
     from .rollback import checkpoint_for_run
     run.checkpoint_id = checkpoint_for_run(run.cwd, run.session_id)
@@ -84,8 +89,71 @@ def build(session_path: str, use_ai: bool = False, ai_model: str = DEFAULT_AI_MO
     return run, score, level, risks, "\n".join(notes) or None
 
 
+def reconcile_git(run) -> None:
+    """Fill what the session log leaves out from the run's Git working tree: the
+    branch when none was recorded, line counts for files written through the shell, and
+    the diffs of changed test files. When the run's changes were committed after it began,
+    both compare the working tree with the last commit before the session start (run.git_base)."""
+    if not run.git_branch:
+        run.git_branch = current_branch(run.cwd)
+    run.git_base = session_base(run.cwd, _ts(run.started))
+    changes = file_changes(run)
+    shell_paths = [p for p, fc in changes.items() if fc.shell]
+    if shell_paths:
+        run.git_changes = working_changes(run.cwd, shell_paths, run.git_base)
+    test_paths = [p for p, fc in changes.items()
+                  if not fc.deleted and not is_abs(p) and is_test_source(p)]
+    if test_paths:
+        run.test_diffs = file_diffs(run.cwd, test_paths, run.git_base)
+
+
 def _one_line(exc: BaseException) -> str:
     return " ".join(str(exc).split())
+
+
+def _write_stdout(text: str) -> None:
+    """Receipts are UTF-8 documents, whatever the console encoding (cp1252 on Windows)."""
+    buffer = getattr(sys.stdout, "buffer", None)
+    if buffer is None:
+        sys.stdout.write(text)
+        return
+    sys.stdout.flush()
+    buffer.write(text.encode("utf-8"))
+    buffer.flush()
+
+
+def _tolerant_console() -> None:
+    """Status lines print `·`, `−` and `⚠️`; a console that cannot encode them gets `?` instead of a crash."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(errors="replace")
+            except (ValueError, OSError):
+                pass
+
+
+def _run(args) -> int:
+    try:
+        return args.func(args)
+    except BrokenPipeError:
+        # The reader (`| head`) went away. Point stdout at devnull so the interpreter's
+        # final flush cannot raise a second BrokenPipeError on exit.
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, sys.stdout.fileno())
+        except (OSError, ValueError, AttributeError):
+            pass
+        return 1
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 130
+    except Exception as exc:
+        if os.environ.get("RUNLEDGER_DEBUG") == "1":
+            raise
+        message = _one_line(exc) or type(exc).__name__
+        print(f"error: {message} (set RUNLEDGER_DEBUG=1 for details)", file=sys.stderr)
+        return 1
 
 
 def cmd_checkpoint(args) -> int:
@@ -223,12 +291,30 @@ def cmd_list(args) -> int:
         except (OSError, ValueError) as exc:
             print(f"skipped: {exc}", file=sys.stderr)
             continue
-        when = datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+        try:
+            when = datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+        except OSError:  # removed after it was listed
+            continue
         first = redact(run.prompts[0] if run.prompts else "").replace("\n", " ")[:60]
         print(f"{when}  {run.session_id[:8]:<8}  {run.agent[:12]:<12}  {len(run.steps):>5} steps  {first}")
         if args.all:
             print(f"                  {run.cwd}")
     return 0
+
+
+def default_safe(fmt: str, target: Optional[Path]) -> bool:
+    """md and json receipts are pasted into PRs and committed, so they are safe when they go to
+    stdout or to a file inside a Git work tree. HTML and files outside any repository are
+    personal copies, where full paths help debugging."""
+    if fmt == "html":
+        return False
+    if target is None:
+        return True
+    try:
+        folder = target.resolve().parent
+    except (OSError, RuntimeError):
+        return True
+    return toplevel(str(folder)) is not None
 
 
 def cmd_receipt(args) -> int:
@@ -241,16 +327,27 @@ def cmd_receipt(args) -> int:
     except (OSError, ValueError) as exc:  # missing file, or a session file that does not validate
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    ext = {"html": "html", "md": "md", "json": "json"}[args.format]
+    target = None if args.output == "-" else Path(args.output or f"runledger-{_file_stem(run.session_id)}.{ext}")
+    safe = args.safe if args.safe is not None else default_safe(args.format, target)
+    if safe:
+        make_safe(run, risks)
     out = render(run, score, level, risks, args.format)
+    if target is None and args.format == "md":
+        out = out.rstrip("\n") + "\n\n" + md_trailer(run)
     if note:
         print(note, file=sys.stderr)
-    if args.output == "-":
-        sys.stdout.write(out)
+    if target is None:
+        _write_stdout(out)
     else:
-        ext = {"html": "html", "md": "md", "json": "json"}[args.format]
-        target = Path(args.output or f"runledger-{_file_stem(run.session_id)}.{ext}")
-        target.write_text(out, encoding="utf-8")
+        try:
+            target.write_text(out, encoding="utf-8")
+        except OSError as exc:
+            print(f"error: cannot write {target}: {exc.strerror or _one_line(exc)}", file=sys.stderr)
+            return 1
         print(f"Receipt: {target}  ·  risk {score}/100 ({level})  ·  {len(run.steps)} steps")
+        print("Safe mode: on (paths shortened, e-mails masked; --no-safe shows them)" if safe
+              else "Safe mode: off (full local paths; --safe hides them)", file=sys.stderr)
         if args.open and args.format == "html":
             webbrowser.open(target.resolve().as_uri())
     return 2 if (args.fail_on is not None and score >= args.fail_on) else 0
@@ -491,6 +588,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help=f"model for --review (default {DEFAULT_REVIEW_MODEL})")
     pr.add_argument("--open", action="store_true", help="open the HTML receipt in a browser")
     pr.add_argument("--fail-on", type=int, metavar="SCORE", help="exit with code 2 if risk score >= SCORE (for CI/hooks)")
+    safe = pr.add_mutually_exclusive_group()
+    safe.add_argument("--safe", dest="safe", action="store_true", default=None,
+                      help="shorten local paths and mask e-mails (default for md/json to stdout or inside a Git repo)")
+    safe.add_argument("--no-safe", dest="safe", action="store_false",
+                      help="keep full local paths and e-mail addresses")
     pr.set_defaults(func=cmd_receipt)
 
     ps = sub.add_parser("serve", help="run the team server (collects pushed runs, serves the dashboard)")
@@ -598,7 +700,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     pg.set_defaults(func=cmd_guard)
 
     args = p.parse_args(argv)
-    return args.func(args)
+    _tolerant_console()
+    return _run(args)
 
 
 if __name__ == "__main__":

@@ -82,7 +82,18 @@ Droid writes a JSONL transcript and a sibling settings file:
 ```
 
 - **Config directory.** `FACTORY_HOME` overrides `~/.factory`.
-- **Matching.** The `cwd` in the `session_start` header identifies the project. Sessions are
+- **Relative `cwd`.** `droid exec --cwd .` records `cwd` as `.`. RunLedger recovers the real folder
+  from, in order: the session's own `% pwd` context, a folder field in the settings file, the Git
+  work tree that a majority of the absolute tool paths lie in, and the encoded session folder name.
+  A `-` in that name can be a separator or part of a folder name, so it is decoded against the
+  filesystem and accepted only when the folder exists. The recorded relative path is then
+  resolved against the recovered folder. JSON receipts record the source as `cwd_source`
+  (`header`, `session`, `settings`, `session_dir` or `unknown`). When nothing works, the folder
+  stays unknown and is never resolved against the folder RunLedger runs in: the branch is unknown,
+  Git line counts are skipped, paths are not flagged as outside the working folder, and safe
+  receipts shorten absolute paths to `…/<last two parts>`.
+- **Matching.** The `cwd` in the `session_start` header identifies the project. When it is
+  relative, the session folder name (the project path with separators replaced by `-`) is used. Sessions are
   sorted newest first by transcript modification time. `list --all --agent droid` covers all projects.
 - **Messages.** Human text becomes the request; system reminders and hidden context are excluded.
   Assistant `tool_use` blocks become steps, matched to `tool_result` blocks by id. `Execute` maps
@@ -92,11 +103,25 @@ Droid writes a JSONL transcript and a sibling settings file:
   file's `model`. No model is guessed when both are absent.
 - **Usage.** Per-message usage is counted once when present. The settings file's cumulative
   `tokenUsage` supplies any remaining input, output, cache-creation and cache-read tokens.
-  Thinking tokens, credits, `inclusiveTokenUsage` and `lastCallTokenUsage` are not added again.
+  Thinking tokens, credits and `lastCallTokenUsage` are not added again.
   Without per-message usage, a single-model total is split evenly across steps as an approximation.
-  A mixed-model cumulative total cannot be attributed reliably, so its remainder has an unknown model.
-- **Cost.** Only token counts with a known model price produce estimates. Unknown models and
-  missing usage leave the run cost unknown. Missing or partially written settings do not prevent
+  A mixed-model cumulative total cannot be attributed reliably, so its remainder is listed as
+  `unattributed`, which has no price.
+- **Sub-agents.** `inclusiveTokenUsage` minus the session's own `tokenUsage` is sub-agent usage.
+  Each child session in `childInclusiveTokenUsageBySessionId` is credited to the model in its own
+  settings file when that file is found; the rest is `unattributed`. An inclusive total smaller
+  than the session's own usage is ignored.
+- **Settings file lookup.** RunLedger reads the sibling `<name>.settings.json` first. If the
+  transcript was copied or renamed without it, RunLedger looks for `<session-id>.settings.json`
+  under `$FACTORY_HOME/sessions/`, preferring the folder for the session's `cwd`.
+- **Where usage came from.** JSON receipts include `totals.usage_source`: `messages` (per-message
+  usage), `settings` (the settings file's total) or `missing`, and `tokens_estimated` on each step
+  that received an even split. Markdown and HTML receipts add a footer note for estimated
+  per-step tokens. When no usage is found, they show token counts as `n/a`, not 0, with a note
+  naming the settings file Droid would have written. Other agents leave `usage_source` null.
+- **Cost.** Only token counts with a known model price produce estimates. Missing usage, or no
+  priced model at all, leaves the run cost unknown. When some tokens are priced and some are not,
+  the cost is a lower bound: `≥ $X (1 model unpriced)`, with `totals.cost_partial` in JSON. Missing or partially written settings do not prevent
   parsing the transcript.
 
 ## Aider (beta)

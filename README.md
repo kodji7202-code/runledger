@@ -8,7 +8,7 @@ can stop risky calls before they run, and a small team server collects receipts 
 Local Git checkpoints let you restore files from before a run, with a safety checkpoint for undo.
 
 RunLedger is fully free and open source, including the self-hosted team server.
-Version 0.5.2. Python 3.9 or later, no runtime dependencies.
+Version 0.6.0. Python 3.9 or later, no runtime dependencies.
 
 ## Quickstart
 
@@ -121,7 +121,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: kodji7202-code/runledger@v0.5.2
+      - uses: kodji7202-code/runledger@v0.6.0
         with:
           fail-on: "60"                   # the job fails at 60 or above; "" never fails
 ```
@@ -152,6 +152,11 @@ as `API_KEY=…`, `password="…"` and `?access_token=…`, flags such as `--tok
 Masking is pattern-based, so an unusual secret can still get through. Treat a receipt like the
 session transcript it came from.
 
+**Safe mode** is on by default for Markdown and JSON receipts written to stdout or inside a Git
+repository, and always on for the PR comment: local paths are shortened (repository-relative, `~`
+for the home folder) and e-mail addresses are masked. HTML receipts keep full paths. Use `--safe` or
+`--no-safe` to choose. See [docs/quickstart.md](docs/quickstart.md#safe-mode).
+
 - **`--ai`** sends the prompts, each step's inputs (up to 600 characters per field, which can include
   file contents being written), each tool result (up to 400 characters) and the agent's final message to
   `api.anthropic.com`. Known secret formats are masked first, but masking is pattern-based. Do not use it
@@ -180,6 +185,7 @@ your Anthropic API key and may incur charges from Anthropic.
 - [Quickstart](docs/quickstart.md): install, first receipt, summaries, CI, hooks, a local team server
 - [Supported agents](docs/agents.md): where each agent's sessions are, and `--agent`
 - [Session format](docs/format.md): the open format for any agent
+- [JSON receipt](docs/receipt-json.md): the versioned receipt contract and its JSON Schema
 - [Real-time guard](docs/guard.md): policy files, approvals, fail-open and fail-closed, the log
 - [Rollback](docs/rollback.md): Git checkpoints, previews, safety checkpoints, undo and agent hooks
 - [Analysis](docs/analysis.md): the quality score, cost tips and the AI risk review

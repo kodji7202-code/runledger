@@ -20,6 +20,18 @@ assignments earlier in the same command are expanded; any other variable makes t
 argument unknown, and its path checks are skipped. A "workdir" input outside the working
 folder is a medium risk, and relative path arguments are resolved against it.
 
+Files a Bash command writes (shell_writes: redirects, heredocs, tee, cp, mv, sed -i, Python
+open(..., "w")) get the edit-tool checks: secrets file (high), .git folder (medium), migration
+file (medium) and outside the working folder (low, as for other shell writes). Copying or
+moving a project file into a temp folder is low (temp_copy); other writes to temp are not
+flagged. Changing a local database file (sqlite3 X.db with write SQL or a script on stdin,
+Python sqlite3 code that runs DDL or DML) or running a migration tool (migrate.py, manage.py
+migrate, alembic, prisma, rails/rake, knex, ...) is medium (db_write). Read-only queries are not.
+
+Migration files (migrations/, db/migrate/, alembic/versions/, prisma/migrations/, V<n>__*.sql)
+written by any tool are medium (db_migration). The Git working tree, when known, tells an
+added migration from a changed one.
+
 Delete tool (canonical "Delete" with file_path) is checked like rm of that path.
 Write, Edit, MultiEdit and Delete inside a .git folder are medium (git_internals).
 
@@ -42,7 +54,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from . import paths
 from .parser import Run, Step
+from .shell_writes import database_writes, shell_writes
+from .testdiff import SKIP_RE, TestChange, analyze as analyze_test_diffs
 
 SEVERITY_POINTS = {"high": 30, "medium": 15, "low": 5}
 MEDIUM_POINTS_CAP = 45  # all medium findings together add at most this many points
@@ -75,6 +90,12 @@ _FIXTURE_DIRS = {"fixtures", "fixture", "testdata", "__snapshots__", "__fixtures
 _DATA_EXTS = (".json", ".jsonl", ".ndjson", ".txt", ".md", ".csv", ".tsv", ".yaml", ".yml", ".xml",
               ".html", ".snap", ".log", ".db", ".sqlite", ".sql", ".toml", ".ini")
 _GIT_DIR_RE = re.compile(r"(^|/)\.git/", re.I)
+# Schema migration files of common tools; __init__.py in a migrations package is not one.
+_MIGRATION_RE = re.compile(
+    r"(^|/)(?:migrations?|db/migrate|alembic/versions|prisma/migrations)/(?:[^/]+/)*"
+    r"(?!__init__\.py$)[^/]+\.(?:sql|py|rb|js|mjs|cjs|ts|go)$"
+    r"|(^|/)V\d+(?:[._]\d+)*__[^/]+\.sql$", re.I)
+_MIGRATION_VERB = re.compile(r"^Wrote a database migration \((.+)\)$")
 
 WRITE_TOOLS = ("Write", "Edit", "MultiEdit", "NotebookEdit")
 DELETE_TOOLS = ("Delete",)
@@ -145,6 +166,69 @@ _WRAPPERS = {"sudo", "nohup", "time", "command", "builtin", "exec", "env", "nice
 _POSIX_ROOT_NAMES = {"tmp", "etc", "var", "usr", "bin", "sbin", "opt", "home", "mnt", "srv", "lib",
                      "lib64", "run", "sys", "boot", "root", "dev", "proc", "private", "media", "snap"}
 
+
+@dataclass(frozen=True)
+class _ArgSpec:
+    """Which options of a search or stream-editing command take a pattern/script ("pattern"),
+    a file to read ("file") or some other value ("value"). Unlisted options are flags."""
+    short: Dict[str, str]
+    long: Dict[str, str]
+    positional_pattern: bool = True  # the first operand is the pattern unless -e/-f gave one
+    skip_assigns: bool = False       # awk: NAME=value operands are variable assignments
+
+
+_GREP_SPEC = _ArgSpec(
+    short={"e": "pattern", "f": "file", "A": "value", "B": "value", "C": "value", "m": "value",
+           "d": "value", "D": "value"},
+    long={"--regexp": "pattern", "--file": "file", "--exclude-from": "file",
+          "--after-context": "value", "--before-context": "value", "--context": "value",
+          "--max-count": "value", "--include": "value", "--exclude": "value",
+          "--exclude-dir": "value", "--label": "value", "--binary-files": "value",
+          "--devices": "value", "--directories": "value", "--group-separator": "value"})
+_RG_SPEC = _ArgSpec(
+    short={"e": "pattern", "f": "file", "A": "value", "B": "value", "C": "value", "m": "value",
+           "g": "value", "t": "value", "T": "value", "E": "value", "j": "value", "M": "value",
+           "r": "value", "d": "value"},
+    long={"--regexp": "pattern", "--file": "file", "--ignore-file": "file",
+          "--after-context": "value", "--before-context": "value", "--context": "value",
+          "--max-count": "value", "--glob": "value", "--iglob": "value", "--type": "value",
+          "--type-not": "value", "--type-add": "value", "--type-clear": "value",
+          "--encoding": "value", "--threads": "value", "--max-columns": "value",
+          "--replace": "value", "--max-depth": "value", "--max-filesize": "value",
+          "--sort": "value", "--sortr": "value", "--color": "value", "--colors": "value",
+          "--engine": "value", "--path-separator": "value", "--pre": "value",
+          "--pre-glob": "value", "--context-separator": "value",
+          "--field-match-separator": "value", "--field-context-separator": "value"})
+_AG_SPEC = _ArgSpec(
+    short={"A": "value", "B": "value", "C": "value", "m": "value", "G": "value", "g": "value",
+           "p": "file"},
+    long={"--after": "value", "--before": "value", "--context": "value", "--max-count": "value",
+          "--file-search-regex": "value", "--ignore": "value", "--ignore-dir": "value",
+          "--path-to-ignore": "file", "--depth": "value", "--match": "pattern",
+          "--type": "value", "--type-set": "value", "--type-add": "value", "--output": "value"})
+_GIT_GREP_SPEC = _ArgSpec(
+    short={"e": "pattern", "f": "file", "A": "value", "B": "value", "C": "value", "m": "value"},
+    long={"--file": "file", "--after-context": "value", "--before-context": "value",
+          "--context": "value", "--max-count": "value", "--max-depth": "value",
+          "--threads": "value"})
+_SED_SPEC = _ArgSpec(
+    short={"e": "pattern", "f": "file", "l": "value"},
+    long={"--expression": "pattern", "--file": "file", "--line-length": "value"})
+_AWK_SPEC = _ArgSpec(
+    short={"f": "file", "e": "pattern", "v": "value", "F": "value"},
+    long={"--file": "file", "--source": "pattern", "--assign": "value",
+          "--field-separator": "value"},
+    skip_assigns=True)
+_SEARCH_SPECS = {"grep": _GREP_SPEC, "egrep": _GREP_SPEC, "fgrep": _GREP_SPEC, "zgrep": _GREP_SPEC,
+                 "rg": _RG_SPEC, "ag": _AG_SPEC, "ack": _AG_SPEC}
+_SCRIPT_SPECS = {"sed": _SED_SPEC, "gsed": _SED_SPEC, "awk": _AWK_SPEC, "gawk": _AWK_SPEC,
+                 "mawk": _AWK_SPEC, "nawk": _AWK_SPEC}
+_FIND_PATTERN_OPTS = {"-name", "-iname", "-path", "-ipath", "-wholename", "-iwholename",
+                      "-regex", "-iregex", "-lname", "-ilname"}
+_PERL_CODE_RE = re.compile(r"^-[A-Za-z]*[eE]$")
+# Quoted text with regex-only syntax (alternation, anchors, .*, groups) is a pattern, not a path.
+_REGEX_TEXT_RE = re.compile(r"\||^\^|\.\*|\(\?|\[\^")
+
 # Hardcoded secrets in written content. Only the kind is reported, never the value.
 _CONTENT_SECRET_RULES = [
     (re.compile(r"(?<![A-Za-z0-9])sk-ant-[A-Za-z0-9_-]{20,}"), "Anthropic API key"),
@@ -197,29 +281,10 @@ def _slashes(p: str) -> str:
     return p.replace("\\", "/")
 
 
-def _is_windows_style(*paths: Optional[str]) -> bool:
-    return any(bool(p) and bool(_WIN_DRIVE_RE.match(p)) for p in paths)
-
-
-def _is_abs(p: str) -> bool:
-    return bool(_WIN_ABS_RE.match(p)) or p.startswith(("/", "\\"))
-
-
-def _key(p: str, win: bool) -> str:
-    """Comparable form of a path: '/' separators, no '.' or '..' segments and,
-    for Windows-style paths, lowercase (Windows names are case-insensitive)."""
-    if win:
-        return ntpath.normpath(p.replace("/", "\\")).replace("\\", "/").lower()
-    return posixpath.normpath(p)
-
-
-def _within(path: str, base: str) -> bool:
-    """True if `path` equals `base` or lies under it. Both must be absolute.
-    A drive letter on either side makes the comparison Windows-style."""
-    win = _is_windows_style(path, base)
-    p = _key(path, win)
-    b = _key(base, win).rstrip("/")
-    return p == b or p.startswith(b + "/")
+_is_windows_style = paths.is_windows_style
+_is_abs = paths.is_abs
+_key = paths.key
+_within = paths.within
 
 
 def _in_temp(target: str) -> bool:
@@ -255,8 +320,8 @@ def _outside(path: str, cwd: Optional[str], base: Optional[str] = None) -> bool:
     A relative path is resolved against `base` (a working directory) when given,
     otherwise against `cwd`. Windows-style paths (drive letter on either side) compare
     case-insensitively with either separator; POSIX paths compare exactly."""
-    if not cwd or not path or _is_device(path):
-        return False
+    if not cwd or not path or _is_device(path) or not _is_abs(cwd):
+        return False  # a relative working folder (some logs record ".") cannot place a path
     win = _is_windows_style(cwd)
     path = _msys_to_windows(path, win)
     if base:
@@ -333,6 +398,11 @@ def _is_test_fixture(path: str) -> bool:
     if any(part in _FIXTURE_DIRS for part in q.lower().split("/")):
         return True
     return name.lower().endswith(_DATA_EXTS)
+
+
+def is_test_source(path: str) -> bool:
+    """A test file with test code in it, not a fixture or data file under a test folder."""
+    return bool(TEST_RE.search(_slashes(path))) and not _is_test_fixture(path)
 
 
 def _test_deleted(path: str, index: int, risks: List[Risk]) -> None:
@@ -517,6 +587,46 @@ def _mark_message_args(words: List[_Word]) -> None:
             take = True
 
 
+def _mark_pattern_args(words: List[_Word], spec: _ArgSpec, pattern_role: str) -> None:
+    """Give the pattern or script of grep/rg/ag/git grep/sed/awk `pattern_role` and other
+    option values "skip", so only operands in file positions are checked as paths."""
+    roles = {"pattern": pattern_role, "value": "skip", "file": "word"}
+    have_pattern = False
+    options = True
+    i = 0
+    while i < len(words):
+        w = words[i]
+        v = w.value
+        kind: Optional[str] = None
+        attached = False
+        if options and v == "--":
+            options = False
+        elif options and v.startswith("--") and len(v) > 2:
+            key, eq, _ = v.partition("=")
+            kind = spec.long.get(key)
+            attached = bool(eq)
+        elif options and v.startswith("-") and len(v) > 1:
+            for k in range(1, len(v)):
+                kind = spec.short.get(v[k])
+                if kind:
+                    attached = k + 1 < len(v)
+                    break
+        elif spec.skip_assigns and have_pattern and _ASSIGN_RE.match(v):
+            w.role = "skip"
+        elif spec.positional_pattern and not have_pattern:
+            w.role = pattern_role
+            have_pattern = True
+        if kind:
+            have_pattern = have_pattern or kind in ("pattern", "file")
+            if attached:
+                if kind != "file":
+                    w.role = roles[kind]
+            elif i + 1 < len(words):
+                words[i + 1].role = roles[kind]
+                i += 1
+        i += 1
+
+
 def _join_base(current: Optional[str], value: str) -> str:
     """Apply a git -C/work-tree path to the current git base without using host OS semantics."""
     if _is_abs(value) or not current:
@@ -583,6 +693,14 @@ def _plan(words: List[_Word], ps: bool) -> Optional[str]:
                 w.base = git_base
         elif sub in ("commit", "tag"):
             _mark_message_args(plain[sub_at + 1:])
+        elif sub == "grep":
+            _mark_pattern_args(plain[sub_at + 1:], _GIT_GREP_SPEC, "text")
+    elif name in _SEARCH_SPECS:
+        _mark_pattern_args(rest, _SEARCH_SPECS[name], "text")
+    elif name in _SCRIPT_SPECS:
+        # Not "text": a sed or awk script can run commands, so the dangerous-command rules
+        # still read it.
+        _mark_pattern_args(rest, _SCRIPT_SPECS[name], "skip")
     elif name == "find" and any(w.value == "-delete" for w in rest):
         # `find ROOT... -delete` recursively removes matches below its search roots.
         # Mark only the starting paths; expressions beginning with '-' do not name files.
@@ -595,8 +713,12 @@ def _plan(words: List[_Word], ps: bool) -> Optional[str]:
         for w in rest:
             if take:
                 w.role, take = "text", False
-            elif w.value in _CODE_FLAGS:
+            elif w.value in _CODE_FLAGS or (name in ("perl", "ruby") and _PERL_CODE_RE.match(w.value)):
                 take = True
+    if name == "find":
+        for q, w in enumerate(rest[:-1]):
+            if w.value in _FIND_PATTERN_OPTS:
+                rest[q + 1].role = "skip"
     if delete_from is None:
         for q in range(j + 1, len(plain) - 1):
             if plain[q].value in ("-exec", "-execdir", "-ok") and _name(plain[q + 1].value) in _DELETE_CMDS:
@@ -647,6 +769,8 @@ def _check_shell_word(w: _Word, name: str, cwd: Optional[str], workdir: Optional
         return
     if name in ("sed", "perl") and _SED_RE.match(raw) and raw.count(raw[1]) >= 3:
         return  # s/old/new/ expression, not a path
+    if mode == "read" and w.quoted and _REGEX_TEXT_RE.search(raw):
+        return  # a quoted regex for a command not listed in _SEARCH_SPECS
     exp = _expand(raw, assigns)
     texts = list(dict.fromkeys(t for t in (exp, raw) if t is not None))
     for t in texts:
@@ -727,6 +851,57 @@ def _shell_risks(step: Step, cwd: Optional[str], extra: List["re.Pattern"], risk
                 assigns[var] = _expand(val, assigns)
             elif w.role in ("word", "write", "read"):
                 _check_shell_word(w, name or "", cwd, workdir, extra, assigns, step, risks)
+
+
+def _project_path(path: str, cwd: Optional[str]) -> str:
+    """`path` relative to the working folder when it lies inside it, as receipts list files."""
+    return paths.relative(path, cwd)
+
+
+def _is_migration(path: str) -> bool:
+    return bool(_MIGRATION_RE.search(_slashes(path)))
+
+
+def _migration_risk(path: str, verb: str, cwd: Optional[str], index: int, risks: List[Risk]) -> None:
+    if _is_migration(path) and not _outside(path, cwd):
+        risks.append(Risk("medium", "db_migration", f"{verb} a database migration ({_project_path(path, cwd)})", index))
+
+
+def _shell_write_risks(step: Step, cwd: Optional[str], extra: List["re.Pattern"], risks: List[Risk]) -> None:
+    """The files a Bash command writes (shell_writes) get the checks edit-tool writes get,
+    and commands that change a database file or run migrations are reported."""
+    cmd = str(step.input.get("command") or "")
+    wd = step.input.get("workdir")
+    base = wd.strip() if isinstance(wd, str) and _is_abs(wd.strip()) else cwd
+    flagged_outside = {_key(r.reason.rsplit("(", 1)[-1].rstrip(")"), False)
+                       for r in risks if r.code == "shell_outside" and r.step == step.index}
+    writes = shell_writes(cmd)
+    moved_away = {w.path for w in writes if w.deleted}
+    for w in writes:
+        target = _resolved(w.path, base)
+        verb = "Deleted" if w.deleted else "Wrote"
+        if _is_secret(w.path, extra):
+            risks.append(Risk("high", "secret_file", f"Touched a secrets file from the shell ({_basename(w.path)})", step.index))
+        if _GIT_DIR_RE.search(_slashes(target)):
+            risks.append(Risk("medium", "git_internals", f"{verb} inside the .git folder ({_basename(target)})", step.index))
+        if not w.deleted:
+            _migration_risk(target, "Wrote", cwd, step.index, risks)
+        if _outside(target, cwd):
+            if _key(target, False) not in flagged_outside:
+                risks.append(Risk("low", "shell_outside", f"Shell command wrote outside the working folder ({target})", step.index))
+        elif w.source and cwd and _is_abs(target) and _in_temp(target):
+            source = _resolved(w.source, base)
+            if not _outside(source, cwd) and not _in_temp(source):
+                how = "Moved" if w.source in moved_away else "Copied"
+                risks.append(Risk("low", "temp_copy", f"{how} a project file outside the project "
+                                  f"({_project_path(source, cwd)} → {target})", step.index))
+    for d in database_writes(cmd):
+        if d.kind == "migrate":
+            shown = d.command if len(d.command) <= 80 else d.command[:77] + "..."
+            risks.append(Risk("medium", "db_write", f"Ran a database migration command ({shown})", step.index))
+        elif d.target:
+            target = _resolved(d.target, base)
+            risks.append(Risk("medium", "db_write", f"Wrote to a local database file ({_project_path(target, cwd)})", step.index))
 
 
 # ---------------------------------------------------------------- policy
@@ -826,18 +1001,23 @@ def assess_step(step: Step, cwd: Optional[str], policy: Optional[Dict[str, Any]]
         risks.append(Risk("medium", "git_internals", f"{verb} inside the .git folder ({_basename(paths[0])})", step.index))
 
     if tool in ("Edit", "MultiEdit") and paths and TEST_RE.search(_slashes(paths[0])):
-        edits = step.input.get("edits") or [step.input]
-        removed = sum(len((e.get("old_string") or "").splitlines()) for e in edits)
-        added = sum(len((e.get("new_string") or "").splitlines()) for e in edits)
-        text = " ".join((e.get("old_string") or "") for e in edits)
-        new_text = " ".join((e.get("new_string") or "") for e in edits)
+        edits = step.input.get("edits")
+        edits = [e for e in edits if isinstance(e, dict)] if isinstance(edits, list) and edits else [step.input]
+        olds = [e.get("old_string") if isinstance(e.get("old_string"), str) else "" for e in edits]
+        news = [e.get("new_string") if isinstance(e.get("new_string"), str) else "" for e in edits]
+        removed = sum(len(o.splitlines()) for o in olds)
+        added = sum(len(n.splitlines()) for n in news)
+        text = " ".join(olds)
+        new_text = " ".join(news)
         asserts_removed = len(re.findall(r"\b(assert|expect)\b", text)) - len(re.findall(r"\b(assert|expect)\b", new_text))
-        skip_pattern = r"\.(skip|only)\(|@pytest\.mark\.skip|xit\(|xdescribe\(|@Ignore|@Disabled"
-        skip_added = re.search(skip_pattern, new_text) and not re.search(skip_pattern, text)
+        skip_added = SKIP_RE.search(new_text) and not SKIP_RE.search(text)
         if skip_added:
             risks.append(Risk("high", "test_skipped", f"Disabled or skipped tests in {_basename(paths[0])}", step.index))
         elif asserts_removed >= 2 or (removed - added) >= 15:
             risks.append(Risk("medium", "test_weakened", f"Removed assertions from {_basename(paths[0])}", step.index))
+
+    if tool in ("Write", "Edit", "MultiEdit") and paths:
+        _migration_risk(paths[0], "Wrote" if tool == "Write" else "Changed", cwd, step.index, risks)
 
     if tool in WRITE_TOOLS:
         name = _basename(paths[0]) if paths else "a file"
@@ -847,6 +1027,8 @@ def assess_step(step: Step, cwd: Optional[str], policy: Optional[Dict[str, Any]]
 
     if tool in SHELL_TOOLS:
         _shell_risks(step, cwd, extra, risks)
+    if tool == "Bash":
+        _shell_write_risks(step, cwd, extra, risks)
 
     if tool.startswith("mcp__"):
         risks.append(Risk("low", "mcp", f"Called an external MCP tool ({tool.split('__', 2)[-1]})", step.index))
@@ -876,11 +1058,65 @@ def _score(risks: List[Risk]) -> int:
     return min(100, total)
 
 
+def _written_paths(step: Step, cwd: Optional[str]) -> List[str]:
+    """Paths a step wrote, relative to cwd when inside it (the keys of Run.test_diffs)."""
+    if step.tool in WRITE_TOOLS:
+        paths = _paths_in_step(step)[:1]
+    elif step.tool == "Bash":
+        paths = [w.path for w in shell_writes(str(step.input.get("command") or "")) if not w.deleted]
+    else:
+        return []
+    out = []
+    for p in paths:
+        p = _project_path(_resolved(p, cwd), cwd)
+        out.append(posixpath.normpath(_slashes(p)) if not _is_abs(p) else p)
+    return out
+
+
+def _apply_test_verdicts(run: Run, changes: List[TestChange], policy: Dict[str, Any]) -> None:
+    """A test file's Git diff verdict replaces what the per-step Edit rule said about it,
+    so one file never reads as both weakened and replaced."""
+    verdicts = {c.path: c for c in changes}
+    if not verdicts:
+        return
+    last_writer: Dict[str, Step] = {}
+    for s in run.steps:
+        written = [p for p in _written_paths(s, run.cwd) if p in verdicts]
+        for p in written:
+            last_writer[p] = s
+        if written and s.tool in ("Edit", "MultiEdit"):
+            s.risks = [r for r in s.risks if r.code not in ("test_weakened", "test_skipped")]
+    for path, change in verdicts.items():
+        step = last_writer.get(path)
+        if step is None:
+            continue
+        name = _basename(path)
+        if change.verdict == "skipped":
+            risk = Risk("high", "test_skipped", f"Disabled or skipped tests in {name}", step.index)
+        elif change.verdict == "weakened" and change.removed_tests:
+            risk = Risk("medium", "test_weakened",
+                        f"Removed {', '.join(change.removed_tests)} from {name} with no replacement", step.index)
+        elif change.verdict == "weakened":
+            risk = Risk("medium", "test_weakened", f"Removed assertions from {name}", step.index)
+        else:
+            continue
+        step.risks.extend(_apply_policy([risk], policy))
+
+
 def assess(run: Run) -> Tuple[int, str, List[Risk]]:
     policy = load_policy(run.cwd)
     all_risks: List[Risk] = []
     for s in run.steps:
         s.risks = assess_step(s, run.cwd, policy)
+        for r in s.risks:
+            # The Git working tree tells a new migration from an edited one.
+            m = _MIGRATION_VERB.match(r.reason) if r.code == "db_migration" else None
+            status = (run.git_changes.get(m.group(1)) or {}).get("status") if m else None
+            if status:
+                verb = "Added" if status in ("untracked", "added") else "Changed"
+                r.reason = f"{verb} a database migration ({m.group(1)})"
+    _apply_test_verdicts(run, analyze_test_diffs(run.test_diffs, run.prompts), policy)
+    for s in run.steps:
         all_risks.extend(s.risks)
     score = _score(all_risks)
     level = "Low" if score < 25 else "Medium" if score < 60 else "High"

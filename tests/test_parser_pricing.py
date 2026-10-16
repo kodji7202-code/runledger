@@ -116,6 +116,19 @@ def test_cost_of_unknown_model_is_none():
     assert cost_of(Usage(input_tokens=10), "claude-mystery-9") is None
 
 
+def test_apply_costs_leaves_steps_with_unknown_usage_unpriced():
+    from runledger.parser import Step
+    known = Step(1, "Read", {}, "a", "claude-opus-5-5", None, usage=Usage(input_tokens=1000))
+    unknown = Step(2, "Read", {}, "b", "claude-opus-5-5", None, usage_known=False)
+    run = Run("s", "/x.jsonl", None, None, None, None, [], [known, unknown], "",
+              Usage(input_tokens=1000), {"claude-opus-5-5": Usage(input_tokens=1000)})
+    pricing.apply_costs(run)
+    assert known.cost == pytest.approx(cost_of(Usage(input_tokens=1000), "claude-opus-5-5"))
+    assert unknown.cost is None
+    md = render(run, 0, "Low", [], "md")
+    assert "n/a tok, n/a" in md and "$0.0000" not in md
+
+
 @pytest.mark.parametrize("model", [
     "ANTHROPIC/CLAUDE-SONNET-4-5",
     "anthropic/claude-sonnet-4.5-latest",
@@ -323,3 +336,47 @@ def test_receipts_with_known_prices_do_not_need_pricing_help(fmt):
     run = _run({"claude-opus-5-5": Usage(input_tokens=10)})
     pricing.apply_costs(run)
     assert pricing.PRICING_HELP not in render(run, 0, "Low", [], fmt)
+
+
+# --- partial costs and unattributed tokens -------------------------------------
+
+@pytest.mark.parametrize("fmt", ["md", "html", "json"])
+def test_partial_cost_is_marked_as_a_lower_bound(fmt):
+    run = _run({"claude-opus-5-5": Usage(input_tokens=1_000_000), "claude-mystery-9": Usage(input_tokens=10)})
+    pricing.apply_costs(run)
+    assert run.cost == pytest.approx(cost_of(Usage(input_tokens=1_000_000), "claude-opus-5-5"))
+    assert run.cost_partial
+    assert pricing.partial_note(run) == "1 model unpriced"
+    result = render(run, 0, "Low", [], fmt)
+    if fmt == "json":
+        totals = json.loads(result)["totals"]
+        assert totals["cost_partial"] is True
+        assert totals["unknown_models"] == ["claude-mystery-9"]
+    else:
+        assert "1 model unpriced" in result
+    if fmt == "md":
+        assert "≥ $" in result
+
+
+@pytest.mark.parametrize("fmt", ["md", "html", "json"])
+def test_unattributed_tokens_do_not_ask_for_a_price(fmt):
+    run = _run({"claude-opus-5-5": Usage(input_tokens=10), pricing.UNATTRIBUTED: Usage(input_tokens=10)})
+    pricing.apply_costs(run)
+    assert unknown_models(run) == []
+    assert run.cost_partial
+    assert pricing.partial_note(run) == "unattributed tokens unpriced"
+    result = render(run, 0, "Low", [], fmt)
+    assert pricing.PRICING_HELP not in result
+    if fmt == "json":
+        payload = json.loads(result)
+        assert payload["pricing_note"] is None
+        assert payload["totals"]["cost_partial"] is True
+    else:
+        assert "cannot be credited to one model" in result
+
+
+def test_complete_cost_is_not_partial():
+    run = _run({"claude-opus-5-5": Usage(input_tokens=10), "claude-mystery-9": Usage()})
+    pricing.apply_costs(run)
+    assert not run.cost_partial
+    assert pricing.partial_note(run) == ""

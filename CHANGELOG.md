@@ -7,6 +7,73 @@ change behavior, so read the entry before you upgrade.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-15
+
+### Changed
+
+- **Safe mode is the default for shareable receipts:** Markdown and JSON receipts written to
+  stdout or inside a Git work tree shorten local paths (repository-relative, `~` for the home
+  folder, `…` for shared or `RUNLEDGER_SAFE_PREFIXES` prefixes) and mask e-mail addresses and URL
+  credentials. HTML and files outside a repository keep full paths. `--safe` and `--no-safe`
+  override the default; JSON receipts add a `safe` key. The GitHub PR comment is always safe.
+
+### Added
+
+- **JSON receipt contract:** JSON receipts carry `schema_version: 1`. `runledger/receipt.schema.json`
+  ships with the package and `docs/receipt-json.md` describes every key. Within a version,
+  changes are additive only. Markdown receipts on stdout end with
+  `<!-- runledger: safe=... schema=1 -->`.
+- **Risk for shell and database writes:** files written through the shell get the same path
+  checks as edit-tool writes (secrets files high, `.git` folder medium, outside the project low).
+  New rules: `db_migration` (medium) for new or changed migration files, `db_write` (medium) for
+  migration runners and `sqlite3`/Python commands that change a local database, and `temp_copy`
+  (low) for copying a project file into a temp folder. Read-only queries and scratch writes to
+  temp folders stay unflagged.
+- **Test changes from the Git diff:** each changed test file gets one verdict from its diff
+  against HEAD, however it was written: skipped, replaced, weakened or changed. Skipped and
+  weakened files add risk and count toward `test_tampering`. Replaced and changed files appear in
+  a neutral quality signal, `test_changes`. A diff verdict replaces the per-step Edit rule for
+  that file, so a receipt no longer calls one file both weakened and replaced.
+- **Receipts after the commit:** when HEAD is newer than the session start (the run's changes
+  were committed before `runledger receipt` ran), Git line counts and test verdicts compare the
+  working tree with the last commit before the session start instead of HEAD. JSON receipts
+  record that commit as `git_base` (null when HEAD was used, including shallow clones and logs
+  without a start time).
+- **Droid usage source:** JSON receipts include `totals.usage_source` (`messages`, `settings` or
+  `missing`) and `tokens_estimated` on each step. Markdown and HTML add a footer note when
+  per-step tokens are an even split of the session total.
+
+### Fixed
+
+- **Droid sessions run with `--cwd .`:** the real project folder is recovered from the session's
+  `% pwd` context, the settings file, the tool paths' Git work tree or the encoded session folder,
+  so these receipts get the branch, repo-relative files and Git line counts. JSON receipts add
+  `cwd_source`. `list` and `--latest` find these sessions by their folder name.
+- **Search patterns are not paths:** the patterns and scripts of `grep`, `rg`, `ag`, `git grep`,
+  `sed`, `awk` and `perl -pe`, and `find -name`/`-path` values, no longer count as paths, so
+  `rg '/workspace|/home' src` is no longer flagged `shell_outside`. Only operands in file
+  positions are checked (`grep root /etc/passwd` is still flagged), and other quoted regexes
+  with `|`, `^`, `.*` or groups are skipped. Quoted grep patterns no longer trigger the
+  dangerous-command rules (`grep 'rm -rf /' .`).
+- **Relative working folders:** a session whose log records `cwd` as `.` (seen in Droid) no longer
+  takes the branch, Git line counts and checkpoints from the folder RunLedger runs in, and no longer
+  flags every absolute path as outside the working folder.
+- **Safe mode and path lists:** colon-separated path lists (`a:/home/u/b`) are rewritten path by path.
+- **Partial costs:** when some tokens have no price, the run cost reads `≥ $X (N models unpriced)`
+  and JSON adds `totals.cost_partial` and `totals.unknown_models`. The cost-per-line quality signal
+  is skipped for partial costs, and advisor savings leave out steps with no token data.
+- **Droid sub-agents and mixed models:** sub-agent tokens from `inclusiveTokenUsage` are counted,
+  credited to the child session's model when its settings file is found. Tokens that cannot be
+  credited to one model are listed as `unattributed` and no longer trigger the "add a price" help.
+- **Large sessions:** shell commands are parsed once per receipt instead of several times, so a
+  5,000-step session renders about twice as fast.
+- **Droid tokens for copied transcripts:** when a transcript has no sibling `.settings.json`,
+  RunLedger finds the session's settings file by id under `$FACTORY_HOME/sessions/`.
+- **Timestamps on Python 3.9 and 3.10:** fractions with other than 3 or 6 digits (`00:01:00.5Z`)
+  no longer make the run duration or a pushed run's time unknown.
+- **Droid receipts without usage:** token counts show `n/a` instead of 0, with a note naming the
+  missing settings file. Cost stays unknown.
+
 ## [0.5.2] - 2026-10-15
 
 ### Added

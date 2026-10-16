@@ -393,7 +393,7 @@ class Repository:
 
 def checkpoint_for_run(cwd: Optional[str], run_id: str) -> Optional[str]:
     """Read-only lookup; missing Git or pruned checkpoints must not break receipts."""
-    if not cwd or not run_id:
+    if not cwd or not run_id or not os.path.isabs(cwd):
         return None
     try:
         return Repository(cwd).select(run_id=run_id).id

@@ -41,7 +41,7 @@ RunLedger. The job needs `pull-requests: write` to post the comment.
 
 ```yaml
 - uses: actions/checkout@v4
-- uses: kodji7202-code/runledger@v0.5.2
+- uses: kodji7202-code/runledger@v0.6.0
   with:
     sessions-dir: .runledger/sessions   # default
     fail-on: "60"                        # default; "" never fails the job
@@ -85,5 +85,8 @@ python -m runledger.github comment --sessions-dir .runledger/sessions \
   Outside Actions, set it to the API base, for example `https://ghe.example.com/api/v3`.
 - **Token safety.** The token is read from an environment variable (`--token-env`,
   default `GITHUB_TOKEN`) and never printed. Do not pass tokens on the command line.
+- **Safe mode.** The comment is always built in safe mode: paths are shown relative to the
+  repository (or with `~` for the home folder) and e-mail addresses are masked. See
+  [safe mode](quickstart.md#safe-mode).
 - **Size.** The comment is kept under 60,000 characters. Long reports are shortened
   with a notice at the end.

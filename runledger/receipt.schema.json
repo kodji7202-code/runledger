@@ -1,0 +1,174 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://runledger.dev/schemas/receipt-1.json",
+  "title": "RunLedger JSON receipt, schema version 1",
+  "description": "Additive within a version: consumers must ignore unknown keys. See docs/receipt-json.md.",
+  "type": "object",
+  "required": ["schema_version", "runledger_version", "safe", "session_id", "rollback", "agent",
+               "agent_id", "cwd", "git_branch", "started", "ended", "duration_seconds", "request",
+               "overview", "risk", "totals", "models", "pricing_note", "files", "steps", "quality",
+               "recommendations", "ai_review"],
+  "properties": {
+    "schema_version": {"type": "integer", "enum": [1]},
+    "runledger_version": {"type": "string"},
+    "safe": {"type": "boolean"},
+    "session_id": {"type": "string"},
+    "rollback": {
+      "type": ["object", "null"],
+      "required": ["checkpoint_id", "command"],
+      "properties": {"checkpoint_id": {"type": "string"}, "command": {"type": "string"}}
+    },
+    "agent": {"type": "string"},
+    "agent_id": {"type": "string"},
+    "cwd": {"type": ["string", "null"]},
+    "cwd_source": {"type": ["string", "null"], "enum": ["header", "session", "settings", "session_dir", "unknown", null]},
+    "git_branch": {"type": ["string", "null"]},
+    "git_base": {"type": ["string", "null"]},
+    "started": {"type": ["string", "null"]},
+    "ended": {"type": ["string", "null"]},
+    "duration_seconds": {"type": ["number", "null"], "minimum": 0},
+    "request": {"type": "array", "items": {"type": "string"}},
+    "overview": {"type": "string"},
+    "risk": {
+      "type": "object",
+      "required": ["score", "level", "reasons"],
+      "properties": {
+        "score": {"type": "integer", "minimum": 0, "maximum": 100},
+        "level": {"type": "string", "enum": ["Low", "Medium", "High"]},
+        "reasons": {"type": "array", "items": {"$ref": "#/$defs/reason"}}
+      }
+    },
+    "totals": {
+      "type": "object",
+      "required": ["steps", "tokens", "input_tokens", "output_tokens", "cache_write_tokens",
+                   "cache_read_tokens", "cost_usd", "reported_cost_usd", "cost_partial",
+                   "unknown_models", "files_changed", "usage_source"],
+      "properties": {
+        "steps": {"type": "integer", "minimum": 0},
+        "tokens": {"type": "integer", "minimum": 0},
+        "input_tokens": {"type": "integer", "minimum": 0},
+        "output_tokens": {"type": "integer", "minimum": 0},
+        "cache_write_tokens": {"type": "integer", "minimum": 0},
+        "cache_read_tokens": {"type": "integer", "minimum": 0},
+        "cost_usd": {"type": ["number", "null"], "minimum": 0},
+        "reported_cost_usd": {"type": ["number", "null"], "minimum": 0},
+        "cost_partial": {"type": "boolean"},
+        "unknown_models": {"type": "array", "items": {"type": "string"}},
+        "files_changed": {"type": "integer", "minimum": 0},
+        "usage_source": {"type": ["string", "null"], "enum": ["messages", "settings", "missing", null]},
+        "guard": {
+          "type": "object",
+          "required": ["blocked", "asked", "approved", "rejected", "monitor_blocked", "monitor_asked"],
+          "additionalProperties": {"type": "integer", "minimum": 0}
+        }
+      }
+    },
+    "models": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["tokens"],
+        "properties": {"tokens": {"type": "integer", "minimum": 0}}
+      }
+    },
+    "pricing_note": {"type": ["string", "null"]},
+    "files": {"type": "array", "items": {"$ref": "#/$defs/file"}},
+    "steps": {"type": "array", "items": {"$ref": "#/$defs/step"}},
+    "quality": {
+      "type": ["object", "null"],
+      "required": ["score", "grade", "signals"],
+      "properties": {
+        "score": {"type": "integer", "minimum": 0, "maximum": 100},
+        "grade": {"type": "string"},
+        "signals": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "value", "impact", "note"],
+            "properties": {
+              "name": {"type": "string"},
+              "value": {"type": ["number", "string", "null"]},
+              "impact": {"type": "integer"},
+              "note": {"type": "string"}
+            }
+          }
+        }
+      }
+    },
+    "recommendations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["kind", "title", "detail", "est_savings_usd", "steps"],
+        "properties": {
+          "kind": {"type": "string"},
+          "title": {"type": "string"},
+          "detail": {"type": "string"},
+          "est_savings_usd": {"type": ["number", "null"], "minimum": 0},
+          "steps": {"type": "array", "items": {"type": "integer"}}
+        }
+      }
+    },
+    "ai_review": {"type": ["object", "null"]},
+    "guard": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["step", "tool", "summary", "decision", "outcome", "reason", "codes", "ts"],
+        "properties": {
+          "step": {"type": ["integer", "null"]},
+          "tool": {"type": "string"},
+          "summary": {"type": "string"},
+          "decision": {"type": "string"},
+          "outcome": {"type": "string"},
+          "reason": {"type": "string"},
+          "codes": {"type": "array", "items": {"type": "string"}},
+          "ts": {"type": ["string", "null"]}
+        }
+      }
+    }
+  },
+  "$defs": {
+    "reason": {
+      "type": "object",
+      "required": ["severity", "code", "reason", "step"],
+      "properties": {
+        "severity": {"type": "string", "enum": ["high", "medium", "low"]},
+        "code": {"type": "string"},
+        "reason": {"type": "string"},
+        "step": {"type": "integer"}
+      }
+    },
+    "file": {
+      "type": "object",
+      "required": ["path", "added", "removed", "created", "deleted", "shell", "verified", "binary"],
+      "properties": {
+        "path": {"type": "string"},
+        "added": {"type": "integer", "minimum": 0},
+        "removed": {"type": "integer", "minimum": 0},
+        "created": {"type": "boolean"},
+        "deleted": {"type": "boolean"},
+        "shell": {"type": "boolean"},
+        "verified": {"type": "boolean"},
+        "binary": {"type": "boolean"}
+      }
+    },
+    "step": {
+      "type": "object",
+      "required": ["n", "tool", "summary", "model", "tokens", "tokens_known", "tokens_estimated",
+                   "cost_usd", "error", "risks"],
+      "properties": {
+        "n": {"type": "integer", "minimum": 1},
+        "tool": {"type": "string"},
+        "summary": {"type": "string"},
+        "model": {"type": ["string", "null"]},
+        "tokens": {"type": "integer", "minimum": 0},
+        "tokens_known": {"type": "boolean"},
+        "tokens_estimated": {"type": "boolean"},
+        "cost_usd": {"type": ["number", "null"], "minimum": 0},
+        "error": {"type": "boolean"},
+        "risks": {"type": "array", "items": {"$ref": "#/$defs/reason"}}
+      }
+    }
+  }
+}
