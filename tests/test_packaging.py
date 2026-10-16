@@ -165,7 +165,10 @@ def test_container_runs_as_non_root_on_port_8787():
     assert "ARG PYTHON_BASE_IMAGE=python:3.12-slim" in dockerfile
     assert "FROM ${PYTHON_BASE_IMAGE}" in dockerfile
     ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-    assert "--build-arg PYTHON_BASE_IMAGE=public.ecr.aws/docker/library/python:3.12-slim" in ci
+    assert '--build-arg PYTHON_BASE_IMAGE="$base"' in ci
+    for mirror in ("public.ecr.aws/docker/library/python:3.12-slim",
+                   "mirror.gcr.io/library/python:3.12-slim"):
+        assert mirror in ci
     assert "pip install --no-cache-dir ." in dockerfile
     assert "USER runledger" in dockerfile
     assert "EXPOSE 8787" in dockerfile
