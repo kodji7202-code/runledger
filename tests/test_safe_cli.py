@@ -95,3 +95,18 @@ def test_pr_comment_is_always_safe(tmp_path, capsys, monkeypatch):
     out = capsys.readouterr().out
     assert str(tmp_path) not in out and "dev@example.com" not in out
     assert "src/app.py" in out
+
+
+def test_summary_path_cut_inside_a_long_root_is_hidden(tmp_path, capsys):
+    """Regression (macOS CI): the step summary cuts a long `cd <root>` path with `…`
+    inside the root folder name; the partial path must not leak the folder layout."""
+    deep = tmp_path / ("very-long-folder-name-" * 4) / "nested" / "repo"
+    deep.mkdir(parents=True)
+    steps = [{"tool": "Bash", "input": {"command": f"cd {deep} && echo hi > notes.txt"}}]
+    path = tmp_path / "long.runledger.json"
+    path.write_text(json.dumps({"runledger_format": 1, "agent": "demo", "session_id": "safe-long",
+                                "cwd": str(deep), "prompts": ["x"], "steps": steps}), encoding="utf-8")
+    for fmt in ("md", "json"):
+        out, _ = _receipt(capsys, str(path), "--format", fmt, "-o", "-")
+        assert str(tmp_path) not in out
+        assert "very-long-folder-name" not in out
