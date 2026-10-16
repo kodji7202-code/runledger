@@ -25,6 +25,24 @@ def _norm(p: str, win: bool) -> str:
     return posixpath.normpath(p)
 
 
+def native(p: str) -> str:
+    """A Windows-style absolute path with backslashes, as Windows tools print it; Git for
+    Windows reports 'C:/x'. Other paths come back unchanged."""
+    return ntpath.normpath(p) if _WIN_ABS_RE.match(p) else p
+
+
+def join(base: Optional[str], path: str) -> str:
+    """`path` joined to `base` unless it is absolute, normalised in the style of the result:
+    a Windows-style absolute result gets backslashes, any other gets '/' semantics."""
+    if base and not is_abs(path):
+        sep = "\\" if _WIN_ABS_RE.match(base) or base.startswith("\\") else "/"
+        # Plain concatenation: ntpath.join would treat a relative 'a:b' as a drive.
+        path = base.rstrip("\\/") + sep + path
+    if _WIN_ABS_RE.match(path) or path.startswith("\\"):
+        return ntpath.normpath(path)
+    return posixpath.normpath(path)
+
+
 def key(p: str, win: bool) -> str:
     """Comparable form of a path; Windows-style paths are lowercased (names are case-insensitive)."""
     return _norm(p, win).lower() if win else _norm(p, win)

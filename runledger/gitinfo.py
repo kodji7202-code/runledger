@@ -8,6 +8,8 @@ import subprocess
 from datetime import datetime, timezone
 from typing import Dict, Iterable, List, Optional, Tuple
 
+from .paths import native
+
 # The session log names the folder, so its repository config is not trusted:
 # these options keep git from running fsmonitor hooks, external diff tools or textconv filters.
 _SAFE = ["-c", "core.fsmonitor=false", "-c", "core.quotepath=false"]
@@ -35,7 +37,8 @@ def toplevel(cwd: Optional[str]) -> Optional[str]:
     """The root folder of the work tree that contains `cwd`, or None outside Git."""
     if not _in_repo(cwd):
         return None
-    return (_git(cwd, "rev-parse", "--show-toplevel") or "").strip() or None
+    top = (_git(cwd, "rev-parse", "--show-toplevel") or "").strip()
+    return native(top) if top else None
 
 
 def current_branch(cwd: Optional[str]) -> Optional[str]:

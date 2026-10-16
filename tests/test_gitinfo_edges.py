@@ -1,4 +1,5 @@
 import json
+import os
 import shutil
 import subprocess
 
@@ -11,6 +12,7 @@ from runledger.receipt import render
 from runledger.summarize import file_changes
 
 needs_git = pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
+windows_invalid_name = pytest.mark.skipif(os.name == "nt", reason="not a valid file name on Windows")
 
 
 def _git(cwd, *args):
@@ -112,8 +114,11 @@ def test_mv_rename_shows_source_deleted_and_destination_new(tmp_path):
 
 
 @needs_git
-@pytest.mark.parametrize("name", ["tests/test a.py", 'tests/test "q".py', "tests/test\tt.py",
-                                  "tests/tést_ü.py"])
+@pytest.mark.parametrize("name", [
+    "tests/test a.py",
+    pytest.param('tests/test "q".py', marks=windows_invalid_name),
+    pytest.param("tests/test\tt.py", marks=windows_invalid_name),
+    "tests/tést_ü.py"])
 def test_diffs_of_test_files_with_unusual_names(tmp_path, name):
     repo = _init(tmp_path)
     target = repo / name
