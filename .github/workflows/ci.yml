@@ -47,9 +47,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build the image
-        # Docker Hub regularly rate-limits shared GitHub-hosted runner IPs.
-        # Use the official Python image's public ECR mirror for this CI build.
-        run: docker build --build-arg PYTHON_BASE_IMAGE=public.ecr.aws/docker/library/python:3.12-slim -t runledger:ci .
+        # Registries rate-limit shared GitHub-hosted runner IPs (Docker Hub, and public ECR
+        # with "429 Data limit exceeded"). Try the official image's mirrors in turn, with backoff.
+        run: |
+          for attempt in 1 2 3; do
+            for base in public.ecr.aws/docker/library/python:3.12-slim mirror.gcr.io/library/python:3.12-slim python:3.12-slim; do
+              echo "::group::attempt $attempt, base $base"
+              if docker build --build-arg PYTHON_BASE_IMAGE="$base" -t runledger:ci .; then
+                echo "::endgroup::"; exit 0
+              fi
+              echo "::endgroup::"
+            done
+            sleep $((attempt * 20))
+          done
+          exit 1
       - name: Run the image and check /health
         run: |
           docker run -d --name runledger-ci -p 127.0.0.1:8787:8787 runledger:ci
