@@ -10,23 +10,51 @@ from __future__ import annotations
 import json
 import os
 import re
-from dataclasses import dataclass
-from typing import Dict, List, Optional
+from dataclasses import dataclass, replace
+from typing import Any, Dict, List, Optional
 
 from . import llm
 from .parser import Run, Step, Usage
+from .paths import is_abs, relative
+from .shell_writes import shell_deletes, shell_writes
 
 DEFAULT_AI_MODEL = os.environ.get("RUNLEDGER_SUMMARY_MODEL", "claude-haiku-5-5")
 
 
 def _short(path: str, cwd: Optional[str]) -> str:
-    if cwd and path.startswith(cwd.rstrip("/") + "/"):
-        return path[len(cwd.rstrip("/")) + 1:]
-    return path
+    return relative(path, cwd)
 
 
-def _lines(s: Optional[str]) -> int:
-    return len(s.splitlines()) if s else 0
+COMMAND_LIMIT = 120
+GOAL_LIMIT = 200
+
+
+def shorten(text: str, limit: int) -> str:
+    """Cut at the last space before `limit` and add an ellipsis; one long word is cut hard."""
+    text = " ".join(text.split())
+    if len(text) <= limit:
+        return text
+    head = text[:limit - 1]
+    space = head.rfind(" ")
+    if space >= limit // 2:
+        head = head[:space]
+    return head.rstrip() + "…"
+
+
+def _lines(s: Any) -> int:
+    return len(s.splitlines()) if isinstance(s, str) else 0
+
+
+def _str(value: Any) -> str:
+    """A step input field as text; session files may carry any JSON type here."""
+    return value if isinstance(value, str) else ""
+
+
+def _edits(inp: Dict[str, Any]) -> List[Dict[str, Any]]:
+    edits = inp.get("edits")
+    if not isinstance(edits, list) or not edits:
+        return [inp]
+    return [e for e in edits if isinstance(e, dict)]
 
 
 @dataclass
@@ -36,22 +64,27 @@ class FileChange:
     removed: int = 0
     created: bool = False
     deleted: bool = False
+    shell: bool = False      # written by a shell command, so the line counts may be incomplete
+    verified: bool = False   # line counts come from the Git working tree
+    binary: bool = False     # Git sees a binary file, so there are no line counts
 
 
 def file_changes(run: Run) -> Dict[str, FileChange]:
+    if run.frozen_changes is not None:
+        return {p: replace(fc) for p, fc in run.frozen_changes.items()}
     changes: Dict[str, FileChange] = {}
     for s in run.steps:
-        p = s.input.get("file_path") or s.input.get("notebook_path")
+        p = _str(s.input.get("file_path")) or _str(s.input.get("notebook_path"))
         p = _short(p, run.cwd) if p else p
         if s.tool == "Write" and p:
             fc = changes.setdefault(p, FileChange(p))
             if not fc.added and not fc.removed:
-                fc.created = "created" in s.result_text.lower() or not s.result_text
+                fc.created = "created" in _str(s.result_text).lower() or not s.result_text
             fc.added += _lines(s.input.get("content"))
         elif s.tool in ("Edit", "MultiEdit") and p:
             fc = changes.setdefault(p, FileChange(p))
-            for e in s.input.get("edits") or [s.input]:
-                o, n = e.get("old_string") or "", e.get("new_string") or ""
+            for e in _edits(s.input):
+                o, n = e.get("old_string"), e.get("new_string")
                 fc.removed += _lines(o)
                 fc.added += _lines(n)
         elif s.tool == "Delete" and p:
@@ -59,42 +92,56 @@ def file_changes(run: Run) -> Dict[str, FileChange]:
         elif s.tool == "NotebookEdit" and p:
             changes.setdefault(p, FileChange(p)).added += _lines(s.input.get("new_source"))
         elif s.tool == "Bash":
-            cmd = str(s.input.get("command", ""))
-            # Only the arguments of an rm in each simple command count: `rm -rf build/ && pytest -q`
-            # deletes build/, not pytest.
-            for part in re.split(r"&&|\|\||;|\||\n", cmd):
-                m = re.match(r"^\s*(git\s+rm|rm)\s+(?:-\S+\s+)*(.+)$", part)
-                if not m:
-                    continue
-                for t in m.group(2).split():
-                    if ">" in t or "<" in t:
-                        break  # redirection target, not a deleted file
-                    if t.startswith(("-", "$")) or "&" in t:
-                        continue
-                    changes.setdefault(t, FileChange(t)).deleted = True
+            cmd = _str(s.input.get("command"))
+            for target in shell_deletes(cmd):
+                p = _short(target, run.cwd)
+                if run.cwd and is_abs(p):
+                    continue  # outside the project, such as a scratch file in /tmp
+                fc = changes.setdefault(p, FileChange(p))
+                fc.deleted = fc.shell = True
+            for w in shell_writes(cmd):
+                p = _short(w.path, run.cwd)
+                if run.cwd and is_abs(p):
+                    continue  # outside the project, such as a backup in /tmp
+                fc = changes.setdefault(p, FileChange(p))
+                fc.shell = True
+                fc.deleted = w.deleted
+                fc.added += w.added
+    for p, fc in changes.items():
+        git = run.git_changes.get(p) if fc.shell else None
+        if git:
+            fc.added, fc.removed = int(git.get("added") or 0), int(git.get("removed") or 0)
+            fc.created = git.get("status") in ("untracked", "added")
+            fc.deleted = git.get("status") == "deleted"
+            fc.verified = True
+            fc.binary = bool(git.get("binary"))
     return changes
 
 
 def template_summary(step: Step, cwd: Optional[str]) -> str:
     i, t = step.input, step.tool
-    p = _short(str(i.get("file_path") or i.get("notebook_path") or i.get("path") or ""), cwd)
+    p = _short(_str(i.get("file_path")) or _str(i.get("notebook_path")) or _str(i.get("path")), cwd)
     if t == "Read":
         return f"Read {p}"
     if t == "Delete":
         return f"Deleted {p}"
     if t == "Search":
-        return f"Searched for '{i.get('pattern', '')}'" + (f" in {p}" if p else "")
+        return f"Searched for '{_str(i.get('pattern'))}'" + (f" in {p}" if p else "")
     if t == "Write":
         return f"Wrote {p} ({_lines(i.get('content'))} lines)"
     if t in ("Edit", "MultiEdit"):
-        edits = i.get("edits") or [i]
+        edits = _edits(i)
         a = sum(_lines(e.get("new_string")) for e in edits)
         r = sum(_lines(e.get("old_string")) for e in edits)
         return f"Edited {p} (+{a} −{r})"
     if t == "Bash":
-        desc = i.get("description")
+        desc = _str(i.get("description"))
+        lines = _str(i.get("command")).strip().splitlines() or [""]
         # Redact before cutting, so the 120-character limit cannot keep half of a secret.
-        cmd = llm.redact((str(i.get("command", "")).strip().splitlines() or [""])[0])[:120]
+        # A backtick would close the Markdown code span and split the HTML <code> early.
+        cmd = shorten(llm.redact(lines[0]), COMMAND_LIMIT).replace("`", "'")
+        if len(lines) > 1:
+            cmd += f" (+{len(lines) - 1} line{'s' if len(lines) > 2 else ''})"
         outcome = " — failed" if step.is_error else ""
         m = re.search(r"(\d+)\s+passed", step.result_text)
         f = re.search(r"(\d+)\s+failed", step.result_text)
@@ -107,19 +154,19 @@ def template_summary(step: Step, cwd: Optional[str]) -> str:
             outcome = " — tests: " + ", ".join(bits)
         return f"{desc or 'Ran'}: `{cmd}`{outcome}" if desc else f"Ran `{cmd}`{outcome}"
     if t == "Grep":
-        return f"Searched the code for “{i.get('pattern', '')}”"
+        return f"Searched the code for “{_str(i.get('pattern'))}”"
     if t == "Glob":
-        return f"Listed files matching {i.get('pattern', '')}"
+        return f"Listed files matching {_str(i.get('pattern'))}"
     if t == "LS":
         return f"Listed folder {p or '.'}"
     if t == "WebFetch":
-        return f"Fetched {i.get('url', '')}"
+        return f"Fetched {_str(i.get('url'))}"
     if t == "WebSearch":
-        return f"Searched the web for “{i.get('query', '')}”"
+        return f"Searched the web for “{_str(i.get('query'))}”"
     if t == "TodoWrite":
         return "Updated its to-do list"
     if t in ("Task", "Agent"):
-        return f"Delegated to a sub-agent: {i.get('description', '')}"
+        return f"Delegated to a sub-agent: {_str(i.get('description'))}"
     if t == "NotebookEdit":
         return f"Edited notebook {p}"
     if t.startswith("mcp__"):
@@ -133,7 +180,7 @@ def apply_templates(run: Run) -> None:
         s.summary = template_summary(s, run.cwd)
     if not run.overall_summary:
         n_files = len(file_changes(run))
-        goal = llm.redact(run.prompts[0])[:200] if run.prompts else "an unspecified task"
+        goal = shorten(llm.redact(run.prompts[0]), GOAL_LIMIT) if run.prompts else "an unspecified task"
         goal = goal.rstrip(" .")
         run.overall_summary = (f"Asked to: “{goal}”. The agent took {len(run.steps)} steps "
                                f"and changed {n_files} file{'s' if n_files != 1 else ''}.")

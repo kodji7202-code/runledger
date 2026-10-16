@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import html
 import json
+import re
 from dataclasses import asdict
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -10,8 +11,9 @@ from . import __version__
 from .adapters import label as agent_label
 from .guard import redact
 from .guard_receipt import guard_counts, guard_summary
-from .parser import Run, Usage
-from .pricing import PRICING_HELP, friendly_model, unknown_models
+from .parser import Run, Step, Usage
+from .pricing import (PRICING_HELP, UNATTRIBUTED, UNATTRIBUTED_NOTE, friendly_model, partial_note,
+                      unknown_models, unpriced)
 from .risk import Risk
 from .summarize import FileChange, file_changes
 
@@ -26,6 +28,30 @@ def _tok(n: int) -> str:
     return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
 
 
+def _run_tok(run: Run, n: int) -> str:
+    """Show unknown usage as n/a, so a missing settings file never reads as zero tokens."""
+    return "n/a" if run.usage_source == "missing" else _tok(n)
+
+
+def _step_known(run: Run, step: Step) -> bool:
+    return step.usage_known and run.usage_source != "missing"
+
+
+def _step_tok(run: Run, step: Step) -> str:
+    return _tok(step.usage.total) if _step_known(run, step) else "n/a"
+
+
+def _usage_note(run: Run) -> str:
+    if run.usage_source == "missing":
+        stem = run.path.replace("\\", "/").rsplit("/", 1)[-1].rsplit(".", 1)[0] or run.session_id
+        return (f"Token usage not found: Droid keeps it in {redact(stem)}.settings.json "
+                "next to the session file.")
+    if any(s.usage_estimated for s in run.steps):
+        source = f" in {redact(run.usage_file)}" if run.usage_file else ""
+        return f"Per-step tokens are estimated: an even split of the session total{source}."
+    return ""
+
+
 def _dur(sec: Optional[float]) -> str:
     if sec is None:
         return "n/a"
@@ -34,12 +60,18 @@ def _dur(sec: Optional[float]) -> str:
     return f"{h}h {m}m" if h else f"{m}m {s}s"
 
 
+def _run_money(run: Run) -> str:
+    """The run estimate; a lower bound reads `≥ $X (N models unpriced)`."""
+    note = partial_note(run)
+    return f"≥ {_money(run.cost)} ({note})" if note else _money(run.cost)
+
+
 def _cost_text(run: Run) -> str:
     """Estimate from list prices, the agent's own figure, or both."""
     if run.cost is not None and run.reported_cost is not None:
-        return f"{_money(run.cost)} est. · {_money(run.reported_cost)} reported by agent"
+        return f"{_run_money(run)} est. · {_money(run.reported_cost)} reported by agent"
     if run.cost is not None:
-        return _money(run.cost)
+        return _run_money(run)
     if run.reported_cost is not None:
         return f"{_money(run.reported_cost)} reported by agent"
     return "n/a"
@@ -51,6 +83,8 @@ def _cost_card(run: Run) -> str:
     if run.cost is not None:
         note = (f"<small>est. · reported by agent {_money(run.reported_cost)}</small>"
                 if run.reported_cost is not None else "")
+        if run.cost_partial:
+            note = f"<small>at least · {_e(partial_note(run))}</small>" + note
         return f'<div class="card"><span>Cost</span><b>{_money(run.cost)}</b>{note}</div>'
     return (f'<div class="card"><span>Cost</span><b>{_money(run.reported_cost)}</b>'
             "<small>reported by agent</small></div>")
@@ -76,6 +110,7 @@ _SIGNAL_LABELS = {
     "failing_then_passing": "Fixed after failing tests",
     "failing_streak": "Longest failing streak",
     "test_tampering": "Tests deleted, skipped or weakened",
+    "test_changes": "Tests replaced or changed",
     "error_rate": "Steps with errors",
     "retry_loops": "Repeated commands and edits",
     "scope": "Changes unrelated to the request",
@@ -300,6 +335,35 @@ def _md_text(text: Any) -> str:
     return str(text).replace("\r", " ").replace("\n", " ").replace("`", "'")
 
 
+def _md_angles(text: str) -> str:
+    """Stop raw HTML tags; unlike html.escape, `&` stays readable in Markdown."""
+    return text.replace("<", "&lt;").replace(">", "&gt;")
+
+
+_MD_LINE_START = re.compile(r"^(\s*)([#+=*-]|\d+[.)])")
+
+
+def _md_inline(text: Any, line_start: bool = True) -> str:
+    """One line of free text that cannot open a heading, list, block quote or HTML tag."""
+    text = _md_angles(re.sub(r"\s+", " ", _md_text(text)))
+    if not line_start:
+        return text
+    return _MD_LINE_START.sub(lambda m: m.group(1) + "\\" + m.group(2), text)
+
+
+def _md_summary(text: Any) -> str:
+    """A step summary: code spans from the templates stay, text around them is escaped."""
+    parts = re.sub(r"\s+", " ", str(text)).split("`")
+    if len(parts) % 2 == 0:  # unpaired backtick from an AI summary
+        return _md_inline(text)
+    return "".join(f"`{p}`" if i % 2 else _md_inline(p, i == 0) if p.strip() else p
+                   for i, p in enumerate(parts))
+
+
+def _md_code(text: Any) -> str:
+    return "`" + _md_text(text) + "`"
+
+
 def _quality_md(quality: Any) -> List[str]:
     if not isinstance(quality, dict):
         return []
@@ -388,6 +452,7 @@ def redact_run(run: Run, risks: List[Risk]) -> None:
     run.agent = redact(run.agent)
     run.cwd = redact(run.cwd) if run.cwd is not None else None
     run.git_branch = redact(run.git_branch) if run.git_branch is not None else None
+    run.git_changes = {redact(p): c for p, c in run.git_changes.items()}
     run.started = redact(run.started) if run.started is not None else None
     run.ended = redact(run.ended) if run.ended is not None else None
     redacted_models: Dict[str, Usage] = {}
@@ -444,7 +509,7 @@ def _guard_md(run: Run) -> List[str]:
                  decision["tool"], decision["summary"], decision["decision"],
                  decision["outcome"], decision["reason"], ", ".join(decision["codes"]),
                  decision["ts"] or ""]
-        out.append("| " + " | ".join(_md_cell(_e(str(c))) for c in cells) + " |")
+        out.append("| " + " | ".join(_md_cell(_md_angles(str(c))) for c in cells) + " |")
     return out + [""]
 
 
@@ -456,14 +521,27 @@ def _rollback(run: Run) -> Optional[Dict[str, str]]:
             "command": f"runledger rollback {run.checkpoint_id}"}
 
 
+# JSON receipt contract (receipt.schema.json, docs/receipt-json.md). Within a version, changes
+# are additive only; removing a key or changing its type needs a new version.
+SCHEMA_VERSION = 1
+
+
+def md_trailer(run: Run) -> str:
+    """A last line that records the mode in a Markdown receipt without showing it."""
+    return f"<!-- runledger: safe={'true' if run.safe else 'false'} schema={SCHEMA_VERSION} -->\n"
+
+
 def to_dict(run: Run, score: int, level: str, risks: List[Risk]) -> Dict:
     changes = file_changes(run)
     data = {
+        "schema_version": SCHEMA_VERSION,
         "runledger_version": __version__,
+        "safe": run.safe,
         "session_id": run.session_id,
         "rollback": _rollback(run),
         "agent": agent_label(run.agent), "agent_id": run.agent,
-        "cwd": run.cwd, "git_branch": run.git_branch,
+        "cwd": run.cwd, "cwd_source": run.cwd_source, "git_branch": run.git_branch,
+        "git_base": run.git_base,
         "started": run.started, "ended": run.ended,
         "duration_seconds": run.duration_seconds,
         "request": run.prompts[:3],
@@ -475,12 +553,15 @@ def to_dict(run: Run, score: int, level: str, risks: List[Risk]) -> Dict:
                    "cache_write_tokens": run.usage.cache_write_tokens,
                    "cache_read_tokens": run.usage.cache_read_tokens,
                    "cost_usd": run.cost, "reported_cost_usd": run.reported_cost,
-                   "files_changed": len(changes)},
+                   "cost_partial": run.cost_partial, "unknown_models": unknown_models(run),
+                   "files_changed": len(changes), "usage_source": run.usage_source},
         "models": {m: {"tokens": u.total} for m, u in run.models.items()},
         "pricing_note": PRICING_HELP if unknown_models(run) else None,
         "files": [asdict(c) for c in changes.values()],
         "steps": [{"n": s.index, "tool": s.tool, "summary": s.summary, "model": s.model,
-                   "tokens": s.usage.total, "cost_usd": s.cost, "error": s.is_error,
+                   "tokens": s.usage.total, "tokens_known": _step_known(run, s),
+                   "tokens_estimated": s.usage_estimated,
+                   "cost_usd": s.cost, "error": s.is_error,
                    "risks": [asdict(r) for r in s.risks]} for s in run.steps],
         "quality": run.quality,
         "recommendations": _recs_list(run),
@@ -495,23 +576,25 @@ def to_dict(run: Run, score: int, level: str, risks: List[Risk]) -> Dict:
 def to_markdown(run: Run, score: int, level: str, risks: List[Risk]) -> str:
     changes = file_changes(run)
     out = [f"# Run receipt · {run.session_id[:8]}", ""]
-    out.append(f"- **Agent:** {agent_label(run.agent)}  ·  **Folder:** `{run.cwd}`  ·  **Branch:** `{run.git_branch or '-'}`  ·  **Duration:** {_dur(run.duration_seconds)}")
-    out.append(f"- **Risk:** {score}/100 ({level})  ·  **Cost:** {_cost_text(run)}  ·  **Tokens:** {_tok(run.usage.total)}  ·  **Files changed:** {len(changes)}")
+    out.append(f"- **Agent:** {agent_label(run.agent)}  ·  **Folder:** {_md_code(run.cwd) if run.cwd else '-'}  ·  **Branch:** {_md_code(run.git_branch or '-')}  ·  **Duration:** {_dur(run.duration_seconds)}")
+    out.append(f"- **Risk:** {score}/100 ({level})  ·  **Cost:** {_cost_text(run)}  ·  **Tokens:** {_run_tok(run, run.usage.total)}  ·  **Files changed:** {len(changes)}")
     if run.guard:
         out.append(f"- **Guard:** {guard_summary(run.guard)}")
     if unknown_models(run):
         out.append(f"- **Unknown model price:** {PRICING_HELP}")
+    if UNATTRIBUTED in unpriced(run):
+        out.append(f"- **Unattributed tokens:** {UNATTRIBUTED_NOTE}")
     rollback = _rollback(run)
     if rollback:
         out.append(f"- **Rollback:** `{rollback['command']}` (creates a safety checkpoint; run in this repository)")
-    out += ["", "## Overview", run.overall_summary, ""]
+    out += ["", "## Overview", _md_inline(run.overall_summary), ""]
     out += _quality_md(run.quality)
     ai = _ai_dict(run)
     ai_map = _ai_map(ai) if ai else {}
     if risks:
         out.append("## Why it was flagged")
         for r in risks:
-            out.append(f"- **{r.severity.upper()}** · step {r.step}: {r.reason}{_ai_md_suffix(r, ai_map)}")
+            out.append(f"- **{r.severity.upper()}** · step {r.step}: {_md_inline(r.reason)}{_ai_md_suffix(r, ai_map)}")
         out.append("")
     out += _ai_md(ai, risks)
     out += _recs_md(run)
@@ -520,12 +603,16 @@ def to_markdown(run: Run, score: int, level: str, risks: List[Risk]) -> str:
         out.append("## Files changed")
         for c in changes.values():
             tag = " (deleted)" if c.deleted else " (new)" if c.created else ""
-            out.append(f"- `{c.path}`{tag} +{c.added} −{c.removed}")
+            counts = "(binary)" if c.binary else f"+{c.added} −{c.removed}"
+            out.append(f"- {_md_code(c.path)}{tag} {counts}")
         out.append("")
     out.append("## Steps")
     for s in run.steps:
         flag = " ⚠️" if s.risks else ""
-        out.append(f"{s.index}. {s.summary}{flag} — {friendly_model(s.model)}, {_tok(s.usage.total)} tok, {_money(s.cost)}")
+        out.append(f"{s.index}. {_md_summary(s.summary)}{flag} — {friendly_model(s.model)}, {_step_tok(run, s)} tok, {_money(s.cost)}")
+    note = _usage_note(run)
+    if note:
+        out += ["", _md_text(note)]
     return "\n".join(out) + "\n"
 
 
@@ -579,7 +666,8 @@ def to_html(run: Run, score: int, level: str, risks: List[Risk]) -> str:
 
     files_html = "".join(
         f"<tr><td><code>{e(c.path)}</code>{' <span class=pill>deleted</span>' if c.deleted else ' <span class=pill>new</span>' if c.created else ''}</td>"
-        f'<td class="num"><span class="add">+{c.added}</span> <span class="rem">−{c.removed}</span></td></tr>'
+        + ('<td class="num">(binary)</td></tr>' if c.binary else
+           f'<td class="num"><span class="add">+{c.added}</span> <span class="rem">−{c.removed}</span></td></tr>')
         for c in changes.values()
     ) or '<tr><td colspan="2" class="meta">No files changed.</td></tr>'
 
@@ -596,13 +684,17 @@ def to_html(run: Run, score: int, level: str, risks: List[Risk]) -> str:
             + ("".join(f" <span class='sev {r.severity}'>{e(r.reason)}</span>" for r in s.risks))
             + ("" if not s.is_error else " <span class='pill'>error</span>")
             + f"</td><td><span class='pill'>{e(friendly_model(s.model))}</span></td>"
-            f"<td class='num'>{_tok(s.usage.total)}</td><td class='num'>{_money(s.cost)}</td></tr>"
+            f"<td class='num'>{_step_tok(run, s)}</td><td class='num'>{_money(s.cost)}</td></tr>"
         )
     models = ", ".join(f"{friendly_model(m)} ({_tok(u.total)})" for m, u in run.models.items())
     request = e(run.prompts[0][:400]) if run.prompts else "—"
     reported_note = " Reported cost comes from the agent itself." if run.reported_cost is not None else ""
+    usage_note = _usage_note(run)
+    usage_note = f" {e(usage_note)}" if usage_note else ""
     pricing_note = (f'<div class="meta">Unknown model price. {e(PRICING_HELP)}</div>'
                     if unknown_models(run) else "")
+    if UNATTRIBUTED in unpriced(run):
+        pricing_note += f'<div class="meta">Unattributed tokens. {e(UNATTRIBUTED_NOTE)}</div>'
     rollback = _rollback(run)
     rollback_html = (
         f'<div class="meta">Rollback: <code>{e(rollback["command"])}</code> '
@@ -622,7 +714,7 @@ def to_html(run: Run, score: int, level: str, risks: List[Risk]) -> str:
 <div class="grid">
  <div class="card"><span>Risk</span><b style="color:{color}">{score}/100</b><div class="bar"><i style="width:{score}%;background:{color}"></i></div></div>
  {_cost_card(run)}
- <div class="card"><span>Tokens</span><b>{_tok(run.usage.total)}</b></div>
+ <div class="card"><span>Tokens</span><b>{_run_tok(run, run.usage.total)}</b></div>
  <div class="card"><span>Steps</span><b>{len(run.steps)}</b></div>
  <div class="card"><span>Files changed</span><b>{len(changes)}</b></div>
  <div class="card"><span>Duration</span><b>{_dur(run.duration_seconds)}</b></div>
@@ -634,7 +726,7 @@ def to_html(run: Run, score: int, level: str, risks: List[Risk]) -> str:
 {_guard_html(run)}
 <h2>Files changed</h2><table>{files_html}</table>
 <h2>Steps</h2><table><tr><th>#</th><th>What happened</th><th>Model</th><th style="text-align:right">Tokens</th><th style="text-align:right">Cost</th></tr>{''.join(rows)}</table>
-<footer>Models: {e(models or 'n/a')}. Costs estimate model token usage from public API list prices, not actual charges.{reported_note}
+<footer>Models: {e(models or 'n/a')}. Costs estimate model token usage from public API list prices, not actual charges.{reported_note}{usage_note}
 Risk score is rule-based. Generated by RunLedger {__version__} · runledger.site</footer>
 </div></body></html>"""
 

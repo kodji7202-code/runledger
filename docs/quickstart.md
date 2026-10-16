@@ -42,6 +42,26 @@ runledger receipt --format json -o run.json    # JSON, for scripts and the team 
 runledger receipt --format json -o -           # JSON to stdout
 ```
 
+### Safe mode
+
+Markdown and JSON receipts are often pasted into pull requests or committed, so by default they
+are **safe** when they go to stdout (`-o -`) or to a file inside a Git work tree, including the
+default file in the current folder:
+
+- paths inside the repository become relative, and the folder is shown as the repository name
+  plus the subfolder the run started in (`app/src`);
+- the home folder (`/home/<user>`, `/Users/<user>`, `C:\Users\<user>`) becomes `~`;
+- other paths that share leading folders with the repository have that prefix shortened to `…`,
+  as do prefixes you list in `RUNLEDGER_SAFE_PREFIXES` (separated by `:`, or `;` on Windows);
+- temp paths such as `/tmp/...` stay as they are;
+- e-mail addresses become `[EMAIL]`, and `user:pass@` in URLs becomes `[REDACTED]@`.
+
+HTML receipts and files written outside any repository keep full paths, which help debugging.
+`--safe` and `--no-safe` override the default. After writing a file, `receipt` prints the mode
+it used to stderr. JSON receipts record it as `"safe": true` or `false`. Session id, branch,
+models, scores and file counts are the same in both modes. The GitHub pull-request comment is
+always safe. `push` is not changed, because the team server needs the project folder.
+
 Choose a session explicitly with a file path:
 
 ```bash
