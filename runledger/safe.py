@@ -125,8 +125,28 @@ def _path_in_text(match: "re.Match[str]", ctx: SafeContext) -> str:
         return raw
     win = bool(re.match(r"^[A-Za-z]:", core))
     probe = core.replace("\\", "/") if win else core
+    if probe.endswith(ELLIPSIS) and len(probe) > 1:
+        # A path cut short by a summary (`cd /long/path/to/re…`). The cut can fall inside
+        # the repository root itself, so the partial path is never `within` the root and
+        # would otherwise slip through untouched (e.g. a long macOS temp folder).
+        shown = _truncated_path(probe[:-len(ELLIPSIS)], ctx)
+        if shown is not None:
+            return shown + tail
     shown = safe_path(probe, ctx)
     return raw if shown == probe else shown + tail
+
+
+def _truncated_path(base: str, ctx: SafeContext) -> Optional[str]:
+    """Safe form of a path prefix cut by `…`, or None when the normal rules apply."""
+    root = ctx.root
+    if not base or not root or not is_abs(base):
+        return None
+    win = is_windows_style(base, root)
+    b, r = (base.lower(), root.lower()) if win else (base, root)
+    if r.startswith(b):  # the cut falls inside the root (or right at its end)
+        return ELLIPSIS
+    shown = safe_path(base, ctx)
+    return None if shown == base else shown + ELLIPSIS
 
 
 def safe_text(text: Any, ctx: SafeContext) -> str:

@@ -141,3 +141,11 @@ def test_relative_cwd_is_not_resolved_against_the_current_folder(tmp_path, monke
         assert toplevel(str(tmp_path)) is not None
     assert current_branch(".") is None and toplevel(".") is None
     assert not _outside("/srv/elsewhere/a.py", ".")
+
+
+def test_truncated_path_inside_root_is_hidden():
+    from runledger.safe import SafeContext, safe_text
+    ctx = SafeContext(root="/private/var/folders/ab/T/pytest-0/case/repo")
+    assert safe_text("Ran `cd /private/var/folders/ab/T/pytest-0/case/r…`", ctx) == "Ran `cd …`"
+    assert safe_text("cat /private/var/folders/ab/T/pytest-0/case/repo/src/app.…", ctx) == "cat src/app.…"
+    assert safe_text("cat /home/alice/notes/to…", SafeContext(root="/work/repo")) == "cat ~/notes/to…"
