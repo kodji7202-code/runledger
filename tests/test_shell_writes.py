@@ -11,7 +11,7 @@ from runledger.adapters import droid
 from runledger.cli import build, reconcile_git
 from runledger.parser import Run, Step, Usage
 from runledger.receipt import to_dict
-from runledger.shell_writes import ShellWrite, shell_writes
+from runledger.shell_writes import ShellWrite, shell_deletes, shell_writes
 from runledger.summarize import file_changes
 
 FIX = Path(__file__).parent / "fixtures" / "droid_shell_edits.jsonl"
@@ -48,6 +48,7 @@ def _paths(command):
     ("cat <<<word\necho x > c.txt", [("c.txt", 0, False)]),
     ("echo $((1<<2))\necho x > d.txt", [("d.txt", 0, False)]),
     ("# <<EOF\necho x > e.txt", [("e.txt", 0, False)]),
+    ("echo $'it\\'s <<EOF'\necho x > f.txt", [("f.txt", 0, False)]),
     ("python3 - <<'EOF'\nopen('a.py', 'w').write('1\\n')\nEOF\necho x > b.txt", [("a.py", 0, False), ("b.txt", 0, False)]),
     ('cat <<"EOF" > c.txt\nhi\nEOF', [("c.txt", 1, False)]),
     ("cat <<-EOF > d.txt\n\thi\n\tEOF", [("d.txt", 1, False)]),
@@ -71,6 +72,16 @@ def test_detects_shell_writes(command, expected):
 ])
 def test_ignores_reads_and_unresolvable_targets(command):
     assert shell_writes(command) == []
+
+
+@pytest.mark.parametrize("command, expected", [
+    ("echo ok # <<EOF\nrm k.txt", ["k.txt"]),
+    ("echo a#b; rm k.txt", ["k.txt"]),
+    ("printf x # note\nrm k.txt", ["k.txt"]),
+])
+def test_comment_ends_at_the_newline(command, expected):
+    # shlex would swallow the comment's newline and read the next line as arguments.
+    assert shell_deletes(command) == expected
 
 
 def test_droid_fixture_lists_shell_edited_files():

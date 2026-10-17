@@ -17,7 +17,7 @@ from functools import lru_cache
 from typing import List, Optional, Tuple
 
 from .paths import is_abs, is_windows_style, join
-from .shell_syntax import strip_heredocs
+from .shell_syntax import ansi_c_end, strip_heredocs
 
 _HEREDOC = re.compile(r"(?<!<)<<(-?)[ \t]*(['\"]?)([A-Za-z_][\w.-]*)\2")
 _WRITE_OPS = (">", ">>", ">|", "&>", "&>>", "<>")
@@ -104,8 +104,50 @@ def _keep_windows_paths(text: str) -> str:
     return "".join(out)
 
 
+def _shell_text(text: str) -> str:
+    """Normalise a command for the tokenizer: ANSI-C `$'...'` strings become POSIX single
+    quotes, so they read as one word (`$'it\\'s'` becomes `'it'\\''s'`), and `#` comments
+    become spaces. The comment's newline is kept and shlex's own comment handling is off,
+    because shlex would drop that newline and read the next line as part of the same command."""
+    if "$'" not in text and "#" not in text:
+        return text
+    out: List[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and i + 1 < n:
+            out.append(text[i:i + 2])
+            i += 2
+            continue
+        if ch in "'\"":
+            j = i + 1
+            while j < n and text[j] != ch:
+                j += 2 if ch == '"' and text[j] == "\\" and j + 1 < n else 1
+            out.append(text[i:j + 1])
+            i = j + 1
+            continue
+        if text.startswith("$'", i):
+            end = ansi_c_end(text, i)
+            if end == -1:
+                out.append(text[i:])
+                break
+            out.append("'" + text[i + 2:end - 1].replace("'", "'\\''") + "'")
+            i = end
+            continue
+        if ch == "#" and (i == 0 or text[i - 1] in " \t\r\n;&|()<>"):
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            out.append(" " * (j - i))
+            i = j
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def _tokens(text: str) -> Optional[List[str]]:
-    lex = shlex.shlex(_keep_windows_paths(text), posix=True, punctuation_chars="();<>|&\n")
+    lex = shlex.shlex(_keep_windows_paths(_shell_text(text)), posix=True, punctuation_chars="();<>|&\n")
+    lex.commenters = ""
     lex.whitespace = " \t\r"
     lex.whitespace_split = True
     try:

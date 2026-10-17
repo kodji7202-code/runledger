@@ -52,7 +52,7 @@ import re
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from . import paths
 try:
@@ -61,7 +61,7 @@ except Exception:  # pragma: no cover - fallback when runledger.secrets is unava
     secrets = None  # type: ignore[assignment]
 from .parser import Run, Step
 from .ps_writes import ps_writes, shell_kind
-from .shell_syntax import strip_heredocs as _posix_strip_heredocs
+from .shell_syntax import ansi_c_end, strip_heredocs as _posix_strip_heredocs
 from .shell_writes import database_writes, shell_writes
 from .testdiff import SKIP_RE, TestChange, analyze as analyze_test_diffs
 
@@ -592,6 +592,13 @@ def _scan(text: str, ps: bool) -> Tuple[List[tuple], List[Tuple[int, int]]]:
         quoted = False
         while i < n and text[i] not in " \t\r\n;|&()<>":
             ch = text[i]
+            if ch == "$" and text[i + 1:i + 2] == "'":
+                end = ansi_c_end(text, i)
+                j = n if end == -1 else end - 1
+                buf.append(text[i + 2:j])
+                quoted = True
+                i = n if end == -1 else end
+                continue
             if ch == "'":
                 j = text.find("'", i + 1)
                 j = n if j < 0 else j
@@ -1042,8 +1049,11 @@ def _is_project_override_raising(kind: str, level: str) -> bool:
     return False
 
 
-def _project_ignored_or_lowered_kinds(cwd: Optional[str]) -> List[str]:
-    """Distinct risk kinds a project `.runledger.json` tried to ignore or lower."""
+def _project_ignored_or_lowered_kinds(cwd: Optional[str], refused: Optional[Set[str]] = None) -> List[str]:
+    """Distinct risk kinds a project `.runledger.json` tried to ignore or lower.
+
+    `refused` holds the overrides `_apply_policy` refused because they would have lowered a
+    finding's actual severity (the static check below only knows each kind's default)."""
     if not cwd or paths.is_unc(cwd):
         return []
     data = _read_json_dict(Path(cwd) / POLICY_FILE)
@@ -1062,7 +1072,8 @@ def _project_ignored_or_lowered_kinds(cwd: Optional[str]) -> List[str]:
                 continue
             if not isinstance(level, str) or level.lower() not in SEVERITY_POINTS:
                 continue
-            if not _is_project_override_raising(code, level):
+            if (not _is_project_override_raising(code, level)
+                    or code.strip().lower() in (refused or ())):
                 rejected.append(code.strip().lower())
     return list(dict.fromkeys(rejected))
 
@@ -1074,7 +1085,10 @@ def load_policy(cwd: Optional[str]) -> Dict[str, Any]:
     Trust model:
     - User config may set `ignore`, `severity_overrides` (raise or lower), and `extra_secret_paths`.
     - Project config may only add safe `extra_secret_paths` and raise severities in
-      `severity_overrides`; project `ignore` and severity-lowering overrides are ignored.
+      `severity_overrides`; project `ignore` entries are ignored and a project override is
+      applied only when it is higher than the severity of the finding it matches, which is
+      checked per finding in `_apply_policy` (the project's own values are carried in
+      `project_severity_overrides`).
     - `extra_secret_paths` are validated with `secrets.safe_user_regex` and capped at 20.
     """
     policy: Dict[str, Any] = {"ignore": [], "severity_overrides": {}, "extra_secret_paths": []}
@@ -1086,20 +1100,26 @@ def load_policy(cwd: Optional[str]) -> Dict[str, Any]:
         policy["ignore"] = [s.strip() for s in ignore if isinstance(s, str) and s.strip()]
 
     merged_overrides: Dict[str, str] = {}
+    project_only: Dict[str, str] = {}
     proj_overrides = proj_data.get("severity_overrides")
     if isinstance(proj_overrides, dict):
         for code, level in proj_overrides.items():
             if (isinstance(code, str) and code.strip()
-                    and isinstance(level, str) and level.lower() in SEVERITY_POINTS
-                    and _is_project_override_raising(code, level)):
-                merged_overrides[code.strip()] = level.lower()
+                    and isinstance(level, str) and level.lower() in SEVERITY_POINTS):
+                project_only[code.strip()] = level.lower()
 
     user_overrides = user_data.get("severity_overrides")
     if isinstance(user_overrides, dict):
         for code, level in user_overrides.items():
             if isinstance(code, str) and code.strip() and isinstance(level, str) and level.lower() in SEVERITY_POINTS:
-                merged_overrides[code.strip()] = level.lower()
+                key = code.strip()
+                merged_overrides[key] = level.lower()
+                project_only.pop(key, None)
+    for code, level in project_only.items():
+        merged_overrides.setdefault(code, level)
     policy["severity_overrides"] = merged_overrides
+    if project_only:
+        policy["project_severity_overrides"] = project_only
 
     max_extra = getattr(secrets, "MAX_EXTRA_SECRET_PATHS", 20)
     raw_extra: List[str] = []
@@ -1147,12 +1167,14 @@ def _risk_matches_key(r: Risk, key: str, allow_substring: bool = False) -> bool:
     return False
 
 
-def _apply_policy(risks: List[Risk], policy: Dict[str, Any]) -> List[Risk]:
+def _apply_policy(risks: List[Risk], policy: Dict[str, Any],
+                  refused: Optional[Set[str]] = None) -> List[Risk]:
     ignore = []
     for s in policy.get("ignore") or []:
         if isinstance(s, str) and s.strip():
             ignore.append(s.strip().lower())
     overrides = policy.get("severity_overrides") or {}
+    project_only = policy.get("project_severity_overrides") or {}
     kept = []
     for r in risks:
         if any(_risk_matches_key(r, s, allow_substring=True) for s in ignore):
@@ -1160,17 +1182,24 @@ def _apply_policy(risks: List[Risk], policy: Dict[str, Any]) -> List[Risk]:
         for k, level in overrides.items():
             if isinstance(k, str) and isinstance(level, str) and level.lower() in SEVERITY_POINTS:
                 if _risk_matches_key(r, k, allow_substring=False):
-                    r.severity = level.lower()
+                    lv = level.lower()
+                    if k in project_only and SEVERITY_POINTS[lv] < SEVERITY_POINTS[r.severity]:
+                        # A project may raise a risk's severity, never lower it.
+                        if refused is not None:
+                            refused.add(k.lower())
+                        continue
+                    r.severity = lv
         kept.append(r)
     return kept
 
 
 def assess_step(step: Step, cwd: Optional[str], policy: Optional[Dict[str, Any]] = None,
-                workdir: Optional[str] = None) -> List[Risk]:
+                workdir: Optional[str] = None, refused: Optional[Set[str]] = None) -> List[Risk]:
     """Risks for one step. `policy` defaults to `load_policy(cwd)`; `assess`
     passes it in so the config file is read once per run. `workdir` (when given and
     different from `cwd`) is the subfolder relative paths resolve against while `cwd`
-    remains the project boundary."""
+    remains the project boundary. `refused` collects the project severity overrides that
+    were refused as lowering."""
     if policy is None:
         policy = load_policy(cwd)
     extra = _user_regexes(policy.get("extra_secret_paths"))
@@ -1238,7 +1267,7 @@ def assess_step(step: Step, cwd: Optional[str], policy: Optional[Dict[str, Any]]
         if key not in seen:
             seen.add(key)
             uniq.append(r)
-    return _apply_policy(uniq, policy)
+    return _apply_policy(uniq, policy, refused)
 
 
 def _score(risks: List[Risk]) -> int:
@@ -1280,7 +1309,8 @@ def _written_paths(step: Step, cwd: Optional[str]) -> List[str]:
     return out
 
 
-def _apply_test_verdicts(run: Run, changes: List[TestChange], policy: Dict[str, Any]) -> None:
+def _apply_test_verdicts(run: Run, changes: List[TestChange], policy: Dict[str, Any],
+                         refused: Optional[Set[str]] = None) -> None:
     """A test file's Git diff verdict replaces what the per-step Edit rule said about it,
     so one file never reads as both weakened and replaced."""
     verdicts = {c.path: c for c in changes}
@@ -1307,22 +1337,15 @@ def _apply_test_verdicts(run: Run, changes: List[TestChange], policy: Dict[str, 
             risk = Risk("medium", "test_weakened", f"Removed assertions from {name}", step.index)
         else:
             continue
-        step.risks.extend(_apply_policy([risk], policy))
+        step.risks.extend(_apply_policy([risk], policy, refused))
 
 
 def assess(run: Run) -> Tuple[int, str, List[Risk]]:
     policy = load_policy(run.cwd)
-    rejected = _project_ignored_or_lowered_kinds(run.cwd)
-    if rejected:
-        note = (
-            f"Project config tried to ignore/lower {len(rejected)} risk kind(s) "
-            "(not applied; set in user config to enable)."
-        )
-        if note not in run.notes:
-            run.notes.append(note)
+    refused_project: Set[str] = set()
     all_risks: List[Risk] = []
     for s in run.steps:
-        s.risks = assess_step(s, run.cwd, policy)
+        s.risks = assess_step(s, run.cwd, policy, refused=refused_project)
         for r in s.risks:
             # The Git working tree tells a new migration from an edited one.
             m = _MIGRATION_VERB.match(r.reason) if r.code == "db_migration" else None
@@ -1330,9 +1353,17 @@ def assess(run: Run) -> Tuple[int, str, List[Risk]]:
             if status:
                 verb = "Added" if status in ("untracked", "added") else "Changed"
                 r.reason = f"{verb} a database migration ({m.group(1)})"
-    _apply_test_verdicts(run, analyze_test_diffs(run.test_diffs, run.prompts), policy)
+    _apply_test_verdicts(run, analyze_test_diffs(run.test_diffs, run.prompts), policy, refused_project)
     for s in run.steps:
         all_risks.extend(s.risks)
+    rejected = _project_ignored_or_lowered_kinds(run.cwd, refused_project)
+    if rejected:
+        note = (
+            f"Project config tried to ignore/lower {len(rejected)} risk kind(s) "
+            "(not applied; set in user config to enable)."
+        )
+        if note not in run.notes:
+            run.notes.append(note)
     score = _score(all_risks)
     level = "Low" if score < 25 else "Medium" if score < 60 else "High"
     return score, level, all_risks

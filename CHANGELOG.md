@@ -91,6 +91,22 @@ change behavior, so read the entry before you upgrade.
   double quotes, `#` comments, `<<<` here-strings and `$((...))` arithmetic expansions no longer
   start a fake heredoc that hides later commands on subsequent lines from `shell_writes` and
   `risk`.
+- **ANSI-C strings do not start a heredoc (`runledger.shell_syntax`, `runledger.shell_writes`,
+  `runledger.risk`):** `echo $'it\'s <<EOF'` is one word, because a backslash escapes the quote
+  inside `$'...'`, so the commands on the following lines are analysed again in the guard and in
+  receipts instead of being swallowed as a heredoc body.
+- **A `#` comment ends at the newline (`runledger.shell_writes`):** the shell tokenizer no
+  longer reads the line after a comment as arguments of the commented command, so
+  `echo ok # <<EOF` followed by `rm k.txt` still lists `k.txt` as deleted, and `echo a#b` is
+  one word.
+- **A project severity override is compared with the finding it matches (`runledger.risk`):** a
+  project `.runledger.json` still raises severities, but an override below the finding's actual
+  severity (a `shell_outside: medium` override on a delete outside the project, for example) no
+  longer lowers it, and the receipt counts the kind in its "not applied" note.
+- **Cmdlets are only sniffed in command position (`runledger.ps_writes`):** a `Bash` step whose
+  only cmdlet-looking text is quoted or commented (`echo 'Set-Content is a cmdlet'; touch t.txt;
+  rm r.txt`) stays POSIX, so its writes and deletes are listed instead of being lost to the
+  PowerShell extractor, while a real `Set-Content` command word is still analysed as PowerShell.
 - **Tightened `test_skipped` detection:** `sys.exit(`, `process.exit(`, `os._exit(`, `foo.xit(`,
   `taxit(`, `@pytest.mark.xfail` and `.todo(` in test diffs or edits are no longer misclassified
   as disabled tests, while `xit(`, `xdescribe(`, `xtest(`, `xcontext(`, `xspecify(`, `t.Skip(`,
