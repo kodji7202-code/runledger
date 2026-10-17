@@ -98,7 +98,9 @@ matches resumed sessions. Alongside the existing `PreToolUse` guard, it installs
 Each lifecycle hook reads `cwd` and `session_id` from the JSON event on stdin and labels the
 checkpoint with the event name. It does not store the prompt in checkpoint metadata. It emits
 no stdout and returns zero even outside Git or on failure, so it never blocks the agent. Outside a
-Git repository it is silent; a failure inside a repository prints a short warning to stderr. Each
+Git repository it is silent; a repository Git cannot read (for example a malformed `.git/config`,
+or a permission problem) counts as a failure and prints a short warning to stderr, while
+`runledger checkpoint` on its own prints Git's reason. Each
 invocation creates a checkpoint, including resumed sessions and unchanged trees. Prune periodically
 to control retention.
 

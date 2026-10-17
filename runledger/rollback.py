@@ -43,6 +43,54 @@ def _unsupported_reparse_point(path: Path, info: os.stat_result) -> bool:
     return bool(is_junction and is_junction(path))
 
 
+def _repo_discovery_error(result: subprocess.CompletedProcess) -> CheckpointError:
+    """Only a directory that is not in a repository is a silent, expected outcome."""
+    stderr = (result.stderr or b"").decode("utf-8", "replace")
+    if "not a git repository" in stderr.casefold():
+        return NotAGitRepository("Not a Git working tree. Use --cwd DIR inside a Git repository.")
+    detail = next((line.strip() for line in stderr.splitlines() if line.strip()), "")
+    if detail.casefold().startswith("fatal:"):
+        detail = detail[len("fatal:"):].strip()
+    return CheckpointError("Git could not read this repository: " + (detail or "no reason reported"))
+
+
+def _split_ref_records(data: bytes) -> Optional[List[Tuple[bytes, ...]]]:
+    """Split a for-each-ref stream that carries the declared size of every ref's contents.
+
+    Each record is refname, objectname, objecttype, symref, tree, contents size and the
+    contents, NUL-separated and terminated by the record separator. Reading the contents by
+    their declared size keeps a separator inside a commit message inside its own record.
+    Returns None when the stream is not framed as expected, so callers can read refs one by one.
+    """
+    records: List[Tuple[bytes, ...]] = []
+    pos, end = 0, len(data)
+    while pos < end:
+        while pos < end and data[pos:pos + 1] in (b"\r", b"\n"):
+            pos += 1
+        if pos >= end:
+            break
+        fields = []
+        for _ in range(6):
+            stop = data.find(b"\x00", pos)
+            if stop < 0:
+                return None
+            fields.append(data[pos:stop])
+            pos = stop + 1
+        body = b""
+        if fields[5]:
+            if not fields[5].isdigit():
+                return None
+            size = int(fields[5])
+            body = data[pos:pos + size]
+            if len(body) != size:
+                return None
+        if data[pos + len(body):pos + len(body) + 1] != b"\x1e":
+            return None
+        pos += len(body) + 1
+        records.append(tuple(fields[:5]) + (body,))
+    return records
+
+
 @dataclass
 class Checkpoint:
     id: str
@@ -70,6 +118,7 @@ class Plan:
 class Repository:
     def __init__(self, cwd: Optional[str] = None):
         self.root = Path(cwd or os.getcwd()).expanduser().resolve()
+        self._trees: Dict[str, Dict[str, Tuple[str, str]]] = {}
         self.env = dict(os.environ)
         # An inherited alternate index/worktree must not redirect an explicit --cwd.
         for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR",
@@ -78,9 +127,10 @@ class Repository:
                      "GIT_ICASE_PATHSPECS"):
             self.env.pop(name, None)
         self.env["GIT_OPTIONAL_LOCKS"] = "0"
-        result = self._git("rev-parse", "--show-toplevel", "--absolute-git-dir", "--git-common-dir", check=False)
+        result = self._git("rev-parse", "--show-toplevel", "--absolute-git-dir", "--git-common-dir",
+                           check=False, extra_env={"LC_ALL": "C", "LANG": "C"})
         if result.returncode:
-            raise NotAGitRepository("Not a Git working tree. Use --cwd DIR inside a Git repository.")
+            raise _repo_discovery_error(result)
         lines = [ln.rstrip("\r") for ln in os.fsdecode(result.stdout).rstrip("\r\n").split("\n")]
         if len(lines) == 3 and all(lines):
             top, abs_git_dir, common_git_dir = lines
@@ -216,6 +266,10 @@ class Repository:
         return path
 
     def entries(self, tree: str) -> Dict[str, Tuple[str, str]]:
+        """Read a tree once per repository; tree objects never change."""
+        cached = self._trees.get(tree)
+        if cached is not None:
+            return cached
         entries = {}
         for record in self._git("ls-tree", "-r", "-z", "--full-tree", tree).stdout.split(b"\0"):
             if not record:
@@ -229,6 +283,7 @@ class Repository:
             entries[name] = (mode, oid)
         if os.name == "nt" and len({p.casefold() for p in entries}) != len(entries):
             raise CheckpointError("Checkpoint contains case-colliding Windows paths.")
+        self._trees[tree] = entries
         return entries
 
     def create(self, label: str = "", run_id: Optional[str] = None, *,
@@ -253,6 +308,9 @@ class Repository:
 
     @staticmethod
     def _parse_checkpoint_body(checkpoint_id: str, oid: str, tree: str, body: bytes) -> Optional[Checkpoint]:
+        if b"\x1e" in body:
+            # The record separator frames the bulk listing, so a body may never contain it.
+            return None
         try:
             text = body.decode("utf-8").replace("\r\n", "\n")
             title, metadata = text.split("\n\n", 1)
@@ -269,19 +327,23 @@ class Repository:
         except (ValueError, KeyError, TypeError, UnicodeError):
             return None
 
+    @staticmethod
+    def _checkpoint_from_ref(ref: str, oid: str, tree: str, body: bytes) -> Optional[Checkpoint]:
+        if not ref.startswith(PREFIX) or not oid or not tree:
+            return None
+        checkpoint_id = ref[len(PREFIX):]
+        if not ID_RE.fullmatch(checkpoint_id):
+            return None
+        return Repository._parse_checkpoint_body(checkpoint_id, oid, tree, body)
+
     def checkpoints(self) -> List[Checkpoint]:
         result = []
-        fmt = "%(refname)%00%(objectname)%00%(objecttype)%00%(symref)%00%(tree)%00%(contents)%1e"
+        fmt = ("%(refname)%00%(objectname)%00%(objecttype)%00%(symref)%00%(tree)"
+               "%00%(contents:size)%00%(contents)%1e")
         probe = self._git("for-each-ref", f"--format={fmt}", PREFIX, check=False)
-        if probe.returncode == 0 and (not probe.stdout or b"\x00" in probe.stdout):
-            for raw_rec in probe.stdout.split(b"\x1e"):
-                raw_rec = raw_rec.lstrip(b"\r\n")
-                if not raw_rec:
-                    continue
-                parts = raw_rec.split(b"\x00", 5)
-                if len(parts) != 6:
-                    continue
-                ref_b, oid_b, obj_type_b, symref_b, tree_b, contents_b = parts
+        records = _split_ref_records(probe.stdout) if probe.returncode == 0 else None
+        if records is not None:
+            for ref_b, oid_b, obj_type_b, symref_b, tree_b, contents_b in records:
                 if obj_type_b != b"commit" or symref_b:
                     continue  # symbolic refs must never redirect a rollback/prune to a branch
                 try:
@@ -290,32 +352,24 @@ class Repository:
                     tree = tree_b.decode("ascii").strip()
                 except UnicodeError:
                     continue
-                if not ref.startswith(PREFIX) or not oid or not tree:
-                    continue
-                checkpoint_id = ref[len(PREFIX):]
-                if not ID_RE.fullmatch(checkpoint_id):
-                    continue
-                cp = self._parse_checkpoint_body(checkpoint_id, oid, tree, contents_b)
+                cp = self._checkpoint_from_ref(ref, oid, tree, contents_b)
                 if cp is not None:
                     result.append(cp)
             return sorted(result, key=lambda cp: cp.id, reverse=True)
-        refs = (probe.stdout if probe.returncode == 0 else
-                self._git("for-each-ref", "--format=%(refname) %(objectname) %(objecttype) %(symref)", PREFIX).stdout)
+        refs = self._git("for-each-ref",
+                         "--format=%(refname) %(objectname) %(objecttype) %(symref)", PREFIX).stdout
         for line in os.fsdecode(refs).splitlines():
             fields = line.split()
             if len(fields) != 3 or fields[2] != "commit":
                 continue  # symbolic refs must never redirect a rollback/prune to a branch
             ref, oid, _ = fields
-            checkpoint_id = ref[len(PREFIX):]
-            if not ID_RE.fullmatch(checkpoint_id):
-                continue
             raw = self._git("cat-file", "commit", oid).stdout
             try:
                 header, body = raw.split(b"\n\n", 1)
                 tree = header.splitlines()[0].decode("ascii").removeprefix("tree ")
             except (ValueError, IndexError, UnicodeError):
                 continue
-            cp = self._parse_checkpoint_body(checkpoint_id, oid, tree, body)
+            cp = self._checkpoint_from_ref(ref, oid, tree, body)
             if cp is not None:
                 result.append(cp)
         return sorted(result, key=lambda cp: cp.id, reverse=True)

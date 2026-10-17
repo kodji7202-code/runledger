@@ -281,18 +281,31 @@ def test_metadata_selection_and_prune_reject_symbolic_or_foreign_refs(repo, monk
     real_git = repo._git
     deleted = []
 
+    def record(ref, oid, obj_type, symref, tree, body):
+        fields = [ref.encode(), oid.encode(), obj_type.encode(), symref.encode(),
+                  tree.encode(), str(len(body)).encode(), body]
+        return b"\x00".join(fields) + b"\x1e\n"
+
+    def checkpoint_body(cp):
+        meta = dict(version=1, id=cp.id, label=cp.label, created_at=cp.created_at,
+                    run_id=cp.run_id, kind=cp.kind)
+        return ("RunLedger checkpoint\n\n" + json.dumps(meta)).encode()
+
     def run(*args, **kwargs):
         if args[0] == "for-each-ref":
-            lines = [f"{cp.ref} {cp.oid} commit " for cp in checkpoints]
-            lines += [f"{rollback.PREFIX}20261015T150000000000Z-00000000 {first.oid} commit refs/heads/main",
-                      f"{rollback.PREFIX}unknown {'4' * 40} commit ",
-                      f"{rollback.PREFIX}20261015T150000000000Z-00000001 {first.tree} tree "]
-            output = "\n".join(lines).encode()
+            output = b"".join(record(cp.ref, cp.oid, "commit", "", cp.tree, checkpoint_body(cp))
+                              for cp in checkpoints)
+            output += record(f"{rollback.PREFIX}20261015T150000000000Z-00000000", first.oid,
+                             "commit", "refs/heads/main", first.tree, checkpoint_body(first))
+            output += record(f"{rollback.PREFIX}unknown", "4" * 40, "commit", "", first.tree, b"")
+            output += record(f"{rollback.PREFIX}20261015T150000000000Z-00000001", first.tree,
+                             "tree", "", first.tree, b"")
         elif args[0] == "cat-file":
             cp = next(cp for cp in checkpoints if cp.oid == args[-1])
-            meta = dict(version=1, id=cp.id, label=cp.label, created_at=cp.created_at,
-                        run_id=cp.run_id, kind=cp.kind)
-            output = (f"tree {cp.tree}\n\nRunLedger checkpoint\n\n" + json.dumps(meta)).encode()
+            output = (f"tree {cp.tree}\n\nRunLedger checkpoint\n\n"
+                      + json.dumps(dict(version=1, id=cp.id, label=cp.label,
+                                        created_at=cp.created_at, run_id=cp.run_id,
+                                        kind=cp.kind))).encode()
         elif args[0] == "update-ref":
             deleted.append(args)
             output = b""
@@ -848,6 +861,29 @@ def test_hook_outside_repo_is_silent(tmp_path, monkeypatch, capsys):
         assert out.out == "" and out.err == ""
 
 
+def test_non_repository_is_distinguished_from_git_failure(repo, tmp_path):
+    with pytest.raises(rollback.NotAGitRepository):
+        rollback.Repository(str(tmp_path))
+    config = repo.root / ".git" / "config"
+    config.write_text(config.read_text(encoding="utf-8") + "malformed line here\n", encoding="utf-8")
+    with pytest.raises(rollback.CheckpointError) as failure:
+        rollback.Repository(str(repo.root))
+    assert not isinstance(failure.value, rollback.NotAGitRepository)
+
+
+def test_hook_warns_when_repository_discovery_fails(repo, monkeypatch, capsys):
+    config = repo.root / ".git" / "config"
+    config.write_text(config.read_text(encoding="utf-8") + "malformed line here\n", encoding="utf-8")
+    event = dict(cwd=str(repo.root), session_id="s", hook_event_name="SessionStart")
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(event)))
+    assert main(["checkpoint", "--hook"]) == 0
+    out = capsys.readouterr()
+    assert out.out == "" and "checkpoint unavailable" in out.err
+    assert main(["checkpoint", "--cwd", str(repo.root)]) == 1
+    err = capsys.readouterr().err
+    assert "bad config" in err and "Not a Git working tree" not in err
+
+
 def test_hook_failure_is_nonblocking(repo, monkeypatch, capsys):
     (repo.root / ".git" / "refs" / "runledger").write_text("blocker\n", encoding="utf-8")
     event = dict(cwd=str(repo.root), session_id="s", hook_event_name="SessionStart")
@@ -855,6 +891,17 @@ def test_hook_failure_is_nonblocking(repo, monkeypatch, capsys):
     assert main(["checkpoint", "--hook"]) == 0
     out = capsys.readouterr()
     assert out.out == "" and "checkpoint unavailable" in out.err
+
+
+def forge_checkpoint_with_separator(repo, checkpoint_id, tree, tail=b"\x1e" + b"junk\n"):
+    """Publish a ref whose commit body is a valid record followed by a raw record separator."""
+    metadata = dict(version=1, id=checkpoint_id, created_at="2026-10-15T15:00:00+00:00",
+                    label="forged", run_id="run-forged", kind="checkpoint")
+    message = ("RunLedger checkpoint\n\n" + json.dumps(metadata) + "\n").encode() + tail
+    oid = repo._git("commit-tree", tree, data=message,
+                    extra_env=repo._checkpoint_identity()).stdout.decode("ascii").strip()
+    git(repo.root, "update-ref", rollback.PREFIX + checkpoint_id, oid)
+    return oid
 
 
 def test_checkpoints_listing_spawn_count_constant(repo, monkeypatch):
@@ -873,6 +920,7 @@ def test_checkpoints_listing_spawn_count_constant(repo, monkeypatch):
         extra_env=repo._checkpoint_identity()
     ).stdout.decode("ascii").strip()
     git(repo.root, "update-ref", f"{rollback.PREFIX}20261015T150000000000Z-00000003", malformed_oid)
+    forge_checkpoint_with_separator(repo, "20261015T150000000000Z-00000004", created[0].tree)
 
     calls = []
     real_run = subprocess.run
@@ -885,6 +933,36 @@ def test_checkpoints_listing_spawn_count_constant(repo, monkeypatch):
     listed = rollback.Repository(str(repo.root)).checkpoints()
     assert [cp.id for cp in listed] == [cp.id for cp in reversed(created)]
     assert len(calls) <= 3
+
+
+def test_records_containing_the_record_separator_are_rejected(repo, capsys):
+    genuine = repo.create(label="genuine", run_id="run-1")
+    early = "20261015T150000000000Z-0badc0de"
+    late = "20261231T235959000000Z-0badc0de"
+    forge_checkpoint_with_separator(repo, early, genuine.tree)
+    forge_checkpoint_with_separator(repo, late, genuine.tree)
+
+    assert [cp.id for cp in repo.checkpoints()] == [genuine.id]
+    assert main(["checkpoints", "--cwd", str(repo.root)]) == 0
+    printed = capsys.readouterr().out
+    assert genuine.id in printed
+    assert early not in printed and late not in printed
+    assert main(["rollback", early, "--dry-run", "--cwd", str(repo.root)]) == 1
+    assert "No matching checkpoint" in capsys.readouterr().err
+
+
+def test_listing_falls_back_to_per_ref_reads_when_git_rejects_the_format(repo, monkeypatch):
+    created = repo.create(label="fallback", run_id="run-fallback")
+    real_git = repo._git
+
+    def run(*args, **kwargs):
+        if args[0] == "for-each-ref" and any("%(contents:size)" in arg for arg in args):
+            return subprocess.CompletedProcess(args, 128, stdout=b"",
+                                               stderr=b"fatal: unknown field name: contents:size\n")
+        return real_git(*args, **kwargs)
+
+    monkeypatch.setattr(repo, "_git", run)
+    assert [cp.id for cp in repo.checkpoints()] == [created.id]
 
 
 
