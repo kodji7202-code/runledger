@@ -252,3 +252,64 @@ def test_guard_text_is_redacted_and_escaped_in_receipts(session):
     run.guard[0]["reason"] = secret
     redact_run(run, [])
     assert secret not in run.guard[0]["reason"]
+
+
+def test_receipt_reads_root_and_legacy_subfolder_guard_logs_with_dedup(tmp_path, capsys):
+    from runledger import guard
+
+    r = tmp_path / "R"
+    pkg = r / "pkg"
+    pkg.mkdir(parents=True)
+    (r / ".git").mkdir()
+
+    # Run hook from cwd=R/pkg with session_id="s-guard1" -> logs to R/.runledger/guard.log
+    ev1 = {
+        "session_id": "s-guard1", "cwd": str(pkg), "hook_event_name": "PreToolUse",
+        "tool_name": "Bash", "tool_use_id": "t-deny-1", "tool_input": {"command": "rm -rf /"},
+    }
+    guard.handle(json.dumps(ev1))
+    root_log = r / ".runledger" / "guard.log"
+    assert root_log.exists()
+    assert not (pkg / ".runledger" / "guard.log").exists()
+    root_line = root_log.read_text(encoding="utf-8").splitlines()[0]
+
+    session_file = tmp_path / "s-guard1.jsonl"
+    session_file.write_text(json.dumps({
+        "type": "assistant", "sessionId": "s-guard1", "cwd": str(pkg),
+        "message": {"id": "m1", "content": [{
+            "type": "tool_use", "id": "t-deny-1", "name": "Bash",
+            "input": {"command": "rm -rf /"},
+        }]},
+    }) + "\n", encoding="utf-8")
+
+    assert main(["receipt", str(session_file), "--format", "json", "-o", "-"]) == 0
+    receipt1 = json.loads(capsys.readouterr().out)
+    assert len(receipt1["guard"]) == 1
+    assert receipt1["guard"][0]["decision"] == "deny"
+    assert receipt1["guard"][0]["outcome"] == "Blocked by Guard"
+    assert receipt1["totals"]["guard"]["blocked"] == 1
+
+    # Add a legacy log at R/pkg/.runledger/guard.log with a second decision + exact copy of root_line
+    legacy_log = pkg / ".runledger" / "guard.log"
+    legacy_log.parent.mkdir(parents=True)
+    second_rec = json.dumps({
+        "ts": "2026-04-20T12:00:05+00:00",
+        "session_id": "s-guard1",
+        "tool_use_id": "t-deny-2",
+        "tool": "Bash",
+        "summary": "rm -rf /var/data",
+        "mode": "enforce",
+        "decision": "deny",
+        "policy_decision": "deny",
+        "approval": None,
+        "codes": ["command"],
+        "reason": "Recursive force delete (rm -rf /)",
+    })
+    legacy_log.write_text(root_line + "\n" + second_rec + "\n", encoding="utf-8")
+
+    assert main(["receipt", str(session_file), "--format", "json", "-o", "-"]) == 0
+    receipt2 = json.loads(capsys.readouterr().out)
+    assert len(receipt2["guard"]) == 2
+    assert [g["summary"] for g in receipt2["guard"]] == ["rm -rf /", "rm -rf /var/data"]
+    assert receipt2["totals"]["guard"]["blocked"] == 2
+

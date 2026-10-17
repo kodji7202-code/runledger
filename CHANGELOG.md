@@ -14,8 +14,23 @@ change behavior, so read the entry before you upgrade.
   `RUNLEDGER_CONFIG`). A project `.runledger.json` may raise severities and add safe
   `extra_secret_paths`; if it tries to ignore or lower risk kinds, the receipt keeps the findings
   and adds a note.
+- **`runledger guard install` writes interpreter-bound hook commands by default:** `guard install`
+  writes `"<sys.executable>" -m runledger guard` and `"<sys.executable>" -m runledger checkpoint --hook`
+  so the hooks run without `runledger` on `PATH` and when the Python path contains spaces, upgrades
+  earlier bare `runledger ...` hook entries in place, and verifies the configured command exits `0`
+  on empty JSON input. Pass `--portable` to write bare `runledger ...` commands for checked-in
+  settings files.
 
 ### Fixed
+
+- **Guard project root resolution and subfolder support (`runledger.guard`, `runledger.guard_receipt`, `runledger.risk`):**
+  the guard resolves the project root from `CLAUDE_PROJECT_DIR` / `FACTORY_PROJECT_DIR` /
+  `DROID_PROJECT_DIR`, else the Git top-level walked up from the event's `cwd`, else `cwd`. Policy
+  is read from `<project_root>/.runledger.json`, `.runledger/guard.log` is written only at the
+  project root, `write_outside` / `read_outside` / `shell_outside` use the project root as the
+  boundary while resolving relative paths against the event's `cwd`, and receipts load both root
+  and legacy subfolder guard logs with de-duplication. Running `runledger guard` interactively with
+  a TTY stdin now prints help and exits `2` instead of blocking.
 
 - **Unified secret detection and redaction (`runledger.secrets`):** `risk`, `guard` and `llm` share
   one leaf rule set for secret content and secret file paths, resolving `sk-proj-` and 30-character

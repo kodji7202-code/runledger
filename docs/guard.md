@@ -22,23 +22,32 @@ Contents:
 runledger guard install                  # this project: writes .claude/settings.json
 runledger guard install --project PATH   # the project at PATH instead of the current folder
 runledger guard install --global         # every project: writes ~/.claude/settings.json
+runledger guard install --portable       # write bare "runledger ..." commands instead of "<python>" -m runledger ...
 runledger guard uninstall                # remove it from this project (also --project PATH, --global)
 runledger guard test 'EVENT_JSON'        # print the decision for one event; writes no log
 ```
 
-`install` adds one entry to `hooks.PreToolUse`, with matcher `*`, command `runledger guard` and a
-`timeout`. It also adds `runledger checkpoint --hook` to `SessionStart` and `UserPromptSubmit`
-so each run and prompt gets a rollback point. These checkpoint hooks require Git, but no identity
+`install` adds one entry to `hooks.PreToolUse`, with matcher `*`, command
+`"<sys.executable>" -m runledger guard` (or bare `runledger guard` with `--portable`) and a
+`timeout`. It also adds `"<sys.executable>" -m runledger checkpoint --hook` (or bare
+`runledger checkpoint --hook` with `--portable`) to `SessionStart` and `UserPromptSubmit`
+so each run and prompt gets a rollback point. Using the current Python interpreter path by default
+means the hook works even when `runledger` is installed in a virtual environment that is not on the
+`PATH` Claude Code starts with, and when the interpreter path contains spaces.
+After writing `settings.json`, `install` runs the configured hook command once with `{}` on stdin
+(timeout 15 seconds) to verify it exits `0`, and prints a warning if it cannot be run.
+These checkpoint hooks require Git, but no identity
 setup. They never block the agent and do not store prompt text in checkpoint metadata.
 See [rollback.md](rollback.md) for setup, privacy, retention, and undo.
 
 It keeps every other setting. Before it changes a file it copies the file to
-`settings.json.bak`, replacing any earlier backup. If the file already has a guard entry, its
-timeout is updated in place and no second entry is added. If nothing would change, the file is not
+`settings.json.bak`, replacing any earlier backup. If the file already has a guard or checkpoint entry, its
+command and timeout are updated in place and no second entry is added. If nothing would change, the file is not
 written. If the file is not valid JSON or is not an object, `install` stops with an error and
 changes nothing.
 
-`uninstall` removes every `runledger guard` hook and both lifecycle checkpoint hooks from the
+`uninstall` removes every `runledger guard` hook and both lifecycle checkpoint hooks (both interpreter-form
+and bare `--portable` entries) from the
 chosen settings file and keeps everything
 else, including other hooks in the same group. A group left empty is removed, and so are an empty
 event list and an empty `hooks` object. The file is copied to `settings.json.bak` first. If
@@ -48,9 +57,19 @@ are.
 Choose one scope. Each settings file you install into gets its own entry, so installing in both
 `~/.claude/settings.json` and a project's `.claude/settings.json` would check every call twice.
 
-The hook runs `runledger`, so the command must be on the PATH that Claude Code uses. A `pip install`
-into a virtual environment puts it there only while that environment is active. Use a global
-install if Claude Code starts from another shell.
+When `runledger guard` is run interactively in a terminal (stdin is a TTY) with no subcommand, it
+prints the `guard` help text and exits with code `2` instead of waiting on stdin.
+
+**Project root resolution.** For every hook call, the guard resolves the project root in order:
+1. `CLAUDE_PROJECT_DIR`, `FACTORY_PROJECT_DIR`, or `DROID_PROJECT_DIR` (when set to an existing absolute directory).
+2. The Git top-level directory walked up from the event's `cwd`.
+3. The event's `cwd`.
+
+The guard always reads `<project_root>/.runledger.json`, writes `<project_root>/.runledger/guard.log`,
+and evaluates `write_outside`, `read_outside` and `shell_outside` against `<project_root>` (while
+resolving relative paths in the step against the event's `cwd`), so running a tool from a subfolder
+still enforces the root policy and keeps one log at the project root. Receipts read `<project_root>/.runledger/guard.log`
+as well as any legacy subfolder `.runledger/guard.log` and de-duplicate identical entries.
 
 **Hook timeout.** `install` writes the hook timeout as the approval wait plus 15 seconds: 135
 seconds with the default wait of 120 seconds. The hook must outlive the approval wait, or the

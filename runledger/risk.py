@@ -283,20 +283,28 @@ _key = paths.key
 _within = paths.within
 
 
-def _in_temp(target: str, self_only: bool = False) -> bool:
+def _in_temp(target: str, self_only: bool = False, cwd: Optional[str] = None) -> bool:
     for env_var in ("HOME", "USERPROFILE"):
         h = os.environ.get(env_var)
         if h and _within(target, h) and not _APPDATA_TEMP_RE.search(target[len(h):]):
             return False
-    if not self_only and _APPDATA_TEMP_RE.search(target):
+    if not self_only and _APPDATA_TEMP_RE.search(target) and not (cwd and _APPDATA_TEMP_RE.search(cwd)):
         return True
     roots = list(_POSIX_TEMP_ROOTS)
+    for var in ("TMPDIR", "TEMP", "TMP"):
+        v = os.environ.get(var)
+        if v:
+            roots.append(v)
     try:
         roots.append(tempfile.gettempdir())
     except OSError:  # no usable temp directory
         pass
-    # Filesystem roots (e.g. TMPDIR=/) would make everything "temp"; skip them.
-    return any(_within(target, r) for r in roots if r and not _WIN_ROOT_RE.match(r))
+    # Filesystem roots (e.g. TMPDIR=/) or temp dirs containing cwd itself would make sibling folders "temp"; skip them.
+    return any(
+        _within(target, r)
+        for r in roots
+        if r and not _WIN_ROOT_RE.match(r) and not (cwd and _within(cwd, r))
+    )
 
 
 def _is_device(p: str) -> bool:
@@ -383,7 +391,7 @@ def _outside(path: str, cwd: Optional[str], base: Optional[str] = None, self_tem
     # _is_abs, not mod.isabs: ntpath.isabs("/tmp") is False on Python 3.13+
     target = path if _is_abs(path) else mod.join(base or cwd, path)
     if not _within(target, cwd):
-        return not _in_temp(target, self_only=self_temp_only)
+        return not _in_temp(target, self_only=self_temp_only, cwd=cwd)
     return _escapes_via_realpath(target, cwd)
 
 
@@ -852,14 +860,17 @@ def _code_view(text: str, comments: List[Tuple[int, int]], text_words: List[_Wor
     return out
 
 
-def _shell_risks(step: Step, cwd: Optional[str], extra: List["re.Pattern"], risks: List[Risk]) -> None:
+def _shell_risks(step: Step, cwd: Optional[str], extra: List["re.Pattern"], risks: List[Risk],
+                 default_workdir: Optional[str] = None) -> None:
     cmd = str(step.input.get("command") or "")
     ps = shell_kind(step) == "powershell"
 
     wd = step.input.get("workdir")
-    workdir = wd.strip() if isinstance(wd, str) and _is_abs(wd.strip()) else None
-    if workdir and cwd and _outside(workdir, cwd):
-        risks.append(Risk("medium", "shell_outside", f"Ran a command outside the working folder ({workdir})", step.index))
+    explicit_wd = wd.strip() if isinstance(wd, str) and _is_abs(wd.strip()) else None
+    if explicit_wd and cwd and _outside(explicit_wd, cwd):
+        risks.append(Risk("medium", "shell_outside", f"Ran a command outside the working folder ({explicit_wd})", step.index))
+    sub_wd = default_workdir if (default_workdir and default_workdir != cwd and _is_abs(default_workdir)) else None
+    workdir = explicit_wd or sub_wd
 
     prepared = _strip_heredocs(cmd, ps)
     items, comments = _scan(prepared, ps)
@@ -907,12 +918,13 @@ def _migration_risk(path: str, verb: str, cwd: Optional[str], index: int, risks:
         risks.append(Risk("medium", "db_migration", f"{verb} a database migration ({_project_path(path, cwd)})", index))
 
 
-def _shell_write_risks(step: Step, cwd: Optional[str], extra: List["re.Pattern"], risks: List[Risk]) -> None:
+def _shell_write_risks(step: Step, cwd: Optional[str], extra: List["re.Pattern"], risks: List[Risk],
+                       default_workdir: Optional[str] = None) -> None:
     """The files a shell command writes (shell_writes / ps_writes) get the checks edit-tool
     writes get, and commands that change a database file or run migrations are reported."""
     cmd = str(step.input.get("command") or "")
     wd = step.input.get("workdir")
-    base = wd.strip() if isinstance(wd, str) and _is_abs(wd.strip()) else cwd
+    base = wd.strip() if isinstance(wd, str) and _is_abs(wd.strip()) else (default_workdir or cwd)
     flagged_outside = {_key(r.reason.rsplit("(", 1)[-1].rstrip(")"), False)
                        for r in risks if r.code == "shell_outside" and r.step == step.index}
     is_ps = shell_kind(step) == "powershell"
@@ -1108,24 +1120,28 @@ def _apply_policy(risks: List[Risk], policy: Dict[str, Any]) -> List[Risk]:
     return kept
 
 
-def assess_step(step: Step, cwd: Optional[str], policy: Optional[Dict[str, Any]] = None) -> List[Risk]:
+def assess_step(step: Step, cwd: Optional[str], policy: Optional[Dict[str, Any]] = None,
+                workdir: Optional[str] = None) -> List[Risk]:
     """Risks for one step. `policy` defaults to `load_policy(cwd)`; `assess`
-    passes it in so the config file is read once per run."""
+    passes it in so the config file is read once per run. `workdir` (when given and
+    different from `cwd`) is the subfolder relative paths resolve against while `cwd`
+    remains the project boundary."""
     if policy is None:
         policy = load_policy(cwd)
     extra = _user_regexes(policy.get("extra_secret_paths"))
     risks: List[Risk] = []
     tool = step.tool
     paths = _paths_in_step(step)
+    base = workdir if (workdir and workdir != cwd and _is_abs(workdir)) else None
 
     for p in paths:
         if _is_secret(p, extra):
             verb = {"Read": "Read", "Delete": "Deleted"}.get(tool, "Modified")
             risks.append(Risk("high", "secret_file", f"{verb} a secrets file ({_basename(p)})", step.index))
-        if (tool in WRITE_TOOLS or tool in DELETE_TOOLS) and _outside(p, cwd):
+        if (tool in WRITE_TOOLS or tool in DELETE_TOOLS) and _outside(p, cwd, base=base):
             verb = "Deleted" if tool in DELETE_TOOLS else "Wrote"
             risks.append(Risk("high", "write_outside", f"{verb} outside the working folder ({p})", step.index))
-        elif _outside(p, cwd):
+        elif _outside(p, cwd, base=base):
             risks.append(Risk("low", "read_outside", f"Read outside the working folder ({p})", step.index))
 
     if tool in DELETE_TOOLS:
@@ -1153,7 +1169,8 @@ def assess_step(step: Step, cwd: Optional[str], policy: Optional[Dict[str, Any]]
             risks.append(Risk("medium", "test_weakened", f"Removed assertions from {_basename(paths[0])}", step.index))
 
     if tool in ("Write", "Edit", "MultiEdit") and paths:
-        _migration_risk(paths[0], "Wrote" if tool == "Write" else "Changed", cwd, step.index, risks)
+        _migration_risk(_resolved(paths[0], base) if base else paths[0],
+                        "Wrote" if tool == "Write" else "Changed", cwd, step.index, risks)
 
     if tool in WRITE_TOOLS:
         name = _basename(paths[0]) if paths else "a file"
@@ -1162,8 +1179,8 @@ def assess_step(step: Step, cwd: Optional[str], policy: Optional[Dict[str, Any]]
                 risks.append(Risk("high", "secret_in_content", f"Wrote a hardcoded {kind} into {name}", step.index))
 
     if tool in SHELL_TOOLS:
-        _shell_risks(step, cwd, extra, risks)
-        _shell_write_risks(step, cwd, extra, risks)
+        _shell_risks(step, cwd, extra, risks, default_workdir=base)
+        _shell_write_risks(step, cwd, extra, risks, default_workdir=base)
 
     if tool.startswith("mcp__"):
         risks.append(Risk("low", "mcp", f"Called an external MCP tool ({tool.split('__', 2)[-1]})", step.index))
