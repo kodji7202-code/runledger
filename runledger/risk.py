@@ -644,7 +644,9 @@ def _join_spaced_drive_paths(text: str, words: List[_Word]) -> List[_Word]:
     """`type E:\\Work\\Client X\\secret.txt` and `echo hi > E:\\Work\\Client y\\z.txt`: an unquoted
     drive path with spaces is read as one word, so a finding names the whole path and safe mode
     can mask it whole instead of a fragment. Redirection targets are joined too, and the merged
-    word keeps the redirect's role so the write check reads the same path the tokenizers do."""
+    word keeps the redirect's role so the write check reads the same path the tokenizers do.
+    This is the display reading: `_swallowed_operands` gives the words it merged their own
+    reading back, so joining decides how a path is shown, never whether it is checked."""
     out: List[_Word] = []
     mergeable = ("word", "write", "read")
     i = 0
@@ -661,6 +663,45 @@ def _join_spaced_drive_paths(text: str, words: List[_Word]) -> List[_Word]:
         out.append(w)
         i += 1
     return out
+
+
+def _swallowed_operands(words: List[_Word], group: List[Tuple[_Word, int]], ps: bool
+                        ) -> List[Tuple[_Word, int]]:
+    """The operands the spaced-path join swallowed in one simple command, each paired with the
+    strongest severity the joined word it was read as part of reported (0 when it reported none).
+
+    The join reads an unquoted drive path with spaces as one path, so a finding names the whole
+    folder name and safe mode masks it whole. That is the display reading; the shell reads the
+    same text its own way, and an operand of that reading can still leave the project
+    (`rm C:/repo/a.txt nested/../../outside.txt`). Roles and delete arguments are recomputed for
+    that second reading on copies, `words` being the shell's own word list."""
+    if len(words) <= len(group):
+        return []  # nothing was joined here: both readings are the same word list
+    members: List[Tuple[_Word, int, List[_Word]]] = []
+    j = 0
+    for w, floor in group:
+        parts: List[_Word] = []
+        while j < len(words) and words[j].end <= w.end:
+            if words[j].start >= w.start:
+                parts.append(words[j])
+            j += 1
+        members.append((w, floor, parts))
+    if not any(len(parts) > 1 for _, _, parts in members):
+        return []
+    copies = [_Word(w.value, w.start, w.end, w.quoted, w.role, w.delete, w.base) for w in words]
+    _plan(copies, ps)
+    by_span = {(c.start, c.end): c for c in copies}
+    out: List[Tuple[_Word, int]] = []
+    for _, floor, parts in members:
+        if len(parts) < 2:
+            continue
+        out += [(by_span[(p.start, p.end)], floor) for p in parts]
+    return [(m, floor) for m, floor in out if m.role in ("word", "write", "read")]
+
+
+def _strongest(risks: List[Risk]) -> int:
+    """Severity points of the most severe finding in `risks`, 0 when there is none."""
+    return max((SEVERITY_POINTS[r.severity] for r in risks), default=0)
 
 
 def _redir_role(op: str, value: str) -> str:
@@ -959,7 +1000,8 @@ def _shell_risks(step: Step, cwd: Optional[str], extra: List["re.Pattern"], risk
 
     prepared = _strip_heredocs(cmd, ps)
     items, comments = _scan(prepared, ps)
-    cmds = [_join_spaced_drive_paths(prepared, words) for words in _simple_commands(items)]
+    shell_cmds = _simple_commands(items)
+    cmds = [_join_spaced_drive_paths(prepared, words) for words in shell_cmds]
     names = [_plan(words, ps) for words in cmds]
     text_words = [w for words in cmds for w in words if w.role == "text"]
     code = _code_view(prepared, comments, text_words)
@@ -974,19 +1016,30 @@ def _shell_risks(step: Step, cwd: Optional[str], extra: List["re.Pattern"], risk
         risks.append(Risk("high", "command", "Ran a command with sudo", step.index))
 
     assigns: Dict[str, Optional[str]] = {}
-    for words, name in zip(cmds, names):
+    for words, name, shell_words in zip(cmds, names, shell_cmds):
         if ps and any(
             not w.quoted and (w.value.lower() == "-whatif" or w.value.lower().startswith("-whatif:"))
             and not w.value.lower().endswith("$false")
             for w in words
         ):
             continue
+        joined: List[Tuple[_Word, int]] = []
         for w in words:
             if w.role == "assign":
                 var, _, val = w.value.partition("=")
                 assigns[var] = _expand(val, assigns)
             elif w.role in ("word", "write", "read"):
-                _check_shell_word(w, name or "", cwd, workdir, extra, assigns, step, risks, flagged)
+                found: List[Risk] = []
+                _check_shell_word(w, name or "", cwd, workdir, extra, assigns, step, found, flagged)
+                risks.extend(found)
+                joined.append((w, _strongest(found)))
+        # The second reading of the same text: every word a join swallowed is an operand of its
+        # own there. A swallowed operand is only reported when it is more severe than everything
+        # the joined word said about that text, so joining can never lower a finding.
+        for w, floor in _swallowed_operands(shell_words, joined, ps):
+            found = []
+            _check_shell_word(w, name or "", cwd, workdir, extra, assigns, step, found, flagged)
+            risks.extend([r for r in found if SEVERITY_POINTS[r.severity] > floor])
     return flagged
 
 

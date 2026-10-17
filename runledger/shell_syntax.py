@@ -48,6 +48,9 @@ def find_heredocs(text: str) -> List[Heredoc]:
     Ignores `<<` inside `'...'`, ANSI-C `$'...'` (where `\\'` does not end the string and a
     literal newline does not either), plain `"..."`, `#` comments, `$((...))` arithmetic, and
     `<<<` here-strings, while recognizing `<<` inside `"$(...)"` command substitutions.
+
+    A queued heredoc takes its body from the newline that ends the command line, so a newline
+    inside a quoted string (a multiline `$'...'` or `"..."`) leaves the body queued.
     """
     if "<<" not in text:
         return []
@@ -107,11 +110,6 @@ def find_heredocs(text: str) -> List[Heredoc]:
 
         if mode == "sq":
             q = text.find("'", i)
-            nl = text.find("\n", i) if pending else -1
-            if nl != -1 and (q == -1 or nl < q):
-                i = consume_pending(nl)
-                line_start = i
-                continue
             if q == -1:
                 break
             stack.pop()
@@ -120,13 +118,6 @@ def find_heredocs(text: str) -> List[Heredoc]:
 
         if mode == "ansic":
             close = ansi_c_end(text, ansic_start)
-            nl = text.find("\n", i) if pending else -1
-            if nl != -1 and (close == -1 or nl < close):
-                i = consume_pending(nl)
-                line_start = i
-                if close != -1 and close <= i:
-                    stack.pop()
-                continue
             if close == -1:
                 break
             stack.pop()
@@ -135,11 +126,6 @@ def find_heredocs(text: str) -> List[Heredoc]:
 
         if mode == "arith":
             close = text.find("))", i)
-            nl = text.find("\n", i) if pending else -1
-            if nl != -1 and (close == -1 or nl < close):
-                i = consume_pending(nl)
-                line_start = i
-                continue
             if close == -1:
                 break
             stack.pop()
@@ -153,10 +139,6 @@ def find_heredocs(text: str) -> List[Heredoc]:
             i = m_tok.start()
             ch = text[i]
             if ch == "\n":
-                if pending:
-                    i = consume_pending(i)
-                    line_start = i
-                    continue
                 i += 1
                 line_start = i
                 continue

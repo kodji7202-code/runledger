@@ -101,6 +101,16 @@ def test_spaced_drive_path_does_not_swallow_a_relative_operand(command, deleted,
 
 
 @pytest.mark.parametrize("command, expected", [
+    ("echo <<EOF $'first\nsecond'\npayload\nEOF\nrm k.txt", ["k.txt"]),
+])
+def test_a_queued_heredoc_starts_after_the_command_line(command, expected):
+    """CORE-SCR-R3-002: a nested newline inside a multiline `$'...'` string is not the end of
+    the command line, so the heredoc body starts at the real terminator and the delete after
+    its `EOF` line stays visible."""
+    assert shell_deletes(command) == expected
+
+
+@pytest.mark.parametrize("command, expected", [
     ("echo ok # <<EOF\nrm k.txt", ["k.txt"]),
     ("echo a#b; rm k.txt", ["k.txt"]),
     ("printf x # note\nrm k.txt", ["k.txt"]),

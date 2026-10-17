@@ -102,6 +102,35 @@ def test_default_asks_again_for_an_operand_after_a_spaced_drive_path(tmp_path):
     assert any(r["code"] == "shell_outside" and r["severity"] == "high" for r in d["risks"])
 
 
+@pytest.mark.parametrize("template", [
+    "rm {root}/sub/a.txt nested/../../outside.txt",
+    "rm {root}/sub/a.txt > {root}/sub/log nested/../../outside.txt",
+    "rm < {root}/sub/input nested/../../outside.txt",
+])
+def test_default_asks_again_for_a_traversing_operand_after_a_spaced_drive_path(tmp_path, template):
+    """CORE-SCR-R3-001: `nested/../../outside.txt` climbs out of the project, so its high
+    finding survives the display join and the default guard asks instead of deleting it."""
+    repo = tmp_path / "client work"
+    repo.mkdir()
+    command = template.format(root=str(repo).replace(chr(92), "/"))
+    d = guard.decide(bash_event(repo, command), {})
+    assert d["policy_decision"] == "ask"
+    assert d["decision"] == "ask"
+    outside = [r for r in d["risks"] if r["code"] == "shell_outside"
+               and r["severity"] == "high" and r["reason"].endswith("(nested/../../outside.txt)")]
+    assert len(outside) == 1
+
+
+def test_default_denies_a_delete_after_a_queued_heredoc_past_a_multiline_ansi_c_string(tmp_path):
+    """CORE-SCR-R3-002: a newline inside `$'...'` is part of that word, not the end of the
+    command line, so the queued heredoc starts after the real terminator and the `rm -rf`
+    following it is still read: the default guard denies it."""
+    command = "echo <<EOF $'first\nsecond'\npayload\nEOF\nrm -rf ./build"
+    d = guard.decide(bash_event(tmp_path, command), {})
+    assert d["decision"] == "deny"
+    assert "command" in d["codes"]
+
+
 def test_default_allows_ls_and_prints_nothing(tmp_path):
     d = guard.decide(bash_event(tmp_path, "ls"), {})
     assert d["decision"] == "allow"
