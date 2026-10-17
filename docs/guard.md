@@ -19,7 +19,7 @@ Contents:
 ## Install and test
 
 ```bash
-runledger guard install                  # this project: writes .claude/settings.json
+runledger guard install                  # this project (see project root below): writes <project root>/.claude/settings.json
 runledger guard install --project PATH   # the project at PATH instead of the current folder
 runledger guard install --global         # every project: writes ~/.claude/settings.json
 runledger guard install --portable       # write bare "runledger ..." commands instead of "<python>" -m runledger ...
@@ -34,8 +34,11 @@ runledger guard test 'EVENT_JSON'        # print the decision for one event; wri
 so each run and prompt gets a rollback point. Using the current Python interpreter path by default
 means the hook works even when `runledger` is installed in a virtual environment that is not on the
 `PATH` Claude Code starts with, and when the interpreter path contains spaces.
+Without `--project`, the settings file is written at the project root, so installing from a
+subfolder configures the whole project.
 After writing `settings.json`, `install` runs the configured hook command once with `{}` on stdin
-(timeout 15 seconds) to verify it exits `0`, and prints a warning if it cannot be run.
+(timeout 15 seconds), from the project folder and with your environment exactly as it is, to verify
+it exits `0`; it prints a warning if the command cannot be run or cannot start RunLedger there.
 These checkpoint hooks require Git, but no identity
 setup. They never block the agent and do not store prompt text in checkpoint metadata.
 See [rollback.md](rollback.md) for setup, privacy, retention, and undo.
@@ -44,12 +47,15 @@ It keeps every other setting. Before it changes a file it copies the file to
 `settings.json.bak`, replacing any earlier backup. If the file already has a guard or checkpoint entry, its
 command and timeout are updated in place and no second entry is added. If nothing would change, the file is not
 written. If the file is not valid JSON or is not an object, `install` stops with an error and
-changes nothing.
+changes nothing. A hook that only mentions the words (for example `echo runledger guard` or
+`other-check.sh && runledger guard`) is treated as your own hook and left alone; only the complete
+commands `runledger guard` and `"<python>" -m runledger guard` count as RunLedger's.
 
-`uninstall` removes every `runledger guard` hook and both lifecycle checkpoint hooks (both interpreter-form
+`uninstall` removes every complete `runledger guard` hook and both lifecycle checkpoint hooks (both interpreter-form
 and bare `--portable` entries) from the
 chosen settings file and keeps everything
-else, including other hooks in the same group. A group left empty is removed, and so are an empty
+else, including other hooks in the same group, and hooks that merely mention the command. A group
+left empty is removed, and so are an empty
 event list and an empty `hooks` object. The file is copied to `settings.json.bak` first. If
 there are no RunLedger hooks, the file is not written. Your policy files, checkpoints and `guard.log` stay where they
 are.
@@ -62,7 +68,7 @@ prints the `guard` help text and exits with code `2` instead of waiting on stdin
 
 **Project root resolution.** For every hook call, the guard resolves the project root in order:
 1. `CLAUDE_PROJECT_DIR`, `FACTORY_PROJECT_DIR`, or `DROID_PROJECT_DIR` (when set to an existing absolute directory).
-2. The Git top-level directory walked up from the event's `cwd`.
+2. The nearest ancestor of the event's `cwd` (including the `cwd` itself) that contains `.runledger.json` or `.git`, so a policy-only project without Git works the same way.
 3. The event's `cwd`.
 
 The guard always reads `<project_root>/.runledger.json`, writes `<project_root>/.runledger/guard.log`,
