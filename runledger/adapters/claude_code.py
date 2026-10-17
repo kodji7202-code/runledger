@@ -20,5 +20,9 @@ def parse(path: Path) -> parser.Run:
     return run
 
 
+def peek(path: Path):
+    return parser.peek_session(path)
+
+
 def find_sessions(project: Optional[str] = None) -> List[Path]:
     return parser.find_sessions(project)

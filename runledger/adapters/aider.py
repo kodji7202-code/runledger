@@ -86,12 +86,69 @@ def parse_all(path) -> List[Run]:
     return [_build_run(p, header, lines) for header, lines in _split_sessions(_read(p))]
 
 
+def _git_ceiling(start: Path, home: Optional[Path]) -> Optional[Path]:
+    from .. import gitinfo
+
+    cur = start
+    while True:
+        try:
+            if (cur / ".git").exists():
+                return cur
+        except OSError:
+            pass
+        if home is not None and cur == home:
+            break
+        parent = cur.parent
+        if parent == cur:
+            break
+        cur = parent
+    top = gitinfo.toplevel(str(start))
+    if top:
+        try:
+            return Path(top).resolve()
+        except OSError:
+            return Path(top)
+    return None
+
+
 def find_sessions(project: Optional[str] = None) -> List[Path]:
-    # Aider keeps no global index, so only the project's own history file counts.
+    # Aider keeps no global index; search from `project` up to the Git top level.
     if not project:
         return []
-    f = Path(project) / HISTORY_FILE
-    return [f] if f.is_file() else []
+    raw_start = Path(project)
+    f = raw_start / HISTORY_FILE
+    try:
+        if f.is_file():
+            return [f]
+    except OSError:
+        pass
+    try:
+        start = raw_start.resolve()
+    except OSError:
+        start = Path(os.path.abspath(str(raw_start)))
+    home_env = os.environ.get("HOME") or os.environ.get("USERPROFILE")
+    try:
+        home = Path(home_env).resolve() if home_env else Path.home().resolve()
+    except OSError:
+        home = None
+    ceiling = _git_ceiling(start, home)
+    if ceiling is None:
+        return []
+    cur = start
+    while True:
+        candidate = cur / HISTORY_FILE
+        try:
+            if candidate.is_file():
+                return [candidate]
+        except OSError:
+            pass
+        if cur == ceiling or (home is not None and cur == home):
+            break
+        parent = cur.parent
+        if parent == cur:
+            break
+        cur = parent
+    return []
 
 
 # --- file level --------------------------------------------------------------

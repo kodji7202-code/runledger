@@ -23,6 +23,17 @@ change behavior, so read the entry before you upgrade.
 
 ### Fixed
 
+- **Session discovery, sub-agent merging, and fast `list` (`runledger.parser`, `runledger.session_cache`, `runledger.adapters`):**
+  Claude Code sub-agent transcripts (`<project>/<session>/subagents/**/*.jsonl` and legacy
+  `<project>/subagents/agent-*.jsonl`) are merged into the parent session's token usage and cost
+  with message-id deduplication and a receipt note (`includes N sub-agent transcript(s)`), without
+  being listed as separate sessions. Encoded Claude project folder names longer than 200 characters
+  resolve via the UTF-16 32-bit base36 hash suffix with a 200-character prefix fallback scan.
+  Codex and Droid session discovery and `runledger list` share a corruption-tolerant header and
+  summary cache in `~/.runledger/cache/sessions.json` keyed by file modification time and size,
+  Droid project discovery filters by encoded folder name before reading unrelated directories,
+  Aider discovery walks up from project subfolders to the Git top-level directory, and
+  `adapters()` logs broken adapter imports to `stderr` (or re-raises when `RUNLEDGER_DEBUG=1`).
 - **Guard project root resolution and subfolder support (`runledger.guard`, `runledger.guard_receipt`, `runledger.risk`):**
   the guard resolves the project root from `CLAUDE_PROJECT_DIR` / `FACTORY_PROJECT_DIR` /
   `DROID_PROJECT_DIR`, else the Git top-level walked up from the event's `cwd`, else `cwd`. Policy

@@ -416,3 +416,29 @@ def test_aider_per_step_usage_distributes_remainders_and_sums_to_total(tmp_path)
     assert run.usage.total == 1200
     assert sum(s.usage.total for s in run.steps) == 1200
 
+
+def test_find_sessions_walks_up_to_git_root(tmp_path):
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    _write(outer, "#### outer history\n")
+
+    repo = outer / "aider-repo"
+    (repo / ".git").mkdir(parents=True)
+    repo_hist = _write(repo, "#### repo history\n")
+
+    deep = repo / "sub" / "deep"
+    deep.mkdir(parents=True)
+
+    # From sub/deep, walks up to git root and finds repo/.aider.chat.history.md
+    assert aider.find_sessions(str(deep)) == [repo_hist]
+
+    # Nearest directory wins when sub/ also has history
+    sub_hist = _write(repo / "sub", "#### sub history\n")
+    assert aider.find_sessions(str(deep)) == [sub_hist]
+
+    # Removing in-repo histories does NOT escape above git root to outer/
+    sub_hist.unlink()
+    repo_hist.unlink()
+    assert aider.find_sessions(str(deep)) == []
+
+

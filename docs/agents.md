@@ -47,11 +47,18 @@ header, an Aider history file, a RunLedger-format file, or else Claude Code's JS
 Claude Code writes one JSONL file per session under `~/.claude/projects/`. Each project folder has
 an encoded name: every character of the absolute folder path that is not a letter or digit becomes
 `-`. For example, `D:\runledger` becomes `D--runledger`, and `/home/dev/my.app` becomes
-`-home-dev-my-app`.
+`-home-dev-my-app`. When the sanitized name exceeds 200 characters, Claude Code truncates to 200
+characters and appends `-<base36(abs(hash))>` (32-bit signed hash over the UTF-16 code units of the
+unsanitized path).
 
 - **Config directory.** If `CLAUDE_CONFIG_DIR` is set, RunLedger reads `$CLAUDE_CONFIG_DIR/projects`
   instead.
-- **Matching.** `--project` (or the current folder) is encoded the same way to find its directory.
+- **Matching.** `--project` (or the current folder) is encoded the same way to find its directory,
+  with a 200-character prefix scan fallback for long project paths.
+- **Sub-agents.** Sub-agent transcripts under `<project>/<session>/subagents/` (including nested
+  `workflows/<wf>/agent-*.jsonl` and legacy `<project>/subagents/agent-*.jsonl`) are merged into
+  the parent session's token usage and cost (deduplicating message ids), with a receipt note
+  `includes N sub-agent transcript(s)`. Sub-agent files are not listed as separate sessions.
 - **Usage.** Streamed messages that repeat the same message id are counted once.
 - **Cost.** Estimated from list prices (see below). Claude Code does not report its own cost.
 
@@ -131,7 +138,9 @@ a line `# aider chat started at YYYY-MM-DD HH:MM:SS`.
 
 - **One receipt per file.** RunLedger reads the **last** session in the history file. Earlier
   sessions in the same file are not listed or scored.
-- **Matching.** Only the project's own history file counts. Aider has no global index.
+- **Matching.** RunLedger checks `--project` (or the current folder) and walks up parent folders
+  to the Git top-level directory (nearest `.aider.chat.history.md` wins, never escaping above the
+  Git top level). Aider has no global index, so `--all` does not list Aider history files.
 - **Steps.** SEARCH/REPLACE blocks become edits. A block with an empty SEARCH section becomes a
   write. Lines Aider prints for added files become reads. Lines `> Running <command>`, and the
   `/run` and `/test` commands, become shell steps. Commits become `GitCommit` steps, which keep their
