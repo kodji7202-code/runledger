@@ -152,8 +152,7 @@ change behavior, so read the entry before you upgrade.
   proxy suffixes (`custom:Claude-Opus-4.5-[Proxy]-0`), Bedrock/Vertex prefixes and `-latest` while
   keeping `-fast`, unverified `-preview` and `-chat-latest` unpriced. `prices.json` adds verified
   OpenAI (`gpt:6-astra`, `gpt:6.1-sol`, `gpt:6-luna`, `gpt:5.6-sol`, `gpt:5.6-cyber`,
-  `gpt:5.3-codex`, `gpt:5.4*`, `gpt:5.2*`, `gpt:5.1*`, `gpt:5*`, `gpt:4.1*`, `gpt:4o*`, `o3*`,
-  `o4-mini`, `o1*`) and Google Gemini (`gemini:4-argon`, `gemini:3.8-flash`, `gemini:3.6-flash`,
+  `gpt:5.3-codex`) and Google Gemini (`gemini:4-argon`, `gemini:3.8-flash`, `gemini:3.6-flash`,
   `gemini:3.5-flash-lite`, `gemini:3.1-flash-lite`, `gemini:3-flash-preview`, `gemini:2.5*`) list
   prices alongside all 20 v0.6.0 Anthropic keys, with backward-compatible optional fields
   (`cache_write_5m`, `cache_write_1h`, `long_context`, `valid_from`, `valid_until`, `windows`),
@@ -161,6 +160,16 @@ change behavior, so read the entry before you upgrade.
   `parser._usage` reads `cache_creation.ephemeral_1h_input_tokens` and bills 1-hour cache writes at
   `2x` input (or `cache_write_1h`), and `cost_of` applies `long_context` rates per request (noting
   when Droid settings-only usage uses the base tier).
+- **Long-context tiers, price windows and cumulative usage are enforced honestly (`runledger.pricing`, `runledger/prices.json`, `runledger.adapters.native`, `runledger.adapters.droid`):**
+  the Haiku 5.5 row carries its documented `>100K` tier again (0.50/2.50/0.05, cache writes
+  0.625/1.00), so a 150K-token request costs $0.0775 and two 75K requests cost $0.0155. `valid_from`
+  /`valid_until` windows are evaluated against today's date in production lookups, and a user row
+  outside its window is skipped so the bundled row stays in effect (a row past every window is
+  `n/a`). Per-request tiering now follows the usage that carries request boundaries: native header
+  totals keep their per-step requests, aggregate-only totals and Droid settings remainders are
+  marked cumulative and stay on the base tier, and the receipt totals, `push` payload and advisor
+  all price those buckets the same way. `PRICING_HELP` names the 120-day re-verification policy,
+  and the bundled `checked` date is back to 2026-10-08 (its last recorded verification).
 - **Codex, Claude Code and Aider usage and prompt parsing (`runledger.adapters.codex`, `runledger.parser`, `runledger.adapters.aider`):**
   Codex `token_count` events deduplicate repeated cumulative totals, fall back to
   `total - _prev_total` when `last_token_usage` is omitted, and handle counter resets; Claude Code

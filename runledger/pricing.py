@@ -1,11 +1,13 @@
 """Model API list prices in USD per million tokens.
 
 The built-in table is runledger/prices.json (verified official vendor pricing,
-checked 2026-10-16). Add ~/.runledger/prices.json or set RUNLEDGER_PRICES to a
+checked 2026-10-08). Add ~/.runledger/prices.json or set RUNLEDGER_PRICES to a
 JSON file of the same shape to add or replace entries without editing the
 package. Unknown models are reported with cost = None instead of a guess.
 Cache writes default to the 5-minute rate (1.25x input) and 1-hour cache writes
-default to 2x input unless overridden in prices.json.
+default to 2x input unless overridden in prices.json. A row outside its
+valid_from/valid_until window (or its windows list) is ignored, and the bundled
+row stays in effect when a user override is inactive.
 """
 from __future__ import annotations
 
@@ -22,9 +24,10 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from .parser import Run, Usage
 
 PRICES_ENV = "RUNLEDGER_PRICES"
-PRICING_HELP = ("Add model prices to ~/.runledger/prices.json (or set RUNLEDGER_PRICES); "
-                "see docs/agents.md#costs-across-agents.")
 STALE_DAYS = 120
+PRICING_HELP = ("Add model prices to ~/.runledger/prices.json (or set RUNLEDGER_PRICES); "
+                "see docs/agents.md#costs-across-agents. Bundled prices are re-verified "
+                f"every {STALE_DAYS} days and a receipt notes when the checked date is older.")
 LONG_CONTEXT_SETTINGS_NOTE = (
     "Token usage came from Droid settings.json totals only; "
     "long-context tier not applied because per-request token counts were unavailable."
@@ -185,21 +188,44 @@ def _parse_table(data: Any, source: str) -> Dict[Tuple[str, str], Tuple[float, f
 _WARNED: set[Tuple[str, str]] = set()
 _DEFAULT_TEXT = resources.files(__package__).joinpath("prices.json").read_text(encoding="utf-8")
 _DEFAULT_RAW = json.loads(_DEFAULT_TEXT)
-CHECKED: str = str(_DEFAULT_RAW.get("checked", "2026-10-16"))
+CHECKED: str = str(_DEFAULT_RAW.get("checked", "2026-10-08"))
+
+
+def _today() -> str:
+    """Today as YYYY-MM-DD. Validity windows are evaluated against it; tests patch it."""
+    return _date.today().isoformat()
+
+
+def _in_window(extra: Dict[str, Any], today: str) -> bool:
+    """True when a table row is alive on `today`: no window at all, inside its own
+    valid_from/valid_until, or inside one of its `windows` entries."""
+    if _inside(extra, today):
+        return True
+    return any(_inside(w, today) for w in extra.get("windows", []))
+
+
+def _inside(extra: Dict[str, Any], today: str) -> bool:
+    valid_from = extra.get("valid_from")
+    valid_until = extra.get("valid_until")
+    return (not valid_from or today >= valid_from) and (not valid_until or today <= valid_until)
 
 
 def load_prices(override: Optional[Union[str, os.PathLike]] = None
                 ) -> Dict[Tuple[str, str], Tuple[float, float, float]]:
     """Built-in prices merged with a JSON override file. The override is `override`
     if given, otherwise $RUNLEDGER_PRICES or ~/.runledger/prices.json. Invalid
-    overrides warn once per process and are ignored in full. A missing default user file is normal."""
+    overrides warn once per process and are ignored in full. A missing default user file is normal.
+    A user row outside its validity window is skipped, so the bundled row stays in effect."""
     prices = _parse_table(_DEFAULT_RAW, "prices.json")
     configured = override if override is not None else os.environ.get(PRICES_ENV)
     path = Path(configured or "~/.runledger/prices.json")
     try:
         path = path.expanduser()
         text = path.read_text(encoding="utf-8")
-        prices.update(_parse_table(json.loads(text), str(path)))
+        user = _parse_table(json.loads(text), str(path))
+        today = _today()
+        prices.update({k: v for k, v in user.items()
+                       if _in_window(getattr(v, "extra", {}), today)})
     except (OSError, ValueError, RuntimeError) as exc:
         if configured or not isinstance(exc, FileNotFoundError):
             detail = " ".join(str(exc).split())
@@ -223,7 +249,7 @@ def is_stale(today: Optional[Union[str, _date]] = None) -> bool:
         elif isinstance(today, _date):
             cur = today
         else:
-            cur = _date.today()
+            cur = _date.fromisoformat(_today())
         return (cur - chk).days > STALE_DAYS
     except ValueError:
         return False
@@ -246,19 +272,13 @@ def _rate_for(model: Optional[str], date: Optional[str] = None) -> Optional[_Rat
     extra = getattr(entry, "extra", {})
     if not isinstance(entry, _Rate):
         entry = _Rate(entry[0], entry[1], entry[2], extra)
-    if date:
-        d = str(date)[:10]
-        vf = extra.get("valid_from")
-        vu = extra.get("valid_until")
-        if (not vf or d >= vf) and (not vu or d <= vu):
-            return entry
-        for w in extra.get("windows", []):
-            w_vf = w.get("valid_from")
-            w_vu = w.get("valid_until")
-            if (not w_vf or d >= w_vf) and (not w_vu or d <= w_vu):
-                return _Rate(w["input"], w["output"], w["cache_read"], w)
-        return None
-    return entry
+    d = str(date)[:10] if date else _today()
+    if _inside(extra, d):
+        return entry
+    for w in extra.get("windows", []):
+        if _inside(w, d):
+            return _Rate(w["input"], w["output"], w["cache_read"], w)
+    return None
 
 
 def price_for(model: Optional[str], date: Optional[str] = None) -> Optional[Tuple[float, float, float]]:
@@ -305,6 +325,28 @@ def _single_cost(usage: Usage, rate: _Rate, allow_long_context: bool = True) -> 
     ) / 1_000_000
 
 
+def _request_cost(usage: Usage, rate: _Rate) -> float:
+    """One request's cost: tiered unless the usage is a cumulative estimate."""
+    return _single_cost(usage, rate, allow_long_context=not getattr(usage, "_cumulative_only", False))
+
+
+def _uncovered(usage: Usage, requests: List[Usage]) -> Usage:
+    """The part of an aggregate that no known request covers. Its per-request
+    boundaries are unknown, so it is priced as a cumulative estimate (base tier)."""
+    def rest(field: str) -> int:
+        return max(0, getattr(usage, field) - sum(getattr(r, field) for r in requests))
+
+    remainder = Usage(
+        input_tokens=rest("input_tokens"),
+        output_tokens=rest("output_tokens"),
+        cache_write_tokens=rest("cache_write_tokens"),
+        cache_read_tokens=rest("cache_read_tokens"),
+        cache_write_1h_tokens=rest("cache_write_1h_tokens"),
+    )
+    remainder._cumulative_only = True
+    return remainder
+
+
 def cost_of(
     usage: Usage,
     model: Optional[str],
@@ -315,14 +357,13 @@ def cost_of(
     if not rate:
         return None
     reqs = getattr(usage, "_requests", None)
-    if (
-        reqs
-        and len(reqs) > 1
-        and allow_long_context
-        and not getattr(usage, "_cumulative_only", False)
-        and sum(r.total for r in reqs) == usage.total
-    ):
-        return sum(_single_cost(r, rate, allow_long_context=True) for r in reqs)
+    if reqs and allow_long_context:
+        covered = sum(r.total for r in reqs)
+        if covered == usage.total:
+            return sum(_request_cost(r, rate) for r in reqs)
+        if covered < usage.total and any(not r._cumulative_only for r in reqs):
+            known = sum(_request_cost(r, rate) for r in reqs)
+            return known + _single_cost(_uncovered(usage, reqs), rate, allow_long_context=False)
     return _single_cost(usage, rate, allow_long_context=allow_long_context)
 
 
@@ -355,16 +396,18 @@ def partial_note(run: Run) -> str:
 
 
 def apply_costs(run: Run) -> None:
-    allow_lc = run.usage_source != "settings"
+    """Price every step and model bucket. Tiering follows each request's own usage;
+    buckets that are only cumulative estimates (Droid settings totals, aggregate
+    native totals) keep the base tier and are noted."""
     for s in run.steps:
-        s.cost = cost_of(s.usage, s.model, allow_long_context=allow_lc) if s.usage_known else None
+        s.cost = cost_of(s.usage, s.model) if s.usage_known else None
     total = 0.0
     known = False
     for model, u in run.models.items():
-        if not allow_lc and u.total > 0 and has_long_context(model):
+        if run.usage_source == "settings" and u.total > 0 and has_long_context(model):
             if LONG_CONTEXT_SETTINGS_NOTE not in run.notes:
                 run.notes.append(LONG_CONTEXT_SETTINGS_NOTE)
-        c = cost_of(u, model, allow_long_context=allow_lc)
+        c = cost_of(u, model)
         if c is not None:
             total += c
             known = True

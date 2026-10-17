@@ -183,13 +183,16 @@ the matching receipt then includes a local rollback command. Checkpoint contents
 ## Costs across agents
 
 Costs are estimates from the public Anthropic, OpenAI and Google Gemini API list prices in
-`runledger/prices.json`, which was checked on 2026-10-16. Each message's tokens are multiplied by
+`runledger/prices.json`, which was checked on 2026-10-08. Each message's tokens are multiplied by
 the list price of its model. Standard 5-minute cache writes are priced at 1.25 times the input
 price (or `cache_write_5m`), 1-hour cache writes (`cache_creation.ephemeral_1h_input_tokens`) at
 2.0 times the input price (or `cache_write_1h`), and cache reads at the cache-hit rate. Where a
 model defines a `long_context` tier, requests whose prompt tokens exceed `threshold_tokens` are
-billed at the long-context rates for that request (when only cumulative settings usage is available
-in a Droid run, RunLedger bills the base tier and adds a receipt note). When the bundled `checked`
+billed at the long-context rates for that request; usage that only exists as a cumulative total
+(a Droid settings total, or a native session whose header `models` totals are not broken down per
+step) keeps the base tier and adds a receipt note. Rows with `valid_from`/`valid_until` (or
+`windows`) are priced only inside their window, against today's date; a user row outside its window
+is ignored so the bundled row stays in effect. When the bundled `checked`
 date is more than 120 days old, receipts include a staleness note. A model RunLedger does not know
 shows `n/a` rather than a guess, with a short line explaining how to add its price. JSON receipts
 expose that guidance as `pricing_note`.
@@ -215,7 +218,8 @@ For example, this entry uses the bundled Sonnet 4.5 list prices:
 ```
 
 For `gpt-5-codex`, add a `"gpt:5-codex"` entry with rates from your provider, not guessed rates.
-The optional top-level `checked` date is used for the 120-day staleness note in receipts.
+The optional top-level `checked` date in a user file is informational only: the 120-day staleness
+note always uses the bundled table's `checked` date.
 
 Lookup ignores case, provider prefixes such as `anthropic/`, `openai/`, `models/`, `custom:` and
 Bedrock `us.anthropic.`, bracket context tags such as `[1m]`, proxy tags such as `-[Proxy]-0`,

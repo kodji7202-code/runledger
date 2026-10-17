@@ -111,7 +111,8 @@ def test_cost_of_counts_cache_write_and_read_tokens():
 
 def test_cost_of_cache_read_only():
     usage = Usage(cache_read_tokens=2_000_000)
-    assert cost_of(usage, "claude-haiku-5-5") == pytest.approx(2 * 0.01)
+    # A 2M-token prompt counts cache reads, so it bills at the haiku 5.5 tier-2 cache-read rate
+    assert cost_of(usage, "claude-haiku-5-5") == pytest.approx(2 * 0.05)
 
 
 def test_cost_of_unknown_model_is_none():
@@ -577,6 +578,97 @@ def test_long_context_tier_evaluated_per_request_not_session_total(tmp_path):
     # 3 requests x 100k <= 200k threshold -> base tier $1.25/MTok -> $0.375 (not $0.75)
     assert run.usage.input_tokens == 300_000
     assert run.cost == pytest.approx(0.375)
+
+
+def test_haiku_5_5_long_context_tier_is_restored():
+    # A request above the 100k prompt threshold bills whole at tier 2 ($0.50/$2.50/$0.05)
+    assert cost_of(Usage(input_tokens=150_000, output_tokens=1_000), "claude-haiku-5-5") == pytest.approx(0.0775)
+    assert cost_of(Usage(input_tokens=60_000, cache_read_tokens=50_000), "claude-haiku-5-5") == pytest.approx(0.0325)
+    assert cost_of(Usage(input_tokens=100_000), "claude-haiku-5-5") == pytest.approx(0.01)
+    # Cache writes count toward the prompt, so their own tier follows the same rule
+    assert cost_of(Usage(cache_write_tokens=1_000_000, cache_write_1h_tokens=1_000_000),
+                   "claude-haiku-5-5") == pytest.approx(1.0)
+    assert cost_of(Usage(cache_write_tokens=50_000, cache_write_1h_tokens=50_000),
+                   "claude-haiku-5-5") == pytest.approx(0.01)
+    assert cost_of(Usage(cache_write_tokens=1_000_000), "claude-haiku-5-5") == pytest.approx(0.625)
+    assert cost_of(Usage(cache_write_tokens=50_000), "claude-haiku-5-5") == pytest.approx(0.00625)
+
+
+def test_haiku_5_5_long_context_tier_is_evaluated_per_request(tmp_path):
+    def transcript(name, turns):
+        lines = [json.dumps({
+            "type": "assistant",
+            "message": {
+                "id": f"m{i}",
+                "model": "claude-haiku-5-5",
+                "usage": usage,
+                "content": [{"type": "tool_use", "id": f"t{i}", "name": "Read",
+                             "input": {"file_path": "a.py"}}],
+            },
+        }) for i, usage in enumerate(turns, start=1)]
+        path = tmp_path / name
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return parse_session(path)
+
+    one_long = transcript("long.jsonl", [{"input_tokens": 150_000, "output_tokens": 1_000}])
+    pricing.apply_costs(one_long)
+    assert one_long.cost == pytest.approx(0.0775)
+
+    two_short = transcript("short.jsonl", [{"input_tokens": 75_000, "output_tokens": 500},
+                                           {"input_tokens": 75_000, "output_tokens": 500}])
+    pricing.apply_costs(two_short)
+    assert two_short.cost == pytest.approx(0.0155)
+
+    cached = transcript("cached.jsonl", [{"input_tokens": 60_000, "cache_read_input_tokens": 50_000}])
+    pricing.apply_costs(cached)
+    assert cached.cost == pytest.approx(0.0325)
+
+    at_threshold = transcript("threshold.jsonl", [{"input_tokens": 100_000}])
+    pricing.apply_costs(at_threshold)
+    assert at_threshold.cost == pytest.approx(0.01)
+
+
+def test_inactive_user_price_rows_keep_the_bundled_rates(tmp_path, monkeypatch):
+    user = tmp_path / "override.json"
+    user.write_text(json.dumps({
+        "sonnet:4.5": {"input": 1, "output": 1, "cache_read": 1, "valid_until": "2020-01-01"},
+    }), encoding="utf-8")
+    monkeypatch.setattr(pricing, "PRICES", load_prices(user))
+    assert cost_of(Usage(input_tokens=1_000_000), "claude-sonnet-4-5") == pytest.approx(3.0)
+
+    user.write_text(json.dumps({
+        "sonnet:4.5": {"input": 1, "output": 1, "cache_read": 1, "valid_from": "2999-01-01"},
+        "mystery:9": {"input": 1, "output": 1, "cache_read": 1, "valid_until": "2020-01-01"},
+    }), encoding="utf-8")
+    monkeypatch.setattr(pricing, "PRICES", load_prices(user))
+    assert cost_of(Usage(input_tokens=1_000_000), "claude-sonnet-4-5") == pytest.approx(3.0)
+    assert price_for("mystery-9") is None
+
+    user.write_text(json.dumps({
+        "sonnet:4.5": {"input": 1, "output": 1, "cache_read": 1,
+                       "valid_from": "2020-01-01", "valid_until": "2999-01-01"},
+    }), encoding="utf-8")
+    monkeypatch.setattr(pricing, "PRICES", load_prices(user))
+    assert cost_of(Usage(input_tokens=1_000_000), "claude-sonnet-4-5") == pytest.approx(1.0)
+
+
+def test_windowed_prices_use_the_system_date_without_an_explicit_date(monkeypatch):
+    monkeypatch.setattr(pricing, "_today", lambda: "2026-10-17")
+    assert price_for("gemini-4-argon") == (2.0, 10.0, 0.1)
+    assert cost_of(Usage(input_tokens=10_000, output_tokens=10_000, cache_read_tokens=10_000),
+                   "gemini-4-argon") == pytest.approx(0.121)
+    monkeypatch.setattr(pricing, "_today", lambda: "2026-12-05")
+    assert price_for("gemini-4-argon") == (4.0, 20.0, 0.2)
+    assert cost_of(Usage(input_tokens=10_000, output_tokens=10_000, cache_read_tokens=10_000),
+                   "gemini-4-argon") == pytest.approx(0.242)
+    # A row whose window closed and has no successor is unpriced, never stale
+    assert price_for("gpt-5.6-sol") is None
+    monkeypatch.setattr(pricing, "_today", lambda: "2026-11-21")
+    assert price_for("gpt-5.6-sol") == (4.0, 20.0, 0.4)
+
+
+def test_pricing_help_carries_the_stale_price_policy():
+    assert "120 days" in pricing.PRICING_HELP
 
 
 def test_parser_retains_user_prompts_starting_with_angle_bracket(tmp_path):

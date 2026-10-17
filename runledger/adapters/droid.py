@@ -533,6 +533,10 @@ def parse(path: Path) -> Run:
             # Never price a mixed-model remainder as the last selected model.
             model = next(iter(observed_models)) if len(observed_models) == 1 else (
                 UNATTRIBUTED if observed_models else default_model)
+            if remainder.total:
+                # Cumulative only: per-request boundaries are unavailable, so the
+                # remainder must not be tiered as one long request.
+                remainder._cumulative_only = True
             run.usage.add(remainder)
             run.models.setdefault(model, Usage()).add(remainder)
             from_settings = remainder.total > 0
@@ -544,6 +548,8 @@ def parse(path: Path) -> Run:
                     step.usage_known = from_settings
         children = _child_usage(settings, own, settings_path)
         for model, usage in children.items():
+            if usage.total:
+                usage._cumulative_only = True
             run.usage.add(usage)
             run.models.setdefault(model, Usage()).add(usage)
             from_settings = from_settings or usage.total > 0

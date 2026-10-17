@@ -62,7 +62,8 @@ folder) or when Markdown or JSON is written to stdout (`-o -`):
   becomes `[REDACTED]@`, while scp-style `git@host:org/repo` remotes (with a non-empty path after
   the colon) and `ssh://git@host/...` Git remotes are kept verbatim.
 
-Files written outside any repository (and HTML sent to stdout) keep full paths, which help debugging.
+Files written outside any repository keep full paths, which help debugging. HTML sent to stdout
+follows the folder it is sent from: redacted inside a Git work tree, full paths outside one.
 `--safe` and `--no-safe` override the default. After writing a file, `receipt` prints the mode
 it used to stderr. JSON receipts record it as `"safe": true` or `false`. Session id, branch,
 models, scores and file counts are the same in both modes. The GitHub pull-request comment is
