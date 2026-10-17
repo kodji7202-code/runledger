@@ -1029,6 +1029,8 @@ def test_guard_redos_extra_secret_paths_is_fast_and_logs_warning(tmp_path):
     (tmp_path / ".runledger.json").write_text(json.dumps({
         "extra_secret_paths": ["(a+)+$", r"\.vault$"],
     }), encoding="utf-8")
+    (tmp_path / ".runledger").mkdir(parents=True, exist_ok=True)
+    (tmp_path / ".runledger" / "guard.log").write_text("", encoding="utf-8")
 
     evil_target = "a" * 50 + "!"
     evt = {"session_id": "sess-redos", "cwd": str(tmp_path), "hook_event_name": "PreToolUse",
