@@ -221,6 +221,21 @@ def test_spaced_drive_path_does_not_absorb_a_relative_operand(command):
          r"Shell command referenced a path outside the working folder (../outside.txt)")]
 
 
+@pytest.mark.parametrize("command", [
+    r"rm C:/repo/sub/a.txt nested/../../outside.txt",
+    r"rm C:/repo/sub/a.txt > C:/repo/sub/log nested/../../outside.txt",
+    r"rm < C:/repo/sub/input nested/../../outside.txt",
+])
+def test_traversing_operand_after_a_spaced_drive_path_stays_a_high_delete(command):
+    """CORE-SCR-R3-001: `nested/../../outside.txt` is an argument of its own that climbs out of
+    the project, so the delete keeps a high finding naming it even when the display join reads
+    the words as one spaced path (both readings are analysed, most severe wins)."""
+    outside = [r for r in _risks("Bash", cwd="C:/repo", command=command)
+               if r.code == "shell_outside" and r.severity == "high"]
+    assert [r.reason for r in outside] == [
+        r"Shell command referenced a path outside the working folder (nested/../../outside.txt)"]
+
+
 def test_spaced_drive_path_with_several_words_is_still_one_path():
     """CORE-SCR-R2-005: a folder name may hold more than one extra word, and the finding names
     the whole path so safe mode can mask it."""

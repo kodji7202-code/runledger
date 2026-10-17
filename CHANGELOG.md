@@ -61,6 +61,24 @@ change behavior, so read the entry before you upgrade.
   high outside-the-working-folder finding for `../outside.txt` (plain, `>` and `<` forms) and
   the guard asks again, as it did before the spaced-path rule existed.
 
+- **The spaced-path join no longer decides which operands are checked (`runledger.risk`):** the
+  join that reads an unquoted drive path with spaces as one path (`E:\Work\Client X\secret.txt`)
+  is a display reading, so the shell's own reading of the same words is analysed as well and the
+  most severe finding wins. `rm C:/repo/sub/a.txt nested/../../outside.txt`, its `>` redirect form
+  and its `<` redirect form report the high outside-the-working-folder finding for
+  `nested/../../outside.txt` again, and the default guard asks instead of allowing, as it did
+  before the spaced-path rule existed. A word the join swallowed is only dropped when the joined
+  word already reported a finding at least as severe, so the whole-path finding (and its safe-mode
+  masking) is unchanged.
+
+- **A queued heredoc starts at the newline that ends the command line (`runledger.shell_syntax`):**
+  a newline inside a multiline `$'...'` or `"..."` string is part of that word, so a pending
+  heredoc keeps waiting for the command's real terminator. In `echo <<EOF $'first` / `second'` /
+  `payload` / `EOF` / `rm -rf ./build` (five lines, as Bash runs them) the heredoc body is now
+  `payload` and the `rm -rf` after it is read again: the receipt keeps the high
+  recursive-force-delete command finding and the default guard denies it, instead of treating the
+  delete as quoted heredoc data.
+
 - **CLI flag validation, non-colliding receipts, and atomic stem-scoped backups (`runledger.cli`,
   `runledger.server.db`):** `--latest` on `receipt` and `push` is now mutually exclusive with an
   explicit `session` argument (exits `2`); `--open` with `--format md` or `--format json` prints a

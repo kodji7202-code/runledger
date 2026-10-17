@@ -186,6 +186,20 @@ def test_spaced_drive_redirect_target_is_one_write_finding():
 
 
 @pytest.mark.parametrize("command", [
+    r"Remove-Item C:/repo/sub/a.txt nested/../../outside.txt",
+    r"Remove-Item C:/repo/sub/a.txt > C:/repo/sub/log nested/../../outside.txt",
+    r"Remove-Item < C:/repo/sub/input nested/../../outside.txt",
+])
+def test_spaced_drive_redirect_target_keeps_a_traversing_operand(command):
+    """CORE-SCR-R3-001 for PowerShell: `nested/../../outside.txt` climbs out of the project and
+    keeps a high finding naming it, whatever the display join reads."""
+    outside = [r for r in _risks("PowerShell", cwd=r"C:\repo", command=command)
+               if r.code == "shell_outside" and r.severity == "high"]
+    assert [r.reason for r in outside] == [
+        r"Shell command referenced a path outside the working folder (nested/../../outside.txt)"]
+
+
+@pytest.mark.parametrize("command", [
     "Set-Content $target 'x'",
     r"Out-File -FilePath $env:TEMP\x.txt",
     r"Remove-Item $dir\*",
