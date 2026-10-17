@@ -1075,6 +1075,35 @@ def test_checkpoint_hook_rejects_attached_shell_operators(command):
     assert rollback.is_checkpoint_hook({"type": "command", "command": command}) is False
 
 
+@pytest.mark.parametrize("command", [
+    '"/usr/$(printf bin)/python3.13t" -m runledger checkpoint --hook',
+    '"/usr/`printf bin`/python3.13t" -m runledger checkpoint --hook',
+    '"$PYTHON3" -m runledger checkpoint --hook',
+])
+def test_checkpoint_hook_rejects_executable_substitutions(command):
+    """CORE-SCR-R4-004: an executable word with a `$` or a backtick computes its own path even
+    inside double quotes, so it is a foreign entry and stays untouched."""
+    assert rollback.is_checkpoint_hook({"type": "command", "command": command}) is False
+
+
+def test_install_preserves_a_substitution_bearing_checkpoint_hook(tmp_path):
+    """The round-4 reproducer for the checkpoint hook: install appends beside the foreign entry
+    and uninstall leaves it exactly as it was."""
+    path = tmp_path / "settings.json"
+    original = {"hooks": {"SessionStart": [{"hooks": [
+        {"type": "command",
+         "command": '"/usr/$(printf bin)/python3.13t" -m runledger checkpoint --hook'}]}]}}
+    path.write_text(json.dumps(original), encoding="utf-8")
+
+    assert guard.install_hook(path)[0] is True
+    groups = json.loads(path.read_text(encoding="utf-8"))["hooks"]["SessionStart"]
+    assert groups[0] == original["hooks"]["SessionStart"][0]
+    assert len(groups) == 2
+
+    assert guard.uninstall_hook(path)[0] is True
+    assert json.loads(path.read_text(encoding="utf-8")) == original
+
+
 def test_install_preserves_a_compound_checkpoint_hook(tmp_path):
     """The round-3 reproducer: v0.6.0 preserved this foreign entry, so install must append
     beside it and uninstall must leave it (VAL-CORE-036/037)."""

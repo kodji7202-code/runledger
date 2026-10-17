@@ -173,8 +173,10 @@ def test_bash_shell_outside_windows_path_is_high_when_deleting():
 
 
 def test_unquoted_spaced_drive_path_is_read_as_one_path():
-    """CORE-SCR-013: a folder name with spaces stays one path in the finding, so safe mode can
-    mask the whole path instead of leaking the folders above the last two parts."""
+    """CORE-SCR-013: a folder name with spaces is shown as one path in the finding, so safe mode
+    can mask the whole path instead of leaking the folders above the last two parts. Writing the
+    same path quoted gives the same reading (the shell's own word), and the unquoted form is
+    labelled to match it (`risk._label_spaced_paths`)."""
     risks = _risks("Bash", command=r"type E:\Work\Client X\secret.txt")
     assert _reasons(risks) == [r"Shell command referenced a path outside the working folder (E:\Work\Client X\secret.txt)"]
     quoted = _risks("Bash", command=r'type "E:\Work\Client X\secret.txt"')
@@ -243,18 +245,71 @@ def test_traversing_operand_after_a_spaced_drive_path_stays_a_high_delete(comman
 ])
 def test_traversing_operand_is_named_when_the_joined_path_is_itself_outside(command):
     """CORE-SCR-R3-001: the shell reads `C:\\a b\\x` and `nested/../../outside.txt` as two
-    arguments, so the escaping operand keeps a finding naming it next to the whole-path finding
-    the display reading makes for the same text."""
+    arguments, so the escaping operand keeps a finding naming it, next to the finding for the
+    fragment (`C:\\a`) that the display label shows as the whole path."""
     reasons = [r.reason for r in _risks("Bash", cwd="C:/repo", command=command)
                if r.code == "shell_outside" and r.severity == "high"]
     assert any(reason.endswith("(nested/../../outside.txt)") for reason in reasons)
 
 
 def test_spaced_drive_path_with_several_words_is_still_one_path():
-    """CORE-SCR-R2-005: a folder name may hold more than one extra word, and the finding names
+    """CORE-SCR-R2-005: a folder name may hold more than one extra word, and the label names
     the whole path so safe mode can mask it."""
     assert _reasons(_risks("Bash", command=r"type E:\Work\Client X Corp\secret.txt")) == [
         r"Shell command referenced a path outside the working folder (E:\Work\Client X Corp\secret.txt)"]
+
+
+def test_the_spaced_path_label_shows_what_the_shell_reads_as_two_words():
+    """The label step rewrites the path a finding shows (`E:\\Work\\Client` ->
+    `E:\\Work\\Client X\\secret.txt`); the finding itself is the shell's own reading, so the
+    unquoted command reports exactly what the same command with the path quoted reports."""
+    loose = _risks("Bash", command=r"echo hi > E:\Work\Client y\z.txt")
+    quoted = _risks("Bash", command=r"echo hi > 'E:\Work\Client y\z.txt'")
+    assert [(r.severity, r.code, r.reason) for r in loose] == \
+        [(r.severity, r.code, r.reason) for r in quoted]
+
+
+def test_the_spaced_path_label_never_adds_a_finding():
+    """The label is a display step: the words the shell splits stay two operands, and the
+    second one is checked as itself (here it resolves inside the working folder)."""
+    assert [(r.severity, r.code, r.reason) for r in
+            _risks("Bash", command=r"type E:\Work\Client y\z.txt")] == [
+        ("low", "shell_outside",
+         r"Shell command referenced a path outside the working folder (E:\Work\Client y\z.txt)")]
+
+
+# ------------------------------------------------ round 4: the shell's own words decide
+
+def test_an_explicit_rm_executable_still_sees_the_escaping_operand():
+    """CORE-SCR-R4-001: `C:/repo/bin/rm` is the executable and `sub/echo` a plain argument, so
+    `../outside.txt` is a delete operand of its own: the outside delete is high again."""
+    assert [(r.severity, r.code, r.reason) for r in
+            _risks("Bash", cwd="C:/repo", command="C:/repo/bin/rm sub/echo ../outside.txt")] == [
+        ("high", "shell_outside",
+         "Shell command referenced a path outside the working folder (../outside.txt)")]
+
+
+@pytest.mark.parametrize("command, codes, named", [
+    ("rm C:/elsewhere/tests/test_a.py other/file.txt",
+     [("high", "test_deleted"), ("high", "shell_outside")], "tests/test_a.py"),
+    ("rm C:/elsewhere/key.pem other/file.txt",
+     [("high", "secret_file"), ("high", "shell_outside")], "key.pem"),
+])
+def test_a_delete_beside_a_spaced_path_keeps_its_own_finding(command, codes, named):
+    """CORE-SCR-R4-002: a finding is kept for the code and the target it names, never dropped
+    because another finding for the same command is equally severe. The path the finding shows
+    is the display label; the finding itself comes from the shell's own word."""
+    risks = _risks("Bash", cwd="C:/repo", command=command)
+    assert [(r.severity, r.code) for r in risks] == codes
+    assert any(named in r.reason for r in risks if r.code == "shell_outside")
+
+
+def test_a_redirect_beside_a_spaced_operand_is_still_a_migration():
+    """CORE-SCR-R4-003: the real redirect target gets the write-specific checks, so writing a
+    migration through the shell stays a medium db_migration."""
+    assert [(r.severity, r.code, r.reason) for r in _risks(
+        "Bash", cwd="C:/repo", command="echo hi > C:/repo/migrations/001_init.sql other/file.txt")] == [
+        ("medium", "db_migration", "Wrote a database migration (migrations/001_init.sql)")]
 
 
 def test_multiline_ansi_c_string_keeps_the_next_command_visible():

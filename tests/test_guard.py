@@ -132,6 +132,32 @@ def test_default_asks_and_names_the_traversing_operand_of_a_backslash_drive_path
     assert any(reason.endswith("(nested/../../outside.txt)") for reason in reasons)
 
 
+def test_default_asks_for_the_escaping_operand_of_an_explicit_rm_executable(tmp_path):
+    """CORE-SCR-R4-001: the executable `bin/rm` and the plain argument `sub/echo` stay separate
+    words, so deleting `../outside.txt` is a high finding and the guard asks instead of
+    allowing an outside delete."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    command = str(repo).replace(chr(92), "/") + "/bin/rm sub/echo ../outside.txt"
+    d = guard.decide(bash_event(repo, command), {})
+    assert d["policy_decision"] == "ask"
+    assert d["decision"] == "ask"
+    assert [(r["severity"], r["code"]) for r in d["risks"] if r["code"] == "shell_outside"] == [
+        ("high", "shell_outside")]
+
+
+def test_the_spaced_path_label_does_not_change_the_guard_decision(tmp_path):
+    """The label only rewrites the path a receipt shows: the unquoted spaced path asks exactly
+    like the same command with the path quoted, with the same codes and severities."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    loose = guard.decide(bash_event(repo, r"echo hi > E:\Work\Client y\z.txt"), {})
+    quoted = guard.decide(bash_event(repo, r"echo hi > 'E:\Work\Client y\z.txt'"), {})
+    assert loose["decision"] == quoted["decision"]
+    assert [(r["code"], r["severity"]) for r in loose["risks"]] == \
+        [(r["code"], r["severity"]) for r in quoted["risks"]]
+
+
 def test_default_denies_a_delete_after_a_queued_heredoc_past_a_multiline_ansi_c_string(tmp_path):
     """CORE-SCR-R3-002: a newline inside `$'...'` is part of that word, not the end of the
     command line, so the queued heredoc starts after the real terminator and the `rm -rf`
@@ -1597,6 +1623,37 @@ def test_is_guard_hook_rejects_attached_shell_operators(command):
     """CORE-SCR-R3-004: an operator written without spaces is still an operator, so the
     basename of the first word must never decide ownership of a compound command."""
     assert guard._is_guard_hook({"type": "command", "command": command}) is False
+
+
+@pytest.mark.parametrize("command", [
+    '"/usr/$(printf bin)/python3.13t" -m runledger guard',
+    '"/usr/`printf bin`/python3.13t" -m runledger guard',
+    '"$PYTHON3" -m runledger guard',
+])
+def test_is_guard_hook_rejects_executable_substitutions(command):
+    """CORE-SCR-R4-004: POSIX `$(...)` and backticks stay executable inside double quotes, so a
+    quoted executable that computes its own path is not the single command the installer
+    writes: it must never be replaced or removed (VAL-CORE-036/037)."""
+    assert guard._is_guard_hook({"type": "command", "command": command}) is False
+
+
+def test_guard_install_preserves_a_substitution_bearing_hook(tmp_path):
+    """The round-4 reproducer: v0.6.0 preserved this foreign entry, so install appends beside it
+    and uninstall leaves it in place."""
+    settings = tmp_path / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    foreign = [{"matcher": "Bash", "hooks": [
+        {"type": "command", "command": '"/usr/$(printf bin)/python3.13t" -m runledger guard'}]}]
+    settings.write_text(json.dumps({"hooks": {"PreToolUse": foreign}}), encoding="utf-8")
+
+    assert guard.install_hook(settings)[0] is True
+    pre = json.loads(settings.read_text(encoding="utf-8"))["hooks"]["PreToolUse"]
+    assert pre[0] == foreign[0]
+    owned = [h for group in pre for h in group["hooks"] if guard._is_guard_hook(h)]
+    assert len(owned) == 1 and owned[0]["command"] == guard.guard_hook_command()
+
+    assert guard.uninstall_hook(settings)[0] is True
+    assert json.loads(settings.read_text(encoding="utf-8"))["hooks"]["PreToolUse"] == foreign
 
 
 def test_guard_install_preserves_a_compound_interpreter_hook(tmp_path):

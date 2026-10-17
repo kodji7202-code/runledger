@@ -140,14 +140,16 @@ def test_powershell_aliases_redirections_and_dotnet_writes():
 
 
 @pytest.mark.parametrize("command, expected", [
-    (r"Set-Content -Path E:\Work\Client y\z.txt -Value x", [("E:\\Work\\Client y\\z.txt", False)]),
-    (r"Set-Content E:\Work\Client y\z.txt x", [("E:\\Work\\Client y\\z.txt", False)]),
-    (r"'x' > E:\Work\Client y\z.txt", [("E:\\Work\\Client y\\z.txt", False)]),
-    (r"Copy-Item a.txt E:\Work\Client y\z.txt", [("E:\\Work\\Client y\\z.txt", False)]),
-    (r"Remove-Item E:\Work\Client y\z.txt", [("E:\\Work\\Client y\\z.txt", True)]),
+    (r"Set-Content -Path E:\Work\Client y\z.txt -Value x", [(r"E:\Work\Client", False)]),
+    (r"Set-Content E:\Work\Client y\z.txt x", [(r"E:\Work\Client", False)]),
+    (r"'x' > E:\Work\Client y\z.txt", [(r"E:\Work\Client", False)]),
+    (r"Copy-Item a.txt E:\Work\Client y\z.txt", [(r"E:\Work\Client", False)]),
+    (r"Remove-Item E:\Work\Client y\z.txt", [(r"E:\Work\Client", True), ("y/z.txt", True)]),
 ])
-def test_unquoted_spaced_drive_path_is_one_write_target(command, expected):
-    """A PowerShell path argument with spaces is one path, never its first fragment."""
+def test_an_unquoted_spaced_drive_path_is_the_shells_own_words(command, expected):
+    """CORE-SCR-R4-001 for PowerShell: the target is the word the shell's own reading gives
+    (`Set-Content -Path E:\\Work\\Client y\\z.txt` passes `E:\\Work\\Client` as -Path and keeps
+    `y\\z.txt` as another argument), and the display label joins the folder name back."""
     assert [(w.path, w.deleted) for w in ps_writes(command)] == expected
 
 

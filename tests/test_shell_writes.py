@@ -75,16 +75,29 @@ def test_ignores_reads_and_unresolvable_targets(command):
 
 
 @pytest.mark.parametrize("command, expected", [
-    (r"echo hi > E:\Work\Client y\z.txt", [("E:\\Work\\Client y\\z.txt", 0, False)]),
-    (r"echo hi > E:/Work/Client y/z.txt", [("E:\\Work\\Client y\\z.txt", 0, False)]),
+    (r"echo hi > E:\Work\Client y\z.txt", [("E:\\Work\\Client", 0, False)]),
+    (r"echo hi > E:/Work/Client y/z.txt", [("E:\\Work\\Client", 0, False)]),
     (r"echo hi >> 'E:\Work\Client y\z.txt'", [("E:\\Work\\Client y\\z.txt", 0, False)]),
-    (r"echo hi > E:\Work\Client X\secret.txt", [("E:\\Work\\Client X\\secret.txt", 0, False)]),
-    (r"touch E:\Work\Client y\z.txt", [("E:\\Work\\Client y\\z.txt", 0, False)]),
+    (r"echo hi > E:\Work\Client X\secret.txt", [("E:\\Work\\Client", 0, False)]),
+    (r"touch E:\Work\Client y\z.txt", [("E:\\Work\\Client", 0, False), ("yz.txt", 0, False)]),
 ])
-def test_unquoted_spaced_drive_path_is_one_write_target(command, expected):
-    """A folder name may contain spaces, so an unquoted drive path is read as one path: a
-    redirect target is never reported as its first fragment."""
+def test_an_unquoted_spaced_drive_path_is_the_shells_own_words(command, expected):
+    """CORE-SCR-R4-001: a shell splits an unquoted path at its spaces, so the write targets are
+    its own words; only a quoted path is one word. Showing the folder name whole is a display
+    label applied afterwards (`risk._label_spaced_paths`, `summarize.file_changes`), never the
+    reading file changes are computed from."""
     assert _paths(command) == expected
+
+
+def test_a_spaced_drive_write_inside_the_project_is_labelled_whole(tmp_path):
+    """The shell writes `My` and `Folder/x.txt`; the file entry whose path is the leading
+    fragment of the spaced drive path is shown as the whole path, so the receipt names the file
+    the command's folder name belongs to."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    root = str(repo).replace(chr(92), "/")
+    run = _run(repo, [f"touch {root}/My Folder/x.txt"])
+    assert sorted(file_changes(run)) == ["Folder/x.txt", "My Folder/x.txt"]
 
 
 @pytest.mark.parametrize("command, deleted, written", [
