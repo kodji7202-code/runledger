@@ -27,7 +27,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from . import guard as _guard  # the secret patterns shared with the risk rules
+from . import guard as _guard, secrets as _secrets  # the secret patterns shared with the risk rules
 from .parser import Usage, _usage
 
 API_VERSION = "2023-06-01"

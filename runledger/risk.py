@@ -54,7 +54,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from . import paths
+from . import paths, secrets
 from .parser import Run, Step
 from .shell_writes import database_writes, shell_writes
 from .testdiff import SKIP_RE, TestChange, analyze as analyze_test_diffs
@@ -73,15 +73,9 @@ class Risk:
     step: int
 
 
-SECRET_PATTERNS = [
-    r"(^|/)\.env(\.[\w-]+)?$", r"(^|/)\.envrc$", r"id_(rsa|ed25519|ecdsa|dsa)(\.pub)?$",
-    r"\.pem$", r"\.key$", r"\.p12$", r"\.pfx$", r"(^|/)\.npmrc$", r"(^|/)\.pypirc$",
-    r"(^|/)\.netrc$", r"(^|/)\.aws/credentials$", r"(^|/)\.ssh/", r"credentials(\.json)?$",
-    r"secrets?\.(ya?ml|json|toml)$", r"(^|/)\.git-credentials$", r"service[-_]account.*\.json$",
-    r"(^|/)\.docker/config\.json$", r"(^|/)\.kube/config$",
-]
+SECRET_PATTERNS = [rx.pattern for rx in secrets.SECRET_PATH_PATTERNS]
 _SECRET_RE = re.compile("|".join(SECRET_PATTERNS), re.I)
-_ENV_EXAMPLE_RE = re.compile(r"\.env\.(example|sample|template|dist)$", re.I)
+_ENV_EXAMPLE_RE = secrets._PUBLIC_OR_TEMPLATE_PATH_RE
 
 TEST_RE = re.compile(r"(^|/)(tests?|__tests__|spec|specs)(/|$)|(\.|_|-)(test|spec)\.[a-z]+$|(^|/)test_[^/]+\.py$", re.I)
 # Real test source: deleting it is high. Anything else under a test folder is data (see _is_test_fixture).
@@ -288,6 +282,10 @@ _within = paths.within
 
 
 def _in_temp(target: str) -> bool:
+    for env_var in ("HOME", "USERPROFILE"):
+        h = os.environ.get(env_var)
+        if h and _within(target, h) and not _APPDATA_TEMP_RE.search(target[len(h):]):
+            return False
     if _APPDATA_TEMP_RE.search(target):
         return True
     roots = list(_POSIX_TEMP_ROOTS)
@@ -343,25 +341,13 @@ def _resolved(path: str, base: Optional[str]) -> str:
     return posixpath.join(base, path)
 
 
-def _is_secret(path: str, extra: List["re.Pattern"]) -> bool:
-    q = _slashes(path)
-    if _SECRET_RE.search(q) and not _ENV_EXAMPLE_RE.search(q):
-        return True
-    return any(rx.search(q) for rx in extra)
+def _is_secret(path: str, extra: Optional[List["re.Pattern"]] = None) -> bool:
+    return secrets.is_secret_path(path, extra)
 
 
 def _user_regexes(patterns: Any) -> List["re.Pattern"]:
-    out = []
-    if not isinstance(patterns, list):
-        return out
-    for rx in patterns:
-        if not isinstance(rx, str):
-            continue
-        try:
-            out.append(re.compile(rx, re.I))
-        except re.error:
-            continue  # invalid pattern in the config: skip it
-    return out
+    compiled, _ = secrets.compile_extra_secret_paths(patterns)
+    return compiled
 
 
 def _written_texts(step: Step) -> List[str]:
@@ -376,12 +362,7 @@ def _written_texts(step: Step) -> List[str]:
 
 def _hardcoded_secret_kinds(text: str) -> List[str]:
     """Kinds of hardcoded secret found in `text`. Returns kind names only."""
-    kinds = [kind for rx, kind in _CONTENT_SECRET_RULES if rx.search(text)]
-    for m in _GENERIC_SECRET_RE.finditer(text):
-        if m.group(2)[:1] in ("$", "{", "<"):  # template placeholder, not a value
-            continue
-        kinds.append(re.sub(r"[_-]", " ", m.group(1).lower()))
-    return list(dict.fromkeys(kinds))
+    return secrets.find_secrets(text)
 
 
 def _looks_like_path_arg(t: str) -> bool:
@@ -906,52 +887,145 @@ def _shell_write_risks(step: Step, cwd: Optional[str], extra: List["re.Pattern"]
 
 # ---------------------------------------------------------------- policy
 
-def load_policy(cwd: Optional[str]) -> Dict[str, Any]:
-    """Per-project settings from `<cwd>/.runledger.json`:
+_LOW_DEFAULT_KINDS = frozenset({
+    "mcp", "read_outside", "shell_outside", "temp_copy", "network", "package_install",
+})
+_HIGH_DEFAULT_KINDS = frozenset({
+    "secret_file", "secret_in_content", "secret", "write_outside", "outside_repo",
+    "test_deleted", "test_skipped", "destructive_delete", "git_force_push",
+    "pipe_to_shell", "destructive_sql", "package_publish", "infra_change", "sudo",
+})
 
-        {"ignore": ["code_or_reason_substring", ...],
-         "severity_overrides": {"code": "low|medium|high"},
-         "extra_secret_paths": ["regex", ...]}
 
-    `ignore` drops every risk whose code or reason contains the text
-    (case-insensitive). `severity_overrides` changes the level of a risk code.
-    `extra_secret_paths` are regexes added to the secret-file patterns.
+def _user_config_path() -> Path:
+    override = os.environ.get("RUNLEDGER_CONFIG", "").strip()
+    if override:
+        return Path(override)
+    home = os.environ.get("HOME") or os.environ.get("USERPROFILE") or str(Path.home())
+    return Path(home) / ".runledger" / "config.json"
 
-    A missing, unreadable or invalid file gives the defaults; so does any invalid
-    entry inside it. This function never raises."""
-    policy: Dict[str, Any] = {"ignore": [], "severity_overrides": {}, "extra_secret_paths": []}
-    if not cwd:
-        return policy
+
+def _read_json_dict(path: Path) -> Dict[str, Any]:
     try:
-        data = json.loads((Path(cwd) / POLICY_FILE).read_text(encoding="utf-8-sig"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError, TypeError, RecursionError):
-        return policy
-    if not isinstance(data, dict):
-        return policy
+        return {}
+    return data if isinstance(data, dict) else {}
 
+
+def _is_project_override_raising(kind: str, level: str) -> bool:
+    """True when a project `severity_overrides` entry raises severity above default."""
+    k = kind.strip().lower()
+    lv = level.strip().lower()
+    if lv == "low":
+        return False
+    if lv == "medium":
+        return k in _LOW_DEFAULT_KINDS
+    if lv == "high":
+        return k not in _HIGH_DEFAULT_KINDS
+    return False
+
+
+def _project_ignored_or_lowered_kinds(cwd: Optional[str]) -> List[str]:
+    """Distinct risk kinds a project `.runledger.json` tried to ignore or lower."""
+    if not cwd:
+        return []
+    data = _read_json_dict(Path(cwd) / POLICY_FILE)
+    if not data:
+        return []
+    rejected: List[str] = []
     ignore = data.get("ignore")
+    if isinstance(ignore, list):
+        for s in ignore:
+            if isinstance(s, str) and s.strip():
+                rejected.append(s.strip().lower())
+    overrides = data.get("severity_overrides")
+    if isinstance(overrides, dict):
+        for code, level in overrides.items():
+            if not isinstance(code, str) or not code.strip():
+                continue
+            if not isinstance(level, str) or level.lower() not in SEVERITY_POINTS:
+                continue
+            if not _is_project_override_raising(code, level):
+                rejected.append(code.strip().lower())
+    return list(dict.fromkeys(rejected))
+
+
+def load_policy(cwd: Optional[str]) -> Dict[str, Any]:
+    """Effective policy combining user config (`RUNLEDGER_CONFIG` or `~/.runledger/config.json`)
+    and project config (`<cwd>/.runledger.json`).
+
+    Trust model:
+    - User config may set `ignore`, `severity_overrides` (raise or lower), and `extra_secret_paths`.
+    - Project config may only add safe `extra_secret_paths` and raise severities in
+      `severity_overrides`; project `ignore` and severity-lowering overrides are ignored.
+    - `extra_secret_paths` are validated with `secrets.safe_user_regex` and capped at 20.
+    """
+    policy: Dict[str, Any] = {"ignore": [], "severity_overrides": {}, "extra_secret_paths": []}
+    user_data = _read_json_dict(_user_config_path())
+    proj_data = _read_json_dict(Path(cwd) / POLICY_FILE) if cwd else {}
+
+    ignore = user_data.get("ignore")
     if isinstance(ignore, list):
         policy["ignore"] = [s.strip() for s in ignore if isinstance(s, str) and s.strip()]
 
-    overrides = data.get("severity_overrides")
-    if isinstance(overrides, dict):
-        policy["severity_overrides"] = {
-            code: level.lower() for code, level in overrides.items()
-            if isinstance(level, str) and level.lower() in SEVERITY_POINTS
-        }
+    merged_overrides: Dict[str, str] = {}
+    proj_overrides = proj_data.get("severity_overrides")
+    if isinstance(proj_overrides, dict):
+        for code, level in proj_overrides.items():
+            if (isinstance(code, str) and code.strip()
+                    and isinstance(level, str) and level.lower() in SEVERITY_POINTS
+                    and _is_project_override_raising(code, level)):
+                merged_overrides[code.strip()] = level.lower()
 
-    extra = data.get("extra_secret_paths")
-    if isinstance(extra, list):
-        policy["extra_secret_paths"] = [rx for rx in extra if isinstance(rx, str) and rx and _compiles(rx)]
+    user_overrides = user_data.get("severity_overrides")
+    if isinstance(user_overrides, dict):
+        for code, level in user_overrides.items():
+            if isinstance(code, str) and code.strip() and isinstance(level, str) and level.lower() in SEVERITY_POINTS:
+                merged_overrides[code.strip()] = level.lower()
+    policy["severity_overrides"] = merged_overrides
+
+    raw_extra: List[str] = []
+    for src in (user_data.get("extra_secret_paths"), proj_data.get("extra_secret_paths")):
+        if isinstance(src, list):
+            for rx in src:
+                if isinstance(rx, str) and rx and _compiles(rx) and rx not in raw_extra:
+                    raw_extra.append(rx)
+                    if len(raw_extra) >= secrets.MAX_EXTRA_SECRET_PATHS:
+                        break
+        if len(raw_extra) >= secrets.MAX_EXTRA_SECRET_PATHS:
+            break
+    policy["extra_secret_paths"] = raw_extra
     return policy
 
 
 def _compiles(rx: str) -> bool:
-    try:
-        re.compile(rx)
-        return True
-    except re.error:
+    return secrets.safe_user_regex(rx) is not None
+
+
+def _risk_matches_key(r: Risk, key: str, allow_substring: bool = False) -> bool:
+    k = key.strip().lower()
+    if not k:
         return False
+    code = r.code.lower()
+    reason = r.reason.lower()
+    if k == code:
+        return True
+    if k == "outside_repo" and code in ("outside_repo", "write_outside", "read_outside", "shell_outside"):
+        return True
+    if k == "destructive_delete" and (code in ("destructive_delete", "delete") or "recursive force delete" in reason):
+        return True
+    if k == "git_force_push" and (code == "git_force_push" or "force-pushed to a git remote" in reason):
+        return True
+    if k == "git_push" and (code == "git_push" or reason == "pushed to a git remote"):
+        return True
+    if k == "network" and (code == "network" or "network request" in reason):
+        return True
+    if k == "secret" and code in ("secret", "secret_in_content"):
+        return True
+    if allow_substring and (k in code or k in reason):
+        return True
+    return False
 
 
 def _apply_policy(risks: List[Risk], policy: Dict[str, Any]) -> List[Risk]:
@@ -962,12 +1036,12 @@ def _apply_policy(risks: List[Risk], policy: Dict[str, Any]) -> List[Risk]:
     overrides = policy.get("severity_overrides") or {}
     kept = []
     for r in risks:
-        code, reason = r.code.lower(), r.reason.lower()
-        if any(s in code or s in reason for s in ignore):
+        if any(_risk_matches_key(r, s, allow_substring=True) for s in ignore):
             continue
-        level = overrides.get(r.code)
-        if isinstance(level, str) and level.lower() in SEVERITY_POINTS:
-            r.severity = level.lower()
+        for k, level in overrides.items():
+            if isinstance(k, str) and isinstance(level, str) and level.lower() in SEVERITY_POINTS:
+                if _risk_matches_key(r, k, allow_substring=False):
+                    r.severity = level.lower()
         kept.append(r)
     return kept
 
@@ -1047,13 +1121,21 @@ def assess_step(step: Step, cwd: Optional[str], policy: Optional[Dict[str, Any]]
 def _score(risks: List[Risk]) -> int:
     """Points for a run: each severity is totalled separately (low and medium are capped,
     high is not), and the sum is capped at 100. A repeat of a code adds a third of its points."""
-    counted: Dict[Tuple[str, str], int] = {}
+    counted: Dict[Tuple[str, ...], int] = {}
     totals = {"high": 0, "medium": 0, "low": 0}
+    distinct_high = 0
     for r in risks:
-        k = (r.code, r.severity)
+        k: Tuple[str, ...] = (r.code, r.reason if r.code == "command" else "", r.severity)
         counted[k] = counted.get(k, 0) + 1
         base = SEVERITY_POINTS[r.severity]
-        totals[r.severity] += base if counted[k] == 1 else base // 3
+        if counted[k] == 1:
+            totals[r.severity] += base
+            if r.severity == "high":
+                distinct_high += 1
+        else:
+            totals[r.severity] += base // 3
+    if distinct_high >= 3:
+        totals["high"] = max(totals["high"], 100)
     total = totals["high"] + min(MEDIUM_POINTS_CAP, totals["medium"]) + min(LOW_POINTS_CAP, totals["low"])
     return min(100, total)
 
@@ -1105,6 +1187,14 @@ def _apply_test_verdicts(run: Run, changes: List[TestChange], policy: Dict[str, 
 
 def assess(run: Run) -> Tuple[int, str, List[Risk]]:
     policy = load_policy(run.cwd)
+    rejected = _project_ignored_or_lowered_kinds(run.cwd)
+    if rejected:
+        note = (
+            f"Project config tried to ignore/lower {len(rejected)} risk kind(s) "
+            "(not applied; set in user config to enable)."
+        )
+        if note not in run.notes:
+            run.notes.append(note)
     all_risks: List[Risk] = []
     for s in run.steps:
         s.risks = assess_step(s, run.cwd, policy)

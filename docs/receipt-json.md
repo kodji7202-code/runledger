@@ -45,6 +45,7 @@ schema = resources.files("runledger").joinpath("receipt.schema.json").read_text(
 | `recommendations` | array | cost tips: `kind`, `title`, `detail`, `est_savings_usd`, `steps` |
 | `ai_review` | object or null | the `--review` result ([analysis.md](analysis.md#ai-risk-review)) |
 | `guard` | array, optional | Guard decisions, present only when the run has some ([guard.md](guard.md#guard-decisions-in-receipts)) |
+| `notes` | array of strings, optional | Policy notes (such as when a project `.runledger.json` tried to ignore or lower risk kinds), present only when the run has some |
 
 A risk reason (in `risk.reasons` and `steps[].risks`) has `severity` (`high`, `medium`, `low`),
 `code`, `reason` and `step`.

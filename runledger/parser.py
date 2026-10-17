@@ -93,6 +93,7 @@ class Run:
     ai_review: Optional[Dict[str, Any]] = None        # review.py (Claude Sonnet): verdict + assessments
     checkpoint_id: Optional[str] = None              # earliest local checkpoint for this session
     guard: List[Dict[str, Any]] = field(default_factory=list)  # local Guard decisions
+    notes: List[str] = field(default_factory=list)   # policy / trust / receipt notes
     # gitinfo.working_changes for files the run wrote through the shell, keyed relative to cwd
     git_changes: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     # gitinfo.file_diffs for changed test files, keyed relative to cwd; read by testdiff, never shown

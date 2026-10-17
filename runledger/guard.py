@@ -50,6 +50,16 @@ from . import risk as _risk
 from .parser import Step
 from .risk import POLICY_FILE, SEVERITY_POINTS, Risk, assess_step
 
+try:
+    from . import secrets as _secrets
+    from .secrets import find_secrets, is_secret_path, redact_text, safe_user_regex
+except Exception:  # pragma: no cover - standalone fallback when runledger.secrets is unavailable
+    _secrets = None  # type: ignore[assignment]
+    find_secrets = None  # type: ignore[assignment]
+    is_secret_path = None  # type: ignore[assignment]
+    redact_text = None  # type: ignore[assignment]
+    safe_user_regex = None  # type: ignore[assignment]
+
 HOOK_COMMAND = "runledger guard"
 HOOK_MARGIN_S = 15             # the hook entry allows the approval wait plus this many seconds
 _GUARD_CMD_RE = re.compile(r"\brunledger(?:\.exe)?\"?\s+guard\b|-m\s+runledger\s+guard\b", re.I)
@@ -78,27 +88,28 @@ REDACTED = "[REDACTED]"
 
 _FALLBACK_SECRET_RES = [
     re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{12,}"),
-    re.compile(r"(?<![A-Za-z0-9])AKIA[0-9A-Z]{16}(?![A-Za-z0-9])"),
-    re.compile(r"(?<![A-Za-z0-9])gh[pousr]_[A-Za-z0-9]{20,}"),
+    re.compile(r"(?<![A-Za-z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Za-z0-9])"),
+    re.compile(r"(?<![A-Za-z0-9])(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{22,})"),
     re.compile(r"(?<![A-Za-z0-9])xox[baprs]-[A-Za-z0-9-]{10,}"),
-    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+    re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"),
     re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{12,}"),
     re.compile(r"(?<![A-Za-z0-9])[rs]k_(?:live|test)_[A-Za-z0-9]{16,}"),
     re.compile(r"(?<![A-Za-z0-9])AIza[0-9A-Za-z_-]{35}"),
     re.compile(r"(?<![A-Za-z0-9])glpat-[A-Za-z0-9_-]{20,}"),
     re.compile(r"(?<![A-Za-z0-9])npm_[A-Za-z0-9]{36}"),
+    re.compile(r"(?<![A-Za-z0-9])pypi-[A-Za-z0-9_-]{32,}"),
     re.compile(r"(?<![A-Za-z0-9])hf_[A-Za-z0-9]{30,}"),
     re.compile(r"(?<![A-Za-z0-9_])rl_[A-Za-z0-9_-]{30,}"),
     re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"),
 ]
 _FALLBACK_GENERIC_RE = re.compile(
-    r"(api[_-]?key|secret|token|password)[\"']?\s*[:=]\s*[\"']([^\"'\s]{8,})[\"']", re.I)
+    r"(api[_-]?key|secret|token|password)[\"']?\s*[:=]\s*[\"']([^\"'\s]{12,})[\"']", re.I)
 
 # Unquoted values, masked last. Only the named group "v" is replaced.
 _SECRET_NAME = (r"(?:api[_-]?key|apikey|secret|token|passw(?:or)?d|credentials?"
                 r"|private[_-]?key|access[_-]?key)")
 _VALUE_SECRET_RES = [
-    # TOKEN=abc123, export DB_PASSWORD=..., ?access_token=..., --password=...
+    # TOKEN=abc123, export DB_PASSWORD=**** ?access_token=..., --password=...
     # The name parts are bounded so a long blob without "=" cannot cause quadratic backtracking.
     re.compile(r"(?i)(?<![A-Za-z0-9])[A-Za-z0-9_.-]{0,40}" + _SECRET_NAME
                + r"[A-Za-z0-9_.-]{0,40}\s*=\s*(?P<v>[^\s\"'&;|,)}\]]{6,})"),
@@ -126,6 +137,9 @@ class InstallError(Exception):
 # ---------------------------------------------------------------- redaction
 
 def _mask_value(m: "re.Match") -> str:
+    val = m.group(2)
+    if val.startswith(_PLACEHOLDER_START) or val.endswith((">", "...")):
+        return m.group(0)
     whole = m.group(0)
     a, b = m.start(2) - m.start(0), m.end(2) - m.start(0)
     return whole[:a] + REDACTED + whole[b:]
@@ -151,12 +165,12 @@ def _mask_named(m: "re.Match") -> str:
 
 
 def _secret_patterns() -> List["re.Pattern"]:
-    """Patterns from risk.py when they are there, plus the fallbacks above."""
+    """Patterns from secrets.py / risk.py when they are there, plus the fallbacks above."""
     try:
-        from_risk = [rx for rx, _kind in getattr(_risk, "_CONTENT_SECRET_RULES", []) if hasattr(rx, "sub")]
+        from_secrets = [rx for rx, _kind in getattr(_secrets, "SECRET_CONTENT_PATTERNS", []) if hasattr(rx, "sub")]
     except (TypeError, ValueError):
-        from_risk = []
-    return from_risk + _FALLBACK_SECRET_RES
+        from_secrets = []
+    return from_secrets + _FALLBACK_SECRET_RES
 
 
 def redact(text: Any) -> str:
@@ -164,8 +178,9 @@ def redact(text: Any) -> str:
     If redaction itself fails, the whole text is replaced."""
     s = "" if text is None else str(text)
     try:
-        generic = getattr(_risk, "_GENERIC_SECRET_RE", None)
-        for rx in ([generic] if generic is not None else []) + [_FALLBACK_GENERIC_RE]:
+        if redact_text is not None:
+            return redact_text(s)
+        for rx in [_FALLBACK_GENERIC_RE]:
             s = rx.sub(_mask_value, s)
         for rx in _secret_patterns():
             s = rx.sub(REDACTED, s)
@@ -202,7 +217,10 @@ def read_policy(cwd: str) -> Dict[str, Any]:
 
 
 def user_config_path() -> Path:
-    """`~/.runledger/config.json`. The home folder is HOME, then USERPROFILE, then the platform default."""
+    """`RUNLEDGER_CONFIG` when set, else `~/.runledger/config.json`."""
+    override = os.environ.get("RUNLEDGER_CONFIG", "").strip()
+    if override:
+        return Path(override)
     base = os.environ.get("HOME") or os.environ.get("USERPROFILE")
     return (Path(base) if base else Path.home()) / USER_CONFIG_DIR / USER_CONFIG_FILE
 
@@ -390,16 +408,35 @@ def _valid_overrides(value: Any) -> Dict[str, str]:
     return {k: v.lower() for k, v in value.items() if isinstance(v, str) and v.lower() in SEVERITY_POINTS}
 
 
-def _valid_extra(value: Any) -> List[str]:
+def _valid_extra_with_warnings(value: Any, existing_count: int = 0) -> Tuple[List[str], List[str]]:
     out: List[str] = []
-    if isinstance(value, list):
-        for rx in value:
-            if isinstance(rx, str) and rx:
-                try:
-                    re.compile(rx)
-                    out.append(rx)
-                except re.error:
-                    pass
+    warnings: List[str] = []
+    if not isinstance(value, list):
+        return out, warnings
+    max_extra = getattr(_secrets, "MAX_EXTRA_SECRET_PATHS", 20)
+    for rx in value:
+        if not isinstance(rx, str) or not rx:
+            continue
+        if existing_count + len(out) >= max_extra:
+            warnings.append(f"ignored unsafe/invalid extra_secret_paths pattern: {rx} (limit {max_extra})")
+            continue
+        if safe_user_regex is not None:
+            ok = safe_user_regex(rx) is not None
+        else:
+            try:
+                re.compile(rx)
+                ok = len(rx) <= 200
+            except re.error:
+                ok = False
+        if ok:
+            out.append(rx)
+        else:
+            warnings.append(f"ignored unsafe/invalid extra_secret_paths pattern: {rx}")
+    return out, warnings
+
+
+def _valid_extra(value: Any) -> List[str]:
+    out, _ = _valid_extra_with_warnings(value)
     return out
 
 
@@ -407,14 +444,19 @@ def _risk_settings(project: Dict[str, Any], user: Dict[str, Any]) -> Dict[str, A
     """`assess` is what risk.py gets: the user's ignore and severity overrides, and the
     union of secret-path patterns. The project's ignore and severity overrides come
     back separately, for the tighten-only checks."""
+    user_extra, user_extra_warnings = _valid_extra_with_warnings(user.get("extra_secret_paths"))
+    proj_extra, proj_extra_warnings = _valid_extra_with_warnings(
+        project.get("extra_secret_paths"), existing_count=len(user_extra)
+    )
     return {
         "assess": {
             "ignore": _valid_ignore(user.get("ignore")),
             "severity_overrides": _valid_overrides(user.get("severity_overrides")),
-            "extra_secret_paths": _valid_extra(user.get("extra_secret_paths")) + _valid_extra(project.get("extra_secret_paths")),
+            "extra_secret_paths": user_extra + proj_extra,
         },
         "project_ignore": _valid_ignore(project.get("ignore")),
         "project_severity": _valid_overrides(project.get("severity_overrides")),
+        "extra_warnings": user_extra_warnings + proj_extra_warnings,
     }
 
 
@@ -526,7 +568,20 @@ def _ask_approver(request: Dict[str, Any], cfg: Dict[str, Any], approver: Option
     return "deny", clean(status, 40), f"Unknown approval status: {text}"
 
 
-def decide(event: dict, policy: dict, approver: Optional[ApproverFn] = None) -> dict:
+class _DecisionDict(dict):
+    """Decision dictionary that also supports attribute access (`d.decision`, `d.codes`, etc.)."""
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return self[name]
+        except KeyError:
+            raise AttributeError(name) from None
+
+    def outcome_when_enforced(self) -> str:
+        return str(self.get("policy_decision") or self.get("decision") or "allow")
+
+
+def decide(event: dict, policy: Optional[dict] = None, approver: Optional[ApproverFn] = None) -> _DecisionDict:
     """Decide one PreToolUse event.
 
     `policy` is the project's .runledger.json dict. The user's ~/.runledger/config.json
@@ -542,7 +597,8 @@ def decide(event: dict, policy: dict, approver: Optional[ApproverFn] = None) -> 
     and warnings (project settings that were ignored). Nothing here touches the log
     or stdout."""
     event = event if isinstance(event, dict) else {}
-    project = policy if isinstance(policy, dict) else {}
+    cwd = _event_cwd(event)
+    project = policy if isinstance(policy, dict) else read_policy(cwd)
     user = load_user_config()
     cfg, warnings = _effective_guard(project, user, trusted_approval_settings(user))
     warnings = _project_key_warnings(project) + warnings
@@ -550,10 +606,10 @@ def decide(event: dict, policy: dict, approver: Optional[ApproverFn] = None) -> 
     tool = str(event.get("tool_name") or "?")
     raw_input = event.get("tool_input")
     tool_input = raw_input if isinstance(raw_input, dict) else {}
-    cwd = _event_cwd(event)
     session_id = str(event.get("session_id") or "")
 
     rs = _risk_settings(project, user)
+    warnings += rs.get("extra_warnings", [])
     step = Step(index=1, tool=tool, input=tool_input,
                 tool_use_id=str(event.get("tool_use_id") or ""), model=None, timestamp=None)
     risks = assess_step(step, cwd, rs["assess"])
@@ -584,7 +640,7 @@ def decide(event: dict, policy: dict, approver: Optional[ApproverFn] = None) -> 
                    "risks": risks_out, "cwd": cwd}
         final, approval, reason = _ask_approver(request, cfg, approver, drivers, reason)
 
-    return {
+    return _DecisionDict({
         "decision": final,
         "policy_decision": policy_decision,
         "mode": cfg["mode"],
@@ -598,7 +654,15 @@ def decide(event: dict, policy: dict, approver: Optional[ApproverFn] = None) -> 
         "approval": approval,
         "summary": summary,
         "warnings": list(dict.fromkeys(warnings)),
-    }
+    })
+
+
+def evaluate(event: dict, policy: Optional[dict] = None, approver: Optional[ApproverFn] = None) -> _DecisionDict:
+    """Evaluate a PreToolUse event and write warnings + the decision record to `.runledger/guard.log`."""
+    decision = decide(event, policy=policy, approver=approver)
+    _log_quietly(lambda: _log_warnings(decision))
+    _log_quietly(lambda: _log_decision(decision))
+    return decision
 
 
 def hook_output(decision: dict) -> Optional[dict]:

@@ -24,19 +24,6 @@ APPROVAL = {"timeout_s": 5}   # the server is never read from the policy; see RU
 SERVER = "https://approvals.example.test"
 
 
-@pytest.fixture(autouse=True)
-def isolated_settings(tmp_path, monkeypatch):
-    """HOME and USERPROFILE point at an empty folder, and the approval variables are
-    cleared, so no test reads the real ~/.runledger/config.json or the environment."""
-    home = tmp_path / "isolated-home"
-    home.mkdir()
-    monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setenv("USERPROFILE", str(home))
-    monkeypatch.delenv("RUNLEDGER_SERVER", raising=False)
-    monkeypatch.delenv("RUNLEDGER_API_KEY", raising=False)
-    return home
-
-
 def bash_event(cwd, command, session="sess-1"):
     return {"session_id": session, "transcript_path": "t.jsonl", "cwd": str(cwd),
             "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": command}}
@@ -1032,3 +1019,44 @@ def test_hook_process_end_to_end(tmp_path):
 
     garbage = run("definitely not json")
     assert garbage.returncode == 0 and garbage.stdout == b""
+
+
+def test_guard_redos_extra_secret_paths_is_fast_and_logs_warning(tmp_path):
+    import time
+    from runledger.parser import Run, Step, Usage
+    from runledger.risk import assess
+
+    (tmp_path / ".runledger.json").write_text(json.dumps({
+        "extra_secret_paths": ["(a+)+$", r"\.vault$"],
+    }), encoding="utf-8")
+
+    evil_target = "a" * 50 + "!"
+    evt = {"session_id": "sess-redos", "cwd": str(tmp_path), "hook_event_name": "PreToolUse",
+           "tool_name": "Read", "tool_input": {"file_path": str(tmp_path / evil_target)}}
+    t0 = time.perf_counter()
+    dec = guard.evaluate(evt)
+    elapsed_guard = time.perf_counter() - t0
+    assert elapsed_guard < 0.05
+    assert dec.decision == "allow"
+
+    log_text = (tmp_path / ".runledger" / "guard.log").read_text(encoding="utf-8")
+    assert "ignored unsafe/invalid extra_secret_paths pattern" in log_text
+
+    run = Run(
+        session_id="sess-redos", path="", agent="claude-code", cwd=str(tmp_path), git_branch="main",
+        started="2026-03-01T10:00:00Z", ended="2026-03-01T10:01:00Z", prompts=["check"],
+        steps=[Step(index=1, tool_use_id="t1", tool="Read", input={"file_path": evil_target},
+                    model=None, timestamp=None)],
+        final_message="done", usage=Usage(), models={},
+    )
+    t1 = time.perf_counter()
+    assess(run)
+    elapsed_assess = time.perf_counter() - t1
+    assert elapsed_assess < 0.05
+
+    vault_evt = {"session_id": "sess-redos", "cwd": str(tmp_path), "hook_event_name": "PreToolUse",
+                 "tool_name": "Read", "tool_input": {"file_path": str(tmp_path / "app.vault")}}
+    vault_dec = guard.evaluate(vault_evt)
+    assert vault_dec.decision in ("ask", "deny")
+    assert "secret_file" in vault_dec.codes
+

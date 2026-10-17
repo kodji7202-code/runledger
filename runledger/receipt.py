@@ -476,6 +476,7 @@ def redact_run(run: Run, risks: List[Risk]) -> None:
     run.recommendations = _redact_value(run.recommendations)
     run.ai_review = _redact_value(run.ai_review)
     run.guard = _redact_value(run.guard)
+    run.notes = [redact(n) for n in (run.notes or []) if isinstance(n, str)]
 
 
 # ---------------------------------------------------------------- output formats
@@ -570,6 +571,8 @@ def to_dict(run: Run, score: int, level: str, risks: List[Risk]) -> Dict:
     if run.guard:
         data["guard"] = run.guard
         data["totals"]["guard"] = guard_counts(run.guard)
+    if run.notes:
+        data["notes"] = list(run.notes)
     return data
 
 
@@ -580,6 +583,8 @@ def to_markdown(run: Run, score: int, level: str, risks: List[Risk]) -> str:
     out.append(f"- **Risk:** {score}/100 ({level})  ·  **Cost:** {_cost_text(run)}  ·  **Tokens:** {_run_tok(run, run.usage.total)}  ·  **Files changed:** {len(changes)}")
     if run.guard:
         out.append(f"- **Guard:** {guard_summary(run.guard)}")
+    for n in run.notes or []:
+        out.append(f"- **Note:** {_md_inline(n)}")
     if unknown_models(run):
         out.append(f"- **Unknown model price:** {PRICING_HELP}")
     if UNATTRIBUTED in unpriced(run):
@@ -702,6 +707,7 @@ def to_html(run: Run, score: int, level: str, risks: List[Risk]) -> str:
     ) if rollback else ""
     guard_note = (f'<div class="meta">Guard: {_e(guard_summary(run.guard))}</div>'
                   if run.guard else "")
+    notes_html = "".join(f'<div class="meta">Note: {_e(n)}</div>' for n in (run.notes or []))
 
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -720,6 +726,7 @@ def to_html(run: Run, score: int, level: str, risks: List[Risk]) -> str:
  <div class="card"><span>Duration</span><b>{_dur(run.duration_seconds)}</b></div>
 </div>
 {guard_note}
+{notes_html}
 {pricing_note}
 <h2>Overview</h2><div class="overview">{e(run.overall_summary)}</div>{quality_html}
 <h2>Risk · {level}</h2><div class="overview">{risk_html}</div>{ai_html}{recs_html}

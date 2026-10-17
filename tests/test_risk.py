@@ -393,25 +393,31 @@ def test_load_policy_invalid_or_non_object_gives_defaults(tmp_path, raw):
     assert load_policy(str(tmp_path)) == DEFAULTS
 
 
-def test_load_policy_drops_invalid_entries(tmp_path):
-    _write_policy(tmp_path, {
+def test_load_policy_drops_invalid_entries(tmp_path, monkeypatch):
+    user_cfg = tmp_path / "user_config.json"
+    user_cfg.write_text(json.dumps({
         "ignore": ["command", 5, "", "   "],
         "severity_overrides": {"command": "critical", "mcp": "LOW", "rm": 3},
         "extra_secret_paths": ["(", r"\.vault$"],
-    })
+    }), encoding="utf-8")
+    monkeypatch.setenv("RUNLEDGER_CONFIG", str(user_cfg))
     policy = load_policy(str(tmp_path))
     assert policy["ignore"] == ["command"]
     assert policy["severity_overrides"] == {"mcp": "low"}
     assert policy["extra_secret_paths"] == [r"\.vault$"]
 
 
-def test_load_policy_accepts_utf8_bom(tmp_path):
-    _write_policy(tmp_path, {"ignore": ["mcp"]}, bom=True)
+def test_load_policy_accepts_utf8_bom(tmp_path, monkeypatch):
+    user_cfg = tmp_path / "user_config.json"
+    user_cfg.write_bytes(json.dumps({"ignore": ["mcp"]}).encode("utf-8-sig"))
+    monkeypatch.setenv("RUNLEDGER_CONFIG", str(user_cfg))
     assert load_policy(str(tmp_path))["ignore"] == ["mcp"]
 
 
-def test_policy_ignore_removes_matching_risks(tmp_path):
-    _write_policy(tmp_path, {"ignore": ["mcp"]})
+def test_policy_ignore_removes_matching_risks(tmp_path, monkeypatch):
+    user_cfg = tmp_path / "user_config.json"
+    user_cfg.write_text(json.dumps({"ignore": ["mcp"]}), encoding="utf-8")
+    monkeypatch.setenv("RUNLEDGER_CONFIG", str(user_cfg))
     steps = [_step("mcp__github__create_issue", 1, title="x"), _step("Bash", 2, command="sudo ls")]
     _, _, risks = assess(_run(steps, str(tmp_path)))
     codes = {r.code for r in risks}
@@ -425,10 +431,12 @@ def test_policy_ignore_matches_reason_text_case_insensitively():
     assert "read_outside" not in {r.code for r in risks}
 
 
-def test_policy_severity_override_changes_level_and_score(tmp_path):
+def test_policy_severity_override_changes_level_and_score(tmp_path, monkeypatch):
     steps = [_step("Bash", 1, command="sudo ls")]
     base_score, _, _ = assess(_run(steps, str(tmp_path)))
-    _write_policy(tmp_path, {"severity_overrides": {"command": "low"}})
+    user_cfg = tmp_path / "user_config.json"
+    user_cfg.write_text(json.dumps({"severity_overrides": {"command": "low"}}), encoding="utf-8")
+    monkeypatch.setenv("RUNLEDGER_CONFIG", str(user_cfg))
     score, _, risks = assess(_run(steps, str(tmp_path)))
     assert [(r.severity, r.reason) for r in risks] == [("low", "Ran a command with sudo")]
     assert base_score == 30 and score == 5
@@ -732,3 +740,165 @@ def test_medium_findings_cap_at_forty_five_points(tmp_path):
 def test_high_findings_are_not_capped_below_one_hundred(tmp_path):
     score, _, _ = assess(_run(_steps("Bash", 4, command="sudo ls"), str(tmp_path)))
     assert score == 60  # 30 for the first sudo, then 10 for each repeat
+
+
+# ---------------------------------------------------------------- secret paths, ReDoS validator & trust model (VAL-CORE-014, 016..018, 024..026)
+
+@pytest.mark.parametrize("secret_path", [
+    "main.tfstate",
+    "terraform.tfstate.backup",
+    "prod.tfvars",
+    "keystore.jks",
+    "app.keystore",
+    "AuthKey_ABC1234567.p8",
+    "cert.p12",
+    "cert.pfx",
+    ".htpasswd",
+    ".vault-token",
+    ".config/gh/hosts.yml",
+    ".azure/accessTokens.json",
+    ".git/config",
+    ".netrc",
+    "id_rsa",
+    "id_ed25519",
+])
+def test_extended_secret_paths_are_detected(secret_path):
+    from runledger import secrets
+
+    assert secrets.is_secret_path(secret_path) is True
+    hits = assess_step(_step("Read", file_path=secret_path), POSIX_CWD)
+    assert any(r.code == "secret_file" and r.severity == "high" for r in hits)
+
+
+@pytest.mark.parametrize("public_path", [
+    "~/.ssh/id_rsa.pub",
+    "id_ed25519.pub",
+    "deploy_key.pub",
+    "src/public.py",
+    "README.md",
+    "package.json",
+])
+def test_public_key_and_normal_paths_are_not_secret(public_path):
+    from runledger import secrets
+
+    assert secrets.is_secret_path(public_path) is False
+    hits = assess_step(_step("Read", file_path=public_path), POSIX_CWD)
+    assert not any(r.code == "secret_file" for r in hits)
+
+
+@pytest.mark.parametrize("bad_pattern", [
+    "(a+)+$",
+    "(a|aa)+$",
+    "(a*)*",
+    "(x+x+)+y",
+    r"(\w+\.)+com",
+    "(a+){2,}",
+    r"(a+)\1",
+    "a" * 201,
+])
+def test_safe_user_regex_rejects_redos_and_overlong(bad_pattern):
+    from runledger import secrets
+
+    assert secrets.safe_user_regex(bad_pattern) is None
+
+
+@pytest.mark.parametrize("good_pattern,matching_sample,non_matching_sample", [
+    (r"\.vault$", "config/app.vault", "config/app.txt"),
+    (r"(^|/)vault\.txt$", "dir/vault.txt", "dir/other.txt"),
+    (r"(^|/)config/prod\.ya?ml$", "config/prod.yaml", "config/dev.yaml"),
+    (r"^(?:src|lib)/secrets/.*$", "src/secrets/key.json", "test/secrets/key.json"),
+    (r"[a-z]+\d*\.pem$", "cert12.pem", "cert12.txt"),
+    ("glob:*.SecretConfig", "app.SecretConfig", "app.Config"),
+])
+def test_safe_user_regex_accepts_valid_and_glob_patterns(good_pattern, matching_sample, non_matching_sample):
+    from runledger import secrets
+
+    compiled = secrets.safe_user_regex(good_pattern)
+    assert compiled is not None
+    assert compiled.search(matching_sample) is not None
+    assert compiled.search(non_matching_sample) is None
+
+
+def test_extra_secret_paths_truncates_long_path_and_caps_count(tmp_path):
+    from runledger import secrets
+
+    long_path = "a/" * 5000 + "file.vault"
+    assert len(long_path) > 10000
+    assert secrets.is_secret_path(long_path, extra=[r"\.vault$"]) is False
+    short_path = "a/" * 40 + "file.vault"
+    assert len(short_path) < 200
+    assert secrets.is_secret_path(short_path, extra=[r"\.vault$"]) is True
+
+    _write_policy(tmp_path, {
+        "extra_secret_paths": [f"pat{i}\\.secret$" for i in range(30)],
+    })
+    policy = load_policy(str(tmp_path))
+    assert len(policy["extra_secret_paths"]) == 20
+
+
+def test_project_config_cannot_ignore_or_lower_risks_and_emits_note(tmp_path):
+    from runledger.receipt import render
+
+    _write_policy(tmp_path, {
+        "ignore": ["destructive_delete", "git_force_push", "secret_file"],
+        "severity_overrides": {"destructive_delete": "low", "secret_file": "low"},
+    })
+    steps = [
+        _step("Bash", 1, command="rm -rf dist"),
+        _step("Bash", 2, command="git push --force"),
+        _step("Read", 3, file_path=".env"),
+    ]
+    run = _run(steps, str(tmp_path))
+    score, level, risks = assess(run)
+    assert score == 100 and level == "High"
+    high_reasons = [r.reason for r in risks if r.severity == "high"]
+    assert len(high_reasons) == 3
+    assert any("rm" in r or "deletion" in r for r in high_reasons)
+    assert any("Force-pushed" in r for r in high_reasons)
+    assert any(".env" in r for r in high_reasons)
+
+    expected_note = "Project config tried to ignore/lower 3 risk kind(s) (not applied; set in user config to enable)."
+    assert expected_note in run.notes
+    for fmt in ("md", "html", "json"):
+        rendered = render(run, score, level, risks, fmt)
+        assert expected_note in rendered
+
+
+def test_project_config_can_raise_severities_and_add_extra_secret_paths(tmp_path):
+    _write_policy(tmp_path, {
+        "severity_overrides": {"git_push": "high", "mcp": "medium"},
+        "extra_secret_paths": [r"\.vault$"],
+    })
+    steps = [
+        _step("mcp__github__create_issue", 1, title="x"),
+        _step("Bash", 2, command="git push origin main"),
+        _step("Read", 3, file_path="secrets.vault"),
+    ]
+    run = _run(steps, str(tmp_path))
+    _, _, risks = assess(run)
+    by_step = {r.step: r for r in risks}
+    assert by_step[1].code == "mcp" and by_step[1].severity == "medium"
+    assert by_step[2].severity == "high"
+    assert by_step[3].code == "secret_file" and by_step[3].severity == "high"
+    assert run.notes == []
+
+
+def test_user_config_can_ignore_and_lower_severities(tmp_path, monkeypatch):
+    user_cfg = tmp_path / "user_cfg.json"
+    user_cfg.write_text(json.dumps({
+        "ignore": ["network"],
+        "severity_overrides": {"outside_repo": "low"},
+    }), encoding="utf-8")
+    monkeypatch.setenv("RUNLEDGER_CONFIG", str(user_cfg))
+    steps = [
+        _step("WebFetch", 1, url="https://example.com"),
+        _step("Bash", 2, command="curl https://example.com"),
+        _step("Write", 3, file_path="/etc/hosts", content="127.0.0.1 localhost"),
+    ]
+    run = _run(steps, str(tmp_path))
+    _, _, risks = assess(run)
+    assert not any(r.code == "network" or "Network call" in r.reason for r in risks)
+    outside = [r for r in risks if r.code in ("outside_workspace", "write_outside", "outside_repo")]
+    assert outside and all(r.severity == "low" for r in outside)
+    assert run.notes == []
+
