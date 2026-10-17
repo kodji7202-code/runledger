@@ -53,6 +53,7 @@ class Usage:
                 self.cache_write_1h_tokens,
             )
             seed._request_prompt_tokens = self._request_prompt_tokens
+            seed._cumulative_only = self._cumulative_only
             self._requests.append(seed)
         if other._requests:
             self._requests.extend(other._requests)
@@ -65,6 +66,7 @@ class Usage:
                 other.cache_write_1h_tokens,
             )
             snap._request_prompt_tokens = other._request_prompt_tokens
+            snap._cumulative_only = other._cumulative_only
             self._requests.append(snap)
         if other._cumulative_only:
             self._cumulative_only = True

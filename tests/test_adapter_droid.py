@@ -11,6 +11,7 @@ import pytest
 from runledger import adapters
 from runledger.adapters import droid
 from runledger.cli import main
+from runledger.client import build_payload
 from runledger.parser import Usage
 from runledger.pricing import apply_costs, cost_of, unknown_models
 from runledger.risk import assess
@@ -668,6 +669,34 @@ def test_find_sessions_matches_a_windows_project_by_folder_name(tmp_path, monkey
     _relative_session(sessions / "C--Users-dev-other", name="other.jsonl")
     assert set(droid.find_sessions("C:\\Users\\dev\\My-Proj")) == expected
     assert set(droid.find_sessions("c:/users/dev/my-proj")) == expected
+
+
+def test_known_message_and_settings_remainder_are_priced_separately(tmp_path):
+    rows = [_message([_call("Read", {"file_path": "a.py"})], modelId="gpt-6-astra",
+                     usage={"input_tokens": 300_000, "output_tokens": 0})]
+    run = droid.parse(_session(tmp_path, rows, settings={
+        "model": "gpt-6-astra", "tokenUsage": {"inputTokens": 400_000, "outputTokens": 0},
+    }))
+    apply_costs(run)
+    assert run.usage_source == "settings"
+    # The 300k message is above the 272k threshold and bills tier 2 ($20/MTok = $6);
+    # only the cumulative 100k remainder falls back to the base tier ($10/MTok = $1).
+    assert run.cost == pytest.approx(7.0)
+
+
+def test_settings_only_cost_matches_the_pushed_payload(tmp_path):
+    rows = [_message([_call("Read", {"file_path": "a.py"}, "c1")])]
+    path = _session(tmp_path, rows, settings={
+        "model": "gpt-6-astra", "tokenUsage": {"inputTokens": 500_000, "outputTokens": 0},
+    })
+    run = droid.parse(path)
+    apply_costs(run)
+    assert run.usage_source == "settings"
+    assert run.cost == pytest.approx(5.0)
+    assert any("long-context tier not applied" in n for n in run.notes)
+    payload = build_payload(path, user="dev", project="demo")
+    assert payload["totals"]["cost_usd"] == pytest.approx(run.cost)
+    assert payload["models"]["gpt-6-astra"]["cost_usd"] == pytest.approx(run.cost)
 
 
 def test_droid_settings_only_usage_with_long_context_model_uses_base_tier_and_notes(tmp_path, capsys):

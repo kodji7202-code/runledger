@@ -280,6 +280,25 @@ def _to_run(path: Path, header: _Record, steps: List[_Record], end: Optional[_Re
         for step in run_steps:
             if step.usage.total:
                 models.setdefault(step.model or "unknown", Usage()).add(step.usage)
+    else:
+        # Header totals are aggregates: keep the per-step request boundaries where the
+        # steps account for a model's total, and mark what they do not cover as a
+        # cumulative estimate so it is never tiered as one long request.
+        stepped: Dict[str, Usage] = {}
+        for step in run_steps:
+            if step.usage.total:
+                stepped.setdefault(step.model or "unknown", Usage()).add(step.usage)
+        for key, bucket in models.items():
+            requests = stepped.get(key)
+            if requests is None:
+                bucket._cumulative_only = True
+                continue
+            bucket._requests = list(requests._requests)
+            if requests.total != bucket.total:
+                bucket._cumulative_only = True
+        for key, requests in stepped.items():
+            if key not in models:
+                models[key] = requests
 
     total = Usage()
     for usage in (models.values() if models else (s.usage for s in run_steps)):

@@ -61,19 +61,19 @@ def _rec(run, kind):
 # ---------------------------------------------------------------- model downgrade
 
 def test_downgrade_saving_matches_the_price_table():
-    # 1M input tokens: $2.00 on Sonnet 5.5, $0.10 on Haiku 5.5
+    # 1M input tokens: $2.00 on Sonnet 5.5, $0.50 on Haiku 5.5 (its >100K prompt tier)
     run = _run([_read(1, model=SONNET, usage=_usage(inp=1_000_000))])
     rec = _rec(run, "model_downgrade")
-    assert rec["est_savings_usd"] == pytest.approx(1.9, abs=1e-4)
+    assert rec["est_savings_usd"] == pytest.approx(1.5, abs=1e-4)
     assert rec["steps"] == [1]
     assert rec["title"] == "Run read-only steps on Haiku 5.5"
     assert "estimated" in rec["detail"].lower()
 
 
 def test_opus_steps_are_priced_at_opus_rates():
-    # 0.5M input tokens: $2.00 on Opus 5.5 ($4/M), $0.05 on Haiku 5.5
+    # 0.5M input tokens: $2.00 on Opus 5.5 ($4/M), $0.25 on Haiku 5.5 (tier 2, $0.50/M)
     run = _run([_step(1, "Grep", {"pattern": "retry"}, model=OPUS, usage=_usage(inp=500_000))])
-    assert _rec(run, "model_downgrade")["est_savings_usd"] == pytest.approx(1.95, abs=1e-4)
+    assert _rec(run, "model_downgrade")["est_savings_usd"] == pytest.approx(1.75, abs=1e-4)
 
 
 def test_downgrade_counts_only_the_read_only_steps():
@@ -84,7 +84,7 @@ def test_downgrade_counts_only_the_read_only_steps():
     ])
     rec = _rec(run, "model_downgrade")
     assert rec["steps"] == [1]
-    assert rec["est_savings_usd"] == pytest.approx(1.9, abs=1e-4)
+    assert rec["est_savings_usd"] == pytest.approx(1.5, abs=1e-4)
 
 
 def test_read_steps_already_on_haiku_are_not_downgraded():
@@ -261,7 +261,9 @@ def test_empty_run_has_no_recommendations():
 
 def test_price_table_has_the_current_model_ids():
     assert price_for(HAIKU) is not None
-    assert cost_of(_usage(inp=1_000_000), HAIKU) == pytest.approx(0.1)
+    # Haiku 5.5 bills whole requests above a 100k prompt at tier 2 ($0.50/MTok)
+    assert cost_of(_usage(inp=100_000), HAIKU) == pytest.approx(0.01)
+    assert cost_of(_usage(inp=1_000_000), HAIKU) == pytest.approx(0.5)
     assert cost_of(_usage(inp=1_000_000), SONNET) == pytest.approx(2.0)
     assert cost_of(_usage(inp=1_000_000), OPUS) == pytest.approx(4.0)
 
@@ -274,7 +276,7 @@ def test_steps_without_token_data_are_left_out_of_the_downgrade_estimate():
     unknown.usage_known = False
     rec = _rec(_run([known, unknown]), "model_downgrade")
     assert rec["steps"] == [1]
-    assert rec["est_savings_usd"] == pytest.approx(1.9, abs=1e-4)
+    assert rec["est_savings_usd"] == pytest.approx(1.5, abs=1e-4)
     assert "1 matching step(s) have no token data" in rec["detail"]
 
 
