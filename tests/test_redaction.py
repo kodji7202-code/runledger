@@ -224,6 +224,8 @@ def test_redact_stays_fast_on_long_text_without_secrets():
     "postgres://admin:" + "s3cret" + "Pass" + "@db.example.com:5432/app",
     'export SECRET_TOKEN="' + "my_super_" + 'secret_val_1234"',
     "Authorization: Bearer " + "eyJ" + "hbGciOiJIUzI1NiJ9.aaa.bbb",
+    "AccountKey=" + "Ab1/" * 11,
+    "aws_secret_access_key = '" + "wJalrXUtnFEMI/K7MDENG/bPxRfiCY" + "EXAMPLEKEY" + "'",
 ])
 def test_secrets_module_detection_and_redaction_parity(secret_str):
     from runledger import llm, secrets
@@ -322,4 +324,20 @@ def test_conftest_isolation_fixture_clears_env_and_Redirects_home(tmp_path):
     assert tmp_path in home.parents or home.parent == tmp_path
     for var in ISOLATED_ENV_VARS:
         assert var not in os.environ
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("TOKEN=abc123 npm publish", "TOKEN=[REDACTED] npm publish"),
+    ("export DB_PASSWORD=" + "hunter22", "export DB_PASSWORD=[REDACTED]"),
+    ('password="' + "hunter22" + '"', 'password="[REDACTED]"'),
+    ("secret=" + "abcd1234", "secret=[REDACTED]"),
+    ("api_key: '" + "mysecret" + "'", "api_key: '[REDACTED]'"),
+])
+def test_short_generic_assignment_redaction_restored(raw, expected):
+    from runledger import llm, secrets
+
+    assert secrets.redact_text(raw) == expected
+    assert guard.redact(raw) == expected
+    assert llm.redact(raw) == expected
+
 

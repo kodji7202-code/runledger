@@ -761,6 +761,14 @@ def test_high_findings_are_not_capped_below_one_hundred(tmp_path):
     ".netrc",
     "id_rsa",
     "id_ed25519",
+    ".envrc",
+    "/app/.envrc",
+    "~/.ssh/config",
+    "~/.ssh/authorized_keys",
+    "~/.ssh/deploy_ed25519",
+    "credentials",
+    "config/credentials",
+    "~/.aws/credentials",
 ])
 def test_extended_secret_paths_are_detected(secret_path):
     from runledger import secrets
@@ -775,6 +783,9 @@ def test_extended_secret_paths_are_detected(secret_path):
     "id_ed25519.pub",
     "deploy_key.pub",
     "src/public.py",
+    "src/credentials.py",
+    "src/credentials/utils.py",
+    "docs/secrets.md",
     "README.md",
     "package.json",
 ])
@@ -789,6 +800,12 @@ def test_public_key_and_normal_paths_are_not_secret(public_path):
 @pytest.mark.parametrize("bad_pattern", [
     "(a+)+$",
     "(a|aa)+$",
+    "(?>(a+)+$)",
+    "(?>(a|aa)+$)",
+    "((?>a+))+$",
+    "((?>a|aa))+$",
+    "(a++)+",
+    "(a+)*+",
     "(a*)*",
     "(x+x+)+y",
     r"(\w+\.)+com",

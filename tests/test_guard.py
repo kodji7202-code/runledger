@@ -1304,3 +1304,60 @@ def test_guard_install_portable_warns_when_runledger_not_on_path(tmp_path, monke
     assert "warning" in combined and ("not found" in combined or "127" in combined or "could not be run" in combined)
 
 
+def test_guard_cold_start_when_secrets_module_raises_import_error(tmp_path):
+    import shutil
+    import runledger
+
+    pkg_src = Path(runledger.__file__).resolve().parent
+    shadow_root = tmp_path / "shadow"
+    shutil.copytree(pkg_src, shadow_root / "runledger")
+    (shadow_root / "runledger" / "secrets.py").write_text("raise ImportError('secrets unavailable')\n", encoding="utf-8")
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / ".git").mkdir()
+
+    secret = "sk-ant-" + "api03-" + "Z" * 36
+    event = json.dumps(bash_event(proj, f"echo {secret}"))
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(shadow_root)
+
+    res = subprocess.run(
+        [sys.executable, "-m", "runledger", "guard"],
+        input=event,
+        text=True,
+        capture_output=True,
+        env=env,
+        cwd=str(proj),
+        timeout=30,
+    )
+    assert res.returncode == 0, res.stderr
+    log_file = proj / ".runledger" / "guard.log"
+    assert log_file.exists()
+    log_text = log_file.read_text(encoding="utf-8")
+    assert secret not in log_text
+    assert "[REDACTED]" in log_text
+
+    write_ev = json.dumps({
+        "session_id": "s1",
+        "cwd": str(proj),
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Write",
+        "tool_input": {"file_path": str(proj / "cfg.py"), "content": f'KEY = "{secret}"'},
+    })
+    res_write = subprocess.run(
+        [sys.executable, "-m", "runledger", "guard"],
+        input=write_ev,
+        text=True,
+        capture_output=True,
+        env=env,
+        cwd=str(proj),
+        timeout=30,
+    )
+    assert res_write.returncode == 0, res_write.stderr
+    out_data = json.loads(res_write.stdout)
+    assert out_data["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+
+

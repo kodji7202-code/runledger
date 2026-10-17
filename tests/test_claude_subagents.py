@@ -76,9 +76,9 @@ def test_subagent_transcripts_merged_into_parent_cost_and_tokens(tmp_path, monke
 
 
 def test_legacy_subagents_merged_and_duplicate_message_ids_deduped(tmp_path, monkeypatch):
-    cfg = tmp_path / "claude_cfg"
+    cfg = tmp_path / "c"
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg))
-    prj = tmp_path / "work" / "legacy"
+    prj = tmp_path / "p"
     prj.mkdir(parents=True)
     proj_dir = cfg / "projects" / encode_project_path(str(prj))
     proj_dir.mkdir(parents=True)
@@ -91,7 +91,7 @@ def test_legacy_subagents_merged_and_duplicate_message_ids_deduped(tmp_path, mon
     )
 
     # Legacy layout: <project>/subagents/agent-*.jsonl
-    legacy_sub = proj_dir / "subagents" / "agent-legacy.jsonl"
+    legacy_sub = proj_dir / "subagents" / "agent-1.jsonl"
     legacy_sub.parent.mkdir(parents=True)
     legacy_sub.write_text(
         # Duplicate msg_p1 should NOT be double counted; msg_s1 is added once
@@ -101,7 +101,7 @@ def test_legacy_subagents_merged_and_duplicate_message_ids_deduped(tmp_path, mon
     )
 
     # Another session's legacy subagent should NOT be merged into sid
-    other_sub = proj_dir / "subagents" / "agent-other.jsonl"
+    other_sub = proj_dir / "subagents" / "agent-2.jsonl"
     other_sub.write_text(
         _assistant_line("msg_other", "claude-sonnet-4-5-20250929", 900_000, session_id="other-session"),
         encoding="utf-8",

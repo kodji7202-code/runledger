@@ -26,13 +26,13 @@ UNPRICED = {"runledger_format": 1, "agent": "lab-bot", "session_id": "lab-run-1"
 @pytest.fixture(autouse=True)
 def isolated_agent_dirs(tmp_path, monkeypatch):
     """No real agent sessions may leak into these tests."""
-    claude_dir = tmp_path / "claude-config"
-    codex_dir = tmp_path / "codex-home"
+    claude_dir = tmp_path / "c"
+    codex_dir = tmp_path / "x"
     claude_dir.mkdir()
     codex_dir.mkdir()
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_dir))
     monkeypatch.setenv("CODEX_HOME", str(codex_dir))
-    monkeypatch.setenv("FACTORY_HOME", str(tmp_path / "factory-home"))
+    monkeypatch.setenv("FACTORY_HOME", str(tmp_path / "f"))
     for name in ("GITHUB_REPOSITORY", "GITHUB_EVENT_PATH", "GITHUB_API_URL", "GITHUB_TOKEN",
                  "GITHUB_STEP_SUMMARY", "GITHUB_OUTPUT", "RUNLEDGER_SERVER", "RUNLEDGER_API_KEY"):
         monkeypatch.delenv(name, raising=False)
@@ -40,7 +40,7 @@ def isolated_agent_dirs(tmp_path, monkeypatch):
 
 def _project(tmp_path: Path, name: str, source: Path = None, text: str = None) -> Path:
     """A project folder with one session file in .runledger/runs/."""
-    project = tmp_path / "project"
+    project = tmp_path / "p"
     runs = project / ".runledger" / "runs"
     runs.mkdir(parents=True, exist_ok=True)
     content = text if text is not None else source.read_text(encoding="utf-8")
@@ -160,7 +160,7 @@ def test_list_shows_an_agent_column_and_filters(tmp_path, capsys):
     project = _project(tmp_path, "demo.runledger.json", source=FIX_NATIVE)
     claude_dir = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "projects" / encode_project_path(str(project))
     claude_dir.mkdir(parents=True)
-    shutil.copy(FIX_CLAUDE, claude_dir / "7f3c2a10-9b1e-4c55-a1d2-0e6f8b3c9d42.jsonl")
+    shutil.copy(FIX_CLAUDE, claude_dir / "s1.jsonl")
 
     assert main(["list", "--project", str(project)]) == 0
     out = capsys.readouterr().out
