@@ -1035,11 +1035,14 @@ def _shell_risks(step: Step, cwd: Optional[str], extra: List["re.Pattern"], risk
                 joined.append((w, _strongest(found)))
         # The second reading of the same text: every word a join swallowed is an operand of its
         # own there. A swallowed operand is only reported when it is more severe than everything
-        # the joined word said about that text, so joining can never lower a finding.
+        # the joined word said about that text, so joining can never lower a finding; an operand
+        # that climbs out of its folder is named even next to a whole-path finding, because the
+        # two readings name different files.
         for w, floor in _swallowed_operands(shell_words, joined, ps):
             found = []
             _check_shell_word(w, name or "", cwd, workdir, extra, assigns, step, found, flagged)
-            risks.extend([r for r in found if SEVERITY_POINTS[r.severity] > floor])
+            keep = bool(_DOTDOT_RE.search(w.value))
+            risks.extend([r for r in found if keep or SEVERITY_POINTS[r.severity] > floor])
     return flagged
 
 
