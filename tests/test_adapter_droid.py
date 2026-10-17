@@ -481,13 +481,13 @@ def test_receipt_agent_droid_end_to_end(tmp_path, monkeypatch, capsys):
 @pytest.mark.parametrize("source", ["default", "env", "invalid"])
 def test_cli_loads_user_prices_and_handles_invalid_files(tmp_path, source):
     path = _session(tmp_path, [_message([_call("Read", {"file_path": "example.py"})])],
-                    settings={"model": "openai/GPT-6.1-SOL-latest",
+                    settings={"model": "openai/GPT-5-codex-latest",
                               "tokenUsage": {"inputTokens": 1000, "outputTokens": 200}})
     prices = tmp_path / ".runledger" / "prices.json"
     prices.parent.mkdir()
     # Synthetic rates only, not a claim about this model's real price.
     prices.write_text("{bad" if source == "invalid" else json.dumps({
-        "gpt:6.1-sol": {"input": 1, "output": 2, "cache_read": 0},
+        "gpt:5-codex": {"input": 1, "output": 2, "cache_read": 0},
     }), encoding="utf-8")
     env = dict(os.environ, HOME=str(tmp_path), USERPROFILE=str(tmp_path))
     env.pop("RUNLEDGER_PRICES", None)
@@ -668,3 +668,58 @@ def test_find_sessions_matches_a_windows_project_by_folder_name(tmp_path, monkey
     _relative_session(sessions / "C--Users-dev-other", name="other.jsonl")
     assert set(droid.find_sessions("C:\\Users\\dev\\My-Proj")) == expected
     assert set(droid.find_sessions("c:/users/dev/my-proj")) == expected
+
+
+def test_droid_settings_only_usage_with_long_context_model_uses_base_tier_and_notes(tmp_path, capsys):
+    path = tmp_path / "lc-droid.jsonl"
+    rows = [
+        {"type": "session_start", "id": "lc-droid", "cwd": str(tmp_path)},
+        _message([_call("Read", {"file_path": "a.py"}, "c1")]),
+    ]
+    path.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+    settings = tmp_path / "lc-droid.settings.json"
+    settings.write_text(json.dumps({
+        "model": "gemini-2.5-pro",
+        "tokenUsage": {"inputTokens": 500_000, "outputTokens": 0},
+    }), encoding="utf-8")
+
+    run = droid.parse(path)
+    apply_costs(run)
+    assert run.usage_source == "settings"
+    # Base tier for gemini:2.5-pro is $1.25/MTok ($0.625 for 500k), not long-context $2.50/MTok ($1.25)
+    assert run.cost == pytest.approx(0.625)
+    assert any("long-context tier not applied" in n for n in run.notes)
+    md = _receipt(capsys, path, "md")
+    assert "long-context tier not applied" in md
+
+
+def test_find_sessions_uses_header_cache(tmp_path, monkeypatch):
+    fhome = tmp_path / "factory"
+    monkeypatch.setenv("FACTORY_HOME", str(fhome))
+    target = "/demo/target-proj"
+    expected = []
+    for i in range(4):
+        expected.append(_discovered(fhome, target, f"t{i}.jsonl", 100 + i))
+    for p in range(5):
+        for i in range(4):
+            _discovered(fhome, f"/demo/other-{p}", f"o{i}.jsonl", 50 + i)
+
+    first = droid.find_sessions(target)
+    assert set(first) == set(expected)
+    cache_file = Path(os.environ["HOME"]) / ".runledger" / "cache" / "sessions.json"
+    assert cache_file.is_file()
+
+    opened = []
+    real_open = Path.open
+
+    def spy_open(self, *args, **kwargs):
+        if self.suffix == ".jsonl":
+            opened.append(self)
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", spy_open)
+    second = droid.find_sessions(target)
+    assert second == first
+    assert opened == []
+
+

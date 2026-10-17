@@ -37,6 +37,7 @@ import math
 import os
 import re
 import shutil
+import subprocess
 import sys
 import time
 import urllib.error
@@ -46,13 +47,25 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from . import paths as _paths
 from . import risk as _risk
 from .parser import Step
 from .risk import POLICY_FILE, SEVERITY_POINTS, Risk, assess_step
 
+try:
+    from . import secrets as _secrets
+    from .secrets import find_secrets, is_secret_path, redact_text, safe_user_regex
+except Exception:  # pragma: no cover - standalone fallback when runledger.secrets is unavailable
+    _secrets = None  # type: ignore[assignment]
+    find_secrets = None  # type: ignore[assignment]
+    is_secret_path = None  # type: ignore[assignment]
+    redact_text = None  # type: ignore[assignment]
+    safe_user_regex = None  # type: ignore[assignment]
+
 HOOK_COMMAND = "runledger guard"
 HOOK_MARGIN_S = 15             # the hook entry allows the approval wait plus this many seconds
 _GUARD_CMD_RE = re.compile(r"\brunledger(?:\.exe)?\"?\s+guard\b|-m\s+runledger\s+guard\b", re.I)
+PROJECT_DIR_ENV_VARS = ("CLAUDE_PROJECT_DIR", "FACTORY_PROJECT_DIR", "DROID_PROJECT_DIR")
 
 LOG_DIR = ".runledger"
 LOG_FILE = "guard.log"
@@ -78,27 +91,28 @@ REDACTED = "[REDACTED]"
 
 _FALLBACK_SECRET_RES = [
     re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{12,}"),
-    re.compile(r"(?<![A-Za-z0-9])AKIA[0-9A-Z]{16}(?![A-Za-z0-9])"),
-    re.compile(r"(?<![A-Za-z0-9])gh[pousr]_[A-Za-z0-9]{20,}"),
+    re.compile(r"(?<![A-Za-z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Za-z0-9])"),
+    re.compile(r"(?<![A-Za-z0-9])(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{22,})"),
     re.compile(r"(?<![A-Za-z0-9])xox[baprs]-[A-Za-z0-9-]{10,}"),
-    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+    re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"),
     re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{12,}"),
     re.compile(r"(?<![A-Za-z0-9])[rs]k_(?:live|test)_[A-Za-z0-9]{16,}"),
     re.compile(r"(?<![A-Za-z0-9])AIza[0-9A-Za-z_-]{35}"),
     re.compile(r"(?<![A-Za-z0-9])glpat-[A-Za-z0-9_-]{20,}"),
     re.compile(r"(?<![A-Za-z0-9])npm_[A-Za-z0-9]{36}"),
+    re.compile(r"(?<![A-Za-z0-9])pypi-[A-Za-z0-9_-]{32,}"),
     re.compile(r"(?<![A-Za-z0-9])hf_[A-Za-z0-9]{30,}"),
     re.compile(r"(?<![A-Za-z0-9_])rl_[A-Za-z0-9_-]{30,}"),
     re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"),
 ]
 _FALLBACK_GENERIC_RE = re.compile(
-    r"(api[_-]?key|secret|token|password)[\"']?\s*[:=]\s*[\"']([^\"'\s]{8,})[\"']", re.I)
+    r"(api[_-]?key|secret|token|password)[\"']?\s*[:=]\s*[\"']([^\"'\s]{12,})[\"']", re.I)
 
 # Unquoted values, masked last. Only the named group "v" is replaced.
 _SECRET_NAME = (r"(?:api[_-]?key|apikey|secret|token|passw(?:or)?d|credentials?"
                 r"|private[_-]?key|access[_-]?key)")
 _VALUE_SECRET_RES = [
-    # TOKEN=abc123, export DB_PASSWORD=..., ?access_token=..., --password=...
+    # TOKEN=abc123, export DB_PASSWORD=**** ?access_token=..., --password=...
     # The name parts are bounded so a long blob without "=" cannot cause quadratic backtracking.
     re.compile(r"(?i)(?<![A-Za-z0-9])[A-Za-z0-9_.-]{0,40}" + _SECRET_NAME
                + r"[A-Za-z0-9_.-]{0,40}\s*=\s*(?P<v>[^\s\"'&;|,)}\]]{6,})"),
@@ -126,6 +140,9 @@ class InstallError(Exception):
 # ---------------------------------------------------------------- redaction
 
 def _mask_value(m: "re.Match") -> str:
+    val = m.group(2)
+    if val.startswith(_PLACEHOLDER_START) or val.endswith((">", "...")):
+        return m.group(0)
     whole = m.group(0)
     a, b = m.start(2) - m.start(0), m.end(2) - m.start(0)
     return whole[:a] + REDACTED + whole[b:]
@@ -151,12 +168,12 @@ def _mask_named(m: "re.Match") -> str:
 
 
 def _secret_patterns() -> List["re.Pattern"]:
-    """Patterns from risk.py when they are there, plus the fallbacks above."""
+    """Patterns from secrets.py / risk.py when they are there, plus the fallbacks above."""
     try:
-        from_risk = [rx for rx, _kind in getattr(_risk, "_CONTENT_SECRET_RULES", []) if hasattr(rx, "sub")]
+        from_secrets = [rx for rx, _kind in getattr(_secrets, "SECRET_CONTENT_PATTERNS", []) if hasattr(rx, "sub")]
     except (TypeError, ValueError):
-        from_risk = []
-    return from_risk + _FALLBACK_SECRET_RES
+        from_secrets = []
+    return from_secrets + _FALLBACK_SECRET_RES
 
 
 def redact(text: Any) -> str:
@@ -164,8 +181,9 @@ def redact(text: Any) -> str:
     If redaction itself fails, the whole text is replaced."""
     s = "" if text is None else str(text)
     try:
-        generic = getattr(_risk, "_GENERIC_SECRET_RE", None)
-        for rx in ([generic] if generic is not None else []) + [_FALLBACK_GENERIC_RE]:
+        if redact_text is not None:
+            return redact_text(s)
+        for rx in [_FALLBACK_GENERIC_RE]:
             s = rx.sub(_mask_value, s)
         for rx in _secret_patterns():
             s = rx.sub(REDACTED, s)
@@ -192,17 +210,62 @@ def _section(data: Any, key: str) -> Dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def read_policy(cwd: str) -> Dict[str, Any]:
-    """The project's `<cwd>/.runledger.json` as a dict. Missing or invalid gives {}."""
+def project_root(event_or_cwd: Any = None) -> str:
+    """Resolve the project root for a guard event or cwd string.
+
+    Order:
+    1. First set, non-empty, existing directory among CLAUDE_PROJECT_DIR,
+       FACTORY_PROJECT_DIR, DROID_PROJECT_DIR.
+    2. Walk up from the event's `cwd` (or `os.getcwd()`) to the first directory
+       containing `.runledger.json` or `.git` (file or directory).
+    3. The event's `cwd` (or `os.getcwd()`).
+    """
+    if isinstance(event_or_cwd, dict) or event_or_cwd is None:
+        cwd = _event_cwd(event_or_cwd)
+    elif isinstance(event_or_cwd, str) and event_or_cwd.strip():
+        cwd = event_or_cwd.strip()
+    else:
+        cwd = os.getcwd()
+
+    for env_var in PROJECT_DIR_ENV_VARS:
+        val = (os.environ.get(env_var) or "").strip()
+        if val and not _paths.is_unc(val) and _paths.is_abs(val):
+            try:
+                if os.path.isdir(val):
+                    return str(Path(val))
+            except OSError:
+                pass
+
+    if cwd and not _paths.is_unc(cwd) and _paths.is_abs(cwd):
+        try:
+            p = Path(cwd)
+            for d in (p, *p.parents):
+                if (d / ".git").exists():
+                    return str(d)
+        except OSError:
+            pass
+    return cwd
+
+
+def read_policy(cwd: str, *, _resolved: bool = False) -> Dict[str, Any]:
+    """The project's `<project_root>/.runledger.json` as a dict. Missing or invalid gives {}."""
+    if not cwd or _paths.is_unc(cwd):
+        return {}
+    root = cwd if _resolved else project_root(cwd)
+    if not root or _paths.is_unc(root):
+        return {}
     try:
-        data = json.loads((Path(cwd) / POLICY_FILE).read_text(encoding="utf-8-sig"))
+        data = json.loads((Path(root) / POLICY_FILE).read_text(encoding="utf-8-sig"))
     except (OSError, ValueError, TypeError, RecursionError):
         return {}
     return data if isinstance(data, dict) else {}
 
 
 def user_config_path() -> Path:
-    """`~/.runledger/config.json`. The home folder is HOME, then USERPROFILE, then the platform default."""
+    """`RUNLEDGER_CONFIG` when set, else `~/.runledger/config.json`."""
+    override = os.environ.get("RUNLEDGER_CONFIG", "").strip()
+    if override:
+        return Path(override)
     base = os.environ.get("HOME") or os.environ.get("USERPROFILE")
     return (Path(base) if base else Path.home()) / USER_CONFIG_DIR / USER_CONFIG_FILE
 
@@ -284,8 +347,8 @@ def _rule_matches(rule: Dict[str, Any], risk: Risk) -> bool:
     if kind == "reason":
         return rule["value"] in risk.reason.lower()
     if kind == "code":
-        return risk.code.lower() == rule["value"]
-    return risk.code.lower() == rule["code"] and risk.severity == rule["value"]
+        return _risk._risk_matches_key(risk, rule["value"])
+    return _risk._risk_matches_key(risk, rule["code"]) and risk.severity == rule["value"]
 
 
 def _matches_list(rules: List[Dict[str, Any]], risk: Risk) -> bool:
@@ -390,16 +453,35 @@ def _valid_overrides(value: Any) -> Dict[str, str]:
     return {k: v.lower() for k, v in value.items() if isinstance(v, str) and v.lower() in SEVERITY_POINTS}
 
 
-def _valid_extra(value: Any) -> List[str]:
+def _valid_extra_with_warnings(value: Any, existing_count: int = 0) -> Tuple[List[str], List[str]]:
     out: List[str] = []
-    if isinstance(value, list):
-        for rx in value:
-            if isinstance(rx, str) and rx:
-                try:
-                    re.compile(rx)
-                    out.append(rx)
-                except re.error:
-                    pass
+    warnings: List[str] = []
+    if not isinstance(value, list):
+        return out, warnings
+    max_extra = getattr(_secrets, "MAX_EXTRA_SECRET_PATHS", 20)
+    for rx in value:
+        if not isinstance(rx, str) or not rx:
+            continue
+        if existing_count + len(out) >= max_extra:
+            warnings.append(f"ignored unsafe/invalid extra_secret_paths pattern: {rx} (limit {max_extra})")
+            continue
+        if safe_user_regex is not None:
+            ok = safe_user_regex(rx) is not None
+        else:
+            try:
+                re.compile(rx)
+                ok = len(rx) <= 200
+            except re.error:
+                ok = False
+        if ok:
+            out.append(rx)
+        else:
+            warnings.append(f"ignored unsafe/invalid extra_secret_paths pattern: {rx}")
+    return out, warnings
+
+
+def _valid_extra(value: Any) -> List[str]:
+    out, _ = _valid_extra_with_warnings(value)
     return out
 
 
@@ -407,14 +489,19 @@ def _risk_settings(project: Dict[str, Any], user: Dict[str, Any]) -> Dict[str, A
     """`assess` is what risk.py gets: the user's ignore and severity overrides, and the
     union of secret-path patterns. The project's ignore and severity overrides come
     back separately, for the tighten-only checks."""
+    user_extra, user_extra_warnings = _valid_extra_with_warnings(user.get("extra_secret_paths"))
+    proj_extra, proj_extra_warnings = _valid_extra_with_warnings(
+        project.get("extra_secret_paths"), existing_count=len(user_extra)
+    )
     return {
         "assess": {
             "ignore": _valid_ignore(user.get("ignore")),
             "severity_overrides": _valid_overrides(user.get("severity_overrides")),
-            "extra_secret_paths": _valid_extra(user.get("extra_secret_paths")) + _valid_extra(project.get("extra_secret_paths")),
+            "extra_secret_paths": user_extra + proj_extra,
         },
         "project_ignore": _valid_ignore(project.get("ignore")),
         "project_severity": _valid_overrides(project.get("severity_overrides")),
+        "extra_warnings": user_extra_warnings + proj_extra_warnings,
     }
 
 
@@ -424,6 +511,11 @@ def _apply_project_severity(risks: List[Risk], project_severity: Dict[str, str])
     lowered = set()
     for r in risks:
         level = project_severity.get(r.code)
+        if level is None:
+            for k, v in project_severity.items():
+                if _risk._risk_matches_key(r, k):
+                    level = v
+                    break
         if level is None:
             continue
         if SEVERITY_POINTS[level] > SEVERITY_POINTS[r.severity]:
@@ -526,7 +618,20 @@ def _ask_approver(request: Dict[str, Any], cfg: Dict[str, Any], approver: Option
     return "deny", clean(status, 40), f"Unknown approval status: {text}"
 
 
-def decide(event: dict, policy: dict, approver: Optional[ApproverFn] = None) -> dict:
+class _DecisionDict(dict):
+    """Decision dictionary that also supports attribute access (`d.decision`, `d.codes`, etc.)."""
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return self[name]
+        except KeyError:
+            raise AttributeError(name) from None
+
+    def outcome_when_enforced(self) -> str:
+        return str(self.get("policy_decision") or self.get("decision") or "allow")
+
+
+def decide(event: dict, policy: Optional[dict] = None, approver: Optional[ApproverFn] = None) -> _DecisionDict:
     """Decide one PreToolUse event.
 
     `policy` is the project's .runledger.json dict. The user's ~/.runledger/config.json
@@ -542,7 +647,9 @@ def decide(event: dict, policy: dict, approver: Optional[ApproverFn] = None) -> 
     and warnings (project settings that were ignored). Nothing here touches the log
     or stdout."""
     event = event if isinstance(event, dict) else {}
-    project = policy if isinstance(policy, dict) else {}
+    event_cwd = _event_cwd(event)
+    cwd = project_root(event)
+    project = policy if isinstance(policy, dict) else read_policy(cwd, _resolved=True)
     user = load_user_config()
     cfg, warnings = _effective_guard(project, user, trusted_approval_settings(user))
     warnings = _project_key_warnings(project) + warnings
@@ -550,13 +657,13 @@ def decide(event: dict, policy: dict, approver: Optional[ApproverFn] = None) -> 
     tool = str(event.get("tool_name") or "?")
     raw_input = event.get("tool_input")
     tool_input = raw_input if isinstance(raw_input, dict) else {}
-    cwd = _event_cwd(event)
     session_id = str(event.get("session_id") or "")
 
     rs = _risk_settings(project, user)
+    warnings += rs.get("extra_warnings", [])
     step = Step(index=1, tool=tool, input=tool_input,
                 tool_use_id=str(event.get("tool_use_id") or ""), model=None, timestamp=None)
-    risks = assess_step(step, cwd, rs["assess"])
+    risks = assess_step(step, cwd, rs["assess"], workdir=event_cwd)
     warnings += _apply_project_severity(risks, rs["project_severity"])
     warnings += _ignore_warnings(risks, rs["project_ignore"])
     warnings += _exclusion_warnings(cfg["user_deny"], cfg["project_deny"], risks, "deny")
@@ -584,7 +691,7 @@ def decide(event: dict, policy: dict, approver: Optional[ApproverFn] = None) -> 
                    "risks": risks_out, "cwd": cwd}
         final, approval, reason = _ask_approver(request, cfg, approver, drivers, reason)
 
-    return {
+    return _DecisionDict({
         "decision": final,
         "policy_decision": policy_decision,
         "mode": cfg["mode"],
@@ -598,7 +705,14 @@ def decide(event: dict, policy: dict, approver: Optional[ApproverFn] = None) -> 
         "approval": approval,
         "summary": summary,
         "warnings": list(dict.fromkeys(warnings)),
-    }
+    })
+
+
+def evaluate(event: dict, policy: Optional[dict] = None, approver: Optional[ApproverFn] = None) -> _DecisionDict:
+    """Evaluate a PreToolUse event and write warnings + the decision record to `.runledger/guard.log`."""
+    decision = decide(event, policy=policy, approver=approver)
+    _log_quietly(lambda: _log_warnings_and_decision(decision))
+    return decision
 
 
 def hook_output(decision: dict) -> Optional[dict]:
@@ -691,30 +805,53 @@ def http_approver(request: Dict[str, Any], approval: Dict[str, Any]) -> str:
 
 # ---------------------------------------------------------------- log
 
-def _append_log(cwd: str, fields: Dict[str, Any]) -> None:
+def _append_logs(cwd: str, records: List[Dict[str, Any]]) -> None:
+    if not cwd or not records or _paths.is_unc(cwd):
+        return
     path = Path(cwd) / LOG_DIR / LOG_FILE
     path.parent.mkdir(parents=True, exist_ok=True)
-    rec: Dict[str, Any] = {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds")}
-    for k, v in fields.items():
-        rec[k] = clean(v, 200) if isinstance(v, str) else v
+    ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    lines: List[str] = []
+    for fields in records:
+        rec: Dict[str, Any] = {"ts": ts}
+        for k, v in fields.items():
+            rec[k] = clean(v, 200) if isinstance(v, str) else v
+        lines.append(json.dumps(rec, ensure_ascii=False) + "\n")
     with path.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        fh.writelines(lines)
 
 
-def _log_decision(decision: dict) -> None:
-    _append_log(decision["cwd"], {
+def _append_log(cwd: str, fields: Dict[str, Any]) -> None:
+    _append_logs(cwd, [fields])
+
+
+def _decision_record(decision: dict) -> Dict[str, Any]:
+    return {
         "session_id": decision["session_id"], "tool": decision["tool"], "mode": decision["mode"],
         "tool_use_id": decision.get("tool_use_id", ""),
         "decision": decision["decision"], "policy_decision": decision["policy_decision"],
         "codes": decision["codes"], "approval": decision["approval"],
         "summary": decision["summary"], "reason": decision["reason"],
-    })
+    }
+
+
+def _warning_records(decision: dict) -> List[Dict[str, Any]]:
+    return [
+        {"session_id": decision["session_id"], "decision": "warning", "reason": text}
+        for text in (decision.get("warnings") or [])
+    ]
+
+
+def _log_decision(decision: dict) -> None:
+    _append_log(decision["cwd"], _decision_record(decision))
 
 
 def _log_warnings(decision: dict) -> None:
-    for text in decision.get("warnings") or []:
-        _append_log(decision["cwd"], {"session_id": decision["session_id"],
-                                      "decision": "warning", "reason": text})
+    _append_logs(decision["cwd"], _warning_records(decision))
+
+
+def _log_warnings_and_decision(decision: dict) -> None:
+    _append_logs(decision["cwd"], _warning_records(decision) + [_decision_record(decision)])
 
 
 def _log_quietly(fn: Callable[[], None]) -> None:
@@ -735,18 +872,19 @@ def handle(raw: str) -> Optional[dict]:
         event = json.loads(raw)
         if not isinstance(event, dict):
             raise ValueError("hook input is not a JSON object")
-        policy = read_policy(_event_cwd(event))
+        if not event:
+            return None
+        policy = read_policy(project_root(event), _resolved=True)
         decision = decide(event, policy)
     except Exception as exc:
         return _on_error(event, policy, exc)
-    _log_quietly(lambda: _log_warnings(decision))
-    _log_quietly(lambda: _log_decision(decision))
+    _log_quietly(lambda: _log_warnings_and_decision(decision))
     return hook_output(decision)
 
 
 def _on_error(event: Any, policy: Dict[str, Any], exc: BaseException) -> Optional[dict]:
     try:
-        cwd = _event_cwd(event)
+        cwd = project_root(event)
         if not policy:
             policy = read_policy(cwd)
         user = load_user_config()
@@ -770,7 +908,14 @@ def _on_error(event: Any, policy: Dict[str, Any], exc: BaseException) -> Optiona
 
 def main() -> int:
     """Entry point for `runledger guard` as a hook: stdin JSON in, stdout JSON out.
-    Always exits 0."""
+    When stdin is an interactive terminal (TTY), print the guard help and exit 2."""
+    try:
+        if sys.stdin is not None and sys.stdin.isatty():
+            from .cli import print_guard_help
+            print_guard_help()
+            return 2
+    except Exception:
+        pass
     try:
         raw = sys.stdin.buffer.read().decode("utf-8", errors="replace")
     except Exception:
@@ -801,7 +946,7 @@ def cmd_test(event_json: str) -> int:
         print("error: event must be a JSON object", file=sys.stderr)
         return 1
     try:
-        decision = decide(event, read_policy(_event_cwd(event)))
+        decision = decide(event, read_policy(project_root(event)))
     except Exception as exc:
         print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
@@ -824,8 +969,21 @@ def hook_timeout_for(approval_timeout_s: Optional[float] = None) -> int:
     return int(math.ceil(base)) + HOOK_MARGIN_S
 
 
-def hook_entry(hook_seconds: int) -> Dict[str, Any]:
-    return {"matcher": "*", "hooks": [{"type": "command", "command": HOOK_COMMAND, "timeout": hook_seconds}]}
+def guard_hook_command(portable: bool = False) -> str:
+    """The hook command written to settings.json: `"<sys.executable>" -m runledger guard`
+    by default, or bare `runledger guard` when `portable=True`."""
+    return HOOK_COMMAND if portable else f'"{sys.executable}" -m runledger guard'
+
+
+def checkpoint_hook_command(portable: bool = False) -> str:
+    """The checkpoint hook command written to settings.json: `"<sys.executable>" -m runledger checkpoint --hook`
+    by default, or bare `runledger checkpoint --hook` when `portable=True`."""
+    from .rollback import HOOK_COMMAND as checkpoint_command
+    return checkpoint_command if portable else f'"{sys.executable}" -m runledger checkpoint --hook'
+
+
+def hook_entry(hook_seconds: int, portable: bool = False) -> Dict[str, Any]:
+    return {"matcher": "*", "hooks": [{"type": "command", "command": guard_hook_command(portable=portable), "timeout": hook_seconds}]}
 
 
 def _is_guard_hook(h: Any) -> bool:
@@ -839,17 +997,21 @@ def _group_has_guard(group: Any) -> bool:
     return any(_is_guard_hook(h) for h in (hooks if isinstance(hooks, list) else []))
 
 
-def install_hook(path: Path, approval_timeout_s: Optional[float] = None) -> Tuple[bool, Optional[Path]]:
+def install_hook(path: Path, approval_timeout_s: Optional[float] = None,
+                 portable: bool = False) -> Tuple[bool, Optional[Path]]:
     """Add the guard and lifecycle checkpoint entries, keeping everything else.
 
     The entry's "timeout" is hook_timeout_for(approval_timeout_s). An existing guard
-    hook (any matcher) gets its timeout updated in place; a second entry is never added.
+    hook (any matcher) gets its command and timeout updated in place; a second entry is
+    never added.
 
     Returns (changed, backup). The original is copied to `settings.json.bak` before
     any change; a file that is already up to date is not written. Raises InstallError
     (and writes nothing) if the file is not a JSON object."""
     path = Path(path)
     want = hook_timeout_for(approval_timeout_s)
+    want_cmd = guard_hook_command(portable=portable)
+    want_cp_cmd = checkpoint_hook_command(portable=portable)
     existed, settings = _read_settings(path)
     hooks = settings.get("hooks")
     hooks = {} if hooks is None else hooks
@@ -867,13 +1029,17 @@ def install_hook(path: Path, approval_timeout_s: Optional[float] = None) -> Tupl
             continue
         found = True
         for h in group["hooks"]:
-            if _is_guard_hook(h) and h.get("timeout") != want:
-                h["timeout"] = want
-                changed = True
+            if _is_guard_hook(h):
+                if h.get("command") != want_cmd:
+                    h["command"] = want_cmd
+                    changed = True
+                if h.get("timeout") != want:
+                    h["timeout"] = want
+                    changed = True
     if not found:
-        pre.append(hook_entry(want))
+        pre.append(hook_entry(want, portable=portable))
         changed = True
-    from .rollback import HOOK_COMMAND as checkpoint_command, HOOK_EVENTS, is_checkpoint_hook
+    from .rollback import HOOK_EVENTS, is_checkpoint_hook
     for event in HOOK_EVENTS:
         groups = hooks.get(event)
         groups = [] if groups is None else groups
@@ -886,11 +1052,14 @@ def install_hook(path: Path, approval_timeout_s: Optional[float] = None) -> Tupl
                 if is_checkpoint_hook(h):
                     if group.get("matcher") in (None, "", "*"):
                         found_checkpoint = True
+                        if h.get("command") != want_cp_cmd:
+                            h["command"] = want_cp_cmd
+                            changed = True
                     if h.get("timeout") != 120:
                         h["timeout"] = 120
                         changed = True
         if not found_checkpoint:
-            groups.append({"hooks": [{"type": "command", "command": checkpoint_command, "timeout": 120}]})
+            groups.append({"hooks": [{"type": "command", "command": want_cp_cmd, "timeout": 120}]})
             changed = True
         hooks[event] = groups
     if not changed:
@@ -974,15 +1143,51 @@ def _write_settings(path: Path, settings: Dict[str, Any], existed: bool) -> Opti
     return backup
 
 
+def verify_hook_command(command: str, portable: bool = False) -> Tuple[bool, str]:
+    """Run the configured hook command in a subprocess with `{}` on stdin and timeout <= 15 s.
+    Returns `(ok, message)`."""
+    if portable or command.strip() == HOOK_COMMAND:
+        exe = shutil.which("runledger")
+        if not exe:
+            return False, (
+                f"Warning: configured hook command `{command}` could not be run "
+                "(runledger was not found on PATH). Re-run `runledger guard install` "
+                "without `--portable` or add runledger to PATH."
+            )
+        argv = [exe, "guard"]
+    else:
+        argv = [sys.executable, "-m", "runledger", "guard"]
+    env = os.environ.copy()
+    repo_root = str(Path(__file__).resolve().parents[1])
+    existing_pp = env.get("PYTHONPATH", "")
+    if repo_root not in existing_pp.split(os.pathsep):
+        env["PYTHONPATH"] = f"{repo_root}{os.pathsep}{existing_pp}" if existing_pp else repo_root
+    try:
+        proc = subprocess.run(
+            argv,
+            input=b"{}",
+            capture_output=True,
+            timeout=15,
+            env=env,
+        )
+    except Exception as exc:
+        return False, f"Warning: configured hook command `{command}` could not be run ({exc})."
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or b"").decode("utf-8", errors="replace").strip()
+        extra = f": {detail}" if detail else ""
+        return False, f"Warning: configured hook command `{command}` exited with code {proc.returncode}{extra}"
+    return True, f"Verified hook command: {command} (exit 0)"
+
+
 def cmd_install(project: Optional[str] = None, global_scope: bool = False,
-                home: Optional[Path] = None) -> int:
+                home: Optional[Path] = None, portable: bool = False) -> int:
     """Install or update the hook. The hook timeout follows the approval wait: the project's
     timeout_s for a project install, the user's or the default for a global install."""
     target = settings_path(project, global_scope, home)
     project_policy = {} if global_scope else read_policy(str(Path(project or os.getcwd())))
     timeout_s = approval_timeout(project_policy)
     try:
-        changed, backup = install_hook(target, timeout_s)
+        changed, backup = install_hook(target, timeout_s, portable=portable)
     except InstallError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -990,12 +1195,15 @@ def cmd_install(project: Optional[str] = None, global_scope: bool = False,
         print(f"error: cannot update {target}: {exc}", file=sys.stderr)
         return 1
     hook_s = hook_timeout_for(timeout_s)
+    cmd = guard_hook_command(portable=portable)
     if changed:
         print(f"Installed or updated the RunLedger guard hook and checkpoint hooks in {target} (hook timeout {hook_s} s)")
         if backup is not None:
             print(f"Backup of the previous file: {backup}")
     else:
         print(f"The RunLedger guard hook and checkpoint hooks in {target} are already up to date (hook timeout {hook_s} s). Nothing changed.")
+    ok, verify_msg = verify_hook_command(cmd, portable=portable)
+    print(verify_msg)
     return 0
 
 

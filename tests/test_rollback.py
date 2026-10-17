@@ -4,6 +4,7 @@ import json
 import os
 import stat
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -770,7 +771,9 @@ def test_checkpoints_listing_and_pruning_only_owned_refs(committed_repo, capsys)
     assert git(repo.root, "rev-parse", "refs/runledger/other").decode().strip() == first.oid
     assert main(["checkpoints", "--cwd", str(repo.root), "prune", "--keep", "0"]) == 0
     assert repo.checkpoints() == []
-    assert main(["checkpoints", "prune", "--cwd", str(repo.root), "--keep", "-1"]) == 1
+    with pytest.raises(SystemExit) as exc:
+        main(["checkpoints", "prune", "--cwd", str(repo.root), "--keep", "-1"])
+    assert exc.value.code == 2
     assert "--keep" in capsys.readouterr().err
 
 
@@ -836,12 +839,53 @@ def test_invalid_hook_input_is_nonblocking(event, monkeypatch, capsys):
     assert capsys.readouterr().out == ""
 
 
-def test_hook_failure_is_nonblocking(tmp_path, monkeypatch, capsys):
-    event = dict(cwd=str(tmp_path), session_id="s", hook_event_name="SessionStart")
+def test_hook_outside_repo_is_silent(tmp_path, monkeypatch, capsys):
+    for event_name in rollback.HOOK_EVENTS:
+        event = dict(cwd=str(tmp_path), session_id="s", hook_event_name=event_name)
+        monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(event)))
+        assert main(["checkpoint", "--hook"]) == 0
+        out = capsys.readouterr()
+        assert out.out == "" and out.err == ""
+
+
+def test_hook_failure_is_nonblocking(repo, monkeypatch, capsys):
+    (repo.root / ".git" / "refs" / "runledger").write_text("blocker\n", encoding="utf-8")
+    event = dict(cwd=str(repo.root), session_id="s", hook_event_name="SessionStart")
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(event)))
     assert main(["checkpoint", "--hook"]) == 0
     out = capsys.readouterr()
     assert out.out == "" and "checkpoint unavailable" in out.err
+
+
+def test_checkpoints_listing_spawn_count_constant(repo, monkeypatch):
+    created = [repo.create(label=f"cp-{i}", run_id=f"run-{i}") for i in range(15)]
+
+    # Inject a symbolic ref, a non-commit ref, a malformed ref name, a foreign commit, and a malformed commit body under PREFIX.
+    git(repo.root, "symbolic-ref", f"{rollback.PREFIX}20261015T150000000000Z-00000000", "refs/heads/main")
+    git(repo.root, "update-ref", f"{rollback.PREFIX}not-a-valid-id", created[0].oid)
+    git(repo.root, "update-ref", f"{rollback.PREFIX}20261015T150000000000Z-00000001", created[0].tree)
+    foreign_oid = repo._git(
+        "commit-tree", created[0].tree, data=b"Foreign commit\n", extra_env=repo._checkpoint_identity()
+    ).stdout.decode("ascii").strip()
+    git(repo.root, "update-ref", f"{rollback.PREFIX}20261015T150000000000Z-00000002", foreign_oid)
+    malformed_oid = repo._git(
+        "commit-tree", created[0].tree, data=b"RunLedger checkpoint\n\n{not-json}\n",
+        extra_env=repo._checkpoint_identity()
+    ).stdout.decode("ascii").strip()
+    git(repo.root, "update-ref", f"{rollback.PREFIX}20261015T150000000000Z-00000003", malformed_oid)
+
+    calls = []
+    real_run = subprocess.run
+
+    def spy_run(cmd, *args, **kwargs):
+        calls.append(list(cmd))
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(rollback.subprocess, "run", spy_run)
+    listed = rollback.Repository(str(repo.root)).checkpoints()
+    assert [cp.id for cp in listed] == [cp.id for cp in reversed(created)]
+    assert len(calls) <= 3
+
 
 
 def test_install_uninstall_preserves_other_lifecycle_hooks(tmp_path):
@@ -856,7 +900,7 @@ def test_install_uninstall_preserves_other_lifecycle_hooks(tmp_path):
     for event in rollback.HOOK_EVENTS:
         assert data["hooks"][event][0] == original["hooks"][event][0]
         assert data["hooks"][event][1] == {"hooks": [
-            {"type": "command", "command": "runledger checkpoint --hook", "timeout": 120}]}
+            {"type": "command", "command": f'"{sys.executable}" -m runledger checkpoint --hook', "timeout": 120}]}
     assert guard.install_hook(path) == (False, None)
     guard.uninstall_hook(path)
     assert json.loads(path.read_text(encoding="utf-8")) == original
@@ -883,6 +927,7 @@ def test_install_covers_all_sessions_when_existing_checkpoint_hook_is_restricted
     "'/a folder/runledger' checkpoint --hook",
     "python -m runledger checkpoint --hook",
     '"/a folder/python3.9" -m runledger checkpoint --hook',
+    r'"C:\Program Files\Python 3\python.exe" -m runledger checkpoint --hook',
 ])
 def test_checkpoint_hook_recognises_exact_commands(command):
     assert rollback.is_checkpoint_hook({"type": "command", "command": command})

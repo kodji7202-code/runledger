@@ -40,7 +40,7 @@ from typing import List, Optional
 
 from . import __version__
 from . import adapters
-from .gitinfo import current_branch, file_diffs, session_base, toplevel, working_changes
+from .gitinfo import current_branch, file_diffs, repo_context, session_base, toplevel, working_changes
 from .guard import redact
 from .guard_receipt import load_guard_decisions
 from .parser import _ts
@@ -94,17 +94,19 @@ def reconcile_git(run) -> None:
     branch when none was recorded, line counts for files written through the shell, and
     the diffs of changed test files. When the run's changes were committed after it began,
     both compare the working tree with the last commit before the session start (run.git_base)."""
-    if not run.git_branch:
-        run.git_branch = current_branch(run.cwd)
-    run.git_base = session_base(run.cwd, _ts(run.started))
-    changes = file_changes(run)
-    shell_paths = [p for p, fc in changes.items() if fc.shell]
-    if shell_paths:
-        run.git_changes = working_changes(run.cwd, shell_paths, run.git_base)
-    test_paths = [p for p, fc in changes.items()
-                  if not fc.deleted and not is_abs(p) and is_test_source(p)]
-    if test_paths:
-        run.test_diffs = file_diffs(run.cwd, test_paths, run.git_base)
+    with repo_context():
+        if not run.git_branch:
+            run.git_branch = current_branch(run.cwd)
+        run.git_base = session_base(run.cwd, _ts(run.started))
+        changes = file_changes(run)
+        shell_paths = [p for p, fc in changes.items()
+                       if fc.shell or (not fc.added and not fc.removed and not fc.deleted)]
+        if shell_paths:
+            run.git_changes = working_changes(run.cwd, shell_paths, run.git_base)
+        test_paths = [p for p, fc in changes.items()
+                      if not fc.deleted and not is_abs(p) and is_test_source(p)]
+        if test_paths:
+            run.test_diffs = file_diffs(run.cwd, test_paths, run.git_base)
 
 
 def _one_line(exc: BaseException) -> str:
@@ -273,6 +275,9 @@ def _session_path(args) -> Optional[str]:
 
 
 def cmd_list(args) -> int:
+    from . import session_cache
+    from .parser import _fs_str
+
     project = None if args.all else (args.project or os.getcwd())
     try:
         files = adapters.find_sessions(project, args.agent)
@@ -284,37 +289,88 @@ def cmd_list(args) -> int:
         kind = f"{adapters.label(args.agent)} " if args.agent else ""
         print(f"No {kind}sessions found for {where}.", file=sys.stderr)
         return 1
+    entries, dirty = session_cache.load()
     print(f"{'when':<16}  {'id':<8}  {'agent':<12}  {'steps':>5}  first request")
-    for f in files[: args.limit]:
+    limit = max(0, args.limit) if args.limit is not None else 20
+    for f in files[:limit]:
         try:
-            run = adapters.detect(f).parse(f)
-        except (OSError, ValueError) as exc:
-            print(f"skipped: {exc}", file=sys.stderr)
-            continue
-        try:
-            when = datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+            st = os.stat(_fs_str(f))
         except OSError:  # removed after it was listed
             continue
-        first = redact(run.prompts[0] if run.prompts else "").replace("\n", " ")[:60]
-        print(f"{when}  {run.session_id[:8]:<8}  {run.agent[:12]:<12}  {len(run.steps):>5} steps  {first}")
+        key = str(f)
+        cached = entries.get(key)
+        if (isinstance(cached, dict)
+                and cached.get("mtime_ns") == st.st_mtime_ns
+                and cached.get("size") == st.st_size
+                and isinstance(cached.get("id"), str)
+                and isinstance(cached.get("agent"), str)
+                and isinstance(cached.get("steps"), int)
+                and isinstance(cached.get("first"), str)
+                and (not args.all or "list_cwd" in cached)):
+            sid = cached["id"]
+            agent = cached["agent"]
+            steps_count = cached["steps"]
+            first = cached["first"]
+            cwd = cached.get("list_cwd")
+        else:
+            try:
+                adapter = adapters.detect(f)
+                peek_fn = getattr(adapter, "peek", None)
+                if callable(peek_fn):
+                    sid, agent, steps_count, raw_first, cwd = peek_fn(f)
+                else:
+                    run = adapter.parse(f)
+                    sid = run.session_id
+                    agent = run.agent
+                    steps_count = len(run.steps)
+                    raw_first = run.prompts[0] if run.prompts else ""
+                    cwd = run.cwd
+            except (OSError, ValueError) as exc:
+                print(f"skipped: {exc}", file=sys.stderr)
+                continue
+            first = redact(raw_first).replace("\n", " ")[:60]
+            updated = dict(cached) if isinstance(cached, dict) and cached.get("mtime_ns") == st.st_mtime_ns and cached.get("size") == st.st_size else {
+                "mtime_ns": st.st_mtime_ns,
+                "size": st.st_size,
+            }
+            updated["id"] = sid
+            updated["agent"] = agent
+            updated["steps"] = steps_count
+            updated["first"] = first
+            updated["list_cwd"] = cwd
+            entries[key] = updated
+            dirty = True
+        when = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M")
+        print(f"{when}  {sid[:8]:<8}  {agent[:12]:<12}  {steps_count:>5} steps  {first}")
         if args.all:
-            print(f"                  {run.cwd}")
+            print(f"                  {cwd}")
+    if dirty:
+        session_cache.save(entries)
     return 0
 
 
 def default_safe(fmt: str, target: Optional[Path]) -> bool:
-    """md and json receipts are pasted into PRs and committed, so they are safe when they go to
-    stdout or to a file inside a Git work tree. HTML and files outside any repository are
-    personal copies, where full paths help debugging."""
-    if fmt == "html":
-        return False
-    if target is None:
+    """Receipts written inside a Git work tree (and md/json written to stdout) are safe by
+    default. Files written outside any repository keep full local paths unless --safe is passed."""
+    if target is None and fmt != "html":
         return True
     try:
-        folder = target.resolve().parent
+        folder = target.resolve().parent if target is not None else Path(os.getcwd()).resolve()
     except (OSError, RuntimeError):
         return True
     return toplevel(str(folder)) is not None
+
+
+def _default_receipt_path(stem: str, ext: str) -> Path:
+    candidate = Path(f"runledger-{stem}.{ext}")
+    if not candidate.exists():
+        return candidate
+    n = 2
+    while True:
+        candidate = Path(f"runledger-{stem}-{n}.{ext}")
+        if not candidate.exists():
+            return candidate
+        n += 1
 
 
 def cmd_receipt(args) -> int:
@@ -328,7 +384,12 @@ def cmd_receipt(args) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     ext = {"html": "html", "md": "md", "json": "json"}[args.format]
-    target = None if args.output == "-" else Path(args.output or f"runledger-{_file_stem(run.session_id)}.{ext}")
+    if args.output == "-":
+        target: Optional[Path] = None
+    elif args.output:
+        target = Path(args.output)
+    else:
+        target = _default_receipt_path(_file_stem(run.session_id), ext)
     safe = args.safe if args.safe is not None else default_safe(args.format, target)
     if safe:
         make_safe(run, risks)
@@ -339,6 +400,12 @@ def cmd_receipt(args) -> int:
         print(note, file=sys.stderr)
     if target is None:
         _write_stdout(out)
+        if args.open:
+            if args.format != "html":
+                print(f"warning: --open is ignored for --format {args.format} "
+                      "(only HTML receipts can be opened in a browser)", file=sys.stderr)
+            else:
+                print("warning: --open is ignored when writing to stdout (-o -)", file=sys.stderr)
     else:
         try:
             target.write_text(out, encoding="utf-8")
@@ -348,8 +415,12 @@ def cmd_receipt(args) -> int:
         print(f"Receipt: {target}  ·  risk {score}/100 ({level})  ·  {len(run.steps)} steps")
         print("Safe mode: on (paths shortened, e-mails masked; --no-safe shows them)" if safe
               else "Safe mode: off (full local paths; --safe hides them)", file=sys.stderr)
-        if args.open and args.format == "html":
-            webbrowser.open(target.resolve().as_uri())
+        if args.open:
+            if args.format == "html":
+                webbrowser.open(target.resolve().as_uri())
+            else:
+                print(f"warning: --open is ignored for --format {args.format} "
+                      "(only HTML receipts can be opened in a browser)", file=sys.stderr)
     return 2 if (args.fail_on is not None and score >= args.fail_on) else 0
 
 
@@ -422,8 +493,65 @@ def cmd_team_create(args) -> int:
     return 0
 
 
+_LEGACY_BACKUP_RE = re.compile(r"^runledger-(\d{8}-\d{6})(?:-(\d+))?\.db$")
+_STEM_BACKUP_RE = re.compile(r"^runledger-(.+)-(\d{8}-\d{6})(?:-(\d+))?\.db$")
+
+
+def _backup_stem(db_path: str) -> str:
+    raw = Path(db_path).stem or "runledger"
+    return re.sub(r"[^A-Za-z0-9._-]", "_", raw) or "runledger"
+
+
+def _next_backup_target(folder: Path, stem: str, stamp: str) -> Path:
+    max_seq = -1
+    for path in folder.glob(f"runledger-{stem}-{stamp}*.db"):
+        m = _STEM_BACKUP_RE.match(path.name)
+        if m and m.group(1) == stem and m.group(2) == stamp:
+            seq = int(m.group(3) or 0)
+            if seq > max_seq:
+                max_seq = seq
+    if max_seq < 0:
+        base = folder / f"runledger-{stem}-{stamp}.db"
+        if not base.exists() and not base.with_name(f"{base.name}.tmp").exists():
+            return base
+        max_seq = 0
+    seq = max_seq + 1
+    while True:
+        candidate = folder / f"runledger-{stem}-{stamp}-{seq}.db"
+        if not candidate.exists() and not candidate.with_name(f"{candidate.name}.tmp").exists():
+            return candidate
+        seq += 1
+
+
+def _prune_backups(folder: Path, stem: str, keep: int) -> List[Path]:
+    parsed = []
+    for path in folder.glob("runledger-*.db"):
+        m_leg = _LEGACY_BACKUP_RE.match(path.name)
+        if m_leg:
+            parsed.append((None, m_leg.group(1), int(m_leg.group(2) or 0), path))
+            continue
+        m_stem = _STEM_BACKUP_RE.match(path.name)
+        if m_stem:
+            parsed.append((m_stem.group(1), m_stem.group(2), int(m_stem.group(3) or 0), path))
+    other_stems = {s for s, _, _, _ in parsed if s is not None and s != stem}
+    include_legacy = not other_stems
+    pool = [
+        (ts, seq, path.name, path)
+        for s, ts, seq, path in parsed
+        if s == stem or (s is None and include_legacy)
+    ]
+    pool.sort(key=lambda item: (item[0], item[1], item[2]))
+    old = [item[3] for item in pool[:-keep]] if keep > 0 else []
+    for path in old:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+    return old
+
+
 def cmd_backup(args) -> int:
-    """Copy the team database to DIR/runledger-YYYYmmdd-HHMMSS.db and keep the newest --keep copies."""
+    """Copy the team database to DIR/runledger-<stem>-YYYYmmdd-HHMMSS[-N].db and keep the newest --keep copies."""
     from .server.db import Database
 
     folder = Path(args.dir)
@@ -433,9 +561,11 @@ def cmd_backup(args) -> int:
     if not Path(args.db).is_file():
         print(f"error: no database at {args.db}", file=sys.stderr)
         return 1
+    stem = _backup_stem(args.db)
     try:
         folder.mkdir(parents=True, exist_ok=True)
-        target = folder / f"runledger-{datetime.now().strftime('%Y%m%d-%H%M%S')}.db"
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        target = _next_backup_target(folder, stem, stamp)
         db = Database(args.db)
         try:
             db.backup_to(str(target))
@@ -444,9 +574,7 @@ def cmd_backup(args) -> int:
     except (OSError, sqlite3.Error) as exc:
         print(f"error: backup failed: {exc}", file=sys.stderr)
         return 1
-    old = sorted(folder.glob("runledger-*.db"))[:-args.keep]
-    for path in old:
-        path.unlink()
+    old = _prune_backups(folder, stem, args.keep)
     print(f"Backup: {target}  ({target.stat().st_size} bytes; removed {len(old)} older)")
     return 0
 
@@ -543,16 +671,54 @@ def cmd_push(args) -> int:
     return 0
 
 
+def print_guard_help() -> None:
+    """Print the `runledger guard` help text (used when stdin is an interactive TTY)."""
+    p = argparse.ArgumentParser(prog="runledger guard",
+                                description="Real-time policy guard and checkpoint hooks for Claude Code.")
+    gsub = p.add_subparsers(dest="guard_cmd", metavar="{install,uninstall,test}")
+    gsub.add_parser("install", help="add guard and automatic checkpoint hooks to Claude Code")
+    gsub.add_parser("uninstall", help="remove the guard hook from Claude Code settings.json")
+    gsub.add_parser("test", help="print the decision for one PreToolUse event (JSON)")
+    p.print_help()
+
+
 def cmd_guard(args) -> int:
     from . import guard
 
     if args.guard_cmd == "install":
-        return guard.cmd_install(args.project, args.global_scope)
+        return guard.cmd_install(args.project, args.global_scope,
+                                 portable=getattr(args, "portable", False))
     if args.guard_cmd == "uninstall":
         return guard.cmd_uninstall(args.project, args.global_scope)
     if args.guard_cmd == "test":
         return guard.cmd_test(args.event)
+    if sys.stdin is not None and sys.stdin.isatty():
+        if hasattr(args, "_guard_parser"):
+            args._guard_parser.print_help()
+        else:
+            print_guard_help()
+        return 2
     return guard.main()
+
+
+def _positive_int(raw: str) -> int:
+    try:
+        val = int(raw, 10)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a positive integer") from None
+    if val < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return val
+
+
+def _non_negative_int(raw: str) -> int:
+    try:
+        val = int(raw, 10)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be 0 or a positive integer") from None
+    if val < 0:
+        raise argparse.ArgumentTypeError("must be 0 or a positive integer")
+    return val
 
 
 def _agent_arg(parser: argparse.ArgumentParser) -> None:
@@ -569,12 +735,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     pl.add_argument("--project", help="project folder (default: current folder)")
     pl.add_argument("--all", action="store_true", help="sessions from every project")
     _agent_arg(pl)
-    pl.add_argument("--limit", type=int, default=20)
+    pl.add_argument("--limit", type=_positive_int, default=20)
     pl.set_defaults(func=cmd_list)
 
     pr = sub.add_parser("receipt", help="build a receipt for a session")
-    pr.add_argument("session", nargs="?", help="session file of any supported agent (default: latest for this folder)")
-    pr.add_argument("--latest", action="store_true", help="use the latest session (default)")
+    r_target = pr.add_mutually_exclusive_group()
+    r_target.add_argument("session", nargs="?", help="session file of any supported agent (default: latest for this folder)")
+    r_target.add_argument("--latest", action="store_true", help="use the latest session (default)")
     pr.add_argument("--project", help="project folder (default: current folder)")
     _agent_arg(pr)
     pr.add_argument("--format", choices=["html", "md", "json"], default="html")
@@ -590,7 +757,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     pr.add_argument("--fail-on", type=int, metavar="SCORE", help="exit with code 2 if risk score >= SCORE (for CI/hooks)")
     safe = pr.add_mutually_exclusive_group()
     safe.add_argument("--safe", dest="safe", action="store_true", default=None,
-                      help="shorten local paths and mask e-mails (default for md/json to stdout or inside a Git repo)")
+                      help="shorten local paths and mask e-mails (default inside a Git repo or for md/json to stdout)")
     safe.add_argument("--no-safe", dest="safe", action="store_false",
                       help="keep full local paths and e-mail addresses")
     pr.set_defaults(func=cmd_receipt)
@@ -646,8 +813,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     pkt.set_defaults(func=cmd_key)
 
     pp = sub.add_parser("push", help="send a session receipt to a team server")
-    pp.add_argument("session", nargs="?", help="session file of any supported agent (default: latest for this folder)")
-    pp.add_argument("--latest", action="store_true", help="use the latest session (default)")
+    p_target = pp.add_mutually_exclusive_group()
+    p_target.add_argument("session", nargs="?", help="session file of any supported agent (default: latest for this folder)")
+    p_target.add_argument("--latest", action="store_true", help="use the latest session (default)")
     pp.add_argument("--project", help="project folder to find sessions in (default: current folder)")
     _agent_arg(pp)
     pp.add_argument("--server", help="server URL (default: $RUNLEDGER_SERVER)")
@@ -671,7 +839,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     pcs.add_argument("--cwd", help="Git working tree folder (default: current folder)")
     cssub = pcs.add_subparsers(dest="checkpoints_cmd")
     prune = cssub.add_parser("prune", help="delete old checkpoint refs, including safety checkpoints")
-    prune.add_argument("--keep", type=int, required=True, help="number of newest checkpoints to keep")
+    prune.add_argument("--keep", type=_non_negative_int, required=True, help="number of newest checkpoints to keep")
     prune.add_argument("--cwd", default=argparse.SUPPRESS, help="Git working tree folder")
     pcs.set_defaults(func=cmd_checkpoints)
 
@@ -691,13 +859,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     scope = pgi.add_mutually_exclusive_group()
     scope.add_argument("--project", metavar="PATH", help="project folder: writes PATH/.claude/settings.json (default: current folder)")
     scope.add_argument("--global", dest="global_scope", action="store_true", help="writes ~/.claude/settings.json")
+    pgi.add_argument("--portable", action="store_true",
+                     help="write bare 'runledger ...' hook commands instead of the current Python interpreter path")
     pgu = gsub.add_parser("uninstall", help="remove the guard hook from Claude Code settings.json")
     uscope = pgu.add_mutually_exclusive_group()
     uscope.add_argument("--project", metavar="PATH", help="project folder: edits PATH/.claude/settings.json (default: current folder)")
     uscope.add_argument("--global", dest="global_scope", action="store_true", help="edits ~/.claude/settings.json")
     pgt = gsub.add_parser("test", help="print the decision for one PreToolUse event (JSON)")
     pgt.add_argument("event", help="the event as a JSON object")
-    pg.set_defaults(func=cmd_guard)
+    pg.set_defaults(func=cmd_guard, _guard_parser=pg)
 
     args = p.parse_args(argv)
     _tolerant_console()

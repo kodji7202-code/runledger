@@ -75,6 +75,28 @@ def test_file_inside_a_repository_is_safe_by_default(tmp_path, capsys):
     assert str(tmp_path) not in target.read_text(encoding="utf-8")
 
 
+@needs_git
+def test_html_safe_inside_repo(tmp_path, capsys):
+    sess = str(_session(tmp_path))
+    out_repo = tmp_path / "repo_out"
+    out_repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(out_repo)], check=True)
+    target = out_repo / "r.html"
+    _, err = _receipt(capsys, sess, "--format", "html", "-o", str(target))
+    body = target.read_text(encoding="utf-8")
+    assert str(tmp_path) not in body
+    assert "dev@example.com" not in body and "[EMAIL]" in body
+    assert "src/app.py" in body
+    assert "Safe mode: on" in err and "--no-safe" in err
+
+    _, err_full = _receipt(capsys, sess, "--format", "html", "--no-safe", "-o", str(target))
+    body_full = target.read_text(encoding="utf-8")
+    assert str(tmp_path / "repo") in body_full
+    assert "dev@example.com" in body_full
+    assert "Safe mode: off" in err_full and "--safe" in err_full
+
+
+
 def test_overrides(tmp_path, capsys):
     session = str(_session(tmp_path))
     out, _ = _receipt(capsys, session, "--format", "json", "-o", "-", "--no-safe")
@@ -110,3 +132,51 @@ def test_summary_path_cut_inside_a_long_root_is_hidden(tmp_path, capsys):
         out, _ = _receipt(capsys, str(path), "--format", fmt, "-o", "-")
         assert str(tmp_path) not in out
         assert "very-long-folder-name" not in out
+
+
+def test_safe_receipt_masks_spaced_homes_foreign_paths_and_keeps_git_remotes(tmp_path, capsys):
+    steps = [
+        {"tool": "Write", "input": {"file_path": r"C:\Users\John Smith\proj\a.py", "content": "x = 1\n"}},
+        {"tool": "Write", "input": {"file_path": "/home/john smith/notes.txt", "content": "y = 1\n"}},
+        {"tool": "Write", "input": {"file_path": "/Users/Mary Jane Doe/notes.txt", "content": "z = 1\n"}},
+        {"tool": "Read", "input": {"file_path": r"D:\secret-corp\client-acme\payroll\q1.xlsx"}},
+        {"tool": "Read", "input": {"file_path": "/opt/proprietary-vendor/sdk-v3/include/header.h"}},
+        {"tool": "Bash", "input": {"command": "git clone git@github.com:org/repo.git"}},
+        {"tool": "Bash", "input": {"command": "git remote set-url origin git@gitlab.internal.corp:team/service.git"}},
+        {"tool": "Bash", "input": {"command": "git fetch ssh://git@github.com/org/repo.git"}},
+        {"tool": "Bash", "input": {"command": "git fetch ssh://alice@host.example.com/repo.git"}},
+        {"tool": "Bash", "input": {"command": "git config user.email bob@example.com"}},
+        {"tool": "Bash", "input": {"command": "git clone https://user:pass@github.com/org/repo.git"}},
+        {"tool": "Bash", "input": {"command": "/usr/bin/python3 /tmp/build.log"}},
+    ]
+    path = tmp_path / "f3.runledger.json"
+    path.write_text(json.dumps({
+        "runledger_format": 1,
+        "agent": "demo",
+        "session_id": "safe-f3",
+        "cwd": "C:/Users/dev/proj",
+        "prompts": [
+            r"Check C:\Users\John Smith\proj\a.py, /home/john smith/notes.txt, /Users/Mary Jane Doe/notes.txt; Co-authored-by: alice@corp.io"
+        ],
+        "steps": steps,
+    }), encoding="utf-8")
+    for fmt in ("md", "json"):
+        out, _ = _receipt(capsys, str(path), "--format", fmt, "-o", "-", "--safe")
+        text = out if fmt == "md" else json.dumps(json.loads(out), ensure_ascii=False)
+        assert "~/proj/a.py" in text
+        assert "~/notes.txt" in text
+        for leaked in ("John", "Smith", "john", "smith", "Mary", "Jane", "Doe",
+                       "secret-corp", "client-acme", "proprietary-vendor", "sdk-v3",
+                       "bob@example.com", "alice@corp.io", "alice@host.example.com", "user:pass"):
+            assert leaked not in text
+        assert "git@github.com:org/repo.git" in text
+        assert "git@gitlab.internal.corp:team/service.git" in text
+        assert "ssh://git@github.com/org/repo.git" in text
+        assert "ssh://[REDACTED]@host.example.com/repo.git" in text
+        assert "https://[REDACTED]@github.com/org/repo.git" in text
+        assert "[EMAIL]" in text
+        assert "…/payroll/q1.xlsx" in text
+        assert "…/include/header.h" in text
+        assert "/usr/bin/python3" in text
+        assert "/tmp/build.log" in text
+

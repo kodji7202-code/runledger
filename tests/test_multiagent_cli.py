@@ -118,6 +118,29 @@ def test_default_file_name_is_safe_for_any_session_id(tmp_path, monkeypatch):
     assert "/" not in written[0].name and "\\" not in written[0].name
 
 
+def test_default_output_does_not_overwrite(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    expected = [
+        "runledger-demo-000.html",
+        "runledger-demo-000-2.html",
+        "runledger-demo-000-3.html",
+    ]
+    for name in expected:
+        assert main(["receipt", str(FIX_NATIVE)]) == 0
+        out = capsys.readouterr().out
+        assert f"Receipt: {name}" in out
+        assert (tmp_path / name).is_file() and (tmp_path / name).stat().st_size > 0
+
+    fixed = tmp_path / "fixed.html"
+    for _ in range(2):
+        assert main(["receipt", str(FIX_NATIVE), "-o", "fixed.html"]) == 0
+        out = capsys.readouterr().out
+        assert "Receipt: fixed.html" in out
+    assert fixed.is_file() and fixed.stat().st_size > 0
+    assert not (tmp_path / "fixed-2.html").exists()
+
+
+
 def test_invalid_native_file_is_reported_not_raised(tmp_path, capsys):
     bad = tmp_path / "bad.runledger.jsonl"
     bad.write_text(json.dumps({"runledger_format": 1}) + "\n" + json.dumps({"tool": ""}) + "\n", encoding="utf-8")
@@ -228,3 +251,26 @@ def test_github_sessions_dir_scores_native_files(tmp_path, capsys):
     shutil.copy(FIX_NATIVE, sessions / "demo.runledger.json")
     assert github_main(["comment", "--sessions-dir", str(sessions), "--dry-run"]) == 0
     assert "demo-agent" in capsys.readouterr().out
+
+
+def test_adapters_reports_import_error_and_reraises_on_debug(monkeypatch, capsys):
+    import importlib
+    from runledger import adapters
+    real_import = importlib.import_module
+
+    def flaky_import(name, package=None):
+        if name.endswith(".codex"):
+            raise ImportError("boom")
+        return real_import(name, package)
+
+    monkeypatch.setattr(importlib, "import_module", flaky_import)
+    monkeypatch.delenv("RUNLEDGER_DEBUG", raising=False)
+    loaded = adapters.adapters()
+    err = capsys.readouterr().err
+    assert "codex" in err and "boom" in err
+    assert [m.NAME for m in loaded] == ["claude-code", "droid", "aider", "native"]
+
+    monkeypatch.setenv("RUNLEDGER_DEBUG", "1")
+    with pytest.raises(ImportError, match="boom"):
+        adapters.adapters()
+

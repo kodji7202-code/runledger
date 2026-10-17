@@ -17,6 +17,7 @@ from functools import lru_cache
 from typing import List, Optional, Tuple
 
 from .paths import is_abs, is_windows_style, join
+from .shell_syntax import strip_heredocs
 
 _HEREDOC = re.compile(r"(?<!<)<<(-?)[ \t]*(['\"]?)([A-Za-z_][\w.-]*)\2")
 _WRITE_OPS = (">", ">>", ">|", "&>", "&>>", "<>")
@@ -66,25 +67,7 @@ class DbWrite:
 def _heredocs(command: str) -> Tuple[str, List[str]]:
     """Remove heredoc bodies from the command text. Bodies are returned in the
     order their `<<` operators appear, so the tokenizer can claim them in turn."""
-    lines = command.split("\n")
-    kept: List[str] = []
-    bodies: List[str] = []
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        kept.append(line)
-        i += 1
-        for m in _HEREDOC.finditer(line):
-            strip_tabs, delim = m.group(1) == "-", m.group(3)
-            body: List[str] = []
-            while i < len(lines):
-                candidate = lines[i].lstrip("\t") if strip_tabs else lines[i]
-                i += 1
-                if candidate == delim:
-                    break
-                body.append(lines[i - 1])
-            bodies.append("\n".join(body))
-    return "\n".join(kept), bodies
+    return strip_heredocs(command)
 
 
 def _keep_windows_paths(text: str) -> str:

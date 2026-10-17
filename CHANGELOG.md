@@ -7,6 +7,122 @@ change behavior, so read the entry before you upgrade.
 
 ## [Unreleased]
 
+### Changed
+
+- **Project `.runledger.json` is tighten-only in receipts as well as the guard:** `ignore` and
+  lowering `severity_overrides` are read only from your user config (`~/.runledger/config.json` or
+  `RUNLEDGER_CONFIG`). A project `.runledger.json` may raise severities and add safe
+  `extra_secret_paths`; if it tries to ignore or lower risk kinds, the receipt keeps the findings
+  and adds a note.
+- **`runledger guard install` writes interpreter-bound hook commands by default:** `guard install`
+  writes `"<sys.executable>" -m runledger guard` and `"<sys.executable>" -m runledger checkpoint --hook`
+  so the hooks run without `runledger` on `PATH` and when the Python path contains spaces, upgrades
+  earlier bare `runledger ...` hook entries in place, and verifies the configured command exits `0`
+  on empty JSON input. Pass `--portable` to write bare `runledger ...` commands for checked-in
+  settings files.
+- **HTML receipts inside a Git work tree are safe by default, and default receipt filenames
+  auto-increment (`runledger.cli`):** `runledger receipt` now enables safe mode by default for HTML
+  files written inside a Git repository (matching Markdown and JSON; pass `--no-safe` for full
+  paths), and when `-o` is omitted it writes `runledger-<stem>-2.<ext>`, `runledger-<stem>-3.<ext>`,
+  and so on instead of overwriting an existing receipt file.
+
+### Fixed
+
+- **CLI flag validation, non-colliding receipts, and atomic stem-scoped backups (`runledger.cli`,
+  `runledger.server.db`):** `--latest` on `receipt` and `push` is now mutually exclusive with an
+  explicit `session` argument (exits `2`); `--open` with `--format md` or `--format json` prints a
+  warning to `stderr` instead of being silently ignored; `list --limit` requires a positive integer
+  and `checkpoints prune --keep` requires a non-negative integer via `argparse` (exits `2`); and
+  `runledger backup` writes stem-qualified `runledger-<db-stem>-YYYYmmdd-HHMMSS[-N].db` files via a
+  temporary file and atomic rename (leaving no `.db` or `.tmp` file on failure) while pruning only
+  matching database stems.
+
+- **Session discovery, sub-agent merging, and fast `list` (`runledger.parser`, `runledger.session_cache`, `runledger.adapters`):**
+  Claude Code sub-agent transcripts (`<project>/<session>/subagents/**/*.jsonl` and legacy
+  `<project>/subagents/agent-*.jsonl`) are merged into the parent session's token usage and cost
+  with message-id deduplication and a receipt note (`includes N sub-agent transcript(s)`), without
+  being listed as separate sessions. Encoded Claude project folder names longer than 200 characters
+  resolve via the UTF-16 32-bit base36 hash suffix with a 200-character prefix fallback scan.
+  Codex and Droid session discovery and `runledger list` share a corruption-tolerant header and
+  summary cache in `~/.runledger/cache/sessions.json` keyed by file modification time and size,
+  Droid project discovery filters by encoded folder name before reading unrelated directories,
+  Aider discovery walks up from project subfolders to the Git top-level directory, and
+  `adapters()` logs broken adapter imports to `stderr` (or re-raises when `RUNLEDGER_DEBUG=1`).
+- **Guard project root resolution and subfolder support (`runledger.guard`, `runledger.guard_receipt`, `runledger.risk`):**
+  the guard resolves the project root from `CLAUDE_PROJECT_DIR` / `FACTORY_PROJECT_DIR` /
+  `DROID_PROJECT_DIR`, else the Git top-level walked up from the event's `cwd`, else `cwd`. Policy
+  is read from `<project_root>/.runledger.json`, `.runledger/guard.log` is written only at the
+  project root, `write_outside` / `read_outside` / `shell_outside` use the project root as the
+  boundary while resolving relative paths against the event's `cwd`, and receipts load both root
+  and legacy subfolder guard logs with de-duplication. Running `runledger guard` interactively with
+  a TTY stdin now prints help and exits `2` instead of blocking.
+
+- **Unified secret detection and redaction (`runledger.secrets`):** `risk`, `guard` and `llm` share
+  one leaf rule set for secret content and secret file paths, resolving `sk-proj-` and 30-character
+  GitHub token mismatches, covering `.tfstate`, `.tfvars`, `.jks`, `.keystore`, `.p8`, `.kdbx`,
+  `.htpasswd`, `.vault-token`, `.config/gh/hosts.yml`, `.config/gcloud/credentials.db` and
+  `.azure/accessTokens.json`, and excluding `id_*.pub` public keys from `secret_file` findings.
+- **ReDoS-safe `extra_secret_paths`:** user and project patterns are validated before compilation
+  (rejecting nested quantifiers, backreferences and patterns over 200 characters, capped at 20
+  patterns and 1,024-character path inputs) and support a `glob:` prefix. Unsafe patterns are
+  skipped and logged as warnings by the guard.
+- **Git plumbing hardening and faster checkpoint listing:** receipt Git calls strip inherited
+  `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE` and related environment overrides, disable optional
+  locks (`GIT_OPTIONAL_LOCKS=0`), treat pathspec magic characters (`[`, `*`, `:`) literally, and
+  cache repository context per run. `runledger checkpoints` reads checkpoint metadata in a single
+  `for-each-ref` call, and `runledger checkpoint --hook` stays silent outside a Git repository
+  while still warning on failures inside a repository.
+- **PowerShell file write and delete analysis (`runledger.ps_writes`):** `PowerShell` tool steps
+  and PowerShell cmdlets inside `Bash` steps (`Set-Content`, `Add-Content`, `Out-File`,
+  `Tee-Object`, `Export-Csv`, `New-Item`, `Copy-Item`, `Move-Item`, `Rename-Item`, `Remove-Item`,
+  `Invoke-WebRequest -OutFile`, their aliases, `>`/`>>` redirections and `[System.IO.File]` writes)
+  now populate `files` in receipts and trigger the same file-path risk rules (`secret_file`,
+  `git_internals`, `db_migration`, `shell_outside`, `temp_copy`, `test_deleted`) and guard
+  decisions as POSIX shell writes, while skipping variable, wildcard and `-WhatIf` targets.
+- **Quote- and comment-aware heredoc scanning (`runledger.shell_syntax`):** `<<` inside single or
+  double quotes, `#` comments, `<<<` here-strings and `$((...))` arithmetic expansions no longer
+  start a fake heredoc that hides later commands on subsequent lines from `shell_writes` and
+  `risk`.
+- **Tightened `test_skipped` detection:** `sys.exit(`, `process.exit(`, `os._exit(`, `foo.xit(`,
+  `taxit(`, `@pytest.mark.xfail` and `.todo(` in test diffs or edits are no longer misclassified
+  as disabled tests, while `xit(`, `xdescribe(`, `xtest(`, `xcontext(`, `xspecify(`, `t.Skip(`,
+  `t.SkipNow(`, `self.skipTest(`, `it.only(`, `@Disabled` and `@Ignore` are flagged.
+- **UNC, `\\?\` long-path and symlink/junction path handling (`runledger.paths`, `runledger.risk`):**
+  UNC paths (`\\srv\share\...` and `//srv/share/...`) and Windows `\\?\` / `\\?\UNC\` long-path
+  prefixes are recognized as Windows-style absolute paths across `paths`, `risk` and `guard` while
+  keeping device paths (`\\.\...`, `\\?\GLOBALROOT...`) excluded. When a path and working directory
+  exist on the local host (non-UNC, matching the host OS style), `_outside` also resolves
+  `os.path.realpath` to flag symlink and Windows junction escapes outside the project without
+  hanging on unreachable UNC shares.
+- **Safe-mode path and Git remote masking (`runledger.safe`):** home folders with spaces in the
+  user name (`C:\Users\John Smith\...`, `/home/john smith/...`, `/Users/Mary Jane Doe/...`) are
+  masked in full to `~/...`; scp-style `git@host:org/repo` and `ssh://git@host/...` Git remotes are
+  preserved instead of being redacted as `[EMAIL]` or `[REDACTED]@`; and foreign non-system
+  absolute paths with more than two segments are trimmed to `…/<last two parts>` even when the
+  repository root is known.
+- **Model normalization, verified OpenAI/Google prices, 1h cache writes and long-context tiers (`runledger.pricing`, `runledger/prices.json`):**
+  `normalize_model` strips trailing `[...]` context tags (`claude-opus-4-6[1m]`), `custom:` and
+  proxy suffixes (`custom:Claude-Opus-4.5-[Proxy]-0`), Bedrock/Vertex prefixes and `-latest` while
+  keeping `-fast`, unverified `-preview` and `-chat-latest` unpriced. `prices.json` adds verified
+  OpenAI (`gpt:6-astra`, `gpt:6.1-sol`, `gpt:6-luna`, `gpt:5.6-sol`, `gpt:5.6-cyber`,
+  `gpt:5.3-codex`, `gpt:5.4*`, `gpt:5.2*`, `gpt:5.1*`, `gpt:5*`, `gpt:4.1*`, `gpt:4o*`, `o3*`,
+  `o4-mini`, `o1*`) and Google Gemini (`gemini:4-argon`, `gemini:3.8-flash`, `gemini:3.6-flash`,
+  `gemini:3.5-flash-lite`, `gemini:3.1-flash-lite`, `gemini:3-flash-preview`, `gemini:2.5*`) list
+  prices alongside all 20 v0.6.0 Anthropic keys, with backward-compatible optional fields
+  (`cache_write_5m`, `cache_write_1h`, `long_context`, `valid_from`, `valid_until`, `windows`),
+  once-per-process invalid price file warnings, and a 120-day staleness note in receipts.
+  `parser._usage` reads `cache_creation.ephemeral_1h_input_tokens` and bills 1-hour cache writes at
+  `2x` input (or `cache_write_1h`), and `cost_of` applies `long_context` rates per request (noting
+  when Droid settings-only usage uses the base tier).
+- **Codex, Claude Code and Aider usage and prompt parsing (`runledger.adapters.codex`, `runledger.parser`, `runledger.adapters.aider`):**
+  Codex `token_count` events deduplicate repeated cumulative totals, fall back to
+  `total - _prev_total` when `last_token_usage` is omitted, and handle counter resets; Claude Code
+  `parse_session` streams in a single pass and retains user prompts starting with `<` (such as HTML
+  or JSX snippets) while still filtering wrapper tags (`<command-`, `<local-command-`,
+  `<system-reminder>`, etc.); and Aider parses `cache write` and `cache hit` token counts in either
+  order without double-counting `sent` and distributes per-step integer remainders so step tokens
+  sum to `totals.tokens`.
+
 ## [0.6.0] - 2026-10-15
 
 ### Changed

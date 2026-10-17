@@ -54,8 +54,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from . import paths
+from . import paths, secrets
 from .parser import Run, Step
+from .ps_writes import ps_writes, shell_kind
+from .shell_syntax import strip_heredocs as _posix_strip_heredocs
 from .shell_writes import database_writes, shell_writes
 from .testdiff import SKIP_RE, TestChange, analyze as analyze_test_diffs
 
@@ -73,15 +75,9 @@ class Risk:
     step: int
 
 
-SECRET_PATTERNS = [
-    r"(^|/)\.env(\.[\w-]+)?$", r"(^|/)\.envrc$", r"id_(rsa|ed25519|ecdsa|dsa)(\.pub)?$",
-    r"\.pem$", r"\.key$", r"\.p12$", r"\.pfx$", r"(^|/)\.npmrc$", r"(^|/)\.pypirc$",
-    r"(^|/)\.netrc$", r"(^|/)\.aws/credentials$", r"(^|/)\.ssh/", r"credentials(\.json)?$",
-    r"secrets?\.(ya?ml|json|toml)$", r"(^|/)\.git-credentials$", r"service[-_]account.*\.json$",
-    r"(^|/)\.docker/config\.json$", r"(^|/)\.kube/config$",
-]
+SECRET_PATTERNS = [rx.pattern for rx in secrets.SECRET_PATH_PATTERNS]
 _SECRET_RE = re.compile("|".join(SECRET_PATTERNS), re.I)
-_ENV_EXAMPLE_RE = re.compile(r"\.env\.(example|sample|template|dist)$", re.I)
+_ENV_EXAMPLE_RE = secrets._PUBLIC_OR_TEMPLATE_PATH_RE
 
 TEST_RE = re.compile(r"(^|/)(tests?|__tests__|spec|specs)(/|$)|(\.|_|-)(test|spec)\.[a-z]+$|(^|/)test_[^/]+\.py$", re.I)
 # Real test source: deleting it is high. Anything else under a test folder is data (see _is_test_fixture).
@@ -287,20 +283,33 @@ _key = paths.key
 _within = paths.within
 
 
-def _in_temp(target: str) -> bool:
-    if _APPDATA_TEMP_RE.search(target):
+def _in_temp(target: str, self_only: bool = False, cwd: Optional[str] = None) -> bool:
+    for env_var in ("HOME", "USERPROFILE"):
+        h = os.environ.get(env_var)
+        if h and _within(target, h) and not _APPDATA_TEMP_RE.search(target[len(h):]):
+            return False
+    if not self_only and _APPDATA_TEMP_RE.search(target) and not (cwd and _APPDATA_TEMP_RE.search(cwd)):
         return True
     roots = list(_POSIX_TEMP_ROOTS)
+    for var in ("TMPDIR", "TEMP", "TMP"):
+        v = os.environ.get(var)
+        if v:
+            roots.append(v)
     try:
         roots.append(tempfile.gettempdir())
     except OSError:  # no usable temp directory
         pass
-    # Filesystem roots (e.g. TMPDIR=/) would make everything "temp"; skip them.
-    return any(_within(target, r) for r in roots if r and not _WIN_ROOT_RE.match(r))
+    # Filesystem roots (e.g. TMPDIR=/) or temp dirs containing cwd itself would make sibling folders "temp"; skip them.
+    return any(
+        _within(target, r)
+        for r in roots
+        if r and not _WIN_ROOT_RE.match(r) and not (cwd and _within(cwd, r))
+    )
 
 
 def _is_device(p: str) -> bool:
     """Device and special files (/dev/null, NUL, /proc/self/...) are never paths in a project."""
+    p = paths.strip_long_prefix(p)
     q = _slashes(p).lower()
     return q.startswith(_DEVICE_PREFIXES) or _basename(p).lower() in _DEVICE_NAMES
 
@@ -315,13 +324,65 @@ def _msys_to_windows(p: str, win: bool) -> str:
     return m.group(1).upper() + ":" + (p[m.end():] or "/")
 
 
-def _outside(path: str, cwd: Optional[str], base: Optional[str] = None) -> bool:
+def _resolve_real(p: str) -> str:
+    """Resolve symlinks and junctions on the local filesystem, including broken links."""
+    real = paths.strip_long_prefix(os.path.realpath(p))
+    if os.name == "nt":
+        probe = ntpath.normpath(p)
+        tail: List[str] = []
+        while probe and not os.path.exists(probe):
+            if os.path.islink(probe):
+                try:
+                    dest = paths.strip_long_prefix(os.readlink(probe))
+                    if not _is_abs(dest):
+                        dest = ntpath.join(ntpath.dirname(probe), dest)
+                    resolved = paths.strip_long_prefix(os.path.realpath(dest))
+                    for part in reversed(tail):
+                        resolved = ntpath.join(resolved, part)
+                    return ntpath.normpath(resolved)
+                except OSError:
+                    break
+            parent, name = ntpath.split(probe)
+            if not name or parent == probe:
+                break
+            tail.append(name)
+            probe = parent
+    return real
+
+
+def _escapes_via_realpath(target: str, cwd: str) -> bool:
+    """True when `target` is lexically inside `cwd`, both exist locally (not UNC, matching
+    host OS style), and resolving symlinks/junctions places `target` outside `cwd`."""
+    if paths.is_unc(target) or paths.is_unc(cwd):
+        return False
+    host_win = os.name == "nt"
+    if _is_windows_style(cwd) != host_win or _is_windows_style(target) != host_win:
+        return False
+    rel = paths.relative(target, cwd)
+    if not rel or rel == ".":
+        return False
+    first = rel.split("/", 1)[0]
+    try:
+        if not os.path.lexists(os.path.join(cwd, first)):
+            return False
+        real_cwd = _resolve_real(cwd)
+        real_target = _resolve_real(target)
+    except OSError:
+        return False
+    return not _within(real_target, real_cwd)
+
+
+def _outside(path: str, cwd: Optional[str], base: Optional[str] = None, self_temp_only: bool = False) -> bool:
     """True if `path` resolves outside `cwd`. Temp directories count as inside.
     A relative path is resolved against `base` (a working directory) when given,
-    otherwise against `cwd`. Windows-style paths (drive letter on either side) compare
-    case-insensitively with either separator; POSIX paths compare exactly."""
+    otherwise against `cwd`. Windows-style paths (drive letter or UNC on either side)
+    compare case-insensitively with either separator; POSIX paths compare exactly."""
     if not cwd or not path or _is_device(path) or not _is_abs(cwd):
         return False  # a relative working folder (some logs record ".") cannot place a path
+    path = paths.strip_long_prefix(path)
+    cwd = paths.strip_long_prefix(cwd)
+    if base:
+        base = paths.strip_long_prefix(base)
     win = _is_windows_style(cwd)
     path = _msys_to_windows(path, win)
     if base:
@@ -329,9 +390,9 @@ def _outside(path: str, cwd: Optional[str], base: Optional[str] = None) -> bool:
     mod = ntpath if _is_windows_style(path, cwd, base) else posixpath
     # _is_abs, not mod.isabs: ntpath.isabs("/tmp") is False on Python 3.13+
     target = path if _is_abs(path) else mod.join(base or cwd, path)
-    if _in_temp(target):
-        return False
-    return not _within(target, cwd)
+    if not _within(target, cwd):
+        return not _in_temp(target, self_only=self_temp_only, cwd=cwd)
+    return _escapes_via_realpath(target, cwd)
 
 
 def _resolved(path: str, base: Optional[str]) -> str:
@@ -343,25 +404,13 @@ def _resolved(path: str, base: Optional[str]) -> str:
     return posixpath.join(base, path)
 
 
-def _is_secret(path: str, extra: List["re.Pattern"]) -> bool:
-    q = _slashes(path)
-    if _SECRET_RE.search(q) and not _ENV_EXAMPLE_RE.search(q):
-        return True
-    return any(rx.search(q) for rx in extra)
+def _is_secret(path: str, extra: Optional[List["re.Pattern"]] = None) -> bool:
+    return secrets.is_secret_path(path, extra)
 
 
 def _user_regexes(patterns: Any) -> List["re.Pattern"]:
-    out = []
-    if not isinstance(patterns, list):
-        return out
-    for rx in patterns:
-        if not isinstance(rx, str):
-            continue
-        try:
-            out.append(re.compile(rx, re.I))
-        except re.error:
-            continue  # invalid pattern in the config: skip it
-    return out
+    compiled, _ = secrets.compile_extra_secret_paths(patterns)
+    return compiled
 
 
 def _written_texts(step: Step) -> List[str]:
@@ -376,12 +425,7 @@ def _written_texts(step: Step) -> List[str]:
 
 def _hardcoded_secret_kinds(text: str) -> List[str]:
     """Kinds of hardcoded secret found in `text`. Returns kind names only."""
-    kinds = [kind for rx, kind in _CONTENT_SECRET_RULES if rx.search(text)]
-    for m in _GENERIC_SECRET_RE.finditer(text):
-        if m.group(2)[:1] in ("$", "{", "<"):  # template placeholder, not a value
-            continue
-        kinds.append(re.sub(r"[_-]", " ", m.group(1).lower()))
-    return list(dict.fromkeys(kinds))
+    return secrets.find_secrets(text)
 
 
 def _looks_like_path_arg(t: str) -> bool:
@@ -441,6 +485,9 @@ def _is_switch(t: str) -> bool:
 
 def _strip_heredocs(cmd: str, ps: bool) -> str:
     """The command without heredoc or here-string bodies (the operator line is kept)."""
+    if not ps:
+        stripped, _ = _posix_strip_heredocs(cmd)
+        return stripped
     out: List[str] = []
     queue: List[Tuple[str, bool]] = []  # (terminator line, strip leading tabs)
     for line in cmd.split("\n"):
@@ -453,14 +500,9 @@ def _strip_heredocs(cmd: str, ps: bool) -> str:
                 queue.pop(0)
             continue
         out.append(line)
-        if ps:
-            m = _PS_HERE_START_RE.search(line)
-            if m:
-                queue.append((m.group(1) + "@", False))
-        else:
-            for m in _HEREDOC_RE.finditer(line):
-                if line[:m.start()].count("'") % 2 == 0:
-                    queue.append((m.group(3), m.group(1) == "-"))
+        m = _PS_HERE_START_RE.search(line)
+        if m:
+            queue.append((m.group(1) + "@", False))
     return "\n".join(out)
 
 
@@ -818,14 +860,17 @@ def _code_view(text: str, comments: List[Tuple[int, int]], text_words: List[_Wor
     return out
 
 
-def _shell_risks(step: Step, cwd: Optional[str], extra: List["re.Pattern"], risks: List[Risk]) -> None:
+def _shell_risks(step: Step, cwd: Optional[str], extra: List["re.Pattern"], risks: List[Risk],
+                 default_workdir: Optional[str] = None) -> None:
     cmd = str(step.input.get("command") or "")
-    ps = step.tool == "PowerShell"
+    ps = shell_kind(step) == "powershell"
 
     wd = step.input.get("workdir")
-    workdir = wd.strip() if isinstance(wd, str) and _is_abs(wd.strip()) else None
-    if workdir and cwd and _outside(workdir, cwd):
-        risks.append(Risk("medium", "shell_outside", f"Ran a command outside the working folder ({workdir})", step.index))
+    explicit_wd = wd.strip() if isinstance(wd, str) and _is_abs(wd.strip()) else None
+    if explicit_wd and cwd and _outside(explicit_wd, cwd):
+        risks.append(Risk("medium", "shell_outside", f"Ran a command outside the working folder ({explicit_wd})", step.index))
+    sub_wd = default_workdir if (default_workdir and default_workdir != cwd and _is_abs(default_workdir)) else None
+    workdir = explicit_wd or sub_wd
 
     prepared = _strip_heredocs(cmd, ps)
     items, comments = _scan(prepared, ps)
@@ -845,6 +890,12 @@ def _shell_risks(step: Step, cwd: Optional[str], extra: List["re.Pattern"], risk
 
     assigns: Dict[str, Optional[str]] = {}
     for words, name in zip(cmds, names):
+        if ps and any(
+            not w.quoted and (w.value.lower() == "-whatif" or w.value.lower().startswith("-whatif:"))
+            and not w.value.lower().endswith("$false")
+            for w in words
+        ):
+            continue
         for w in words:
             if w.role == "assign":
                 var, _, val = w.value.partition("=")
@@ -867,29 +918,33 @@ def _migration_risk(path: str, verb: str, cwd: Optional[str], index: int, risks:
         risks.append(Risk("medium", "db_migration", f"{verb} a database migration ({_project_path(path, cwd)})", index))
 
 
-def _shell_write_risks(step: Step, cwd: Optional[str], extra: List["re.Pattern"], risks: List[Risk]) -> None:
-    """The files a Bash command writes (shell_writes) get the checks edit-tool writes get,
-    and commands that change a database file or run migrations are reported."""
+def _shell_write_risks(step: Step, cwd: Optional[str], extra: List["re.Pattern"], risks: List[Risk],
+                       default_workdir: Optional[str] = None) -> None:
+    """The files a shell command writes (shell_writes / ps_writes) get the checks edit-tool
+    writes get, and commands that change a database file or run migrations are reported."""
     cmd = str(step.input.get("command") or "")
     wd = step.input.get("workdir")
-    base = wd.strip() if isinstance(wd, str) and _is_abs(wd.strip()) else cwd
+    base = wd.strip() if isinstance(wd, str) and _is_abs(wd.strip()) else (default_workdir or cwd)
     flagged_outside = {_key(r.reason.rsplit("(", 1)[-1].rstrip(")"), False)
                        for r in risks if r.code == "shell_outside" and r.step == step.index}
-    writes = shell_writes(cmd)
+    is_ps = shell_kind(step) == "powershell"
+    writes = ps_writes(cmd) if is_ps else shell_writes(cmd)
     moved_away = {w.path for w in writes if w.deleted}
     for w in writes:
         target = _resolved(w.path, base)
         verb = "Deleted" if w.deleted else "Wrote"
+        if w.deleted:
+            _test_deleted(w.path, step.index, risks)
         if _is_secret(w.path, extra):
             risks.append(Risk("high", "secret_file", f"Touched a secrets file from the shell ({_basename(w.path)})", step.index))
         if _GIT_DIR_RE.search(_slashes(target)):
             risks.append(Risk("medium", "git_internals", f"{verb} inside the .git folder ({_basename(target)})", step.index))
         if not w.deleted:
             _migration_risk(target, "Wrote", cwd, step.index, risks)
-        if _outside(target, cwd):
+        if not w.deleted and _outside(target, cwd, self_temp_only=True):
             if _key(target, False) not in flagged_outside:
                 risks.append(Risk("low", "shell_outside", f"Shell command wrote outside the working folder ({target})", step.index))
-        elif w.source and cwd and _is_abs(target) and _in_temp(target):
+        elif w.source and cwd and _is_abs(target) and _in_temp(target, self_only=True):
             source = _resolved(w.source, base)
             if not _outside(source, cwd) and not _in_temp(source):
                 how = "Moved" if w.source in moved_away else "Copied"
@@ -906,52 +961,145 @@ def _shell_write_risks(step: Step, cwd: Optional[str], extra: List["re.Pattern"]
 
 # ---------------------------------------------------------------- policy
 
-def load_policy(cwd: Optional[str]) -> Dict[str, Any]:
-    """Per-project settings from `<cwd>/.runledger.json`:
+_LOW_DEFAULT_KINDS = frozenset({
+    "mcp", "read_outside", "shell_outside", "temp_copy", "network", "package_install",
+})
+_HIGH_DEFAULT_KINDS = frozenset({
+    "secret_file", "secret_in_content", "secret", "write_outside", "outside_repo",
+    "test_deleted", "test_skipped", "destructive_delete", "git_force_push",
+    "pipe_to_shell", "destructive_sql", "package_publish", "infra_change", "sudo",
+})
 
-        {"ignore": ["code_or_reason_substring", ...],
-         "severity_overrides": {"code": "low|medium|high"},
-         "extra_secret_paths": ["regex", ...]}
 
-    `ignore` drops every risk whose code or reason contains the text
-    (case-insensitive). `severity_overrides` changes the level of a risk code.
-    `extra_secret_paths` are regexes added to the secret-file patterns.
+def _user_config_path() -> Path:
+    override = os.environ.get("RUNLEDGER_CONFIG", "").strip()
+    if override:
+        return Path(override)
+    home = os.environ.get("HOME") or os.environ.get("USERPROFILE") or str(Path.home())
+    return Path(home) / ".runledger" / "config.json"
 
-    A missing, unreadable or invalid file gives the defaults; so does any invalid
-    entry inside it. This function never raises."""
-    policy: Dict[str, Any] = {"ignore": [], "severity_overrides": {}, "extra_secret_paths": []}
-    if not cwd:
-        return policy
+
+def _read_json_dict(path: Path) -> Dict[str, Any]:
     try:
-        data = json.loads((Path(cwd) / POLICY_FILE).read_text(encoding="utf-8-sig"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError, TypeError, RecursionError):
-        return policy
-    if not isinstance(data, dict):
-        return policy
+        return {}
+    return data if isinstance(data, dict) else {}
 
+
+def _is_project_override_raising(kind: str, level: str) -> bool:
+    """True when a project `severity_overrides` entry raises severity above default."""
+    k = kind.strip().lower()
+    lv = level.strip().lower()
+    if lv == "low":
+        return False
+    if lv == "medium":
+        return k in _LOW_DEFAULT_KINDS
+    if lv == "high":
+        return k not in _HIGH_DEFAULT_KINDS
+    return False
+
+
+def _project_ignored_or_lowered_kinds(cwd: Optional[str]) -> List[str]:
+    """Distinct risk kinds a project `.runledger.json` tried to ignore or lower."""
+    if not cwd or paths.is_unc(cwd):
+        return []
+    data = _read_json_dict(Path(cwd) / POLICY_FILE)
+    if not data:
+        return []
+    rejected: List[str] = []
     ignore = data.get("ignore")
+    if isinstance(ignore, list):
+        for s in ignore:
+            if isinstance(s, str) and s.strip():
+                rejected.append(s.strip().lower())
+    overrides = data.get("severity_overrides")
+    if isinstance(overrides, dict):
+        for code, level in overrides.items():
+            if not isinstance(code, str) or not code.strip():
+                continue
+            if not isinstance(level, str) or level.lower() not in SEVERITY_POINTS:
+                continue
+            if not _is_project_override_raising(code, level):
+                rejected.append(code.strip().lower())
+    return list(dict.fromkeys(rejected))
+
+
+def load_policy(cwd: Optional[str]) -> Dict[str, Any]:
+    """Effective policy combining user config (`RUNLEDGER_CONFIG` or `~/.runledger/config.json`)
+    and project config (`<cwd>/.runledger.json`).
+
+    Trust model:
+    - User config may set `ignore`, `severity_overrides` (raise or lower), and `extra_secret_paths`.
+    - Project config may only add safe `extra_secret_paths` and raise severities in
+      `severity_overrides`; project `ignore` and severity-lowering overrides are ignored.
+    - `extra_secret_paths` are validated with `secrets.safe_user_regex` and capped at 20.
+    """
+    policy: Dict[str, Any] = {"ignore": [], "severity_overrides": {}, "extra_secret_paths": []}
+    user_data = _read_json_dict(_user_config_path())
+    proj_data = _read_json_dict(Path(cwd) / POLICY_FILE) if (cwd and not paths.is_unc(cwd)) else {}
+
+    ignore = user_data.get("ignore")
     if isinstance(ignore, list):
         policy["ignore"] = [s.strip() for s in ignore if isinstance(s, str) and s.strip()]
 
-    overrides = data.get("severity_overrides")
-    if isinstance(overrides, dict):
-        policy["severity_overrides"] = {
-            code: level.lower() for code, level in overrides.items()
-            if isinstance(level, str) and level.lower() in SEVERITY_POINTS
-        }
+    merged_overrides: Dict[str, str] = {}
+    proj_overrides = proj_data.get("severity_overrides")
+    if isinstance(proj_overrides, dict):
+        for code, level in proj_overrides.items():
+            if (isinstance(code, str) and code.strip()
+                    and isinstance(level, str) and level.lower() in SEVERITY_POINTS
+                    and _is_project_override_raising(code, level)):
+                merged_overrides[code.strip()] = level.lower()
 
-    extra = data.get("extra_secret_paths")
-    if isinstance(extra, list):
-        policy["extra_secret_paths"] = [rx for rx in extra if isinstance(rx, str) and rx and _compiles(rx)]
+    user_overrides = user_data.get("severity_overrides")
+    if isinstance(user_overrides, dict):
+        for code, level in user_overrides.items():
+            if isinstance(code, str) and code.strip() and isinstance(level, str) and level.lower() in SEVERITY_POINTS:
+                merged_overrides[code.strip()] = level.lower()
+    policy["severity_overrides"] = merged_overrides
+
+    raw_extra: List[str] = []
+    for src in (user_data.get("extra_secret_paths"), proj_data.get("extra_secret_paths")):
+        if isinstance(src, list):
+            for rx in src:
+                if isinstance(rx, str) and rx and _compiles(rx) and rx not in raw_extra:
+                    raw_extra.append(rx)
+                    if len(raw_extra) >= secrets.MAX_EXTRA_SECRET_PATHS:
+                        break
+        if len(raw_extra) >= secrets.MAX_EXTRA_SECRET_PATHS:
+            break
+    policy["extra_secret_paths"] = raw_extra
     return policy
 
 
 def _compiles(rx: str) -> bool:
-    try:
-        re.compile(rx)
-        return True
-    except re.error:
+    return secrets.safe_user_regex(rx) is not None
+
+
+def _risk_matches_key(r: Risk, key: str, allow_substring: bool = False) -> bool:
+    k = key.strip().lower()
+    if not k:
         return False
+    code = r.code.lower()
+    reason = r.reason.lower()
+    if k == code:
+        return True
+    if k == "outside_repo" and code in ("outside_repo", "write_outside", "read_outside", "shell_outside"):
+        return True
+    if k == "destructive_delete" and (code in ("destructive_delete", "delete") or "recursive force delete" in reason):
+        return True
+    if k == "git_force_push" and (code == "git_force_push" or "force-pushed to a git remote" in reason):
+        return True
+    if k == "git_push" and (code == "git_push" or reason == "pushed to a git remote"):
+        return True
+    if k == "network" and (code == "network" or "network request" in reason):
+        return True
+    if k == "secret" and code in ("secret", "secret_in_content"):
+        return True
+    if allow_substring and (k in code or k in reason):
+        return True
+    return False
 
 
 def _apply_policy(risks: List[Risk], policy: Dict[str, Any]) -> List[Risk]:
@@ -962,34 +1110,38 @@ def _apply_policy(risks: List[Risk], policy: Dict[str, Any]) -> List[Risk]:
     overrides = policy.get("severity_overrides") or {}
     kept = []
     for r in risks:
-        code, reason = r.code.lower(), r.reason.lower()
-        if any(s in code or s in reason for s in ignore):
+        if any(_risk_matches_key(r, s, allow_substring=True) for s in ignore):
             continue
-        level = overrides.get(r.code)
-        if isinstance(level, str) and level.lower() in SEVERITY_POINTS:
-            r.severity = level.lower()
+        for k, level in overrides.items():
+            if isinstance(k, str) and isinstance(level, str) and level.lower() in SEVERITY_POINTS:
+                if _risk_matches_key(r, k, allow_substring=False):
+                    r.severity = level.lower()
         kept.append(r)
     return kept
 
 
-def assess_step(step: Step, cwd: Optional[str], policy: Optional[Dict[str, Any]] = None) -> List[Risk]:
+def assess_step(step: Step, cwd: Optional[str], policy: Optional[Dict[str, Any]] = None,
+                workdir: Optional[str] = None) -> List[Risk]:
     """Risks for one step. `policy` defaults to `load_policy(cwd)`; `assess`
-    passes it in so the config file is read once per run."""
+    passes it in so the config file is read once per run. `workdir` (when given and
+    different from `cwd`) is the subfolder relative paths resolve against while `cwd`
+    remains the project boundary."""
     if policy is None:
         policy = load_policy(cwd)
     extra = _user_regexes(policy.get("extra_secret_paths"))
     risks: List[Risk] = []
     tool = step.tool
     paths = _paths_in_step(step)
+    base = workdir if (workdir and workdir != cwd and _is_abs(workdir)) else None
 
     for p in paths:
         if _is_secret(p, extra):
             verb = {"Read": "Read", "Delete": "Deleted"}.get(tool, "Modified")
             risks.append(Risk("high", "secret_file", f"{verb} a secrets file ({_basename(p)})", step.index))
-        if (tool in WRITE_TOOLS or tool in DELETE_TOOLS) and _outside(p, cwd):
+        if (tool in WRITE_TOOLS or tool in DELETE_TOOLS) and _outside(p, cwd, base=base):
             verb = "Deleted" if tool in DELETE_TOOLS else "Wrote"
             risks.append(Risk("high", "write_outside", f"{verb} outside the working folder ({p})", step.index))
-        elif _outside(p, cwd):
+        elif _outside(p, cwd, base=base):
             risks.append(Risk("low", "read_outside", f"Read outside the working folder ({p})", step.index))
 
     if tool in DELETE_TOOLS:
@@ -1017,7 +1169,8 @@ def assess_step(step: Step, cwd: Optional[str], policy: Optional[Dict[str, Any]]
             risks.append(Risk("medium", "test_weakened", f"Removed assertions from {_basename(paths[0])}", step.index))
 
     if tool in ("Write", "Edit", "MultiEdit") and paths:
-        _migration_risk(paths[0], "Wrote" if tool == "Write" else "Changed", cwd, step.index, risks)
+        _migration_risk(_resolved(paths[0], base) if base else paths[0],
+                        "Wrote" if tool == "Write" else "Changed", cwd, step.index, risks)
 
     if tool in WRITE_TOOLS:
         name = _basename(paths[0]) if paths else "a file"
@@ -1026,9 +1179,8 @@ def assess_step(step: Step, cwd: Optional[str], policy: Optional[Dict[str, Any]]
                 risks.append(Risk("high", "secret_in_content", f"Wrote a hardcoded {kind} into {name}", step.index))
 
     if tool in SHELL_TOOLS:
-        _shell_risks(step, cwd, extra, risks)
-    if tool == "Bash":
-        _shell_write_risks(step, cwd, extra, risks)
+        _shell_risks(step, cwd, extra, risks, default_workdir=base)
+        _shell_write_risks(step, cwd, extra, risks, default_workdir=base)
 
     if tool.startswith("mcp__"):
         risks.append(Risk("low", "mcp", f"Called an external MCP tool ({tool.split('__', 2)[-1]})", step.index))
@@ -1047,13 +1199,21 @@ def assess_step(step: Step, cwd: Optional[str], policy: Optional[Dict[str, Any]]
 def _score(risks: List[Risk]) -> int:
     """Points for a run: each severity is totalled separately (low and medium are capped,
     high is not), and the sum is capped at 100. A repeat of a code adds a third of its points."""
-    counted: Dict[Tuple[str, str], int] = {}
+    counted: Dict[Tuple[str, ...], int] = {}
     totals = {"high": 0, "medium": 0, "low": 0}
+    distinct_high = 0
     for r in risks:
-        k = (r.code, r.severity)
+        k: Tuple[str, ...] = (r.code, r.reason if r.code == "command" else "", r.severity)
         counted[k] = counted.get(k, 0) + 1
         base = SEVERITY_POINTS[r.severity]
-        totals[r.severity] += base if counted[k] == 1 else base // 3
+        if counted[k] == 1:
+            totals[r.severity] += base
+            if r.severity == "high":
+                distinct_high += 1
+        else:
+            totals[r.severity] += base // 3
+    if distinct_high >= 3:
+        totals["high"] = max(totals["high"], 100)
     total = totals["high"] + min(MEDIUM_POINTS_CAP, totals["medium"]) + min(LOW_POINTS_CAP, totals["low"])
     return min(100, total)
 
@@ -1062,8 +1222,10 @@ def _written_paths(step: Step, cwd: Optional[str]) -> List[str]:
     """Paths a step wrote, relative to cwd when inside it (the keys of Run.test_diffs)."""
     if step.tool in WRITE_TOOLS:
         paths = _paths_in_step(step)[:1]
-    elif step.tool == "Bash":
-        paths = [w.path for w in shell_writes(str(step.input.get("command") or "")) if not w.deleted]
+    elif step.tool in SHELL_TOOLS:
+        cmd = str(step.input.get("command") or "")
+        writes = ps_writes(cmd) if shell_kind(step) == "powershell" else shell_writes(cmd)
+        paths = [w.path for w in writes if not w.deleted]
     else:
         return []
     out = []
@@ -1105,6 +1267,14 @@ def _apply_test_verdicts(run: Run, changes: List[TestChange], policy: Dict[str, 
 
 def assess(run: Run) -> Tuple[int, str, List[Risk]]:
     policy = load_policy(run.cwd)
+    rejected = _project_ignored_or_lowered_kinds(run.cwd)
+    if rejected:
+        note = (
+            f"Project config tried to ignore/lower {len(rejected)} risk kind(s) "
+            "(not applied; set in user config to enable)."
+        )
+        if note not in run.notes:
+            run.notes.append(note)
     all_risks: List[Risk] = []
     for s in run.steps:
         s.risks = assess_step(s, run.cwd, policy)

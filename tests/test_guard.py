@@ -24,19 +24,6 @@ APPROVAL = {"timeout_s": 5}   # the server is never read from the policy; see RU
 SERVER = "https://approvals.example.test"
 
 
-@pytest.fixture(autouse=True)
-def isolated_settings(tmp_path, monkeypatch):
-    """HOME and USERPROFILE point at an empty folder, and the approval variables are
-    cleared, so no test reads the real ~/.runledger/config.json or the environment."""
-    home = tmp_path / "isolated-home"
-    home.mkdir()
-    monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setenv("USERPROFILE", str(home))
-    monkeypatch.delenv("RUNLEDGER_SERVER", raising=False)
-    monkeypatch.delenv("RUNLEDGER_API_KEY", raising=False)
-    return home
-
-
 def bash_event(cwd, command, session="sess-1"):
     return {"session_id": session, "transcript_path": "t.jsonl", "cwd": str(cwd),
             "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": command}}
@@ -503,7 +490,7 @@ def test_install_merges_and_keeps_every_existing_setting(tmp_path):
     assert data["hooks"]["Stop"] == original["hooks"]["Stop"]
     pre = data["hooks"]["PreToolUse"]
     assert pre[0] == original["hooks"]["PreToolUse"][0]
-    assert pre[1] == {"matcher": "*", "hooks": [{"type": "command", "command": "runledger guard", "timeout": 135}]}
+    assert pre[1] == {"matcher": "*", "hooks": [{"type": "command", "command": f'"{sys.executable}" -m runledger guard', "timeout": 135}]}
 
 
 def test_install_is_idempotent(tmp_path):
@@ -514,7 +501,7 @@ def test_install_is_idempotent(tmp_path):
     assert settings.read_bytes() == first
     assert not settings.with_name("settings.json.bak").exists()
     entries = [h for g in json.loads(first)["hooks"]["PreToolUse"] for h in g["hooks"]]
-    assert sum("runledger guard" in h["command"] for h in entries) == 1
+    assert sum(guard._is_guard_hook(h) for h in entries) == 1
 
 
 def test_install_recognises_a_guard_entry_under_another_matcher(tmp_path):
@@ -523,11 +510,11 @@ def test_install_recognises_a_guard_entry_under_another_matcher(tmp_path):
         {"matcher": "Bash", "hooks": [{"type": "command", "command": "runledger guard"}]}]}}
     settings.write_text(json.dumps(existing), encoding="utf-8")
     changed, backup = guard.install_hook(settings)
-    assert changed is True and backup is not None          # timeout added to the existing entry
+    assert changed is True and backup is not None          # command and timeout updated on the existing entry
     pre = json.loads(settings.read_text(encoding="utf-8"))["hooks"]["PreToolUse"]
     assert len(pre) == 1                                    # no second entry
     assert pre[0]["matcher"] == "Bash"                      # the user's matcher is kept
-    assert pre[0]["hooks"][0] == {"type": "command", "command": "runledger guard", "timeout": 135}
+    assert pre[0]["hooks"][0] == {"type": "command", "command": f'"{sys.executable}" -m runledger guard', "timeout": 135}
 
 
 def test_install_refuses_invalid_json_and_leaves_the_file(tmp_path):
@@ -959,7 +946,7 @@ def test_install_writes_the_default_hook_timeout(tmp_path):
     settings = tmp_path / "s" / "settings.json"
     guard.install_hook(settings)
     hook = json.loads(settings.read_text(encoding="utf-8"))["hooks"]["PreToolUse"][0]["hooks"][0]
-    assert hook == {"type": "command", "command": "runledger guard", "timeout": 135}
+    assert hook == {"type": "command", "command": f'"{sys.executable}" -m runledger guard', "timeout": 135}
 
 
 def test_install_hook_timeout_is_approval_wait_plus_15(tmp_path):
@@ -1032,3 +1019,288 @@ def test_hook_process_end_to_end(tmp_path):
 
     garbage = run("definitely not json")
     assert garbage.returncode == 0 and garbage.stdout == b""
+
+
+def test_guard_redos_extra_secret_paths_is_fast_and_logs_warning(tmp_path):
+    import time
+    from runledger.parser import Run, Step, Usage
+    from runledger.risk import assess
+
+    (tmp_path / ".runledger.json").write_text(json.dumps({
+        "extra_secret_paths": ["(a+)+$", r"\.vault$"],
+    }), encoding="utf-8")
+    (tmp_path / ".runledger").mkdir(parents=True, exist_ok=True)
+    (tmp_path / ".runledger" / "guard.log").write_text("", encoding="utf-8")
+
+    evil_target = "a" * 50 + "!"
+    evt = {"session_id": "sess-redos", "cwd": str(tmp_path), "hook_event_name": "PreToolUse",
+           "tool_name": "Read", "tool_input": {"file_path": str(tmp_path / evil_target)}}
+    t0 = time.perf_counter()
+    dec = guard.evaluate(evt)
+    elapsed_guard = time.perf_counter() - t0
+    assert elapsed_guard < 0.05
+    assert dec.decision == "allow"
+
+    log_text = (tmp_path / ".runledger" / "guard.log").read_text(encoding="utf-8")
+    assert "ignored unsafe/invalid extra_secret_paths pattern" in log_text
+
+    run = Run(
+        session_id="sess-redos", path="", agent="claude-code", cwd=str(tmp_path), git_branch="main",
+        started="2026-03-01T10:00:00Z", ended="2026-03-01T10:01:00Z", prompts=["check"],
+        steps=[Step(index=1, tool_use_id="t1", tool="Read", input={"file_path": evil_target},
+                    model=None, timestamp=None)],
+        final_message="done", usage=Usage(), models={},
+    )
+    t1 = time.perf_counter()
+    assess(run)
+    elapsed_assess = time.perf_counter() - t1
+    assert elapsed_assess < 0.05
+
+    vault_evt = {"session_id": "sess-redos", "cwd": str(tmp_path), "hook_event_name": "PreToolUse",
+                 "tool_name": "Read", "tool_input": {"file_path": str(tmp_path / "app.vault")}}
+    vault_dec = guard.evaluate(vault_evt)
+    assert vault_dec.decision in ("ask", "deny")
+    assert "secret_file" in vault_dec.codes
+
+
+# ---------------------------------------------------------------- project root, subfolder policy/log, and installer command verification
+
+def test_guard_project_root_resolution_order(tmp_path, monkeypatch):
+    r = tmp_path / "R"
+    nested = r / "a" / "b" / "c"
+    nested.mkdir(parents=True)
+    write_project(r, {"guard": {"deny": ["severity:medium"]}})
+    ev = bash_event(nested, "git push origin main")
+
+    # (a) CLAUDE_PROJECT_DIR set (R is not a git repo)
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(r))
+    out = guard.handle(json.dumps(ev))
+    assert out is not None and out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert (r / ".runledger" / "guard.log").exists()
+    assert not (nested / ".runledger" / "guard.log").exists()
+
+    # Precedence: CLAUDE_PROJECT_DIR > FACTORY_PROJECT_DIR > DROID_PROJECT_DIR
+    r_factory = tmp_path / "R_factory"
+    r_droid = tmp_path / "R_droid"
+    r_factory.mkdir()
+    r_droid.mkdir()
+    monkeypatch.setenv("FACTORY_PROJECT_DIR", str(r_factory))
+    monkeypatch.setenv("DROID_PROJECT_DIR", str(r_droid))
+    assert guard.project_root(ev) == str(r)
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR")
+    assert guard.project_root(ev) == str(r_factory)
+    monkeypatch.delenv("FACTORY_PROJECT_DIR")
+    assert guard.project_root(ev) == str(r_droid)
+    monkeypatch.delenv("DROID_PROJECT_DIR")
+
+    # (c) Neither env var nor .git -> falls back to event cwd
+    (r / ".runledger" / "guard.log").unlink()
+    out_c = guard.handle(json.dumps(ev))
+    assert out_c is None
+    assert (nested / ".runledger" / "guard.log").exists()
+    (nested / ".runledger" / "guard.log").unlink()
+    (nested / ".runledger").rmdir()
+
+    # (b) Env vars unset, R initialized as git repo (.git exists) -> resolves to R
+    (r / ".git").mkdir()
+    out_b = guard.handle(json.dumps(ev))
+    assert out_b is not None and out_b["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert (r / ".runledger" / "guard.log").exists()
+    assert not (nested / ".runledger").exists()
+
+
+def test_guard_log_written_only_at_project_root(tmp_path):
+    r = tmp_path / "R"
+    pkg = r / "pkg"
+    sub = pkg / "sub"
+    sub.mkdir(parents=True)
+    (r / ".git").mkdir()
+
+    for folder in (r, pkg, sub):
+        guard.handle(json.dumps(bash_event(folder, "ls")))
+
+    log_file = r / ".runledger" / "guard.log"
+    assert log_file.exists()
+    assert len(log_file.read_text(encoding="utf-8").splitlines()) == 3
+    assert not (pkg / ".runledger").exists()
+    assert not (sub / ".runledger").exists()
+
+
+def test_guard_project_policy_in_root_enforced_from_subfolder(tmp_path):
+    r = tmp_path / "R"
+    sub = r / "pkg" / "sub"
+    sub.mkdir(parents=True)
+    (r / ".git").mkdir()
+    write_project(r, {"guard": {"deny": ["reason:Installed packages"]}})
+
+    out = guard.handle(json.dumps(bash_event(sub, "npm install left-pad")))
+    assert out is not None
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_guard_inside_outside_project_rule_uses_project_root(tmp_path):
+    r = tmp_path / "R"
+    pkg = r / "pkg"
+    other = r / "other"
+    sibling = tmp_path / "R_sibling"
+    pkg.mkdir(parents=True)
+    other.mkdir(parents=True)
+    sibling.mkdir(parents=True)
+    (r / ".git").mkdir()
+
+    # (a) Write to R/other/out.txt or ../other/out.txt from cwd=R/pkg -> allowed (inside project R)
+    ev_abs_inside = {
+        "session_id": "s", "cwd": str(pkg), "hook_event_name": "PreToolUse",
+        "tool_name": "Write", "tool_input": {"file_path": str(other / "out.txt"), "content": "hi"},
+    }
+    ev_rel_inside = {
+        "session_id": "s", "cwd": str(pkg), "hook_event_name": "PreToolUse",
+        "tool_name": "Write", "tool_input": {"file_path": str(Path("..") / "other" / "out.txt"), "content": "hi"},
+    }
+    assert guard.decide(ev_abs_inside)["decision"] == "allow"
+    assert guard.decide(ev_rel_inside)["decision"] == "allow"
+    assert guard.decide(bash_event(pkg, "rm ../other/out.txt"))["decision"] == "allow"
+
+    # (b) Write to sibling folder outside R -> triggers write_outside (ask by default)
+    ev_abs_outside = {
+        "session_id": "s", "cwd": str(pkg), "hook_event_name": "PreToolUse",
+        "tool_name": "Write", "tool_input": {"file_path": str(sibling / "out.txt"), "content": "hi"},
+    }
+    ev_rel_outside = {
+        "session_id": "s", "cwd": str(pkg), "hook_event_name": "PreToolUse",
+        "tool_name": "Write", "tool_input": {"file_path": str(Path("..") / ".." / "R_sibling" / "out.txt"), "content": "hi"},
+    }
+    d_abs = guard.decide(ev_abs_outside)
+    d_rel = guard.decide(ev_rel_outside)
+    assert d_abs["decision"] == "ask" and "write_outside" in d_abs["codes"]
+    assert d_rel["decision"] == "ask" and "write_outside" in d_rel["codes"]
+    d_sh = guard.decide(bash_event(pkg, "rm ../../R_sibling/out.txt"))
+    assert d_sh["decision"] == "ask" and "shell_outside" in d_sh["codes"]
+
+
+def test_guard_install_default_and_portable_commands(tmp_path, capsys):
+    p1 = tmp_path / "P1"
+    p1.mkdir()
+    assert cli_main(["guard", "install", "--project", str(p1)]) == 0
+    captured = capsys.readouterr()
+    expected_guard = f'"{sys.executable}" -m runledger guard'
+    expected_cp = f'"{sys.executable}" -m runledger checkpoint --hook'
+    assert expected_guard in captured.out
+    assert "Verified hook command:" in captured.out
+    data1 = json.loads((p1 / ".claude" / "settings.json").read_text(encoding="utf-8"))
+    assert data1["hooks"]["PreToolUse"][0]["hooks"][0] == {
+        "type": "command", "command": expected_guard, "timeout": 135,
+    }
+    for event_name in ("SessionStart", "UserPromptSubmit"):
+        assert data1["hooks"][event_name][0]["hooks"][0] == {
+            "type": "command", "command": expected_cp, "timeout": 120,
+        }
+
+    p2 = tmp_path / "P2"
+    p2.mkdir()
+    assert cli_main(["guard", "install", "--project", str(p2), "--portable"]) == 0
+    capsys.readouterr()
+    data2 = json.loads((p2 / ".claude" / "settings.json").read_text(encoding="utf-8"))
+    assert data2["hooks"]["PreToolUse"][0]["hooks"][0] == {
+        "type": "command", "command": "runledger guard", "timeout": 135,
+    }
+    for event_name in ("SessionStart", "UserPromptSubmit"):
+        assert data2["hooks"][event_name][0]["hooks"][0] == {
+            "type": "command", "command": "runledger checkpoint --hook", "timeout": 120,
+        }
+
+
+def test_guard_install_upgrades_bare_entries_in_place_and_is_idempotent(tmp_path, capsys):
+    p2 = tmp_path / "P2"
+    settings = p2 / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    initial = {
+        "customKey": 42,
+        "hooks": {
+            "PreToolUse": [
+                {"matcher": "Write", "hooks": [{"type": "command", "command": "echo custom"}]},
+                {"matcher": "*", "hooks": [{"type": "command", "command": "runledger guard", "timeout": 135}]},
+            ],
+            "SessionStart": [
+                {"hooks": [{"type": "command", "command": "runledger checkpoint --hook", "timeout": 120}]},
+            ],
+            "UserPromptSubmit": [
+                {"hooks": [{"type": "command", "command": "runledger checkpoint --hook", "timeout": 120}]},
+            ],
+        },
+    }
+    settings.write_text(json.dumps(initial, indent=2), encoding="utf-8")
+
+    assert cli_main(["guard", "install", "--project", str(p2)]) == 0
+    capsys.readouterr()
+    first_bytes = settings.read_bytes()
+    data = json.loads(first_bytes.decode("utf-8"))
+    assert data["customKey"] == 42
+    assert len(data["hooks"]["PreToolUse"]) == 2
+    assert data["hooks"]["PreToolUse"][0] == {"matcher": "Write", "hooks": [{"type": "command", "command": "echo custom"}]}
+    assert data["hooks"]["PreToolUse"][1]["hooks"] == [{
+        "type": "command", "command": f'"{sys.executable}" -m runledger guard', "timeout": 135,
+    }]
+    for event_name in ("SessionStart", "UserPromptSubmit"):
+        assert len(data["hooks"][event_name]) == 1
+        assert data["hooks"][event_name][0]["hooks"] == [{
+            "type": "command", "command": f'"{sys.executable}" -m runledger checkpoint --hook', "timeout": 120,
+        }]
+
+    assert cli_main(["guard", "install", "--project", str(p2)]) == 0
+    out2 = capsys.readouterr().out
+    assert "already up to date" in out2
+    assert settings.read_bytes() == first_bytes
+
+
+def test_guard_uninstall_removes_interpreter_portable_and_quoted_spaces(tmp_path):
+    # (a) interpreter form
+    s1 = tmp_path / "s1" / "settings.json"
+    guard.install_hook(s1)
+    assert guard.uninstall_hook(s1)[0] is True
+    assert json.loads(s1.read_text(encoding="utf-8")) == {}
+
+    # (b) portable form
+    s2 = tmp_path / "s2" / "settings.json"
+    guard.install_hook(s2, portable=True)
+    assert guard.uninstall_hook(s2)[0] is True
+    assert json.loads(s2.read_text(encoding="utf-8")) == {}
+
+    # (c) hand-written quoted interpreter with spaces + foreign hook
+    s3 = tmp_path / "s3" / "settings.json"
+    s3.parent.mkdir(parents=True)
+    s3.write_text(json.dumps({
+        "hooks": {
+            "PreToolUse": [
+                {"matcher": "Write", "hooks": [{"type": "command", "command": "echo keep"}]},
+                {"matcher": "*", "hooks": [{"type": "command", "command": r'"C:\Program Files\Python 3\python.exe" -m runledger guard', "timeout": 135}]},
+            ],
+            "SessionStart": [
+                {"hooks": [{"type": "command", "command": r'"C:\Program Files\Python 3\python.exe" -m runledger checkpoint --hook', "timeout": 120}]},
+            ],
+        },
+    }), encoding="utf-8")
+    assert guard.uninstall_hook(s3)[0] is True
+    assert json.loads(s3.read_text(encoding="utf-8")) == {
+        "hooks": {
+            "PreToolUse": [
+                {"matcher": "Write", "hooks": [{"type": "command", "command": "echo keep"}]},
+            ],
+        },
+    }
+
+
+def test_guard_install_portable_warns_when_runledger_not_on_path(tmp_path, monkeypatch, capsys):
+    p4 = tmp_path / "P4"
+    p4.mkdir()
+    monkeypatch.setenv("PATH", str(tmp_path / "empty_bin"))
+    rc = cli_main(["guard", "install", "--project", str(p4), "--portable"])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert (p4 / ".claude" / "settings.json").exists()
+    assert "Verified hook command:" not in captured.out
+    assert "Verified hook command:" not in captured.err
+    combined = (captured.out + "\n" + captured.err).lower()
+    assert "warning" in combined and ("not found" in combined or "127" in combined or "could not be run" in combined)
+
+

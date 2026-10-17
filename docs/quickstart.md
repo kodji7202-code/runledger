@@ -33,7 +33,8 @@ runledger receipt --open         # latest session as HTML, opened in your browse
 ```
 
 By default the receipt is written to the current folder as `runledger-<first 8 characters of the
-session id>.html`. Pick another name with `-o`:
+session id>.html` (or `-2.html`, `-3.html`, … if that file already exists). Pick another name
+(or overwrite an existing file) with `-o`:
 
 ```bash
 runledger receipt -o review.html
@@ -44,19 +45,22 @@ runledger receipt --format json -o -           # JSON to stdout
 
 ### Safe mode
 
-Markdown and JSON receipts are often pasted into pull requests or committed, so by default they
-are **safe** when they go to stdout (`-o -`) or to a file inside a Git work tree, including the
-default file in the current folder:
+Receipts are often shared, pasted into pull requests, or committed, so by default they are **safe**
+when they go to a file inside a Git work tree (including HTML, Markdown, and JSON in the current
+folder) or when Markdown or JSON is written to stdout (`-o -`):
 
 - paths inside the repository become relative, and the folder is shown as the repository name
   plus the subfolder the run started in (`app/src`);
-- the home folder (`/home/<user>`, `/Users/<user>`, `C:\Users\<user>`) becomes `~`;
+- the home folder (`/home/<user>`, `/Users/<user>`, `C:\Users\<user>`, including user names with
+  spaces) becomes `~`;
 - other paths that share leading folders with the repository have that prefix shortened to `…`,
-  as do prefixes you list in `RUNLEDGER_SAFE_PREFIXES` (separated by `:`, or `;` on Windows);
-- temp paths such as `/tmp/...` stay as they are;
-- e-mail addresses become `[EMAIL]`, and `user:pass@` in URLs becomes `[REDACTED]@`.
+  as do prefixes you list in `RUNLEDGER_SAFE_PREFIXES` (separated by `:`, or `;` on Windows), and
+  unrelated non-system paths with more than two segments are trimmed to `…/<last two parts>`;
+- temp paths such as `/tmp/...` and standard system paths such as `/usr/bin/...` stay as they are;
+- e-mail addresses become `[EMAIL]` and `user:pass@` in URLs becomes `[REDACTED]@`, while
+  `git@host:org/repo` and `ssh://git@host/...` Git remotes are kept verbatim.
 
-HTML receipts and files written outside any repository keep full paths, which help debugging.
+Files written outside any repository (and HTML sent to stdout) keep full paths, which help debugging.
 `--safe` and `--no-safe` override the default. After writing a file, `receipt` prints the mode
 it used to stderr. JSON receipts record it as `"safe": true` or `false`. Session id, branch,
 models, scores and file counts are the same in both modes. The GitHub pull-request comment is

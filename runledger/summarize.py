@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional
 from . import llm
 from .parser import Run, Step, Usage
 from .paths import is_abs, relative
+from .ps_writes import ps_deletes, ps_writes, shell_kind
 from .shell_writes import shell_deletes, shell_writes
 
 DEFAULT_AI_MODEL = os.environ.get("RUNLEDGER_SUMMARY_MODEL", "claude-haiku-5-5")
@@ -73,6 +74,7 @@ def file_changes(run: Run) -> Dict[str, FileChange]:
     if run.frozen_changes is not None:
         return {p: replace(fc) for p, fc in run.frozen_changes.items()}
     changes: Dict[str, FileChange] = {}
+    uncounted = set()
     for s in run.steps:
         p = _str(s.input.get("file_path")) or _str(s.input.get("notebook_path"))
         p = _short(p, run.cwd) if p else p
@@ -80,10 +82,19 @@ def file_changes(run: Run) -> Dict[str, FileChange]:
             fc = changes.setdefault(p, FileChange(p))
             if not fc.added and not fc.removed:
                 fc.created = "created" in _str(s.result_text).lower() or not s.result_text
-            fc.added += _lines(s.input.get("content"))
+            if "content" in s.input:
+                fc.added += _lines(s.input.get("content"))
+                uncounted.discard(p)
+            elif not fc.added and not fc.removed:
+                uncounted.add(p)
         elif s.tool in ("Edit", "MultiEdit") and p:
             fc = changes.setdefault(p, FileChange(p))
-            for e in _edits(s.input):
+            edits = _edits(s.input)
+            if not any("old_string" in e or "new_string" in e for e in edits) and not fc.added and not fc.removed:
+                uncounted.add(p)
+            else:
+                uncounted.discard(p)
+            for e in edits:
                 o, n = e.get("old_string"), e.get("new_string")
                 fc.removed += _lines(o)
                 fc.added += _lines(n)
@@ -91,15 +102,18 @@ def file_changes(run: Run) -> Dict[str, FileChange]:
             changes.setdefault(p, FileChange(p)).deleted = True
         elif s.tool == "NotebookEdit" and p:
             changes.setdefault(p, FileChange(p)).added += _lines(s.input.get("new_source"))
-        elif s.tool == "Bash":
+        elif s.tool in ("Bash", "PowerShell"):
             cmd = _str(s.input.get("command"))
-            for target in shell_deletes(cmd):
+            is_ps = shell_kind(s) == "powershell"
+            deletes = ps_deletes(cmd) if is_ps else shell_deletes(cmd)
+            writes = ps_writes(cmd) if is_ps else shell_writes(cmd)
+            for target in deletes:
                 p = _short(target, run.cwd)
                 if run.cwd and is_abs(p):
                     continue  # outside the project, such as a scratch file in /tmp
                 fc = changes.setdefault(p, FileChange(p))
                 fc.deleted = fc.shell = True
-            for w in shell_writes(cmd):
+            for w in writes:
                 p = _short(w.path, run.cwd)
                 if run.cwd and is_abs(p):
                     continue  # outside the project, such as a backup in /tmp
@@ -108,7 +122,7 @@ def file_changes(run: Run) -> Dict[str, FileChange]:
                 fc.deleted = w.deleted
                 fc.added += w.added
     for p, fc in changes.items():
-        git = run.git_changes.get(p) if fc.shell else None
+        git = run.git_changes.get(p) if (fc.shell or p in uncounted) else None
         if git:
             fc.added, fc.removed = int(git.get("added") or 0), int(git.get("removed") or 0)
             fc.created = git.get("status") in ("untracked", "added")
@@ -134,7 +148,7 @@ def template_summary(step: Step, cwd: Optional[str]) -> str:
         a = sum(_lines(e.get("new_string")) for e in edits)
         r = sum(_lines(e.get("old_string")) for e in edits)
         return f"Edited {p} (+{a} −{r})"
-    if t == "Bash":
+    if t in ("Bash", "PowerShell"):
         desc = _str(i.get("description"))
         lines = _str(i.get("command")).strip().splitlines() or [""]
         # Redact before cutting, so the 120-character limit cannot keep half of a secret.
