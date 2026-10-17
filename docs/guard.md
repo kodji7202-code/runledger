@@ -80,7 +80,7 @@ The guard scores each call with the rules in `runledger/risk.py`. Each finding h
 | Code | Severity | Matches |
 | --- | --- | --- |
 | `secret_in_content` | high | A Write, Edit, MultiEdit or NotebookEdit call that writes a hardcoded secret. Only the kind is reported: for example "Anthropic API key", "AWS access key", "private key", or a generic `api_key`, `secret`, `token` or `password` value of 12 or more characters. |
-| `secret_file` | high | Touching a secrets file: `.env` (but not `.env.example`, `.sample`, `.template` or `.dist`), `.pem`, `.key`, `.p12`, `.pfx`, `id_rsa` and related keys, `.npmrc`, `.pypirc`, `.netrc`, `.aws/credentials`, `.ssh/`, `credentials*`, `secrets.yaml|json|toml`, `.git-credentials`, `service-account*.json`, `.docker/config.json`, `.kube/config`. Covers Read, Write, Edit, Delete and shell commands. |
+| `secret_file` | high | Touching a secrets file: `.env` (but not `.env.example`, `.sample`, `.template` or `.dist`), `.pem`, `.key`, `.p8`, `.p12`, `.pfx`, `.jks`, `.keystore`, `.kdbx`, `id_rsa` and related private keys (but not `*.pub` public keys), `.tfstate`, `.tfvars`, `.npmrc`, `.pypirc`, `.netrc`, `.pgpass`, `.htpasswd`, `.vault-token`, `.aws/credentials`, `.aws/config`, `credentials*`, `secrets.yaml|json|toml`, `.git-credentials`, `.git/config`, `service-account*.json`, `.docker/config.json`, `.kube/config`, `.config/gh/hosts.yml`, `.config/gcloud/credentials.db`, `.azure/accessTokens.json`. Covers Read, Write, Edit, Delete and shell commands. |
 | `write_outside` | high | Write, Edit, MultiEdit, NotebookEdit or Delete of a path outside the working folder. Temp folders do not count. |
 | `shell_outside` | low, medium or high | A shell command that uses a path outside the working folder. Reading or writing is low, deleting is high, and running a command with `workdir` outside the folder is medium. The patterns of `grep`, `rg`, `ag` and `git grep` and the scripts of `sed` and `awk` are not treated as paths. |
 | `read_outside` | low | Read of a path outside the working folder. |
@@ -114,8 +114,8 @@ There are two settings files, and they are not equal:
 
 | File | Owner | What it can do |
 | --- | --- | --- |
-| `~/.runledger/config.json` | You | Everything: mode, lists, approval server, approval key variable, timeouts, fail-closed. The home folder is `HOME`, then `USERPROFILE`. |
-| `<project>/.runledger.json` | The repository | Only tighten: add to the lists, raise severities, turn on fail-closed, and switch monitor to enforce. Anything that would loosen the guard is ignored and logged as a warning. |
+| `~/.runledger/config.json` (or `$RUNLEDGER_CONFIG`) | You | Everything: mode, lists, `ignore`, `severity_overrides`, `extra_secret_paths`, approval server, approval key variable, timeouts, fail-closed. The home folder is `HOME`, then `USERPROFILE`. |
+| `<project>/.runledger.json` | The repository | Only tighten: add to the lists, raise severities, add safe `extra_secret_paths`, turn on fail-closed, and switch monitor to enforce. Anything that would loosen the guard or hide/lower receipt risks is ignored. |
 
 Both files are JSON. Put the guard settings under the `guard` key. The risk settings `ignore`,
 `severity_overrides` and `extra_secret_paths` sit at the top level of each file.
@@ -132,9 +132,9 @@ What each file can set:
 | `guard.approval.on_timeout` | `deny` or `ask`. | `deny` only. `ask` would turn a timeout denial into a local prompt, so only your file can set it. |
 | `guard.approval.server` | Sets it. | Ignored. |
 | `guard.approval.api_key_env` | Sets it. | Ignored. |
-| `ignore` | Hides matching findings from the guard. | Ignored by the guard (the receipt still applies it). |
-| `severity_overrides` | Sets any severity. | Can raise a severity, never lower it. |
-| `extra_secret_paths` | Adds regular expressions. | Adds regular expressions. Both lists apply. |
+| `ignore` | Hides matching findings from the guard and the receipt. | Ignored by both the guard and the receipt (the receipt adds a note). |
+| `severity_overrides` | Sets any severity. | Can raise a severity, never lower it (in both the guard and the receipt). |
+| `extra_secret_paths` | Adds safe regular expressions or `glob:...` patterns (up to 20, max 200 characters each). | Adds safe regular expressions or `glob:...` patterns. Unsafe backtracking patterns are ignored and logged. |
 
 The server and key can come only from the environment or your user file. A repository cannot send
 your key to a server of its choosing. See [approvals](#approvals-on-the-team-server).

@@ -7,6 +7,26 @@ change behavior, so read the entry before you upgrade.
 
 ## [Unreleased]
 
+### Changed
+
+- **Project `.runledger.json` is tighten-only in receipts as well as the guard:** `ignore` and
+  lowering `severity_overrides` are read only from your user config (`~/.runledger/config.json` or
+  `RUNLEDGER_CONFIG`). A project `.runledger.json` may raise severities and add safe
+  `extra_secret_paths`; if it tries to ignore or lower risk kinds, the receipt keeps the findings
+  and adds a note.
+
+### Fixed
+
+- **Unified secret detection and redaction (`runledger.secrets`):** `risk`, `guard` and `llm` share
+  one leaf rule set for secret content and secret file paths, resolving `sk-proj-` and 30-character
+  GitHub token mismatches, covering `.tfstate`, `.tfvars`, `.jks`, `.keystore`, `.p8`, `.kdbx`,
+  `.htpasswd`, `.vault-token`, `.config/gh/hosts.yml`, `.config/gcloud/credentials.db` and
+  `.azure/accessTokens.json`, and excluding `id_*.pub` public keys from `secret_file` findings.
+- **ReDoS-safe `extra_secret_paths`:** user and project patterns are validated before compilation
+  (rejecting nested quantifiers, backreferences and patterns over 200 characters, capped at 20
+  patterns and 1,024-character path inputs) and support a `glob:` prefix. Unsafe patterns are
+  skipped and logged as warnings by the guard.
+
 ## [0.6.0] - 2026-10-15
 
 ### Changed
