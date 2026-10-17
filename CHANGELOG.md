@@ -47,30 +47,29 @@ change behavior, so read the entry before you upgrade.
   command. Foreign hooks (`echo runledger guard`, `other.sh && runledger guard`, another
   executable) are still left alone.
 
-- **Spaced drive paths in shell writes, redirects and PowerShell paths (`runledger.shell_writes`,
-  `runledger.ps_writes`, `runledger.risk`):** an unquoted drive path that contains spaces is read
-  as one path whether it is a redirect target (`echo hi > E:\Work\Client y\z.txt`), a shell
-  operand (`touch E:\Work\Client y\z.txt`) or a PowerShell path argument
-  (`Set-Content -Path E:\Work\Client y\z.txt -Value x`), so the finding and the files list name
-  the whole path and the safe receipt shows `…/Client y/z.txt` instead of the unmasked fragment
-  `E:\Work\Client`; each redirect target keeps exactly one outside-the-working-folder finding,
-  because the shell write check de-duplicates by the flagged path instead of reading the path
-  back out of the reason text. A folder name may hold several words
-  (`E:\Work\Client X Corp\secret.txt` is one path), and an independently rooted operand after a
-  drive path is never read as part of it: `rm C:/repo/a.txt ../outside.txt` still reports the
-  high outside-the-working-folder finding for `../outside.txt` (plain, `>` and `<` forms) and
-  the guard asks again, as it did before the spaced-path rule existed.
+- **Spaced drive paths are a display label, never the reading findings come from
+  (`runledger.paths`, `runledger.risk`, `runledger.shell_writes`, `runledger.ps_writes`,
+  `runledger.summarize`):** an unquoted path that contains spaces (`echo hi > E:\Work\Client
+  y\z.txt`) is two words to a shell, and risk findings, file changes and guard decisions are
+  computed from exactly those words again. Reading the whole folder name
+  (`E:\Work\Client X\secret.txt`) is now a display step applied afterwards: a finding or a file
+  entry whose path is the leading fragment of a spaced drive path shows the whole path, so a safe
+  receipt shows `…/Client X/secret.txt` instead of the unmasked `E:\Work\Client`, and a quoted
+  path (`"E:\Work\Client X\secret.txt"`) is one word already and is left as written. The label
+  never adds, removes or merges a finding, never changes a code or a severity, and never changes
+  a guard decision.
 
-- **The spaced-path join no longer decides which operands are checked (`runledger.risk`):** the
-  join that reads an unquoted drive path with spaces as one path (`E:\Work\Client X\secret.txt`)
-  is a display reading, so the shell's own reading of the same words is analysed as well and the
-  most severe finding wins. `rm C:/repo/sub/a.txt nested/../../outside.txt`, its `>` redirect form
-  and its `<` redirect form report the high outside-the-working-folder finding for
-  `nested/../../outside.txt` again, and the default guard asks instead of allowing, as it did
-  before the spaced-path rule existed. A word the join swallowed is only dropped when the joined
-  word already reported a finding at least as severe, so the whole-path finding (and its safe-mode
-  masking) is unchanged; an operand that climbs out of its folder is named even next to that
-  whole-path finding (`rm C:\a b\x nested/../../outside.txt` reports both readings).
+- **Findings beside a spaced path are the shell's own reading again (`runledger.risk`):** the
+  joined/unjoined "union" this milestone added between the two readings is gone, which restores
+  three behaviours that join-based analysis had lost: with the working folder `C:/repo`,
+  `C:/repo/bin/rm sub/echo ../outside.txt` reports the high outside-the-working-folder finding for
+  `../outside.txt` and the default guard asks instead of allowing the outside delete;
+  `rm C:/elsewhere/tests/test_a.py other/file.txt` keeps the high `test_deleted` finding for
+  `test_a.py` and `rm C:/elsewhere/key.pem other/file.txt` keeps the high `secret_file` finding
+  for `key.pem`; and `echo hi > C:/repo/migrations/001_init.sql other/file.txt` reports the medium
+  `db_migration` for the real redirect target. `rm C:/repo/a.txt ../outside.txt`,
+  `rm C:\a b\x nested/../../outside.txt` and their `>` and `<` redirect forms still report the
+  high finding for the operand that climbs out of the project and still ask again.
 
 - **A queued heredoc starts at the newline that ends the command line (`runledger.shell_syntax`):**
   a newline inside a multiline `$'...'` or `"..."` string is part of that word, so a pending
@@ -86,7 +85,11 @@ change behavior, so read the entry before you upgrade.
   command substitution, sub-shell or second line, so `true;/usr/bin/python3.13t -m runledger
   checkpoint --hook` (and the `guard` form, with `&&`, `||`, `|`, `&`, `>` or a second line) is
   preserved again: `guard install` appends beside it and `guard uninstall` leaves it, as v0.6.0
-  did. A single command is also ours when its executable word is the interpreter that runs
+  did. A `$` or a backtick in the executable word keeps the entry foreign as well, even inside
+  double quotes, because a POSIX shell executes those substitutions:
+  `"/usr/$(printf bin)/python3.13t" -m runledger checkpoint --hook` and its backtick form (and
+  the `guard` forms) compute their own path, so they are left untouched instead of being replaced
+  or removed. A single command is also ours when its executable word is the interpreter that runs
   `install`, which writes that path literally: a copied or renamed interpreter
   (`agent-python.exe`) now works through install, the no-op second install, the install self-test
   and uninstall. Other interpreters still match the python/pypy name pattern

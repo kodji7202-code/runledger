@@ -9,7 +9,8 @@ import posixpath
 import re
 import shlex
 import sys
-from typing import Any, List, Optional, Sequence
+from functools import lru_cache
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 _WIN_DRIVE_RE = re.compile(r"^[A-Za-z]:")
 _WIN_ABS_RE = re.compile(r"^[A-Za-z]:[\\/]")
@@ -30,16 +31,83 @@ SPACED_NAME = r"(?![.]{1,2}[\\/]|~[\\/])" + PATH_NAME
 # (`E:\Work\Client X Corp\secret.txt`): the words before the last one carry no separator,
 # the last one does.
 SPACED_SUFFIX = r"(?: (?:" + SPACED_NAME + r" )*" + SPACED_NAME + r"[\\/]" + PATH_REST + r")"
-# A Windows drive path containing spaces, read as one token: an unquoted path like
-# `type E:\Work\Client X\secret.txt` is two arguments to a shell, but a folder name may
-# contain spaces, so RunLedger reads (and safe mode masks) the whole path, never a fragment.
+# A Windows drive path containing spaces, read as one token for display: a folder name may
+# contain spaces, so a receipt shows `type E:\Work\Client X\secret.txt` as one path and safe
+# mode masks the whole of it. A shell splits the same text at its spaces, and that shell
+# reading is what findings, file changes and guard decisions are computed from; the join is
+# applied to the paths a receipt shows only (`spaced_drive_labels` and the two users below).
 SPACED_DRIVE_RE = re.compile(r"[A-Za-z]:[\\/]" + PATH_CHUNK + SPACED_SUFFIX + "+")
 
 
-def spaced_drive_path(text: str, pos: int) -> Optional[str]:
-    """The drive path with spaces that starts at `pos`, or None when there is not one."""
-    m = SPACED_DRIVE_RE.match(text, pos)
-    return m.group(0) if m else None
+def spaced_drive_labels(text: str) -> Dict[str, str]:
+    """Every leading fragment of an unquoted spaced drive path in `text` -> the whole path.
+
+    `E:\\Work\\Client X\\secret.txt` is two words to a shell and one display path; the first
+    word is the fragment. A caller relabels the paths a finding or a file entry shows with
+    these, so the folder name stays together for masking (VAL-CORE-034). Quoted text is left
+    alone: `"E:\\Work\\Client X\\secret.txt"` is already one word to the shell."""
+    labels: Dict[str, str] = {}
+    index, length, quote = 0, len(text), ""
+    while index < length:
+        char = text[index]
+        if quote:
+            if char == quote:
+                quote = ""
+            elif quote == '"' and char == "\\" and index + 1 < length and text[index + 1] in '\\"':
+                index += 1
+            index += 1
+            continue
+        if char in ("'", '"'):
+            quote = char
+            index += 1
+            continue
+        m = SPACED_DRIVE_RE.match(text, index)
+        if m is None:
+            index += 1
+            continue
+        whole = m.group(0)
+        head, sep, _ = whole.partition(" ")
+        if sep:
+            labels.setdefault(head, whole)
+        index = m.end()
+    return labels
+
+
+@lru_cache(maxsize=64)
+def _labels_re(fragments: Tuple[Tuple[str, str], ...]) -> "re.Pattern[str]":
+    """One alternative per fragment, refusing an occurrence that already carries the whole path
+    (the quoted form of the same text), so a label is never applied twice."""
+    alts = [re.escape(fragment) + "(?!" + re.escape(whole[len(fragment):]) + ")"
+            for fragment, whole in fragments]
+    return re.compile("|".join(alts))
+
+
+def show_spaced_drive_paths(text: str, labels: Dict[str, str]) -> str:
+    """`text` with every leading fragment of a spaced drive path shown as the whole path.
+
+    This is a display step: it rewrites the text of a reason, never the finding itself. Codes,
+    severities, changed files and guard decisions are always computed from the shell's words."""
+    hits = tuple(sorted(((f, w) for f, w in labels.items() if f in text),
+                        key=lambda fw: len(fw[0]), reverse=True))
+    if not hits:
+        return text
+    return _labels_re(hits).sub(lambda m: labels[m.group(0)], text)
+
+
+def label_spaced_drive_path(path: str, labels: Dict[str, str]) -> str:
+    """One path shown as the whole spaced drive path when it is that path's leading fragment.
+
+    The tokenized path may be normalised (`E:/Work/Client` -> `E:\\Work\\Client`), so the
+    comparison is normalised too. Display only, exactly as `show_spaced_drive_paths`."""
+    if not path or not labels:
+        return path
+    if path in labels:
+        return labels[path]
+    norm = _norm(path, is_windows_style(path))
+    for head, whole in labels.items():
+        if _norm(head, is_windows_style(head)) == norm:
+            return whole
+    return path
 
 
 def strip_long_prefix(p: str) -> str:
@@ -100,7 +168,10 @@ _SUBSTITUTION_HEADS = frozenset("({")
 
 def has_shell_operator(command: str) -> bool:
     """True when `command` holds an unquoted shell operator, redirection, command substitution
-    or sub-shell. Quoted text is data: a quoted executable path may contain any of them."""
+    or sub-shell. Quoted text is data: a quoted executable path may contain any of them. A `$`
+    or a backtick inside double quotes is not data, though: a POSIX shell executes those
+    substitutions (`"/usr/$(printf bin)/python3.13t"` computes its own path), so the command is
+    not the single simple command an installer writes."""
     quote = ""
     index, length = 0, len(command)
     while index < length:
@@ -108,8 +179,11 @@ def has_shell_operator(command: str) -> bool:
         if quote:
             if char == quote:
                 quote = ""
-            elif quote == '"' and char == "\\" and index + 1 < length and command[index + 1] in '\\"':
-                index += 1
+            elif quote == '"':
+                if char == "\\" and index + 1 < length and command[index + 1] in '\\"':
+                    index += 1
+                elif char in "$`":
+                    return True
             index += 1
             continue
         if char in ("'", '"'):
@@ -161,14 +235,17 @@ def owned_hook_command(command: Any, tail: Sequence[str]) -> Optional[List[str]]
     the two the installer writes: `<runledger>` + tail, and `<interpreter> -m runledger` + tail
     for `sys.executable` itself (whatever its file is called) or an interpreter-looking name
     (`python3.13t.exe`, `pythonw`, `pypy3`). A command with a shell operator, a redirection, a
-    second command or any other tail is a foreign hook: install must append beside it and
-    uninstall must leave it alone."""
+    command substitution (`$` or a backtick, even inside double quotes), a second command or
+    any other tail is a foreign hook: install must append beside it and uninstall must leave it
+    alone."""
     if not isinstance(command, str):
         return None
     words = command_words(command)
     if not words:
         return None
     words = [w[1:-1] if len(w) >= 2 and w[0] in ("'", '"') and w[-1] == w[0] else w for w in words]
+    if "$" in words[0] or "`" in words[0]:
+        return None  # the executable word computes its own path: not the command we wrote
     suffix = list(tail)
     if words[1:] == suffix and is_runledger_executable(words[0]):
         return words

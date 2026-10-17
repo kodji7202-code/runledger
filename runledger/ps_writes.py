@@ -7,7 +7,7 @@ import re
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 
-from .paths import is_abs, is_windows_style, join, spaced_drive_path
+from .paths import is_abs, is_windows_style, join
 from .shell_syntax import ansi_c_end, strip_heredocs
 from .shell_writes import ShellWrite
 
@@ -183,54 +183,6 @@ def _strip_ps_herestrings(text: str) -> str:
     text = _HERE_DQ_RE.sub('""', text)
     text = _HERE_SQ_RE.sub("''", text)
     return text
-
-
-# Characters a word can start after: separators, parentheses and redirection operators.
-_SPACED_BREAKS = " \t\r\n;|&()<>"
-
-
-def _quote_spaced_drive_paths(text: str) -> str:
-    """Quote an unquoted drive path that contains spaces (`Set-Content -Path E:\\Work\\Client
-    y\\z.txt`, `'x' > E:\\Work\\Client y\\z.txt`), so a path argument or redirect target is read
-    as one path instead of its first fragment. Quoted text and comments are left untouched."""
-    if ":" not in text:
-        return text
-    out: List[str] = []
-    quote: Optional[str] = None
-    i, n = 0, len(text)
-    while i < n:
-        c = text[i]
-        if quote:
-            out.append(c)
-            if c == quote:
-                if i + 1 < n and text[i + 1] == quote:  # '' and "" escape the quote itself
-                    out.append(text[i + 1])
-                    i += 2
-                    continue
-                quote = None
-            elif quote == '"' and c == "`" and i + 1 < n:
-                out.append(text[i + 1])
-                i += 2
-                continue
-            i += 1
-            continue
-        if c in "'\"":
-            quote = c
-        elif c == "#" and (i == 0 or text[i - 1] in " \t\r\n;|("):
-            end = text.find("\n", i)
-            end = n if end < 0 else end
-            out.append(text[i:end])
-            i = end
-            continue
-        elif i == 0 or text[i - 1] in _SPACED_BREAKS:
-            whole = spaced_drive_path(text, i)
-            if whole is not None:
-                out.append("'" + whole + "'")
-                i += len(whole)
-                continue
-        out.append(c)
-        i += 1
-    return "".join(out)
 
 
 def _clean_ps_path(raw: Optional[str], cwd: Optional[str] = None) -> Optional[str]:
@@ -536,7 +488,6 @@ def _ps_writes_cached(command: str) -> Tuple[ShellWrite, ...]:
         return ()
     text = _strip_ps_herestrings(command)
     text, _ = strip_heredocs(text)
-    text = _quote_spaced_drive_paths(text)
 
     out: List[ShellWrite] = []
     cwd: Optional[str] = None
