@@ -25,7 +25,9 @@ Anything else keeps the agent's own tool name.
 from __future__ import annotations
 
 import importlib
+import os
 from pathlib import Path
+import sys
 from typing import List, Optional
 
 from ..parser import mtime
@@ -35,11 +37,14 @@ ADAPTER_MODULES = ["claude_code", "codex", "droid", "aider", "native"]
 
 def adapters():
     out = []
+    debug = os.environ.get("RUNLEDGER_DEBUG", "").strip().lower() in ("1", "true", "yes")
     for name in ADAPTER_MODULES:
         try:
             out.append(importlib.import_module(f"{__name__}.{name}"))
-        except ImportError:
-            continue
+        except ImportError as exc:
+            if debug:
+                raise
+            print(f"runledger: adapter '{name}' failed to load: {exc}", file=sys.stderr)
     return out
 
 
@@ -73,4 +78,4 @@ def find_sessions(project: Optional[str] = None, agent: Optional[str] = None) ->
     found: List[Path] = []
     for a in chosen:
         found.extend(a.find_sessions(project))
-    return sorted(set(found), key=mtime, reverse=True)
+    return sorted(set(found), key=lambda p: (mtime(p), str(p)), reverse=True)

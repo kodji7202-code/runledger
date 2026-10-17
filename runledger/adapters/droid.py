@@ -113,23 +113,82 @@ def _mtime(path: Path) -> float:
 
 
 def find_sessions(project: Optional[str] = None) -> List[Path]:
+    from .. import session_cache
+
     root = factory_home() / "sessions"
+    if not root.is_dir():
+        return []
     wanted = _absolute(str(project)) if project else None
+    wanted_norm = _norm(wanted) if wanted else None
+    entries, dirty = session_cache.load()
     found = []
-    for path in root.glob("*/*.jsonl"):
-        if not path.is_file():
-            continue
-        header = _header(path)
-        if not _is_header(header):
-            continue
-        # Encoding is lossy: /demo/a-b and /demo/a/b share a directory.
-        cwd = header["cwd"]
-        if wanted and _is_absolute(cwd) and _norm(cwd) != _norm(wanted):
-            continue
-        if wanted and not _is_absolute(cwd) and not _is_project_folder(path.parent.name, wanted):
-            continue  # `droid exec --cwd .` records ".": the folder name is the only clue
-        found.append(path)
-    return sorted(found, key=_mtime, reverse=True)
+
+    def scan_folder(folder: Path, folder_matches: bool) -> None:
+        nonlocal dirty
+        try:
+            paths = list(folder.glob("*.jsonl"))
+        except OSError:
+            return
+        for path in paths:
+            try:
+                st = path.stat()
+            except OSError:
+                continue
+            key = str(path)
+            cached = entries.get(key)
+            if (isinstance(cached, dict)
+                    and cached.get("mtime_ns") == st.st_mtime_ns
+                    and cached.get("size") == st.st_size
+                    and "valid" in cached):
+                valid = bool(cached.get("valid"))
+                cwd = cached.get("cwd") or ""
+            else:
+                header = _header(path)
+                valid = _is_header(header)
+                cwd = header["cwd"] if valid else ""
+                entries[key] = {
+                    "mtime_ns": st.st_mtime_ns,
+                    "size": st.st_size,
+                    "valid": valid,
+                    "cwd": cwd,
+                    "id": header.get("id") if valid else None,
+                }
+                dirty = True
+            if not valid:
+                continue
+            # Encoding is lossy: /demo/a-b and /demo/a/b share a directory.
+            if wanted_norm and _is_absolute(cwd) and _norm(cwd) != wanted_norm:
+                continue
+            if wanted and not _is_absolute(cwd) and not folder_matches:
+                continue  # `droid exec --cwd .` records ".": the folder name is the only clue
+            found.append((st.st_mtime, path))
+
+    try:
+        subdirs = [d for d in root.iterdir() if d.is_dir()]
+    except OSError:
+        subdirs = []
+
+    if wanted:
+        matching_dirs = []
+        other_dirs = []
+        for d in subdirs:
+            if _is_project_folder(d.name, wanted):
+                matching_dirs.append(d)
+            else:
+                other_dirs.append(d)
+        for d in matching_dirs:
+            scan_folder(d, True)
+        if not found:
+            for d in other_dirs:
+                scan_folder(d, False)
+    else:
+        for d in subdirs:
+            scan_folder(d, False)
+
+    if dirty:
+        session_cache.save(entries)
+    found.sort(key=lambda item: item[0], reverse=True)
+    return [p for _, p in found]
 
 
 def _objects(path: Path) -> Iterator[Dict[str, Any]]:

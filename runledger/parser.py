@@ -258,6 +258,119 @@ def _is_event(ev: Dict[str, Any]) -> bool:
     return _str(ev.get("type")) in _EVENT_TYPES or isinstance(ev.get("sessionId"), str)
 
 
+def _fs_str(path: str | os.PathLike) -> str:
+    s = str(path)
+    if os.name == "nt" and len(s) >= 240 and not s.startswith("\\\\"):
+        return "\\\\?\\" + os.path.abspath(s)
+    return s
+
+
+def _discover_subagent_files(parent_path: Path, session_id: str) -> List[Tuple[Path, bool]]:
+    """Return `[(sub_path, is_legacy), ...]` for a parent Claude Code transcript."""
+    if any(part.lower() == "subagents" for part in parent_path.parent.parts):
+        return []
+    found: List[Tuple[Path, bool]] = []
+    seen = set()
+    parent_dir = parent_path.parent
+
+    # 1. Session-scoped layout: <project>/<session>/subagents/**/*.jsonl
+    candidates = [parent_path.stem]
+    if (session_id and session_id != parent_path.stem
+            and "/" not in session_id and "\\" not in session_id
+            and session_id not in (".", "..")):
+        candidates.append(session_id)
+    for sname in candidates:
+        sub_dir = Path(_fs_str(parent_dir / sname / "subagents"))
+        try:
+            is_dir = sub_dir.is_dir()
+        except OSError:
+            is_dir = False
+        if is_dir:
+            for f in sorted(sub_dir.rglob("*.jsonl")):
+                key = str(f)
+                if key not in seen:
+                    seen.add(key)
+                    found.append((f, False))
+
+    # 2. Legacy layout: <project>/subagents/**/*.jsonl
+    legacy_dir = Path(_fs_str(parent_dir / "subagents"))
+    try:
+        is_legacy_dir = legacy_dir.is_dir()
+    except OSError:
+        is_legacy_dir = False
+    if is_legacy_dir:
+        for f in sorted(legacy_dir.rglob("*.jsonl")):
+            key = str(f)
+            if key not in seen:
+                seen.add(key)
+                found.append((f, True))
+
+    return found
+
+
+def _merge_subagents(
+    parent_path: Path,
+    session_id: str,
+    msg_usage: Dict[str, Usage],
+    msg_model: Dict[str, Optional[str]],
+) -> int:
+    """Merge sub-agent assistant message usage into `msg_usage`/`msg_model`.
+    Returns the number of sub-agent transcripts merged."""
+    merged_files = 0
+    valid_session_ids = {session_id, parent_path.stem}
+
+    for sub_path, is_legacy in _discover_subagent_files(parent_path, session_id):
+        sub_events: List[Dict[str, Any]] = []
+        sub_sids = set()
+        try:
+            with open(_fs_str(sub_path), "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        ev = json.loads(line)
+                    except (ValueError, RecursionError):
+                        continue
+                    if not isinstance(ev, dict):
+                        continue
+                    if _is_event(ev):
+                        sub_events.append(ev)
+                        sid = _str(ev.get("sessionId")) or _str(ev.get("parentSessionId"))
+                        if sid:
+                            sub_sids.add(sid)
+        except OSError:
+            continue
+
+        if not sub_events:
+            continue
+        if is_legacy and sub_sids and not (sub_sids & valid_session_ids):
+            continue
+
+        merged_files += 1
+        for idx, ev in enumerate(sub_events):
+            if ev.get("type") != "assistant":
+                continue
+            msg = ev.get("message")
+            msg = msg if isinstance(msg, dict) else {}
+            mid = _str(msg.get("id")) or _str(ev.get("uuid")) or f"{sub_path}:{idx}"
+            model = _str(msg.get("model")) or None
+            if model == "<synthetic>":
+                model = None
+            u = _usage(msg.get("usage"))
+            if mid not in msg_usage:
+                msg_usage[mid] = u
+                msg_model[mid] = model
+            else:
+                if u.total > msg_usage[mid].total:
+                    msg_usage[mid] = u
+                if not msg_model.get(mid) and model:
+                    msg_model[mid] = model
+
+    return merged_files
+
+
+
 def parse_session(path: str | os.PathLike) -> Run:
     path = str(path)
     lines = 0
@@ -272,7 +385,7 @@ def parse_session(path: str | os.PathLike) -> Run:
     msg_model: Dict[str, Optional[str]] = {}
     final_message = ""
 
-    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+    with open(_fs_str(path), "r", encoding="utf-8", errors="replace") as fh:
         for line in fh:
             line = line.strip()
             if not line:
@@ -355,6 +468,12 @@ def parse_session(path: str | os.PathLike) -> Run:
     if lines and not valid_events:
         raise ValueError(f"{path}: not a supported session file")
 
+    subagent_count = _merge_subagents(Path(path), session_id, msg_usage, msg_model)
+    notes: List[str] = []
+    if subagent_count > 0:
+        suffix = "s" if subagent_count != 1 else ""
+        notes.append(f"includes {subagent_count} sub-agent transcript{suffix}")
+
     # Attribute each assistant message's usage to the steps it issued
     # (split evenly); messages without tool calls count toward the run only.
     total = Usage()
@@ -371,8 +490,75 @@ def parse_session(path: str | os.PathLike) -> Run:
     return Run(
         session_id=session_id, path=path, cwd=cwd, git_branch=git_branch,
         started=started, ended=ended, prompts=prompts, steps=steps,
-        final_message=final_message, usage=total, models=models,
+        final_message=final_message, usage=total, models=models, notes=notes,
     )
+
+
+def peek_session(path: str | os.PathLike) -> Tuple[str, str, int, str, Optional[str]]:
+    """Fast single-pass summary `(session_id, agent, steps_count, first_prompt, cwd)` for `list`.
+
+    Skips `json.loads` on large `tool_result` or text-only lines once the header
+    and first prompt have been seen, while counting every `tool_use` block.
+    """
+    p_str = str(path)
+    lines = 0
+    valid_events = 0
+    session_id = Path(p_str).stem
+    cwd: Optional[str] = None
+    first_prompt: Optional[str] = None
+    steps_count = 0
+
+    with open(_fs_str(p_str), "r", encoding="utf-8", errors="replace") as fh:
+        for raw_line in fh:
+            line = raw_line.strip()
+            if not line:
+                continue
+            lines += 1
+            if valid_events > 0 and 'tool_use"' not in line:
+                if first_prompt is not None and (cwd is not None or '"cwd"' not in line[:512]):
+                    continue
+                head = line[:512]
+                if 'tool_result"' in head and '"text"' not in head and '"cwd"' not in head:
+                    continue
+            try:
+                ev = json.loads(line)
+            except (ValueError, RecursionError):
+                continue
+            if not isinstance(ev, dict):
+                continue
+            if _is_event(ev):
+                valid_events += 1
+            etype = ev.get("type")
+            if cwd is None:
+                cwd = _str(ev.get("cwd")) or None
+            sid = _str(ev.get("sessionId"))
+            if sid:
+                session_id = sid
+            msg = ev.get("message")
+            msg = msg if isinstance(msg, dict) else {}
+
+            if etype == "user" and first_prompt is None:
+                content = msg.get("content")
+                if isinstance(content, str):
+                    if not ev.get("isMeta") and content.strip() and not _is_noise_prompt(content):
+                        first_prompt = content.strip()
+                elif isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text" and not ev.get("isMeta"):
+                            t = _str(block.get("text")).strip()
+                            if t and not _is_noise_prompt(t):
+                                first_prompt = t
+                                break
+            elif etype == "assistant" and 'tool_use"' in line:
+                content = msg.get("content")
+                if isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "tool_use":
+                            steps_count += 1
+
+    if lines and not valid_events:
+        raise ValueError(f"{p_str}: not a supported session file")
+    return session_id, "claude-code", steps_count, first_prompt or "", cwd
 
 
 def claude_projects_dir() -> Path:
@@ -381,6 +567,27 @@ def claude_projects_dir() -> Path:
 
 
 _WINDOWS_ABSOLUTE = re.compile(r"^[A-Za-z]:[\\/]")
+_MAX_ENCODED_LEN = 200
+_BASE36_DIGITS = "0123456789abcdefghijklmnopqrstuvwxyz"
+
+
+def _java_hash_base36(text: str) -> str:
+    """Java-style 32-bit signed hash over UTF-16 code units of `text`, formatted as base36(abs(h))."""
+    raw = text.encode("utf-16-le")
+    h = 0
+    for i in range(0, len(raw), 2):
+        unit = raw[i] | (raw[i + 1] << 8)
+        h = (h * 31 + unit) & 0xFFFFFFFF
+    if h >= 0x80000000:
+        h -= 0x100000000
+    n = abs(h)
+    if n == 0:
+        return "0"
+    out = []
+    while n:
+        n, r = divmod(n, 36)
+        out.append(_BASE36_DIGITS[r])
+    return "".join(reversed(out))
 
 
 def encode_project_path(project: str) -> str:
@@ -388,28 +595,72 @@ def encode_project_path(project: str) -> str:
     character of the project path with '-': '/home/dev/my.app' becomes
     '-home-dev-my-app' and 'D:\\runledger' becomes 'D--runledger'.
 
+    When the sanitized name exceeds 200 characters, Claude Code truncates to
+    200 characters and appends '-' + base36(abs(java_hash_utf16(project))).
+
     Paths that are already absolute (POSIX or Windows form) are encoded as
     given; only relative paths are resolved against the current directory."""
     if not (project.startswith("/") or _WINDOWS_ABSOLUTE.match(project)):
         project = os.path.abspath(project)
-    return "".join(ch if ch.isascii() and ch.isalnum() else "-" for ch in project)
+    sanitized = "".join(ch if ch.isascii() and ch.isalnum() else "-" for ch in project)
+    if len(sanitized) <= _MAX_ENCODED_LEN:
+        return sanitized
+    return f"{sanitized[:_MAX_ENCODED_LEN]}-{_java_hash_base36(project)}"
 
 
 def mtime(path: Path) -> float:
     """Modified time, or 0 for a file that vanished after it was listed (live sessions rotate)."""
     try:
-        return path.stat().st_mtime
+        return os.stat(_fs_str(path)).st_mtime
     except OSError:
         return 0.0
 
 
+def _list_jsonl_in_dir(d: Path) -> List[Path]:
+    fs_d = Path(_fs_str(d))
+    try:
+        if not fs_d.is_dir():
+            return []
+        return [d / f.name for f in fs_d.glob("*.jsonl")]
+    except OSError:
+        return []
+
+
 def find_sessions(project: Optional[str] = None) -> List[Path]:
     root = claude_projects_dir()
-    if not root.exists():
+    fs_root = Path(_fs_str(root))
+    try:
+        if not fs_root.exists():
+            return []
+    except OSError:
         return []
     if project:
-        d = root / encode_project_path(project)
-        files = list(d.glob("*.jsonl")) if d.exists() else []
+        encoded = encode_project_path(project)
+        files = _list_jsonl_in_dir(root / encoded)
+        if not files and len(encoded) > _MAX_ENCODED_LEN:
+            prefix = encoded[:_MAX_ENCODED_LEN] + "-"
+            prefix_low = prefix.lower()
+            try:
+                children = sorted(fs_root.iterdir(), key=lambda p: p.name)
+            except OSError:
+                children = []
+            for cand in children:
+                name = cand.name
+                if name.startswith(prefix) or (os.name == "nt" and name.lower().startswith(prefix_low)):
+                    files.extend(_list_jsonl_in_dir(root / name))
     else:
-        files = list(root.glob("*/*.jsonl"))
+        try:
+            files = [
+                root / f.parent.name / f.name
+                for f in fs_root.glob("*/*.jsonl")
+                if f.parent.name.lower() != "subagents"
+            ]
+        except OSError:
+            files = []
+    files = [
+        f for f in files
+        if not f.name.startswith("agent-")
+        and not any(part.lower() == "subagents" for part in f.parts)
+    ]
     return sorted(files, key=mtime, reverse=True)
+

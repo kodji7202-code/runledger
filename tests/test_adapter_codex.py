@@ -537,3 +537,66 @@ def test_codex_token_count_falls_back_to_delta_from_total_and_handles_reset(tmp_
     assert run.usage.input_tokens == 2000
     assert run.usage.output_tokens == 100
 
+
+def test_find_sessions_uses_header_cache_and_survives_corruption(tmp_path, monkeypatch):
+    codex_dir = tmp_path / "codex_home"
+    monkeypatch.setenv("CODEX_HOME", str(codex_dir))
+    proj_a = str(tmp_path / "proj_a")
+    proj_b = str(tmp_path / "proj_b")
+
+    rollouts = []
+    for i in range(6):
+        day = codex_dir / "sessions" / "2026" / "10" / f"0{i + 1}"
+        day.mkdir(parents=True)
+        f = day / f"rollout-2026-10-0{i + 1}-{i}.jsonl"
+        cwd = proj_a if i < 3 else proj_b
+        f.write_text(json.dumps({
+            "timestamp": "2026-10-01T10:00:00Z",
+            "type": "session_meta",
+            "payload": {"id": f"cid-{i}", "cwd": cwd},
+        }) + "\n", encoding="utf-8")
+        rollouts.append(f)
+
+    # First pass populates ~/.runledger/cache/sessions.json
+    first = codex.find_sessions(proj_a)
+    assert len(first) == 3
+    cache_file = Path(os.environ["HOME"]) / ".runledger" / "cache" / "sessions.json"
+    assert cache_file.is_file()
+
+    # Second pass does not open any unchanged rollout files
+    opened = []
+    real_open = Path.open
+
+    def spy_open(self, *args, **kwargs):
+        if self.name.startswith("rollout-"):
+            opened.append(self)
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", spy_open)
+    second = codex.find_sessions(proj_a)
+    assert second == first
+    assert opened == []
+    monkeypatch.setattr(Path, "open", real_open)
+
+    # Corrupt cache file -> still succeeds and rewrites valid cache
+    cache_file.write_text("{corrupt-garbage", encoding="utf-8")
+    third = codex.find_sessions(proj_a)
+    assert third == first
+    assert isinstance(json.loads(cache_file.read_text(encoding="utf-8")), dict)
+
+    # Changing a rollout's cwd (size/mtime change) is picked up
+    rollouts[3].write_text(json.dumps({
+        "timestamp": "2026-10-01T10:00:00Z",
+        "type": "session_meta",
+        "payload": {"id": "cid-3", "cwd": proj_a, "note": "moved to proj_a"},
+    }) + "\n", encoding="utf-8")
+    fourth = codex.find_sessions(proj_a)
+    assert len(fourth) == 4
+
+    # Deleting a rollout file does not leave a ghost row
+    rollouts[0].unlink()
+    fifth = codex.find_sessions(proj_a)
+    assert len(fifth) == 3
+    assert rollouts[0] not in fifth
+
+

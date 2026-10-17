@@ -68,23 +68,46 @@ def detect(path: Path) -> bool:
 
 
 def find_sessions(project: Optional[str] = None) -> List[Path]:
+    from .. import session_cache
+
     root = codex_home() / "sessions"
     if not root.is_dir():
         return []
     wanted = _norm_path(_absolute(str(project))) if project else None
+    entries, dirty = session_cache.load()
     found = []
     for f in root.rglob("rollout-*.jsonl"):
-        if not f.is_file():
+        try:
+            st = f.stat()
+        except OSError:
             continue
-        if wanted is not None and _norm_path(_session_cwd(f) or "") != wanted:
+        key = str(f)
+        cached = entries.get(key)
+        if (isinstance(cached, dict)
+                and cached.get("mtime_ns") == st.st_mtime_ns
+                and cached.get("size") == st.st_size
+                and "cwd" in cached):
+            cwd = cached.get("cwd")
+        else:
+            cwd = _session_cwd(f)
+            entries[key] = {
+                "mtime_ns": st.st_mtime_ns,
+                "size": st.st_size,
+                "cwd": cwd,
+            }
+            dirty = True
+        if wanted is not None and _norm_path(cwd or "") != wanted:
             continue
-        found.append(f)
-    return sorted(found, key=_mtime, reverse=True)
+        found.append((st.st_mtime, f))
+    if dirty:
+        session_cache.save(entries)
+    found.sort(key=lambda item: item[0], reverse=True)
+    return [f for _, f in found]
 
 
 def _first_line_object(path: Path) -> Optional[Dict[str, Any]]:
     try:
-        with open(path, "r", encoding="utf-8-sig", errors="replace") as fh:
+        with path.open("r", encoding="utf-8-sig", errors="replace") as fh:
             for line in fh:
                 line = line.strip()
                 if not line:
@@ -103,7 +126,7 @@ def _session_cwd(path: Path) -> Optional[str]:
     """cwd from the session header, or from the first turn context, within the first lines."""
     turn_cwd = None
     try:
-        with open(path, "r", encoding="utf-8-sig", errors="replace") as fh:
+        with path.open("r", encoding="utf-8-sig", errors="replace") as fh:
             for n, line in enumerate(fh):
                 if n >= 50:
                     break

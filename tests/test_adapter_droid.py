@@ -692,3 +692,34 @@ def test_droid_settings_only_usage_with_long_context_model_uses_base_tier_and_no
     md = _receipt(capsys, path, "md")
     assert "long-context tier not applied" in md
 
+
+def test_find_sessions_uses_header_cache(tmp_path, monkeypatch):
+    fhome = tmp_path / "factory"
+    monkeypatch.setenv("FACTORY_HOME", str(fhome))
+    target = "/demo/target-proj"
+    expected = []
+    for i in range(4):
+        expected.append(_discovered(fhome, target, f"t{i}.jsonl", 100 + i))
+    for p in range(5):
+        for i in range(4):
+            _discovered(fhome, f"/demo/other-{p}", f"o{i}.jsonl", 50 + i)
+
+    first = droid.find_sessions(target)
+    assert set(first) == set(expected)
+    cache_file = Path(os.environ["HOME"]) / ".runledger" / "cache" / "sessions.json"
+    assert cache_file.is_file()
+
+    opened = []
+    real_open = Path.open
+
+    def spy_open(self, *args, **kwargs):
+        if self.suffix == ".jsonl":
+            opened.append(self)
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", spy_open)
+    second = droid.find_sessions(target)
+    assert second == first
+    assert opened == []
+
+

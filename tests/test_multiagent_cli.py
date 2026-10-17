@@ -228,3 +228,26 @@ def test_github_sessions_dir_scores_native_files(tmp_path, capsys):
     shutil.copy(FIX_NATIVE, sessions / "demo.runledger.json")
     assert github_main(["comment", "--sessions-dir", str(sessions), "--dry-run"]) == 0
     assert "demo-agent" in capsys.readouterr().out
+
+
+def test_adapters_reports_import_error_and_reraises_on_debug(monkeypatch, capsys):
+    import importlib
+    from runledger import adapters
+    real_import = importlib.import_module
+
+    def flaky_import(name, package=None):
+        if name.endswith(".codex"):
+            raise ImportError("boom")
+        return real_import(name, package)
+
+    monkeypatch.setattr(importlib, "import_module", flaky_import)
+    monkeypatch.delenv("RUNLEDGER_DEBUG", raising=False)
+    loaded = adapters.adapters()
+    err = capsys.readouterr().err
+    assert "codex" in err and "boom" in err
+    assert [m.NAME for m in loaded] == ["claude-code", "droid", "aider", "native"]
+
+    monkeypatch.setenv("RUNLEDGER_DEBUG", "1")
+    with pytest.raises(ImportError, match="boom"):
+        adapters.adapters()
+

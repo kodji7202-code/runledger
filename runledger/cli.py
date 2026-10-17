@@ -275,6 +275,9 @@ def _session_path(args) -> Optional[str]:
 
 
 def cmd_list(args) -> int:
+    from . import session_cache
+    from .parser import _fs_str
+
     project = None if args.all else (args.project or os.getcwd())
     try:
         files = adapters.find_sessions(project, args.agent)
@@ -286,21 +289,63 @@ def cmd_list(args) -> int:
         kind = f"{adapters.label(args.agent)} " if args.agent else ""
         print(f"No {kind}sessions found for {where}.", file=sys.stderr)
         return 1
+    entries, dirty = session_cache.load()
     print(f"{'when':<16}  {'id':<8}  {'agent':<12}  {'steps':>5}  first request")
-    for f in files[: args.limit]:
+    limit = max(0, args.limit) if args.limit is not None else 20
+    for f in files[:limit]:
         try:
-            run = adapters.detect(f).parse(f)
-        except (OSError, ValueError) as exc:
-            print(f"skipped: {exc}", file=sys.stderr)
-            continue
-        try:
-            when = datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+            st = os.stat(_fs_str(f))
         except OSError:  # removed after it was listed
             continue
-        first = redact(run.prompts[0] if run.prompts else "").replace("\n", " ")[:60]
-        print(f"{when}  {run.session_id[:8]:<8}  {run.agent[:12]:<12}  {len(run.steps):>5} steps  {first}")
+        key = str(f)
+        cached = entries.get(key)
+        if (isinstance(cached, dict)
+                and cached.get("mtime_ns") == st.st_mtime_ns
+                and cached.get("size") == st.st_size
+                and isinstance(cached.get("id"), str)
+                and isinstance(cached.get("agent"), str)
+                and isinstance(cached.get("steps"), int)
+                and isinstance(cached.get("first"), str)
+                and (not args.all or "list_cwd" in cached)):
+            sid = cached["id"]
+            agent = cached["agent"]
+            steps_count = cached["steps"]
+            first = cached["first"]
+            cwd = cached.get("list_cwd")
+        else:
+            try:
+                adapter = adapters.detect(f)
+                peek_fn = getattr(adapter, "peek", None)
+                if callable(peek_fn):
+                    sid, agent, steps_count, raw_first, cwd = peek_fn(f)
+                else:
+                    run = adapter.parse(f)
+                    sid = run.session_id
+                    agent = run.agent
+                    steps_count = len(run.steps)
+                    raw_first = run.prompts[0] if run.prompts else ""
+                    cwd = run.cwd
+            except (OSError, ValueError) as exc:
+                print(f"skipped: {exc}", file=sys.stderr)
+                continue
+            first = redact(raw_first).replace("\n", " ")[:60]
+            updated = dict(cached) if isinstance(cached, dict) and cached.get("mtime_ns") == st.st_mtime_ns and cached.get("size") == st.st_size else {
+                "mtime_ns": st.st_mtime_ns,
+                "size": st.st_size,
+            }
+            updated["id"] = sid
+            updated["agent"] = agent
+            updated["steps"] = steps_count
+            updated["first"] = first
+            updated["list_cwd"] = cwd
+            entries[key] = updated
+            dirty = True
+        when = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M")
+        print(f"{when}  {sid[:8]:<8}  {agent[:12]:<12}  {steps_count:>5} steps  {first}")
         if args.all:
-            print(f"                  {run.cwd}")
+            print(f"                  {cwd}")
+    if dirty:
+        session_cache.save(entries)
     return 0
 
 
