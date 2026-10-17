@@ -189,8 +189,9 @@ price (or `cache_write_5m`), 1-hour cache writes (`cache_creation.ephemeral_1h_i
 2.0 times the input price (or `cache_write_1h`), and cache reads at the cache-hit rate. Where a
 model defines a `long_context` tier, requests whose prompt tokens exceed `threshold_tokens` are
 billed at the long-context rates for that request; usage that only exists as a cumulative total
-(a Droid settings total, or a native session whose header `models` totals are not broken down per
-step) keeps the base tier and adds a receipt note. Rows with `valid_from`/`valid_until` (or
+(a Droid settings total or sub-agent total, or a native session whose header `models` totals are
+not broken down per step) keeps the base tier and adds a receipt note, even when a genuinely long
+request shares the same model. Rows with `valid_from`/`valid_until` (or
 `windows`) are priced only inside their window, against today's date; a user row outside its window
 is ignored so the bundled row stays in effect. When the bundled `checked`
 date is more than 120 days old, receipts include a staleness note. A model RunLedger does not know

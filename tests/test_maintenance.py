@@ -216,6 +216,7 @@ def test_failed_backup_leaves_no_partial_file(tmp_path, monkeypatch, capsys):
     assert "error:" in capsys.readouterr().err
     assert list(folder.glob("runledger-*.db")) == []
     assert list(folder.glob("*.tmp")) == []
+    assert list(folder.glob("*.lock")) == []
 
     good_db = tmp_path / "good.db"
     db = Database(str(good_db))
@@ -255,6 +256,7 @@ def test_failed_backup_leaves_no_partial_file(tmp_path, monkeypatch, capsys):
 
     assert list(folder.glob("runledger-*.db")) == []
     assert list(folder.glob("*.tmp")) == []
+    assert list(folder.glob("*.lock")) == []
 
 
 def test_backup_stems_keep_distinct_database_names():
@@ -333,4 +335,133 @@ def test_concurrent_backups_never_share_a_target(tmp_path, monkeypatch):
         with closing(sqlite3.connect(str(path))) as conn:
             assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
             assert conn.execute("SELECT COUNT(*) FROM teams").fetchone()[0] == 1
+
+
+def _valid_backup(path):
+    from contextlib import closing
+
+    assert path.stat().st_size > 0
+    with closing(sqlite3.connect(str(path))) as conn:
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        return conn.execute("SELECT COUNT(*) FROM teams").fetchone()[0]
+
+
+def test_retention_ignores_a_backup_that_is_still_copying(tmp_path, monkeypatch, capsys):
+    """An unfinished backup (a reserved name, or a copy still under `.tmp`) must not count
+    against --keep, and must never make a finished copy the one this run prunes."""
+    db_path = tmp_path / "team.db"
+    db = Database(str(db_path))
+    db.create_team("Overlap")
+    db.close()
+    folder = tmp_path / "bkp"
+
+    quick_copying = threading.Event()
+    slow_reserved = threading.Event()
+    release_slow = threading.Event()
+    main_thread = threading.current_thread()
+    real_backup_to = Database.backup_to
+
+    def controlled_backup_to(self, path):
+        if threading.current_thread() is main_thread:
+            quick_copying.set()
+            assert slow_reserved.wait(timeout=15)  # finish only while the other run still copies
+            return real_backup_to(self, path)
+        slow_reserved.set()
+        assert release_slow.wait(timeout=15)
+        return real_backup_to(self, path)
+
+    monkeypatch.setattr(Database, "backup_to", controlled_backup_to)
+    codes = {}
+
+    def slow_run():
+        assert quick_copying.wait(timeout=15)  # reserve the newer name after the quick run has one
+        codes["slow"] = main(["backup", "--db", str(db_path), "--dir", str(folder), "--keep", "1"])
+
+    thread = threading.Thread(target=slow_run)
+    thread.start()
+
+    assert main(["backup", "--db", str(db_path), "--dir", str(folder), "--keep", "1"]) == 0
+    finished = sorted(folder.glob("runledger-*.db"))
+    assert len(finished) == 1
+    assert _valid_backup(finished[0]) == 1
+    assert str(finished[0]) in capsys.readouterr().out
+
+    release_slow.set()
+    thread.join(timeout=30)
+    assert not thread.is_alive()
+    assert codes == {"slow": 0}
+    capsys.readouterr()
+    files = sorted(folder.glob("runledger-*.db"))
+    assert len(files) == 1
+    assert _valid_backup(files[0]) == 1
+    assert list(folder.glob("*.tmp")) == []
+    assert list(folder.glob("*.lock")) == []
+
+
+def test_retention_leaves_an_empty_placeholder_alone(tmp_path, capsys):
+    """A zero-byte `.db` is not a backup: it neither counts against --keep nor gets pruned, so a
+    reservation an interrupted older run left behind cannot displace a finished copy."""
+    db_path = tmp_path / "a.db"
+    db = Database(str(db_path))
+    db.create_team("Kept")
+    db.close()
+    folder = tmp_path / "bkp"
+    folder.mkdir()
+    placeholder = folder / "runledger-a-20200101-000000.db"
+    placeholder.write_bytes(b"")
+
+    assert main(["backup", "--db", str(db_path), "--dir", str(folder), "--keep", "1"]) == 0
+    capsys.readouterr()
+    files = sorted(folder.glob("runledger-*.db"))
+    copies = [p for p in files if p != placeholder]
+    assert len(copies) == 1
+    assert _valid_backup(copies[0]) == 1
+    assert placeholder.exists()
+
+
+def test_a_failed_backup_cleans_only_its_own_reservation(tmp_path, monkeypatch, capsys):
+    """A copy that fails must not take a finished backup with it, and must leave no reservation."""
+    db_path = tmp_path / "team.db"
+    db = Database(str(db_path))
+    db.create_team("Survivor")
+    db.close()
+    folder = tmp_path / "bkp"
+
+    quick_copying = threading.Event()
+    failing_reserved = threading.Event()
+    fail_now = threading.Event()
+    main_thread = threading.current_thread()
+    real_backup_to = Database.backup_to
+
+    def controlled_backup_to(self, path):
+        if threading.current_thread() is main_thread:
+            quick_copying.set()
+            assert failing_reserved.wait(timeout=15)
+            return real_backup_to(self, path)
+        failing_reserved.set()
+        assert fail_now.wait(timeout=15)
+        raise sqlite3.OperationalError("simulated copy failure")
+
+    monkeypatch.setattr(Database, "backup_to", controlled_backup_to)
+    codes = {}
+
+    def failing_run():
+        assert quick_copying.wait(timeout=15)
+        codes["failing"] = main(["backup", "--db", str(db_path), "--dir", str(folder), "--keep", "1"])
+
+    thread = threading.Thread(target=failing_run)
+    thread.start()
+
+    assert main(["backup", "--db", str(db_path), "--dir", str(folder), "--keep", "1"]) == 0
+    fail_now.set()
+    thread.join(timeout=30)
+    assert not thread.is_alive()
+    assert codes == {"failing": 1}
+    assert "error:" in capsys.readouterr().err
+
+    files = sorted(folder.glob("runledger-*.db"))
+    assert len(files) == 1
+    assert _valid_backup(files[0]) == 1
+    assert list(folder.glob("*.tmp")) == []
+    assert list(folder.glob("*.lock")) == []
 

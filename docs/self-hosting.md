@@ -322,7 +322,9 @@ temporary file and atomic rename so the server keeps running, writes
 `runledger-<db-stem>-YYYYmmdd-HHMMSS[-N].db`, and keeps the newest 14 copies for that database stem.
 Each database keeps its own retention namespace: the stem is its file name with characters outside
 `A-Za-z0-9._-` percent-encoded, so `team a.db` and `team_a.db` do not prune each other. Concurrent
-backups in the same second reserve different names:
+backups in the same second reserve different names (`<name>.db.lock` markers), and retention never
+counts an unfinished copy: the marker, an empty placeholder or a `.tmp` file stays out of the count,
+so two overlapping `--keep 1` runs still leave at least one finished backup:
 
 ```bash
 runledger backup --db /var/lib/runledger/runledger.db --dir /var/backups/runledger --keep 14

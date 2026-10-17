@@ -36,7 +36,7 @@ import sys
 import webbrowser
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from . import __version__
 from . import adapters
@@ -495,6 +495,8 @@ def cmd_team_create(args) -> int:
 
 _LEGACY_BACKUP_RE = re.compile(r"^runledger-(\d{8}-\d{6})(?:-(\d+))?\.db$")
 _STEM_BACKUP_RE = re.compile(r"^runledger-(.+)-(\d{8}-\d{6})(?:-(\d+))?\.db$")
+_STEM_RESERVED_RE = re.compile(r"^runledger-(.+)-(\d{8}-\d{6})(?:-(\d+))?\.db\.lock$")
+_BACKUP_MARKER = ".lock"
 _BACKUP_STEM_SAFE = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-")
 
 
@@ -510,48 +512,72 @@ def _backup_stem(db_path: str) -> str:
     return "".join(encoded) or "runledger"
 
 
+def _backup_seq(name: str, stem: str, stamp: str) -> Optional[int]:
+    """The sequence number a backup or a reservation name carries for this database and second."""
+    m = _STEM_BACKUP_RE.match(name) or _STEM_RESERVED_RE.match(name)
+    if m and m.group(1) == stem and m.group(2) == stamp:
+        return int(m.group(3) or 0)
+    return None
+
+
 def _next_backup_seq(folder: Path, stem: str, stamp: str) -> int:
+    """Reservations count as taken here, so a run that is still copying keeps its name and a
+    sequence number freed by pruning is never reused."""
     max_seq = -1
-    for path in folder.glob(f"runledger-{stem}-{stamp}*.db"):
-        m = _STEM_BACKUP_RE.match(path.name)
-        if m and m.group(1) == stem and m.group(2) == stamp:
-            seq = int(m.group(3) or 0)
-            if seq > max_seq:
-                max_seq = seq
+    for path in folder.glob(f"runledger-{stem}-{stamp}*"):
+        seq = _backup_seq(path.name, stem, stamp)
+        if seq is not None and seq > max_seq:
+            max_seq = seq
     return max_seq + 1
 
 
-def _reserve_backup_target(folder: Path, stem: str, stamp: str) -> Path:
-    """Reserve the next backup name by creating the file exclusively. Concurrent backups in the
-    same second then take different names instead of writing over each other, and a sequence
-    number freed by pruning is never reused. The caller removes the empty placeholder when the
-    copy fails."""
+def _reserve_backup_target(folder: Path, stem: str, stamp: str) -> Tuple[Path, Path]:
+    """Reserve the next backup name and return `(target, reservation)`. The reservation is a
+    marker file beside the target, never the `.db` name itself: concurrent backups in the same
+    second take different names, and a copy that has not finished yet is invisible to retention
+    (which lists `.db` files only), so it cannot consume the retention allowance. The caller
+    removes its own marker."""
     seq = _next_backup_seq(folder, stem, stamp)
     while True:
         suffix = "" if seq == 0 else f"-{seq}"
         target = folder / f"runledger-{stem}-{stamp}{suffix}.db"
+        reservation = target.with_name(target.name + _BACKUP_MARKER)
         try:
-            handle = os.open(str(target), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            handle = os.open(str(reservation), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         except FileExistsError:
             seq += 1
             continue
         os.close(handle)
-        return target
+        return target, reservation
 
 
-def _discard_reserved_backup(target: Optional[Path]) -> None:
-    """Drop a reserved name that never became a backup, so a failed run leaves no empty file."""
-    if target is None:
+def _discard_reserved_backup(reservation: Optional[Path]) -> None:
+    """Drop this run's own name reservation, so a failed copy leaves no placeholder behind."""
+    if reservation is None:
         return
     try:
-        target.unlink()
+        reservation.unlink()
     except OSError:
         pass
 
 
+def _finished_backup(path: Path) -> bool:
+    """A finished backup holds data. A copy in progress is still under its `.tmp` name, and a
+    placeholder an interrupted older RunLedger reserved is empty, so both stay out of retention."""
+    try:
+        return path.stat().st_size > 0
+    except OSError:
+        return False
+
+
 def _prune_backups(folder: Path, stem: str, keep: int) -> List[Path]:
+    """Prune old copies of one database. Unfinished files are not backups: they neither count
+    against `keep` nor make a finished copy older than they are, and they are left in place for
+    the run that owns them to clean up."""
     parsed = []
     for path in folder.glob("runledger-*.db"):
+        if not _finished_backup(path):
+            continue
         m_leg = _LEGACY_BACKUP_RE.match(path.name)
         if m_leg:
             parsed.append((None, m_leg.group(1), int(m_leg.group(2) or 0), path))
@@ -576,6 +602,14 @@ def _prune_backups(folder: Path, stem: str, keep: int) -> List[Path]:
     return old
 
 
+def _backup_size(target: Path) -> Optional[int]:
+    """The size of the copy this run wrote, or None when a concurrent retention removed it first."""
+    try:
+        return target.stat().st_size
+    except OSError:
+        return None
+
+
 def cmd_backup(args) -> int:
     """Copy the team database to DIR/runledger-<stem>-YYYYmmdd-HHMMSS[-N].db and keep the newest --keep copies."""
     from .server.db import Database
@@ -588,22 +622,26 @@ def cmd_backup(args) -> int:
         print(f"error: no database at {args.db}", file=sys.stderr)
         return 1
     stem = _backup_stem(args.db)
-    target: Optional[Path] = None
+    reservation: Optional[Path] = None
+    size: Optional[int] = None
     try:
         folder.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        target = _reserve_backup_target(folder, stem, stamp)
+        target, reservation = _reserve_backup_target(folder, stem, stamp)
         db = Database(args.db)
         try:
             db.backup_to(str(target))
         finally:
             db.close()
+        size = _backup_size(target)
     except (OSError, sqlite3.Error) as exc:
-        _discard_reserved_backup(target)
+        _discard_reserved_backup(reservation)
         print(f"error: backup failed: {exc}", file=sys.stderr)
         return 1
+    _discard_reserved_backup(reservation)
     old = _prune_backups(folder, stem, args.keep)
-    print(f"Backup: {target}  ({target.stat().st_size} bytes; removed {len(old)} older)")
+    detail = f"{size} bytes" if size is not None else "size n/a (already pruned by another backup)"
+    print(f"Backup: {target}  ({detail}; removed {len(old)} older)")
     return 0
 
 
