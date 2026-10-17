@@ -50,11 +50,14 @@ default file in the current folder:
 
 - paths inside the repository become relative, and the folder is shown as the repository name
   plus the subfolder the run started in (`app/src`);
-- the home folder (`/home/<user>`, `/Users/<user>`, `C:\Users\<user>`) becomes `~`;
+- the home folder (`/home/<user>`, `/Users/<user>`, `C:\Users\<user>`, including user names with
+  spaces) becomes `~`;
 - other paths that share leading folders with the repository have that prefix shortened to `…`,
-  as do prefixes you list in `RUNLEDGER_SAFE_PREFIXES` (separated by `:`, or `;` on Windows);
-- temp paths such as `/tmp/...` stay as they are;
-- e-mail addresses become `[EMAIL]`, and `user:pass@` in URLs becomes `[REDACTED]@`.
+  as do prefixes you list in `RUNLEDGER_SAFE_PREFIXES` (separated by `:`, or `;` on Windows), and
+  unrelated non-system paths with more than two segments are trimmed to `…/<last two parts>`;
+- temp paths such as `/tmp/...` and standard system paths such as `/usr/bin/...` stay as they are;
+- e-mail addresses become `[EMAIL]` and `user:pass@` in URLs becomes `[REDACTED]@`, while
+  `git@host:org/repo` and `ssh://git@host/...` Git remotes are kept verbatim.
 
 HTML receipts and files written outside any repository keep full paths, which help debugging.
 `--safe` and `--no-safe` override the default. After writing a file, `receipt` prints the mode

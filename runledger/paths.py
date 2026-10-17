@@ -8,38 +8,74 @@ from typing import Optional
 
 _WIN_DRIVE_RE = re.compile(r"^[A-Za-z]:")
 _WIN_ABS_RE = re.compile(r"^[A-Za-z]:[\\/]")
+_LONG_DRIVE_RE = re.compile(r"^[\\/]{2}\?[\\/](?=[A-Za-z]:(?:[\\/]|$))")
+_LONG_UNC_RE = re.compile(r"^[\\/]{2}\?[\\/]UNC[\\/](?=[^\\/])", re.I)
+_UNC_RE = re.compile(r"^[\\/]{2}(?![?.][\\/])[^\\/]+[\\/][^\\/]")
+
+
+def strip_long_prefix(p: str) -> str:
+    """Normalise `\\\\?\\C:\\x` to `C:\\x` and `\\\\?\\UNC\\srv\\share\\x` to `\\\\srv\\share\\x`.
+    Real device paths (`\\\\.\\...`, `\\\\?\\GLOBALROOT...`) are returned unchanged."""
+    if not p:
+        return p
+    if _LONG_DRIVE_RE.match(p):
+        return p[4:]
+    if _LONG_UNC_RE.match(p):
+        return "\\\\" + p[8:]
+    return p
+
+
+def is_unc(p: Optional[str]) -> bool:
+    """True for UNC paths (`\\\\srv\\share...`, `//srv/share...`, `\\\\?\\UNC\\srv\\share...`),
+    excluding device prefixes (`\\\\.\\`, `\\\\?\\`)."""
+    if not p:
+        return False
+    q = strip_long_prefix(p)
+    return bool(_UNC_RE.match(q))
 
 
 def is_windows_style(*paths: Optional[str]) -> bool:
-    return any(bool(p) and bool(_WIN_DRIVE_RE.match(p)) for p in paths)
+    for p in paths:
+        if not p:
+            continue
+        q = strip_long_prefix(p)
+        if _WIN_DRIVE_RE.match(q) or _UNC_RE.match(q):
+            return True
+    return False
 
 
 def is_abs(p: str) -> bool:
-    return bool(_WIN_ABS_RE.match(p)) or p.startswith(("/", "\\"))
+    q = strip_long_prefix(p)
+    return bool(_WIN_ABS_RE.match(q)) or q.startswith(("/", "\\"))
 
 
 def _norm(p: str, win: bool) -> str:
     """'/' separators and no '.' or '..' segments; case is kept."""
+    q = strip_long_prefix(p)
     if win:
-        return ntpath.normpath(p.replace("/", "\\")).replace("\\", "/")
-    return posixpath.normpath(p)
+        return ntpath.normpath(q.replace("/", "\\")).replace("\\", "/")
+    return posixpath.normpath(q)
 
 
 def native(p: str) -> str:
     """A Windows-style absolute path with backslashes, as Windows tools print it; Git for
     Windows reports 'C:/x'. Other paths come back unchanged."""
-    return ntpath.normpath(p) if _WIN_ABS_RE.match(p) else p
+    q = strip_long_prefix(p)
+    return ntpath.normpath(q.replace("/", "\\")) if (_WIN_ABS_RE.match(q) or _UNC_RE.match(q)) else p
 
 
 def join(base: Optional[str], path: str) -> str:
     """`path` joined to `base` unless it is absolute, normalised in the style of the result:
     a Windows-style absolute result gets backslashes, any other gets '/' semantics."""
+    if base:
+        base = strip_long_prefix(base)
+    path = strip_long_prefix(path)
     if base and not is_abs(path):
-        sep = "\\" if _WIN_ABS_RE.match(base) or base.startswith("\\") else "/"
+        sep = "\\" if _WIN_ABS_RE.match(base) or base.startswith("\\") or _UNC_RE.match(base) else "/"
         # Plain concatenation: ntpath.join would treat a relative 'a:b' as a drive.
         path = base.rstrip("\\/") + sep + path
-    if _WIN_ABS_RE.match(path) or path.startswith("\\"):
-        return ntpath.normpath(path)
+    if _WIN_ABS_RE.match(path) or path.startswith("\\") or _UNC_RE.match(path):
+        return ntpath.normpath(path.replace("/", "\\"))
     return posixpath.normpath(path)
 
 

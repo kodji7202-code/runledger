@@ -902,3 +902,101 @@ def test_user_config_can_ignore_and_lower_severities(tmp_path, monkeypatch):
     assert outside and all(r.severity == "low" for r in outside)
     assert run.notes == []
 
+
+# ---------------------------------------------------------------- UNC, \\?\, symlinks/junctions (VAL-CORE-027..031)
+
+def test_unc_paths_in_risk_and_guard():
+    from runledger import guard
+
+    cwd = r"\\srv\share\proj"
+    for inside_path in (r"\\srv\share\proj\a.py", "//srv/share/proj/a.py", r"\\SRV\Share\Proj\b.py"):
+        risks = _risks("Write", cwd=cwd, file_path=inside_path, content="x")
+        assert "write_outside" not in {r.code for r in risks}
+        ev = {"session_id": "s1", "cwd": cwd, "hook_event_name": "PreToolUse",
+              "tool_name": "Write", "tool_input": {"file_path": inside_path, "content": "x"}}
+        assert guard.decide(ev, {})["decision"] == "allow"
+
+    for outside_path in (r"\\srv\share2\x.py", r"\\srv\share\other\x.py"):
+        risks = _risks("Write", cwd=cwd, file_path=outside_path, content="x")
+        assert any(r.code == "write_outside" and r.severity == "high" for r in risks)
+        ev = {"session_id": "s1", "cwd": cwd, "hook_event_name": "PreToolUse",
+              "tool_name": "Write", "tool_input": {"file_path": outside_path, "content": "x"}}
+        assert guard.decide(ev, {})["decision"] == "ask"
+
+
+def test_long_path_prefix_in_risk():
+    cwd = r"C:\proj"
+    assert any(r.code == "write_outside" for r in _risks("Write", cwd=cwd, file_path=r"\\?\C:\Windows\x.txt", content="x"))
+    assert not any(r.code == "write_outside" for r in _risks("Write", cwd=cwd, file_path=r"\\?\C:\proj\a.py", content="x"))
+    assert any(r.code == "write_outside" for r in _risks("Write", cwd=r"\\srv\share\proj", file_path=r"\\?\UNC\srv\share\x", content="x"))
+    assert any(r.code == "write_outside" for r in _risks("Write", cwd=cwd, file_path=r"C:\proj\..\Windows\x", content="x"))
+    assert not any(r.code == "write_outside" for r in _risks("Write", cwd=cwd, file_path=r"\\.\PhysicalDrive0", content="x"))
+    assert not any(r.code == "write_outside" for r in _risks("Write", cwd=cwd, file_path=r"\\?\GLOBALROOT\Device\HarddiskVolume1", content="x"))
+
+
+def test_symlink_and_junction_escapes_are_flagged(tmp_path):
+    import subprocess
+    from runledger import guard
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    sub = proj / "sub"
+    sub.mkdir()
+    outside_dir = Path(r"C:\Windows\Temp") if os.name == "nt" and Path(r"C:\Windows\Temp").exists() else (tmp_path / "outside")
+    if not outside_dir.exists():
+        outside_dir.mkdir()
+
+    escape_link = proj / "link"
+    in_link = proj / "inlink"
+    if os.name == "nt":
+        subprocess.run(["cmd", "/c", "mklink", "/J", str(escape_link), str(outside_dir)], check=True, capture_output=True)
+        subprocess.run(["cmd", "/c", "mklink", "/J", str(in_link), str(sub)], check=True, capture_output=True)
+    else:
+        os.symlink(str(outside_dir), str(escape_link))
+        os.symlink(str(sub), str(in_link))
+
+    try:
+        evil_file = str(escape_link / "evil.txt")
+        risks = _risks("Write", cwd=str(proj), file_path=evil_file, content="x")
+        assert any(r.code == "write_outside" and r.severity == "high" for r in risks)
+
+        ev = {"session_id": "s1", "cwd": str(proj), "hook_event_name": "PreToolUse",
+              "tool_name": "Write", "tool_input": {"file_path": evil_file, "content": "x"}}
+        assert guard.decide(ev, {})["decision"] == "ask"
+
+        bash_risks = _risks("Bash", cwd=str(proj), command="echo hi > link/evil.txt")
+        assert any(r.code in ("shell_outside", "write_outside") for r in bash_risks)
+
+        ok_file = str(in_link / "ok.txt")
+        ok_risks = _risks("Write", cwd=str(proj), file_path=ok_file, content="x")
+        assert not any(r.code in ("write_outside", "shell_outside") for r in ok_risks)
+    finally:
+        if os.name == "nt":
+            subprocess.run(["cmd", "/c", "rmdir", str(escape_link)], check=False, capture_output=True)
+            subprocess.run(["cmd", "/c", "rmdir", str(in_link)], check=False, capture_output=True)
+
+
+def test_foreign_host_paths_use_lexical_comparison():
+    cwd = "/home/dev/proj"
+    assert not any(r.code == "write_outside" for r in _risks("Write", cwd=cwd, file_path="/home/dev/proj/src/a.py", content="x"))
+    assert any(r.code == "write_outside" for r in _risks("Write", cwd=cwd, file_path="/etc/passwd", content="x"))
+
+
+def test_unreachable_unc_share_never_hangs_realpath():
+    import time
+    from runledger import guard
+
+    cwd = r"\\192.0.2.1\share\proj"
+    t0 = time.monotonic()
+    in_risks = assess_step(_step("Write", file_path=r"\\192.0.2.1\share\proj\a.py", content="x"), cwd=cwd)
+    out_risks = assess_step(_step("Write", file_path=r"\\192.0.2.1\share\other\a.py", content="x"), cwd=cwd)
+    dec = guard.decide({"session_id": "s1", "cwd": cwd, "hook_event_name": "PreToolUse",
+                        "tool_name": "Write", "tool_input": {"file_path": r"\\192.0.2.1\share\other\a.py", "content": "x"}})
+    elapsed = time.monotonic() - t0
+    assert elapsed < 1.0
+    assert not any(r.code == "write_outside" for r in in_risks)
+    assert any(r.code == "write_outside" for r in out_risks)
+    assert dec["decision"] == "ask"
+    assert "write_outside" in dec["codes"]
+
+

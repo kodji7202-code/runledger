@@ -9,6 +9,7 @@ from typing import Any, Dict, Iterator, List, Optional
 
 from .guard import LOG_DIR, LOG_FILE, _summary, redact
 from .parser import Run, Step
+from .paths import is_unc
 
 
 # Guard writes short records. Bound memory even for a corrupt, enormous single line.
@@ -74,7 +75,7 @@ def load_guard_decisions(run: Run) -> List[Dict[str, Any]]:
     Only legacy records use the fallback. A present but unknown id remains unmatched.
     Repeated legacy calls consume steps in transcript order, including blocked calls.
     """
-    if not run.cwd:
+    if not run.cwd or is_unc(run.cwd):
         return []
     by_id = {s.tool_use_id: s for s in run.steps if s.tool_use_id}
     by_summary = defaultdict(deque)

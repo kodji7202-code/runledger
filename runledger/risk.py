@@ -301,6 +301,7 @@ def _in_temp(target: str, self_only: bool = False) -> bool:
 
 def _is_device(p: str) -> bool:
     """Device and special files (/dev/null, NUL, /proc/self/...) are never paths in a project."""
+    p = paths.strip_long_prefix(p)
     q = _slashes(p).lower()
     return q.startswith(_DEVICE_PREFIXES) or _basename(p).lower() in _DEVICE_NAMES
 
@@ -315,13 +316,65 @@ def _msys_to_windows(p: str, win: bool) -> str:
     return m.group(1).upper() + ":" + (p[m.end():] or "/")
 
 
+def _resolve_real(p: str) -> str:
+    """Resolve symlinks and junctions on the local filesystem, including broken links."""
+    real = paths.strip_long_prefix(os.path.realpath(p))
+    if os.name == "nt":
+        probe = ntpath.normpath(p)
+        tail: List[str] = []
+        while probe and not os.path.exists(probe):
+            if os.path.islink(probe):
+                try:
+                    dest = paths.strip_long_prefix(os.readlink(probe))
+                    if not _is_abs(dest):
+                        dest = ntpath.join(ntpath.dirname(probe), dest)
+                    resolved = paths.strip_long_prefix(os.path.realpath(dest))
+                    for part in reversed(tail):
+                        resolved = ntpath.join(resolved, part)
+                    return ntpath.normpath(resolved)
+                except OSError:
+                    break
+            parent, name = ntpath.split(probe)
+            if not name or parent == probe:
+                break
+            tail.append(name)
+            probe = parent
+    return real
+
+
+def _escapes_via_realpath(target: str, cwd: str) -> bool:
+    """True when `target` is lexically inside `cwd`, both exist locally (not UNC, matching
+    host OS style), and resolving symlinks/junctions places `target` outside `cwd`."""
+    if paths.is_unc(target) or paths.is_unc(cwd):
+        return False
+    host_win = os.name == "nt"
+    if _is_windows_style(cwd) != host_win or _is_windows_style(target) != host_win:
+        return False
+    rel = paths.relative(target, cwd)
+    if not rel or rel == ".":
+        return False
+    first = rel.split("/", 1)[0]
+    try:
+        if not os.path.lexists(os.path.join(cwd, first)):
+            return False
+        real_cwd = _resolve_real(cwd)
+        real_target = _resolve_real(target)
+    except OSError:
+        return False
+    return not _within(real_target, real_cwd)
+
+
 def _outside(path: str, cwd: Optional[str], base: Optional[str] = None, self_temp_only: bool = False) -> bool:
     """True if `path` resolves outside `cwd`. Temp directories count as inside.
     A relative path is resolved against `base` (a working directory) when given,
-    otherwise against `cwd`. Windows-style paths (drive letter on either side) compare
-    case-insensitively with either separator; POSIX paths compare exactly."""
+    otherwise against `cwd`. Windows-style paths (drive letter or UNC on either side)
+    compare case-insensitively with either separator; POSIX paths compare exactly."""
     if not cwd or not path or _is_device(path) or not _is_abs(cwd):
         return False  # a relative working folder (some logs record ".") cannot place a path
+    path = paths.strip_long_prefix(path)
+    cwd = paths.strip_long_prefix(cwd)
+    if base:
+        base = paths.strip_long_prefix(base)
     win = _is_windows_style(cwd)
     path = _msys_to_windows(path, win)
     if base:
@@ -329,9 +382,9 @@ def _outside(path: str, cwd: Optional[str], base: Optional[str] = None, self_tem
     mod = ntpath if _is_windows_style(path, cwd, base) else posixpath
     # _is_abs, not mod.isabs: ntpath.isabs("/tmp") is False on Python 3.13+
     target = path if _is_abs(path) else mod.join(base or cwd, path)
-    if _in_temp(target, self_only=self_temp_only):
-        return False
-    return not _within(target, cwd)
+    if not _within(target, cwd):
+        return not _in_temp(target, self_only=self_temp_only)
+    return _escapes_via_realpath(target, cwd)
 
 
 def _resolved(path: str, base: Optional[str]) -> str:
@@ -937,7 +990,7 @@ def _is_project_override_raising(kind: str, level: str) -> bool:
 
 def _project_ignored_or_lowered_kinds(cwd: Optional[str]) -> List[str]:
     """Distinct risk kinds a project `.runledger.json` tried to ignore or lower."""
-    if not cwd:
+    if not cwd or paths.is_unc(cwd):
         return []
     data = _read_json_dict(Path(cwd) / POLICY_FILE)
     if not data:
@@ -972,7 +1025,7 @@ def load_policy(cwd: Optional[str]) -> Dict[str, Any]:
     """
     policy: Dict[str, Any] = {"ignore": [], "severity_overrides": {}, "extra_secret_paths": []}
     user_data = _read_json_dict(_user_config_path())
-    proj_data = _read_json_dict(Path(cwd) / POLICY_FILE) if cwd else {}
+    proj_data = _read_json_dict(Path(cwd) / POLICY_FILE) if (cwd and not paths.is_unc(cwd)) else {}
 
     ignore = user_data.get("ignore")
     if isinstance(ignore, list):
