@@ -56,6 +56,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from . import paths, secrets
 from .parser import Run, Step
+from .ps_writes import ps_writes, shell_kind
+from .shell_syntax import strip_heredocs as _posix_strip_heredocs
 from .shell_writes import database_writes, shell_writes
 from .testdiff import SKIP_RE, TestChange, analyze as analyze_test_diffs
 
@@ -281,12 +283,12 @@ _key = paths.key
 _within = paths.within
 
 
-def _in_temp(target: str) -> bool:
+def _in_temp(target: str, self_only: bool = False) -> bool:
     for env_var in ("HOME", "USERPROFILE"):
         h = os.environ.get(env_var)
         if h and _within(target, h) and not _APPDATA_TEMP_RE.search(target[len(h):]):
             return False
-    if _APPDATA_TEMP_RE.search(target):
+    if not self_only and _APPDATA_TEMP_RE.search(target):
         return True
     roots = list(_POSIX_TEMP_ROOTS)
     try:
@@ -313,7 +315,7 @@ def _msys_to_windows(p: str, win: bool) -> str:
     return m.group(1).upper() + ":" + (p[m.end():] or "/")
 
 
-def _outside(path: str, cwd: Optional[str], base: Optional[str] = None) -> bool:
+def _outside(path: str, cwd: Optional[str], base: Optional[str] = None, self_temp_only: bool = False) -> bool:
     """True if `path` resolves outside `cwd`. Temp directories count as inside.
     A relative path is resolved against `base` (a working directory) when given,
     otherwise against `cwd`. Windows-style paths (drive letter on either side) compare
@@ -327,7 +329,7 @@ def _outside(path: str, cwd: Optional[str], base: Optional[str] = None) -> bool:
     mod = ntpath if _is_windows_style(path, cwd, base) else posixpath
     # _is_abs, not mod.isabs: ntpath.isabs("/tmp") is False on Python 3.13+
     target = path if _is_abs(path) else mod.join(base or cwd, path)
-    if _in_temp(target):
+    if _in_temp(target, self_only=self_temp_only):
         return False
     return not _within(target, cwd)
 
@@ -422,6 +424,9 @@ def _is_switch(t: str) -> bool:
 
 def _strip_heredocs(cmd: str, ps: bool) -> str:
     """The command without heredoc or here-string bodies (the operator line is kept)."""
+    if not ps:
+        stripped, _ = _posix_strip_heredocs(cmd)
+        return stripped
     out: List[str] = []
     queue: List[Tuple[str, bool]] = []  # (terminator line, strip leading tabs)
     for line in cmd.split("\n"):
@@ -434,14 +439,9 @@ def _strip_heredocs(cmd: str, ps: bool) -> str:
                 queue.pop(0)
             continue
         out.append(line)
-        if ps:
-            m = _PS_HERE_START_RE.search(line)
-            if m:
-                queue.append((m.group(1) + "@", False))
-        else:
-            for m in _HEREDOC_RE.finditer(line):
-                if line[:m.start()].count("'") % 2 == 0:
-                    queue.append((m.group(3), m.group(1) == "-"))
+        m = _PS_HERE_START_RE.search(line)
+        if m:
+            queue.append((m.group(1) + "@", False))
     return "\n".join(out)
 
 
@@ -801,7 +801,7 @@ def _code_view(text: str, comments: List[Tuple[int, int]], text_words: List[_Wor
 
 def _shell_risks(step: Step, cwd: Optional[str], extra: List["re.Pattern"], risks: List[Risk]) -> None:
     cmd = str(step.input.get("command") or "")
-    ps = step.tool == "PowerShell"
+    ps = shell_kind(step) == "powershell"
 
     wd = step.input.get("workdir")
     workdir = wd.strip() if isinstance(wd, str) and _is_abs(wd.strip()) else None
@@ -826,6 +826,12 @@ def _shell_risks(step: Step, cwd: Optional[str], extra: List["re.Pattern"], risk
 
     assigns: Dict[str, Optional[str]] = {}
     for words, name in zip(cmds, names):
+        if ps and any(
+            not w.quoted and (w.value.lower() == "-whatif" or w.value.lower().startswith("-whatif:"))
+            and not w.value.lower().endswith("$false")
+            for w in words
+        ):
+            continue
         for w in words:
             if w.role == "assign":
                 var, _, val = w.value.partition("=")
@@ -849,28 +855,31 @@ def _migration_risk(path: str, verb: str, cwd: Optional[str], index: int, risks:
 
 
 def _shell_write_risks(step: Step, cwd: Optional[str], extra: List["re.Pattern"], risks: List[Risk]) -> None:
-    """The files a Bash command writes (shell_writes) get the checks edit-tool writes get,
-    and commands that change a database file or run migrations are reported."""
+    """The files a shell command writes (shell_writes / ps_writes) get the checks edit-tool
+    writes get, and commands that change a database file or run migrations are reported."""
     cmd = str(step.input.get("command") or "")
     wd = step.input.get("workdir")
     base = wd.strip() if isinstance(wd, str) and _is_abs(wd.strip()) else cwd
     flagged_outside = {_key(r.reason.rsplit("(", 1)[-1].rstrip(")"), False)
                        for r in risks if r.code == "shell_outside" and r.step == step.index}
-    writes = shell_writes(cmd)
+    is_ps = shell_kind(step) == "powershell"
+    writes = ps_writes(cmd) if is_ps else shell_writes(cmd)
     moved_away = {w.path for w in writes if w.deleted}
     for w in writes:
         target = _resolved(w.path, base)
         verb = "Deleted" if w.deleted else "Wrote"
+        if w.deleted:
+            _test_deleted(w.path, step.index, risks)
         if _is_secret(w.path, extra):
             risks.append(Risk("high", "secret_file", f"Touched a secrets file from the shell ({_basename(w.path)})", step.index))
         if _GIT_DIR_RE.search(_slashes(target)):
             risks.append(Risk("medium", "git_internals", f"{verb} inside the .git folder ({_basename(target)})", step.index))
         if not w.deleted:
             _migration_risk(target, "Wrote", cwd, step.index, risks)
-        if _outside(target, cwd):
+        if not w.deleted and _outside(target, cwd, self_temp_only=True):
             if _key(target, False) not in flagged_outside:
                 risks.append(Risk("low", "shell_outside", f"Shell command wrote outside the working folder ({target})", step.index))
-        elif w.source and cwd and _is_abs(target) and _in_temp(target):
+        elif w.source and cwd and _is_abs(target) and _in_temp(target, self_only=True):
             source = _resolved(w.source, base)
             if not _outside(source, cwd) and not _in_temp(source):
                 how = "Moved" if w.source in moved_away else "Copied"
@@ -1101,7 +1110,6 @@ def assess_step(step: Step, cwd: Optional[str], policy: Optional[Dict[str, Any]]
 
     if tool in SHELL_TOOLS:
         _shell_risks(step, cwd, extra, risks)
-    if tool == "Bash":
         _shell_write_risks(step, cwd, extra, risks)
 
     if tool.startswith("mcp__"):
@@ -1144,8 +1152,10 @@ def _written_paths(step: Step, cwd: Optional[str]) -> List[str]:
     """Paths a step wrote, relative to cwd when inside it (the keys of Run.test_diffs)."""
     if step.tool in WRITE_TOOLS:
         paths = _paths_in_step(step)[:1]
-    elif step.tool == "Bash":
-        paths = [w.path for w in shell_writes(str(step.input.get("command") or "")) if not w.deleted]
+    elif step.tool in SHELL_TOOLS:
+        cmd = str(step.input.get("command") or "")
+        writes = ps_writes(cmd) if shell_kind(step) == "powershell" else shell_writes(cmd)
+        paths = [w.path for w in writes if not w.deleted]
     else:
         return []
     out = []

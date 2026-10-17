@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional
 from . import llm
 from .parser import Run, Step, Usage
 from .paths import is_abs, relative
+from .ps_writes import ps_deletes, ps_writes, shell_kind
 from .shell_writes import shell_deletes, shell_writes
 
 DEFAULT_AI_MODEL = os.environ.get("RUNLEDGER_SUMMARY_MODEL", "claude-haiku-5-5")
@@ -101,15 +102,18 @@ def file_changes(run: Run) -> Dict[str, FileChange]:
             changes.setdefault(p, FileChange(p)).deleted = True
         elif s.tool == "NotebookEdit" and p:
             changes.setdefault(p, FileChange(p)).added += _lines(s.input.get("new_source"))
-        elif s.tool == "Bash":
+        elif s.tool in ("Bash", "PowerShell"):
             cmd = _str(s.input.get("command"))
-            for target in shell_deletes(cmd):
+            is_ps = shell_kind(s) == "powershell"
+            deletes = ps_deletes(cmd) if is_ps else shell_deletes(cmd)
+            writes = ps_writes(cmd) if is_ps else shell_writes(cmd)
+            for target in deletes:
                 p = _short(target, run.cwd)
                 if run.cwd and is_abs(p):
                     continue  # outside the project, such as a scratch file in /tmp
                 fc = changes.setdefault(p, FileChange(p))
                 fc.deleted = fc.shell = True
-            for w in shell_writes(cmd):
+            for w in writes:
                 p = _short(w.path, run.cwd)
                 if run.cwd and is_abs(p):
                     continue  # outside the project, such as a backup in /tmp
@@ -144,7 +148,7 @@ def template_summary(step: Step, cwd: Optional[str]) -> str:
         a = sum(_lines(e.get("new_string")) for e in edits)
         r = sum(_lines(e.get("old_string")) for e in edits)
         return f"Edited {p} (+{a} −{r})"
-    if t == "Bash":
+    if t in ("Bash", "PowerShell"):
         desc = _str(i.get("description"))
         lines = _str(i.get("command")).strip().splitlines() or [""]
         # Redact before cutting, so the 120-character limit cannot keep half of a secret.
