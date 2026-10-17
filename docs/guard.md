@@ -49,7 +49,10 @@ command and timeout are updated in place and no second entry is added. If nothin
 written. If the file is not valid JSON or is not an object, `install` stops with an error and
 changes nothing. A hook that only mentions the words (for example `echo runledger guard` or
 `other-check.sh && runledger guard`) is treated as your own hook and left alone; only the complete
-commands `runledger guard` and `"<python>" -m runledger guard` count as RunLedger's.
+commands `runledger guard` and `"<python>" -m runledger guard` count as RunLedger's. Every Python
+interpreter name `install` can write counts, versioned and free-threaded ones included
+(`python3.13t.exe`), so an entry written by this installer is always recognised by a later
+`install`, `uninstall` or self-test.
 
 `uninstall` removes every complete `runledger guard` hook and both lifecycle checkpoint hooks (both interpreter-form
 and bare `--portable` entries) from the

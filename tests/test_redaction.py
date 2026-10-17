@@ -341,3 +341,42 @@ def test_short_generic_assignment_redaction_restored(raw, expected):
     assert llm.redact(raw) == expected
 
 
+@pytest.mark.parametrize("raw,expected", [
+    ("TOKEN2=abc123 npm publish", "TOKEN2=[REDACTED] npm publish"),
+    ("MYTOKEN=abc123 npm publish", "MYTOKEN=[REDACTED] npm publish"),
+    ("export MY_ACCESS_TOKEN2=abc123", "export MY_ACCESS_TOKEN2=[REDACTED]"),
+    ("my-token=hunter2 ./deploy.sh", "my-token=[REDACTED] ./deploy.sh"),
+    ("PASSWORD2=hunter22", "PASSWORD2=[REDACTED]"),
+    ("CLIENT_SECRET_ID=abc123", "CLIENT_SECRET_ID=[REDACTED]"),
+    ('MYTOKEN="abc12345"', 'MYTOKEN="[REDACTED]"'),
+    ("MY_API_KEY: 'abc12345'", "MY_API_KEY: '[REDACTED]'"),
+])
+def test_assignment_name_containing_a_secret_keyword_is_redacted(raw, expected):
+    """CORE-SCR-R2-001: the containing-name coverage v0.6.0 had (`TOKEN2=`, `MYTOKEN=`)
+    must survive in the shared redactor, the guard and the LLM text."""
+    from runledger import llm, secrets
+
+    assert secrets.redact_text(raw) == expected
+    assert guard.redact(raw) == expected
+    assert llm.redact(raw) == expected
+
+
+def test_guard_standalone_fallback_keeps_the_containing_name_coverage():
+    import subprocess
+    import sys
+
+    code = (
+        "import importlib, sys; "
+        "import runledger.guard as guard; "
+        "sys.modules['runledger.secrets'] = None; "
+        "importlib.reload(guard); "
+        "samples = {'TOKEN2=abc123 npm publish': 'TOKEN2=[REDACTED] npm publish', "
+        "'MYTOKEN=abc123 npm publish': 'MYTOKEN=[REDACTED] npm publish', "
+        "'MYTOKEN=\"abc12345\"': 'MYTOKEN=\"[REDACTED]\"'}; "
+        "out = {s: guard.redact(s) for s in samples}; "
+        "assert out == samples, out"
+    )
+    res = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=30)
+    assert res.returncode == 0, res.stderr
+
+

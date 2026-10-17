@@ -126,13 +126,18 @@ _GENERIC_UNQUOTED_RE = re.compile(
     r"(\s*=\s*)([^\s\"';,&|<>(){}\[\]]{12,})",
     re.IGNORECASE,
 )
+# Redaction covers a name that merely contains the keyword (`MYTOKEN=`, `TOKEN2=`,
+# `MY_ACCESS_TOKEN2=`), as v0.6.0 did. The prefix and suffix are bounded so a long blob
+# without a keyword cannot cause backtracking; detection (the _GENERIC_* patterns) stays
+# word-anchored and keeps its longer value threshold.
+_REDACT_NAME = r"[A-Za-z0-9_.-]{0,40}" + _SECRET_KEYWORD + r"[A-Za-z0-9_.-]{0,40}"
 _REDACT_QUOTED_RE = re.compile(
-    r"(?<![A-Za-z0-9])(" + _SECRET_KEYWORD + r"(?:[_-][A-Za-z0-9]{1,16})?)"
+    r"(?<![A-Za-z0-9])(" + _REDACT_NAME + r")"
     r"([\"']?\s*[:=]\s*[\"'])([^\"'\s]{8,})([\"'])",
     re.IGNORECASE,
 )
 _REDACT_UNQUOTED_RE = re.compile(
-    r"(?<![A-Za-z0-9])(" + _SECRET_KEYWORD + r"(?:[_-][A-Za-z0-9]{1,16})?)"
+    r"(?<![A-Za-z0-9])(" + _REDACT_NAME + r")"
     r"(\s*=\s*)([^\s\"';,&|<>(){}\[\]]{6,})",
     re.IGNORECASE,
 )

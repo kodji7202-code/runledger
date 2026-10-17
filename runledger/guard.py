@@ -65,7 +65,6 @@ except Exception:  # pragma: no cover - standalone fallback when runledger.secre
 
 HOOK_COMMAND = "runledger guard"
 HOOK_MARGIN_S = 15             # the hook entry allows the approval wait plus this many seconds
-_PYTHON_RE = re.compile(r"python(?:w|[0-9]+(?:\.[0-9]+)*)?(?:\.exe)?\Z", re.I)
 PROJECT_DIR_ENV_VARS = ("CLAUDE_PROJECT_DIR", "FACTORY_PROJECT_DIR", "DROID_PROJECT_DIR")
 
 LOG_DIR = ".runledger"
@@ -996,9 +995,11 @@ def _owned_command_parts(command: Any) -> Optional[List[str]]:
     """The words of a complete RunLedger guard hook command, else None.
 
     Only the two forms the installer writes count: bare `runledger guard` (optionally with a
-    path or `.exe`) and `"<python>" -m runledger guard`. A foreign hook that merely mentions
-    the words (`echo runledger guard`, `other.sh && runledger guard`, a pipeline) is not ours
-    and must never be replaced or removed."""
+    path or `.exe`) and `"<interpreter>" -m runledger guard`, for every interpreter name the
+    installer can write (`python3.13t.exe` included, since it stores `sys.executable`). A
+    foreign hook that merely mentions the words (`echo runledger guard`,
+    `other.sh && runledger guard`, a pipeline) is not ours and must never be replaced or
+    removed."""
     if not isinstance(command, str):
         return None
     try:
@@ -1012,7 +1013,8 @@ def _owned_command_parts(command: Any) -> Optional[List[str]]:
     executable = parts[0].replace("\\", "/").rsplit("/", 1)[-1]
     if len(parts) == 2 and parts[1] == "guard" and executable.casefold() in ("runledger", "runledger.exe"):
         return parts
-    if len(parts) == 4 and parts[1:3] == ["-m", "runledger"] and parts[3] == "guard" and _PYTHON_RE.fullmatch(executable):
+    if len(parts) == 4 and parts[1:3] == ["-m", "runledger"] and parts[3] == "guard" \
+            and _paths.is_python_executable(executable):
         return parts
     return None
 
