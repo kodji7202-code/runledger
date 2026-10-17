@@ -54,7 +54,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from . import paths, secrets
+from . import paths
+try:
+    from . import secrets
+except Exception:  # pragma: no cover - fallback when runledger.secrets is unavailable
+    secrets = None  # type: ignore[assignment]
 from .parser import Run, Step
 from .ps_writes import ps_writes, shell_kind
 from .shell_syntax import strip_heredocs as _posix_strip_heredocs
@@ -75,9 +79,29 @@ class Risk:
     step: int
 
 
-SECRET_PATTERNS = [rx.pattern for rx in secrets.SECRET_PATH_PATTERNS]
+_FALLBACK_SECRET_PATTERNS = [
+    r"(^|/)\.env(\.[\w-]+)?$", r"(^|/)\.envrc$", r"id_(rsa|ed25519|ecdsa|dsa)(_[\w-]+)?$",
+    r"\.(pem|key|p8|p12|pfx|jks|keystore|kdbx|keychain)$", r"\.tfstate(\.backup)?$", r"\.tfvars$",
+    r"(^|/)\.(npmrc|pypirc|netrc|pgpass|htpasswd|vault-token|dockercfg|git-credentials)$",
+    r"(^|/)\.git/config$", r"(^|/)\.aws/(credentials|config)$", r"(^|/)\.ssh/",
+    r"(^|/)(credentials(\.json)?|client_secret[^/]*\.json|service[-_]account[^/]*\.json|"
+    r"secrets?\.(ya?ml|json|toml)|master\.key)$",
+    r"(^|/)\.docker/config\.json$", r"(^|/)\.kube/config$",
+]
+_FALLBACK_PUBLIC_PATH_RE = re.compile(
+    r"(?:\.pub$|(?:^|/)\.env\.(?:example|sample|template|dist|schema|defaults|test|ci)$"
+    r"|\.tfvars\.(?:example|sample|template)$)",
+    re.I,
+)
+SECRET_PATTERNS = (
+    [rx.pattern for rx in secrets.SECRET_PATH_PATTERNS]
+    if secrets is not None else list(_FALLBACK_SECRET_PATTERNS)
+)
 _SECRET_RE = re.compile("|".join(SECRET_PATTERNS), re.I)
-_ENV_EXAMPLE_RE = secrets._PUBLIC_OR_TEMPLATE_PATH_RE
+_ENV_EXAMPLE_RE = (
+    secrets._PUBLIC_OR_TEMPLATE_PATH_RE
+    if secrets is not None else _FALLBACK_PUBLIC_PATH_RE
+)
 
 TEST_RE = re.compile(r"(^|/)(tests?|__tests__|spec|specs)(/|$)|(\.|_|-)(test|spec)\.[a-z]+$|(^|/)test_[^/]+\.py$", re.I)
 # Real test source: deleting it is high. Anything else under a test folder is data (see _is_test_fixture).
@@ -405,12 +429,23 @@ def _resolved(path: str, base: Optional[str]) -> str:
 
 
 def _is_secret(path: str, extra: Optional[List["re.Pattern"]] = None) -> bool:
-    return secrets.is_secret_path(path, extra)
+    if secrets is not None:
+        return secrets.is_secret_path(path, extra)
+    if not isinstance(path, str) or not path:
+        return False
+    norm = path.replace("\\", "/")
+    if _ENV_EXAMPLE_RE.search(norm):
+        return False
+    if _SECRET_RE.search(norm):
+        return True
+    return bool(extra and any(rx.search(norm[:1024]) for rx in extra))
 
 
 def _user_regexes(patterns: Any) -> List["re.Pattern"]:
-    compiled, _ = secrets.compile_extra_secret_paths(patterns)
-    return compiled
+    if secrets is not None:
+        compiled, _ = secrets.compile_extra_secret_paths(patterns)
+        return compiled
+    return []
 
 
 def _written_texts(step: Step) -> List[str]:
@@ -425,7 +460,14 @@ def _written_texts(step: Step) -> List[str]:
 
 def _hardcoded_secret_kinds(text: str) -> List[str]:
     """Kinds of hardcoded secret found in `text`. Returns kind names only."""
-    return secrets.find_secrets(text)
+    if secrets is not None:
+        return secrets.find_secrets(text)
+    if not isinstance(text, str) or not text:
+        return []
+    kinds = [kind for rx, kind in _CONTENT_SECRET_RULES if rx.search(text)]
+    for m in _GENERIC_SECRET_RE.finditer(text):
+        kinds.append(m.group(1).lower().replace("_", " ").replace("-", " "))
+    return list(dict.fromkeys(kinds))
 
 
 def _looks_like_path_arg(t: str) -> bool:
@@ -1059,22 +1101,25 @@ def load_policy(cwd: Optional[str]) -> Dict[str, Any]:
                 merged_overrides[code.strip()] = level.lower()
     policy["severity_overrides"] = merged_overrides
 
+    max_extra = getattr(secrets, "MAX_EXTRA_SECRET_PATHS", 20)
     raw_extra: List[str] = []
     for src in (user_data.get("extra_secret_paths"), proj_data.get("extra_secret_paths")):
         if isinstance(src, list):
             for rx in src:
                 if isinstance(rx, str) and rx and _compiles(rx) and rx not in raw_extra:
                     raw_extra.append(rx)
-                    if len(raw_extra) >= secrets.MAX_EXTRA_SECRET_PATHS:
+                    if len(raw_extra) >= max_extra:
                         break
-        if len(raw_extra) >= secrets.MAX_EXTRA_SECRET_PATHS:
+        if len(raw_extra) >= max_extra:
             break
     policy["extra_secret_paths"] = raw_extra
     return policy
 
 
 def _compiles(rx: str) -> bool:
-    return secrets.safe_user_regex(rx) is not None
+    if secrets is not None:
+        return secrets.safe_user_regex(rx) is not None
+    return False
 
 
 def _risk_matches_key(r: Risk, key: str, allow_substring: bool = False) -> bool:

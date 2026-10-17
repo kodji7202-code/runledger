@@ -84,6 +84,7 @@ _TOKEN_RULES: Tuple[Tuple[Pattern[str], str], ...] = (
     (re.compile(r"(?<![A-Za-z0-9])pypi-[A-Za-z0-9_-]{32,}"), "PyPI token"),
     (re.compile(r"(?<![A-Za-z0-9])hf_[A-Za-z0-9]{30,}"), "HuggingFace token"),
     (re.compile(r"(?<![A-Za-z0-9])rl_[A-Za-z0-9_-]{30,}"), "RunLedger API key"),
+    (re.compile(r"(?i)(?<![A-Za-z0-9])AccountKey\s*=\s*[A-Za-z0-9+/=]{40,}"), "Azure storage key"),
     (re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"), "JWT token"),
     (re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"), "private key"),
 )
@@ -112,7 +113,7 @@ _FLAG_SECRET_RE = re.compile(
 )
 _SECRET_KEYWORD = (
     r"(?:api[_-]?key|apikey|access[_-]?token|auth[_-]?token|client[_-]?secret|"
-    r"private[_-]?key|secret[_-]?key|secret[_-]?token|access[_-]?key|"
+    r"secret[_-]?access[_-]?key|private[_-]?key|secret[_-]?key|secret[_-]?token|access[_-]?key|"
     r"db[_-]?password|passw(?:or)?d|pwd|secret|token|credentials?)"
 )
 _GENERIC_QUOTED_RE = re.compile(
@@ -123,6 +124,16 @@ _GENERIC_QUOTED_RE = re.compile(
 _GENERIC_UNQUOTED_RE = re.compile(
     r"(?<![A-Za-z0-9])(" + _SECRET_KEYWORD + r"(?:[_-][A-Za-z0-9]{1,16})?)"
     r"(\s*=\s*)([^\s\"';,&|<>(){}\[\]]{12,})",
+    re.IGNORECASE,
+)
+_REDACT_QUOTED_RE = re.compile(
+    r"(?<![A-Za-z0-9])(" + _SECRET_KEYWORD + r"(?:[_-][A-Za-z0-9]{1,16})?)"
+    r"([\"']?\s*[:=]\s*[\"'])([^\"'\s]{8,})([\"'])",
+    re.IGNORECASE,
+)
+_REDACT_UNQUOTED_RE = re.compile(
+    r"(?<![A-Za-z0-9])(" + _SECRET_KEYWORD + r"(?:[_-][A-Za-z0-9]{1,16})?)"
+    r"(\s*=\s*)([^\s\"';,&|<>(){}\[\]]{6,})",
     re.IGNORECASE,
 )
 
@@ -186,6 +197,18 @@ def _mask_if_secret(value: str) -> str:
     return value if _is_benign_value(value) else "[REDACTED]"
 
 
+def _looks_like_unquoted_secret(value: str) -> bool:
+    """An unquoted value worth masking: not benign, and either contains a digit
+    or is at least 12 characters long (so `token=refresh` stays readable)."""
+    if _is_benign_value(value):
+        return False
+    return any(c.isdigit() for c in value) or len(value) >= 12
+
+
+def _mask_unquoted_if_secret(value: str) -> str:
+    return "[REDACTED]" if _looks_like_unquoted_secret(value) else value
+
+
 def redact_text(text: Any) -> str:
     """Replace secret values in `text` with `[REDACTED]`, keeping surrounding structure."""
     if not isinstance(text, str) or not text:
@@ -200,11 +223,11 @@ def redact_text(text: Any) -> str:
     s = _FLAG_SECRET_RE.sub(
         lambda m: m.group(1) + m.group(2) + _mask_if_secret(m.group(3)) + m.group(2), s
     )
-    s = _GENERIC_QUOTED_RE.sub(
+    s = _REDACT_QUOTED_RE.sub(
         lambda m: m.group(1) + m.group(2) + _mask_if_secret(m.group(3)) + m.group(4), s
     )
-    s = _GENERIC_UNQUOTED_RE.sub(
-        lambda m: m.group(1) + m.group(2) + _mask_if_secret(m.group(3)), s
+    s = _REDACT_UNQUOTED_RE.sub(
+        lambda m: m.group(1) + m.group(2) + _mask_unquoted_if_secret(m.group(3)), s
     )
     return s
 
@@ -222,6 +245,7 @@ _PUBLIC_OR_TEMPLATE_PATH_RE = re.compile(
 
 SECRET_PATH_PATTERNS: Tuple[Pattern[str], ...] = (
     re.compile(r"(?:^|/)\.env(?:\.[A-Za-z0-9_-]+)?$", re.IGNORECASE),
+    re.compile(r"(?:^|/)\.envrc$", re.IGNORECASE),
     re.compile(r"(?:^|/)id_(?:rsa|dsa|ecdsa|ed25519)(?:_[A-Za-z0-9_-]+)?$", re.IGNORECASE),
     re.compile(r"\.(?:pem|key|p8|p12|pfx|jks|keystore|kdbx|keychain)$", re.IGNORECASE),
     re.compile(r"\.tfstate(?:\.backup)?$", re.IGNORECASE),
@@ -229,13 +253,14 @@ SECRET_PATH_PATTERNS: Tuple[Pattern[str], ...] = (
     re.compile(r"(?:^|/)\.(?:npmrc|pypirc|netrc|pgpass|htpasswd|vault-token|dockercfg|git-credentials)$", re.IGNORECASE),
     re.compile(r"(?:^|/)\.git/config$", re.IGNORECASE),
     re.compile(r"(?:^|/)\.aws/(?:credentials|config)$", re.IGNORECASE),
+    re.compile(r"(?:^|/)\.ssh/", re.IGNORECASE),
     re.compile(r"(?:^|/)\.kube/config$", re.IGNORECASE),
     re.compile(r"(?:^|/)\.docker/config\.json$", re.IGNORECASE),
     re.compile(r"(?:^|/)\.config/gh/hosts\.yml$", re.IGNORECASE),
     re.compile(r"(?:^|/)\.config/gcloud/(?:credentials\.db|application_default_credentials\.json|legacy_credentials(?:/|$))", re.IGNORECASE),
     re.compile(r"(?:^|/)\.azure/(?:accessTokens|azureProfile)\.json$", re.IGNORECASE),
     re.compile(
-        r"(?:^|/)(?:credentials\.json|client_secret[^/]*\.json|service[-_]account[^/]*\.json|"
+        r"(?:^|/)(?:credentials(?:\.json)?|client_secret[^/]*\.json|service[-_]account[^/]*\.json|"
         r"secrets?\.(?:ya?ml|json|toml)|master\.key)$",
         re.IGNORECASE,
     ),
@@ -285,6 +310,11 @@ def _walk_regex_ast(
         elif op_name == "SUBPATTERN":
             subpattern = av[-1]
             ok, sub_unbounded = _walk_regex_ast(subpattern, in_repeat=in_repeat, in_unbounded=in_unbounded)
+            if not ok:
+                return False, unbounded_count
+            unbounded_count += sub_unbounded
+        elif op_name == "ATOMIC_GROUP":
+            ok, sub_unbounded = _walk_regex_ast(av, in_repeat=in_repeat, in_unbounded=in_unbounded)
             if not ok:
                 return False, unbounded_count
             unbounded_count += sub_unbounded

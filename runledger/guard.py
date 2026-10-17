@@ -103,10 +103,11 @@ _FALLBACK_SECRET_RES = [
     re.compile(r"(?<![A-Za-z0-9])pypi-[A-Za-z0-9_-]{32,}"),
     re.compile(r"(?<![A-Za-z0-9])hf_[A-Za-z0-9]{30,}"),
     re.compile(r"(?<![A-Za-z0-9_])rl_[A-Za-z0-9_-]{30,}"),
+    re.compile(r"(?i)(?<![A-Za-z0-9])AccountKey\s*=\s*[A-Za-z0-9+/=]{40,}"),
     re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"),
 ]
 _FALLBACK_GENERIC_RE = re.compile(
-    r"(api[_-]?key|secret|token|password)[\"']?\s*[:=]\s*[\"']([^\"'\s]{12,})[\"']", re.I)
+    r"(api[_-]?key|secret|token|password)[\"']?\s*[:=]\s*[\"']([^\"'\s]{8,})[\"']", re.I)
 
 # Unquoted values, masked last. Only the named group "v" is replaced.
 _SECRET_NAME = (r"(?:api[_-]?key|apikey|secret|token|passw(?:or)?d|credentials?"
