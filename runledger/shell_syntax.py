@@ -25,11 +25,31 @@ class Heredoc:
     body: str
 
 
+def ansi_c_end(text: str, start: int) -> int:
+    """Index just past the closing quote of the `$'...'` string at `start`, or `-1` when
+    the string is not closed on its own line. A backslash escapes the next character,
+    so `$'it\\'s'` is one word."""
+    n = len(text)
+    i = start + 2
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and i + 1 < n and text[i + 1] != "\n":
+            i += 2
+            continue
+        if ch == "'":
+            return i + 1
+        if ch == "\n":
+            return -1
+        i += 1
+    return -1
+
+
 def find_heredocs(text: str) -> List[Heredoc]:
     """Return every unquoted POSIX heredoc in `text` with its operator and body spans.
 
-    Ignores `<<` inside `'...'`, plain `"..."`, `#` comments, `$((...))` arithmetic,
-    and `<<<` here-strings, while recognizing `<<` inside `"$(...)"` command substitutions.
+    Ignores `<<` inside `'...'`, ANSI-C `$'...'` (where `\\'` does not end the string),
+    plain `"..."`, `#` comments, `$((...))` arithmetic, and `<<<` here-strings, while
+    recognizing `<<` inside `"$(...)"` command substitutions.
     """
     if "<<" not in text:
         return []
@@ -97,6 +117,19 @@ def find_heredocs(text: str) -> List[Heredoc]:
                 break
             stack.pop()
             i = q + 1
+            continue
+
+        if mode == "ansic":
+            close = ansi_c_end(text, i - 2)
+            nl = text.find("\n", i) if pending else -1
+            if nl != -1 and (close == -1 or nl < close):
+                i = consume_pending(nl)
+                line_start = i
+                continue
+            if close == -1:
+                break
+            stack.pop()
+            i = close
             continue
 
         if mode == "arith":
@@ -174,6 +207,10 @@ def find_heredocs(text: str) -> List[Heredoc]:
         if ch == '"':
             stack.append("dq")
             i += 1
+            continue
+        if text.startswith("$'", i):
+            stack.append("ansic")
+            i += 2
             continue
         if text.startswith("$((", i):
             stack.append("arith")

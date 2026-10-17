@@ -900,6 +900,37 @@ def test_project_config_can_raise_severities_and_add_extra_secret_paths(tmp_path
     assert run.notes == []
 
 
+def test_project_severity_override_cannot_lower_a_high_finding(tmp_path):
+    # `rm` of a path outside the folder is a high shell_outside; the project's medium is refused.
+    _write_policy(tmp_path, {"severity_overrides": {"shell_outside": "medium"}})
+    run = _run([_step("Bash", 1, command=r"rm C:\other\important.txt")], str(tmp_path))
+    _, _, risks = assess(run)
+    assert [(r.severity, r.code) for r in risks] == [("high", "shell_outside")]
+    assert run.notes == [
+        "Project config tried to ignore/lower 1 risk kind(s) (not applied; set in user config to enable)."
+    ]
+
+
+def test_project_severity_override_still_raises_low_findings(tmp_path):
+    _write_policy(tmp_path, {"severity_overrides": {"shell_outside": "high"}})
+    run = _run([_step("Bash", 1, command=r"echo x > C:\Windows\win.ini")], str(tmp_path))
+    _, _, risks = assess(run)
+    assert risks and {r.code for r in risks} == {"shell_outside"}
+    assert {r.severity for r in risks} == {"high"}
+    assert run.notes == []
+
+
+def test_user_severity_override_outranks_the_project(tmp_path, monkeypatch):
+    _write_policy(tmp_path, {"severity_overrides": {"shell_outside": "high"}})
+    user_cfg = tmp_path / "user_cfg.json"
+    user_cfg.write_text(json.dumps({"severity_overrides": {"shell_outside": "low"}}), encoding="utf-8")
+    monkeypatch.setenv("RUNLEDGER_CONFIG", str(user_cfg))
+    run = _run([_step("Bash", 1, command=r"rm C:\other\important.txt")], str(tmp_path))
+    _, _, risks = assess(run)
+    assert [(r.severity, r.code) for r in risks] == [("low", "shell_outside")]
+    assert run.notes == []
+
+
 def test_user_config_can_ignore_and_lower_severities(tmp_path, monkeypatch):
     user_cfg = tmp_path / "user_cfg.json"
     user_cfg.write_text(json.dumps({

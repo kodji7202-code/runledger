@@ -8,21 +8,33 @@ from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 
 from .paths import is_abs, is_windows_style, join
-from .shell_syntax import strip_heredocs
+from .shell_syntax import ansi_c_end, strip_heredocs
 from .shell_writes import ShellWrite
 
 Write = ShellWrite
 
-_PS_SNIFF_RE = re.compile(
-    r"(?<![\w-])(?:"
+_PS_CMDLET_WORD_RE = re.compile(
+    r"(?:"
     r"(?:Set|Add|Out|New|Copy|Move|Remove|Rename|Export|Tee)-[A-Z]\w+"
     r"|(?:Set-Content|Add-Content|Out-File|Tee-Object|Export-Csv"
     r"|New-Item|Copy-Item|Move-Item|Rename-Item|Remove-Item"
     r"|Set-Location|Push-Location|Invoke-WebRequest|Invoke-RestMethod)\b"
-    r")"
-    r"|\[(?:System\.)?IO\.File\]::",
+    r")",
     re.IGNORECASE,
 )
+_DOTNET_CALL_RE = re.compile(r"\[(?:System\.)?IO\.File\]::", re.IGNORECASE)
+# Cheap pre-filter: the careful check below only has to run when some text looks
+# like a cmdlet at all.
+_PS_SNIFF_HINT_RE = re.compile(
+    r"(?<![\w-])(?:" + _PS_CMDLET_WORD_RE.pattern + r")|\[(?:System\.)?IO\.File\]::",
+    re.IGNORECASE,
+)
+_SHELL_BREAK_RE = re.compile(r"[;\n|&(){}]")
+_SHELL_PREFIX_WORDS = frozenset({
+    "!", "builtin", "case", "command", "do", "done", "elif", "else", "env", "esac", "exec",
+    "fi", "for", "if", "nohup", "noglob", "sudo", "then", "time", "until", "while", "xargs",
+})
+_ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 
 _HERE_DQ_RE = re.compile(r'@"[ \t]*\r?\n.*?\r?\n"@', re.DOTALL)
 _HERE_SQ_RE = re.compile(r"@'[ \t]*\r?\n.*?\r?\n'@", re.DOTALL)
@@ -91,6 +103,60 @@ _VALUE_PARAMS = {
 }
 
 
+def _shell_code(text: str) -> str:
+    """`text` with quoted strings, ANSI-C strings and comments blanked, so that a cmdlet
+    name inside data does not look like a command."""
+    chars = list(text)
+    n = len(text)
+    i = 0
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if ch == "$" and text.startswith("$'", i):
+            close = ansi_c_end(text, i)
+            end = n if close == -1 else close
+        elif ch == "'":
+            close = text.find("'", i + 1)
+            end = n if close == -1 else close + 1
+        elif ch == '"':
+            j = i + 1
+            while j < n and text[j] != '"':
+                if text[j] == "\\" and j + 1 < n:
+                    j += 2
+                    continue
+                if text[j] == "\n":
+                    break
+                j += 1
+            end = j + 1 if j < n and text[j] == '"' else j
+        elif ch == "#" and (text.rfind("\n", 0, i) + 1 == i or text[i - 1] in " \t\r;&|()<>"):
+            close = text.find("\n", i)
+            end = n if close == -1 else close
+        else:
+            i += 1
+            continue
+        for k in range(i, end):
+            if chars[k] != "\n":
+                chars[k] = " "
+        i = end
+    return "".join(chars)
+
+
+def _powershell_sniff(code: str) -> bool:
+    """True when a cmdlet or a .NET file call is the command word of a statement in `code`."""
+    if _DOTNET_CALL_RE.search(code):
+        return True
+    for segment in _SHELL_BREAK_RE.split(code):
+        words = segment.split()
+        i = 0
+        while i < len(words) and (words[i].lower() in _SHELL_PREFIX_WORDS or _ASSIGNMENT_RE.match(words[i])):
+            i += 1
+        if i < len(words) and _PS_CMDLET_WORD_RE.match(words[i]):
+            return True
+    return False
+
+
 def shell_kind(step_or_tool: Any, command: Optional[str] = None) -> str:
     """Return `'powershell'` or `'posix'` for a `Step` or `(tool, command)` pair."""
     if hasattr(step_or_tool, "tool"):
@@ -106,10 +172,10 @@ def shell_kind(step_or_tool: Any, command: Optional[str] = None) -> str:
     if tool == "PowerShell":
         return "powershell"
     if tool == "Bash":
-        if not _PS_SNIFF_RE.search(cmd):
+        if not _PS_SNIFF_HINT_RE.search(cmd):
             return "posix"
         stripped, _ = strip_heredocs(cmd)
-        if _PS_SNIFF_RE.search(stripped):
+        if _powershell_sniff(_shell_code(stripped)):
             return "powershell"
     return "posix"
 

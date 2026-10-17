@@ -34,6 +34,23 @@ def test_shell_kind_detection():
     assert shell_kind(step_bash) == "posix"
 
 
+def test_quoted_or_commented_cmdlet_does_not_flip_a_bash_step_to_powershell():
+    cmd = "echo 'Set-Content is a cmdlet'; touch t.txt; rm r.txt"
+    assert shell_kind("Bash", cmd) == "posix"
+    step = Step(1, "Bash", {"command": cmd}, "t1", None, None)
+    run = Run("s", "p", r"C:\proj", "main", None, None, ["go"], [step], "", Usage(), {})
+    assert sorted(file_changes(run)) == ["r.txt", "t.txt"]
+    assert shell_kind("Bash", "# Remove-Item old.txt\nrm old.txt") == "posix"
+    assert shell_kind("Bash", "grep -n Set-Content notes.md") == "posix"
+    assert shell_kind("Bash", 'printf "%s" "Remove-Item"') == "posix"
+
+
+def test_cmdlet_in_command_position_is_still_powershell():
+    assert shell_kind("Bash", "Set-Content -Path a.txt -Value 1") == "powershell"
+    assert shell_kind("Bash", "echo hi; Remove-Item -Path a.txt") == "powershell"
+    assert shell_kind("Bash", "for f in *.txt; do Remove-Item $f; done") == "powershell"
+
+
 @pytest.mark.parametrize("tool", ["PowerShell", "Bash"])
 def test_powershell_write_risks_match_shell_write_risks(tool):
     assert ("high", "secret_file") in _codes(tool, command="Set-Content -Path .env -Value SECRET=1")
