@@ -69,3 +69,45 @@ def test_cached_results_cannot_be_changed_by_callers():
     assert [w.path for w in shell_writes(command)] == ["pkg/a.txt"]
     assert shell_deletes(command) == ["pkg/b.txt"]
     assert shell_deletes(command) == ["pkg/b.txt"]
+
+
+def test_parse_session_is_single_pass_with_bounded_memory(tmp_path):
+    import inspect
+    import tracemalloc
+    from runledger import parser
+
+    src = inspect.getsource(parser.parse_session)
+    assert "events: List" not in src and "events = [" not in src
+
+    # Write a ~10 MB JSONL session with 20 tool calls each returning a 500 KB tool_result
+    big_chunk = "A" * 500_000
+    session = tmp_path / "big.jsonl"
+    with session.open("w", encoding="utf-8") as f:
+        for i in range(20):
+            f.write(json.dumps({
+                "type": "assistant",
+                "message": {
+                    "id": f"m{i}",
+                    "model": "claude-opus-4-6",
+                    "usage": {"input_tokens": 100, "output_tokens": 10},
+                    "content": [{"type": "tool_use", "id": f"t{i}", "name": "Read", "input": {"file_path": f"f{i}.txt"}}],
+                },
+            }) + "\n")
+            f.write(json.dumps({
+                "type": "user",
+                "message": {
+                    "content": [{"type": "tool_result", "tool_use_id": f"t{i}", "content": big_chunk}],
+                },
+            }) + "\n")
+
+    tracemalloc.start()
+    try:
+        run = parser.parse_session(session)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert len(run.steps) == 20
+    # Peak allocation stays under 3x the largest single event (~1.8 MB << 10 MB file)
+    assert peak < 3 * 650_000
+

@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
-from ..parser import Run, Step, Usage
+from ..parser import Run, Step, Usage, _split_usage
 
 NAME = "codex"
 LABEL = "Codex CLI"
@@ -210,6 +210,7 @@ class _Rollout:
         self.outputs: Dict[str, Tuple[str, Optional[int]]] = {}
         self.event_results: Dict[str, Tuple[str, bool]] = {}
         self.total: Optional[Usage] = None
+        self._prev_total: Optional[Usage] = None
         self.attributed = Usage()
         self.models: Dict[str, Usage] = {}
 
@@ -234,12 +235,13 @@ class _Rollout:
             self._item(payload, ts)
 
     def finish(self) -> Run:
-        total = self.total if self.total is not None else _minus(self.attributed, Usage())
-        tail = _minus(total, self.attributed)  # usage not covered by any token_count event
-        if self.pending:
+        tail = _minus(self.total, self.attributed) if self.total is not None else Usage()
+        if self.pending and tail.total > 0:
             for step, share in zip(self.pending, _split(tail, len(self.pending))):
                 step.usage = share
+        self.attributed.add(tail)
         self.models.setdefault(self.model_name(), Usage()).add(tail)
+        total = self.attributed
 
         for call_id, steps in self.by_call.items():
             if call_id in self.outputs:
@@ -317,10 +319,29 @@ class _Rollout:
     def _token_count(self, info: Any) -> None:
         if not isinstance(info, dict):
             return
-        if isinstance(info.get("total_token_usage"), dict):
-            self.total = _usage(info["total_token_usage"])
-        if isinstance(info.get("last_token_usage"), dict):
-            self._attribute(_usage(info["last_token_usage"]))
+        total = (_usage(info["total_token_usage"])
+                 if isinstance(info.get("total_token_usage"), dict) else None)
+        last = (_usage(info["last_token_usage"])
+                if isinstance(info.get("last_token_usage"), dict) else None)
+
+        if total is not None and self._prev_total is not None:
+            if total == self._prev_total:
+                return  # duplicate token_count event with identical cumulative counters
+            if any(getattr(total, f) < getattr(self._prev_total, f) for f in USAGE_FIELDS):
+                delta = last if last is not None else total
+                self._prev_total = total
+                self.total = total
+                self._attribute(delta)
+                return
+            delta = last if last is not None else _minus(total, self._prev_total)
+        else:
+            delta = last if last is not None else total
+
+        if total is not None:
+            self._prev_total = total
+            self.total = total
+        if delta is not None:
+            self._attribute(delta)
 
     def _attribute(self, u: Usage) -> None:
         self.attributed.add(u)
@@ -615,12 +636,7 @@ def _count(value: Any) -> int:
 
 def _split(u: Usage, n: int) -> List[Usage]:
     """Divide u into n parts whose sums equal u exactly."""
-    parts = [Usage() for _ in range(n)]
-    for f in USAGE_FIELDS:
-        q, r = divmod(getattr(u, f), n)
-        for i, part in enumerate(parts):
-            setattr(part, f, q + (1 if i < r else 0))
-    return parts
+    return _split_usage(u, n)
 
 
 def _minus(a: Usage, b: Usage) -> Usage:

@@ -502,3 +502,38 @@ def test_build_flow_risk_costs_and_receipt(fixture_run):
     assert "Codex CLI" in receipt
     assert "Cost:** n/a" in receipt  # unpriced model shows no cost, no crash
     assert "Touched a secrets file from the shell (.env)" in receipt
+
+
+def test_codex_deduplicates_identical_token_count_events(tmp_path):
+    tok = {"input_tokens": 1000, "cached_input_tokens": 0, "output_tokens": 100}
+    run = _parse_items(tmp_path, [
+        _meta_line(),
+        _line("turn_context", {"model": "gpt-5.3-codex"}),
+        _line("event_msg", {"type": "token_count", "info": {"total_token_usage": tok, "last_token_usage": tok}}),
+        _line("event_msg", {"type": "token_count", "info": {"total_token_usage": tok, "last_token_usage": tok}}),
+    ])
+    assert run.usage.input_tokens == 1000
+    assert run.usage.output_tokens == 100
+
+
+def test_codex_token_count_falls_back_to_delta_from_total_and_handles_reset(tmp_path):
+    run = _parse_items(tmp_path, [
+        _meta_line(),
+        _line("turn_context", {"model": "gpt-5.3-codex"}),
+        _line("event_msg", {"type": "token_count", "info": {
+            "total_token_usage": {"input_tokens": 1000, "cached_input_tokens": 0, "output_tokens": 50},
+            "last_token_usage": None,
+        }}),
+        _line("event_msg", {"type": "token_count", "info": {
+            "total_token_usage": {"input_tokens": 1600, "cached_input_tokens": 0, "output_tokens": 80},
+            "last_token_usage": None,
+        }}),
+        # Counter reset (total drops to 400 with last=400)
+        _line("event_msg", {"type": "token_count", "info": {
+            "total_token_usage": {"input_tokens": 400, "cached_input_tokens": 0, "output_tokens": 20},
+            "last_token_usage": {"input_tokens": 400, "cached_input_tokens": 0, "output_tokens": 20},
+        }}),
+    ])
+    assert run.usage.input_tokens == 2000
+    assert run.usage.output_tokens == 100
+

@@ -27,23 +27,64 @@ class Usage:
     output_tokens: int = 0
     cache_write_tokens: int = 0
     cache_read_tokens: int = 0
+    cache_write_1h_tokens: int = 0
+    _requests: List["Usage"] = field(default_factory=list, init=False, repr=False, compare=False)
+    _request_prompt_tokens: Optional[int] = field(default=None, init=False, repr=False, compare=False)
+    _cumulative_only: bool = field(default=False, init=False, repr=False, compare=False)
 
     @property
     def total(self) -> int:
         return (self.input_tokens + self.output_tokens
-                + self.cache_write_tokens + self.cache_read_tokens)
+                + max(self.cache_write_tokens, self.cache_write_1h_tokens)
+                + self.cache_read_tokens)
+
+    @property
+    def prompt_tokens(self) -> int:
+        return (self.input_tokens + self.cache_read_tokens
+                + max(self.cache_write_tokens, self.cache_write_1h_tokens))
 
     def add(self, other: "Usage") -> None:
+        if self.total > 0 and not self._requests:
+            seed = Usage(
+                self.input_tokens,
+                self.output_tokens,
+                self.cache_write_tokens,
+                self.cache_read_tokens,
+                self.cache_write_1h_tokens,
+            )
+            seed._request_prompt_tokens = self._request_prompt_tokens
+            self._requests.append(seed)
+        if other._requests:
+            self._requests.extend(other._requests)
+        elif other.total > 0:
+            snap = Usage(
+                other.input_tokens,
+                other.output_tokens,
+                other.cache_write_tokens,
+                other.cache_read_tokens,
+                other.cache_write_1h_tokens,
+            )
+            snap._request_prompt_tokens = other._request_prompt_tokens
+            self._requests.append(snap)
+        if other._cumulative_only:
+            self._cumulative_only = True
         self.input_tokens += other.input_tokens
         self.output_tokens += other.output_tokens
         self.cache_write_tokens += other.cache_write_tokens
         self.cache_read_tokens += other.cache_read_tokens
+        self.cache_write_1h_tokens += other.cache_write_1h_tokens
 
 
 def _split_usage(usage: Usage, count: int) -> List[Usage]:
     """Split usage across `count` steps without losing integer remainders."""
     parts = [Usage() for _ in range(count)]
-    for field_name in ("input_tokens", "output_tokens", "cache_write_tokens", "cache_read_tokens"):
+    req_prompt = (usage._request_prompt_tokens
+                  if usage._request_prompt_tokens is not None else usage.prompt_tokens)
+    for part in parts:
+        part._request_prompt_tokens = req_prompt
+        part._cumulative_only = usage._cumulative_only
+    for field_name in ("input_tokens", "output_tokens", "cache_write_tokens",
+                       "cache_read_tokens", "cache_write_1h_tokens"):
         quotient, remainder = divmod(getattr(usage, field_name), count)
         for i, part in enumerate(parts):
             setattr(part, field_name, quotient + (1 if i < remainder else 0))
@@ -153,11 +194,21 @@ def _count(value: Any) -> int:
 
 def _usage(raw: Optional[Dict[str, Any]]) -> Usage:
     raw = raw if isinstance(raw, dict) else {}
+    cc = raw.get("cache_creation")
+    cc = cc if isinstance(cc, dict) else {}
+    cw_1h = _count(cc.get("ephemeral_1h_input_tokens"))
+    cw_5m = _count(cc.get("ephemeral_5m_input_tokens"))
+    cw_total = _count(raw.get("cache_creation_input_tokens"))
+    if cw_total == 0 and (cw_1h or cw_5m):
+        cw_total = cw_5m + cw_1h
+    elif cw_1h > cw_total:
+        cw_total = cw_1h
     return Usage(
         input_tokens=_count(raw.get("input_tokens")),
         output_tokens=_count(raw.get("output_tokens")),
-        cache_write_tokens=_count(raw.get("cache_creation_input_tokens")),
+        cache_write_tokens=cw_total,
         cache_read_tokens=_count(raw.get("cache_read_input_tokens")),
+        cache_write_1h_tokens=cw_1h,
     )
 
 
@@ -181,6 +232,22 @@ def _text_of(content: Any, depth: int = 0) -> str:
 
 _EVENT_TYPES = {"user", "assistant", "system", "summary", "result", "file-history-snapshot",
                 "queue-operation", "progress"}
+_NOISE_PREFIXES = (
+    "<command-",
+    "<local-command-",
+    "<system-reminder>",
+    "<user-prompt-submit-hook>",
+    "<environment_context>",
+    "<user_instructions>",
+    "<ide_",
+    "<task-notification",
+    "[Request interrupted by user",
+)
+
+
+def _is_noise_prompt(text: str) -> bool:
+    s = text.lstrip()
+    return any(s.startswith(p) for p in _NOISE_PREFIXES)
 
 
 def _str(value: Any) -> str:
@@ -193,23 +260,8 @@ def _is_event(ev: Dict[str, Any]) -> bool:
 
 def parse_session(path: str | os.PathLike) -> Run:
     path = str(path)
-    events: List[Dict[str, Any]] = []
     lines = 0
-    with open(path, "r", encoding="utf-8", errors="replace") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            lines += 1
-            try:
-                event = json.loads(line)
-            except (ValueError, RecursionError):
-                continue  # tolerate partial lines from a live session, and absurdly deep nesting
-            if isinstance(event, dict):
-                events.append(event)
-    if lines and not any(_is_event(ev) for ev in events):
-        raise ValueError(f"{path}: not a supported session file")
-
+    valid_events = 0
     session_id = Path(path).stem
     cwd = git_branch = started = ended = None
     prompts: List[str] = []
@@ -220,71 +272,88 @@ def parse_session(path: str | os.PathLike) -> Run:
     msg_model: Dict[str, Optional[str]] = {}
     final_message = ""
 
-    for ev in events:
-        etype = ev.get("type")
-        ts = _str(ev.get("timestamp")) or None
-        if ts:
-            started = started or ts
-            ended = ts
-        cwd = cwd or _str(ev.get("cwd")) or None
-        git_branch = git_branch or _str(ev.get("gitBranch")) or None
-        session_id = _str(ev.get("sessionId")) or session_id
-        msg = ev.get("message")
-        msg = msg if isinstance(msg, dict) else {}
-
-        if etype == "user":
-            content = msg.get("content")
-            if isinstance(content, str):
-                if not ev.get("isMeta") and content.strip() and not content.startswith("<command-"):
-                    prompts.append(content.strip())
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
                 continue
-            for block in content if isinstance(content, list) else []:
-                if not isinstance(block, dict):
-                    continue
-                if block.get("type") == "tool_result":
-                    step = by_tool_id.get(_str(block.get("tool_use_id")))
-                    if step:
-                        step.result_text = _text_of(block.get("content"))[:4000]
-                        step.is_error = bool(block.get("is_error"))
-                        step.has_result = True
-                elif block.get("type") == "text" and not ev.get("isMeta"):
-                    t = _str(block.get("text")).strip()
-                    if t and not t.startswith("<"):
-                        prompts.append(t)
+            lines += 1
+            try:
+                ev = json.loads(line)
+            except (ValueError, RecursionError):
+                continue  # tolerate partial lines from a live session, and absurdly deep nesting
+            if not isinstance(ev, dict):
+                continue
+            if _is_event(ev):
+                valid_events += 1
 
-        elif etype == "assistant":
-            mid = _str(msg.get("id")) or _str(ev.get("uuid")) or str(len(seen_msg_ids))
-            model = _str(msg.get("model")) or None
-            if model == "<synthetic>":
-                model = None
-            if mid not in msg_usage:
-                msg_usage[mid] = _usage(msg.get("usage"))
-                msg_model[mid] = model
-                seen_msg_ids[mid] = []
-            else:
-                # later chunks may carry the final (larger) usage figures
-                u = _usage(msg.get("usage"))
-                if u.total > msg_usage[mid].total:
-                    msg_usage[mid] = u
-            content = msg.get("content")
-            for block in content if isinstance(content, list) else []:
-                if not isinstance(block, dict):
+            etype = ev.get("type")
+            ts = _str(ev.get("timestamp")) or None
+            if ts:
+                started = started or ts
+                ended = ts
+            cwd = cwd or _str(ev.get("cwd")) or None
+            git_branch = git_branch or _str(ev.get("gitBranch")) or None
+            session_id = _str(ev.get("sessionId")) or session_id
+            msg = ev.get("message")
+            msg = msg if isinstance(msg, dict) else {}
+
+            if etype == "user":
+                content = msg.get("content")
+                if isinstance(content, str):
+                    if not ev.get("isMeta") and content.strip() and not _is_noise_prompt(content):
+                        prompts.append(content.strip())
                     continue
-                if block.get("type") == "tool_use":
-                    inp = block.get("input")
-                    step = Step(
-                        index=len(steps) + 1,
-                        tool=_str(block.get("name")) or "?",
-                        input=inp if isinstance(inp, dict) else {},
-                        tool_use_id=_str(block.get("id")),
-                        model=model,
-                        timestamp=ts,
-                    )
-                    steps.append(step)
-                    by_tool_id[step.tool_use_id] = step
-                    seen_msg_ids[mid].append(step)
-                elif block.get("type") == "text" and _str(block.get("text")).strip():
-                    final_message = block["text"].strip()
+                for block in content if isinstance(content, list) else []:
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") == "tool_result":
+                        step = by_tool_id.get(_str(block.get("tool_use_id")))
+                        if step:
+                            step.result_text = _text_of(block.get("content"))[:4000]
+                            step.is_error = bool(block.get("is_error"))
+                            step.has_result = True
+                    elif block.get("type") == "text" and not ev.get("isMeta"):
+                        t = _str(block.get("text")).strip()
+                        if t and not _is_noise_prompt(t):
+                            prompts.append(t)
+
+            elif etype == "assistant":
+                mid = _str(msg.get("id")) or _str(ev.get("uuid")) or str(len(seen_msg_ids))
+                model = _str(msg.get("model")) or None
+                if model == "<synthetic>":
+                    model = None
+                if mid not in msg_usage:
+                    msg_usage[mid] = _usage(msg.get("usage"))
+                    msg_model[mid] = model
+                    seen_msg_ids[mid] = []
+                else:
+                    # later chunks may carry the final (larger) usage figures
+                    u = _usage(msg.get("usage"))
+                    if u.total > msg_usage[mid].total:
+                        msg_usage[mid] = u
+                content = msg.get("content")
+                for block in content if isinstance(content, list) else []:
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") == "tool_use":
+                        inp = block.get("input")
+                        step = Step(
+                            index=len(steps) + 1,
+                            tool=_str(block.get("name")) or "?",
+                            input=inp if isinstance(inp, dict) else {},
+                            tool_use_id=_str(block.get("id")),
+                            model=model,
+                            timestamp=ts,
+                        )
+                        steps.append(step)
+                        by_tool_id[step.tool_use_id] = step
+                        seen_msg_ids[mid].append(step)
+                    elif block.get("type") == "text" and _str(block.get("text")).strip():
+                        final_message = block["text"].strip()
+
+    if lines and not valid_events:
+        raise ValueError(f"{path}: not a supported session file")
 
     # Attribute each assistant message's usage to the steps it issued
     # (split evenly); messages without tool calls count toward the run only.

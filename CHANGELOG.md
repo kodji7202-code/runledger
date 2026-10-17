@@ -75,6 +75,28 @@ change behavior, so read the entry before you upgrade.
   preserved instead of being redacted as `[EMAIL]` or `[REDACTED]@`; and foreign non-system
   absolute paths with more than two segments are trimmed to `…/<last two parts>` even when the
   repository root is known.
+- **Model normalization, verified OpenAI/Google prices, 1h cache writes and long-context tiers (`runledger.pricing`, `runledger/prices.json`):**
+  `normalize_model` strips trailing `[...]` context tags (`claude-opus-4-6[1m]`), `custom:` and
+  proxy suffixes (`custom:Claude-Opus-4.5-[Proxy]-0`), Bedrock/Vertex prefixes and `-latest` while
+  keeping `-fast`, unverified `-preview` and `-chat-latest` unpriced. `prices.json` adds verified
+  OpenAI (`gpt:6-astra`, `gpt:6.1-sol`, `gpt:6-luna`, `gpt:5.6-sol`, `gpt:5.6-cyber`,
+  `gpt:5.3-codex`, `gpt:5.4*`, `gpt:5.2*`, `gpt:5.1*`, `gpt:5*`, `gpt:4.1*`, `gpt:4o*`, `o3*`,
+  `o4-mini`, `o1*`) and Google Gemini (`gemini:4-argon`, `gemini:3.8-flash`, `gemini:3.6-flash`,
+  `gemini:3.5-flash-lite`, `gemini:3.1-flash-lite`, `gemini:3-flash-preview`, `gemini:2.5*`) list
+  prices alongside all 20 v0.6.0 Anthropic keys, with backward-compatible optional fields
+  (`cache_write_5m`, `cache_write_1h`, `long_context`, `valid_from`, `valid_until`, `windows`),
+  once-per-process invalid price file warnings, and a 120-day staleness note in receipts.
+  `parser._usage` reads `cache_creation.ephemeral_1h_input_tokens` and bills 1-hour cache writes at
+  `2x` input (or `cache_write_1h`), and `cost_of` applies `long_context` rates per request (noting
+  when Droid settings-only usage uses the base tier).
+- **Codex, Claude Code and Aider usage and prompt parsing (`runledger.adapters.codex`, `runledger.parser`, `runledger.adapters.aider`):**
+  Codex `token_count` events deduplicate repeated cumulative totals, fall back to
+  `total - _prev_total` when `last_token_usage` is omitted, and handle counter resets; Claude Code
+  `parse_session` streams in a single pass and retains user prompts starting with `<` (such as HTML
+  or JSX snippets) while still filtering wrapper tags (`<command-`, `<local-command-`,
+  `<system-reminder>`, etc.); and Aider parses `cache write` and `cache hit` token counts in either
+  order without double-counting `sent` and distributes per-step integer remainders so step tokens
+  sum to `totals.tokens`.
 
 ## [0.6.0] - 2026-10-15
 

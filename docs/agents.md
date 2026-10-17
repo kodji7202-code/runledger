@@ -173,22 +173,30 @@ the matching receipt then includes a local rollback command. Checkpoint contents
 
 ## Costs across agents
 
-Costs are estimates from the public Claude API list prices in `runledger/prices.json`, which was
-checked on 2026-10-08. Each message's tokens are multiplied by the list price of its model. Cache
-writes are priced at 1.25 times the input price, and cache reads at the cache-hit rate. A model
-RunLedger does not know shows `n/a` rather than a guess, with a short line explaining how to
-add its price. JSON receipts expose that guidance as `pricing_note`.
+Costs are estimates from the public Anthropic, OpenAI and Google Gemini API list prices in
+`runledger/prices.json`, which was checked on 2026-10-16. Each message's tokens are multiplied by
+the list price of its model. Standard 5-minute cache writes are priced at 1.25 times the input
+price (or `cache_write_5m`), 1-hour cache writes (`cache_creation.ephemeral_1h_input_tokens`) at
+2.0 times the input price (or `cache_write_1h`), and cache reads at the cache-hit rate. Where a
+model defines a `long_context` tier, requests whose prompt tokens exceed `threshold_tokens` are
+billed at the long-context rates for that request (when only cumulative settings usage is available
+in a Droid run, RunLedger bills the base tier and adds a receipt note). When the bundled `checked`
+date is more than 120 days old, receipts include a staleness note. A model RunLedger does not know
+shows `n/a` rather than a guess, with a short line explaining how to add its price. JSON receipts
+expose that guidance as `pricing_note`.
 
 ### User prices
 
 Create `~/.runledger/prices.json`, or set `RUNLEDGER_PRICES=/path/to/prices.json` to choose a
 different file. The environment variable takes precedence over the default user file.
 The selected file adds or replaces entries over the bundled table; other bundled entries stay.
-An invalid or unreadable file prints a warning to stderr and is ignored in full. A missing
+An invalid or unreadable file prints a warning to stderr once per process and is ignored in full. A missing
 default user file is normal and silent. Prices load when RunLedger starts.
 
 Use the same schema as the bundled table: `"family:version"` keys and USD per million tokens
-for `input`, `output`, and `cache_read`. All three rates must be finite, non-negative numbers.
+for `input`, `output`, and `cache_read` (with optional `cache_write_5m`, `cache_write_1h`,
+`long_context`, `valid_from`, `valid_until`, and `windows`). All rates must be finite,
+non-negative numbers.
 For example, this entry uses the bundled Sonnet 4.5 list prices:
 
 ```json
@@ -197,14 +205,16 @@ For example, this entry uses the bundled Sonnet 4.5 list prices:
 }
 ```
 
-For `gpt-6.1-sol`, add a `"gpt:6.1-sol"` entry with rates from your provider, not guessed rates.
-Likewise, `gpt-5-codex` uses `"gpt:5-codex"`. The optional top-level `checked` date is informational.
+For `gpt-5-codex`, add a `"gpt:5-codex"` entry with rates from your provider, not guessed rates.
+The optional top-level `checked` date is used for the 120-day staleness note in receipts.
 
-Lookup ignores case, provider prefixes such as `anthropic/` and `openai/`, dated suffixes
-(`-20250929` or `-2025-09-29`), deployment suffixes such as `-v1:0`, and `-latest`.
-Claude's dotted and legacy names also match, so `anthropic/Claude-Sonnet-4.5-latest` and
-`claude-sonnet-4-5-20250929` both use `"sonnet:4.5"`. Meaningful variants such as `-sol`,
-`-codex`, and `-mini` keep distinct prices. Normalization never supplies a missing price.
+Lookup ignores case, provider prefixes such as `anthropic/`, `openai/`, `models/`, `custom:` and
+Bedrock `us.anthropic.`, bracket context tags such as `[1m]`, proxy tags such as `-[Proxy]-0`,
+dated suffixes (`-20250929` or `-2025-09-29`), deployment suffixes such as `-v1:0`, and `-latest`.
+Claude's dotted and legacy names also match, so `anthropic/Claude-Sonnet-4.5-latest`,
+`claude-opus-4-6[1m]` and `claude-sonnet-4-5-20250929` all match their canonical keys. Meaningful
+or unverified variants such as `-fast`, unverified `-preview`, `-chat-latest`, `-sol`, `-codex`,
+and `-mini` keep distinct keys so normalization never guesses a missing price.
 
 On a Claude subscription you are not billed per token. Read the figure as "what this run would cost
 on the API".

@@ -12,8 +12,8 @@ from .adapters import label as agent_label
 from .guard import redact
 from .guard_receipt import guard_counts, guard_summary
 from .parser import Run, Step, Usage
-from .pricing import (PRICING_HELP, UNATTRIBUTED, UNATTRIBUTED_NOTE, friendly_model, partial_note,
-                      unknown_models, unpriced)
+from .pricing import (PRICING_HELP, UNATTRIBUTED, UNATTRIBUTED_NOTE, friendly_model, is_stale,
+                      partial_note, stale_note, unknown_models, unpriced)
 from .risk import Risk
 from .summarize import FileChange, file_changes
 
@@ -532,6 +532,15 @@ def md_trailer(run: Run) -> str:
     return f"<!-- runledger: safe={'true' if run.safe else 'false'} schema={SCHEMA_VERSION} -->\n"
 
 
+def _pricing_note(run: Run) -> Optional[str]:
+    notes: List[str] = []
+    if unknown_models(run):
+        notes.append(PRICING_HELP)
+    if is_stale():
+        notes.append(stale_note())
+    return " ".join(notes) if notes else None
+
+
 def to_dict(run: Run, score: int, level: str, risks: List[Risk]) -> Dict:
     changes = file_changes(run)
     data = {
@@ -557,7 +566,7 @@ def to_dict(run: Run, score: int, level: str, risks: List[Risk]) -> Dict:
                    "cost_partial": run.cost_partial, "unknown_models": unknown_models(run),
                    "files_changed": len(changes), "usage_source": run.usage_source},
         "models": {m: {"tokens": u.total} for m, u in run.models.items()},
-        "pricing_note": PRICING_HELP if unknown_models(run) else None,
+        "pricing_note": _pricing_note(run),
         "files": [asdict(c) for c in changes.values()],
         "steps": [{"n": s.index, "tool": s.tool, "summary": s.summary, "model": s.model,
                    "tokens": s.usage.total, "tokens_known": _step_known(run, s),
@@ -587,6 +596,8 @@ def to_markdown(run: Run, score: int, level: str, risks: List[Risk]) -> str:
         out.append(f"- **Note:** {_md_inline(n)}")
     if unknown_models(run):
         out.append(f"- **Unknown model price:** {PRICING_HELP}")
+    if is_stale():
+        out.append(f"- **Pricing note:** {stale_note()}")
     if UNATTRIBUTED in unpriced(run):
         out.append(f"- **Unattributed tokens:** {UNATTRIBUTED_NOTE}")
     rollback = _rollback(run)
@@ -698,6 +709,8 @@ def to_html(run: Run, score: int, level: str, risks: List[Risk]) -> str:
     usage_note = f" {e(usage_note)}" if usage_note else ""
     pricing_note = (f'<div class="meta">Unknown model price. {e(PRICING_HELP)}</div>'
                     if unknown_models(run) else "")
+    if is_stale():
+        pricing_note += f'<div class="meta">{e(stale_note())}</div>'
     if UNATTRIBUTED in unpriced(run):
         pricing_note += f'<div class="meta">Unattributed tokens. {e(UNATTRIBUTED_NOTE)}</div>'
     rollback = _rollback(run)

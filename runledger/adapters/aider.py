@@ -32,7 +32,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from ..parser import Run, Step, Usage
+from ..parser import Run, Step, Usage, _split_usage
 
 NAME = "aider"
 LABEL = "Aider"
@@ -52,6 +52,10 @@ _APPLIED_RE = re.compile(r"^Applied edit to (.+?)\s*$")
 _COMMIT_RE = re.compile(r"^Commit ([0-9a-fA-F]{4,40})(?:\s+(.*?))?\s*$")
 _RUNNING_RE = re.compile(r"^Running (.+?)\s*$")
 _TOKENS_RE = re.compile(r"Tokens:\s*([\d.,]+[kKmM]?)\s+sent\b.*?([\d.,]+[kKmM]?)\s+received\b")
+_SENT_RE = re.compile(r"Tokens:\s*([\d.,]+[kKmM]?)\s+sent\b")
+_RECEIVED_RE = re.compile(r"([\d.,]+[kKmM]?)\s+received\b")
+_CACHE_WRITE_RE = re.compile(r"([\d.,]+[kKmM]?)\s+cache\s+write\b", re.IGNORECASE)
+_CACHE_HIT_RE = re.compile(r"([\d.,]+[kKmM]?)\s+cache\s+hit\b", re.IGNORECASE)
 _COST_RE = re.compile(r"\$\s*([\d.,]+)\s+session\b")
 _COUNT_RE = re.compile(r"^([\d.,]+)([kKmM]?)$")
 
@@ -153,9 +157,8 @@ def _build_run(path: Path, header: Optional[str], lines: List[str]) -> Run:
             total.add(usage)
             models.setdefault(ev["model"] or "unknown", Usage()).add(usage)
             if pending:
-                n = len(pending)
-                for st in pending:
-                    st.usage = Usage(usage.input_tokens // n, usage.output_tokens // n)
+                for st, share in zip(pending, _split_usage(usage, len(pending))):
+                    st.usage = share
                 pending = []
 
     stamp = session.timestamps[-1] if session.timestamps else None
@@ -288,15 +291,17 @@ class _Session:
             self._add_step("Bash", {"command": cmd})
 
     def _tokens(self, text: str) -> None:
-        m = _TOKENS_RE.search(text)
-        if m:
-            sent, received = _count(m.group(1)), _count(m.group(2))
-            if sent is not None and received is not None:
-                self.events.append({
-                    "kind": "tokens",
-                    "usage": Usage(input_tokens=sent, output_tokens=received),
-                    "model": self.model,
-                })
+        parsed = _tokens(text)
+        if parsed is not None:
+            usage, cost_val = parsed
+            self.events.append({
+                "kind": "tokens",
+                "usage": usage,
+                "model": self.model,
+            })
+            if cost_val is not None:
+                self.reported_cost = cost_val   # aider's running session total; last one wins
+            return
         cost = _COST_RE.search(text)
         if cost:
             value = _number(cost.group(1))
@@ -404,6 +409,30 @@ def _number(text: str) -> Optional[float]:
         return float(text.replace(",", ""))
     except ValueError:
         return None
+
+
+def _tokens(text: str) -> Optional[Tuple[Usage, Optional[float]]]:
+    ms = _SENT_RE.search(text)
+    mr = _RECEIVED_RE.search(text)
+    if not ms or not mr:
+        return None
+    sent = _count(ms.group(1))
+    received = _count(mr.group(1))
+    if sent is None or received is None:
+        return None
+    mw = _CACHE_WRITE_RE.search(text)
+    mh = _CACHE_HIT_RE.search(text)
+    write = (_count(mw.group(1)) or 0) if mw else 0
+    hit = (_count(mh.group(1)) or 0) if mh else 0
+    mc = _COST_RE.search(text)
+    session_cost = _number(mc.group(1)) if mc else None
+    usage = Usage(
+        input_tokens=max(sent - hit - write, 0),
+        output_tokens=received,
+        cache_write_tokens=write,
+        cache_read_tokens=hit,
+    )
+    return usage, session_cost
 
 
 def _count(text: str) -> Optional[int]:
