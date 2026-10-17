@@ -12,6 +12,26 @@ _LONG_DRIVE_RE = re.compile(r"^[\\/]{2}\?[\\/](?=[A-Za-z]:(?:[\\/]|$))")
 _LONG_UNC_RE = re.compile(r"^[\\/]{2}\?[\\/]UNC[\\/](?=[^\\/])", re.I)
 _UNC_RE = re.compile(r"^[\\/]{2}(?![?.][\\/])[^\\/]+[\\/][^\\/]")
 
+# The shape of a path inside a shell command. `PATH_NAME` is one folder or file name and
+# `PATH_REST` is the rest of a path (separators allowed); a name inside a Windows path may
+# contain ':' (drive letters, alternate data streams), so the two classes differ.
+PATH_NAME = r"[^\s\\/'\"`<>|;:,(){}\[\]]+"
+PATH_REST = r"[^\s'\"`<>|;:,(){}\[\]]*"
+PATH_CHUNK = r"[^\s'\"`<>|;,(){}\[\]]+"
+# More of a path, separated by a space: a name followed by a separator, then the rest of
+# the folder or file name (`Client X\secret.txt` in `E:\Work\Client X\secret.txt`).
+SPACED_SUFFIX = r"(?: " + PATH_NAME + r"[\\/]" + PATH_REST + r")"
+# A Windows drive path containing spaces, read as one token: an unquoted path like
+# `type E:\Work\Client X\secret.txt` is two arguments to a shell, but a folder name may
+# contain spaces, so RunLedger reads (and safe mode masks) the whole path, never a fragment.
+SPACED_DRIVE_RE = re.compile(r"[A-Za-z]:[\\/]" + PATH_CHUNK + SPACED_SUFFIX + "+")
+
+
+def spaced_drive_path(text: str, pos: int) -> Optional[str]:
+    """The drive path with spaces that starts at `pos`, or None when there is not one."""
+    m = SPACED_DRIVE_RE.match(text, pos)
+    return m.group(0) if m else None
+
 
 def strip_long_prefix(p: str) -> str:
     """Normalise `\\\\?\\C:\\x` to `C:\\x` and `\\\\?\\UNC\\srv\\share\\x` to `\\\\srv\\share\\x`.

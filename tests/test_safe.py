@@ -214,3 +214,48 @@ def test_foreign_absolute_paths_are_trimmed_when_root_is_known():
             assert safe_path(sys_path, ctx) == sys_path
         assert safe_path("/tmp/build.log", ctx) == "/tmp/build.log"
 
+
+def test_spaced_foreign_windows_paths_are_fully_masked():
+    """CORE-SCR-013: a foreign drive path containing spaces is masked as a whole, quoted
+    or bare, so neither the drive nor the folders above the last two parts survive."""
+    ctx = SafeContext(root="D:/repo", home="C:/Users/local")
+    assert safe_text(r'type "E:\Work\Client X\secret.txt"', ctx) == 'type "…/Client X/secret.txt"'
+    assert safe_text(r"type E:\Work\Client X\secret.txt", ctx) == "type …/Client X/secret.txt"
+    assert safe_text(r"type E:\Work\Client X\secret.txt now", ctx) == "type …/Client X/secret.txt now"
+    assert safe_text(r"copy D:\other\proj\file.py E:\Work\Client X\secret.txt", ctx) == (
+        "copy …/proj/file.py …/Client X/secret.txt")
+    for leaked in ("E:", "E:\\", "Work", "D:\\other"):
+        assert leaked not in safe_text(
+            r'type "E:\Work\Client X\secret.txt" and E:\Work\Client X\secret.txt and D:\other\proj\file.py', ctx)
+
+
+def test_spaced_and_non_ascii_home_usernames_are_fully_masked():
+    """CORE-SCR-014: an unknown home user name is consumed up to a separator, quote or end
+    of line with no ASCII or capitalisation restriction, so a surname never leaks."""
+    ctx = SafeContext(root="D:/repo", home="C:/Users/local")
+    posix = safe_text("cat /home/john smith/notes.txt today", ctx)
+    assert posix == "cat ~/notes.txt today"
+    assert safe_text("cd /home/john smith/work && ls", ctx) == "cd ~/work && ls"
+    mac = safe_text("ls /Users/mary jane doe", ctx)
+    assert mac == "ls ~"
+    win = safe_text(r"cat C:\Users\José Smith\Documents\x.txt", ctx)
+    assert win == "cat ~/Documents/x.txt"
+    for leaked in ("john", "smith", "mary", "jane", "doe", "José", "Smith"):
+        assert leaked not in posix + mac + win
+
+
+def test_git_scp_exemption_needs_a_remote_path():
+    """CORE-SCR-015: only `git@host:path` with a non-empty path is an scp remote; a real
+    address followed by a prose colon, a bare colon or a slash is still masked."""
+    ctx = SafeContext(root="D:/repo")
+    out = safe_text("Contact git@example.com: please respond", ctx)
+    assert out == "Contact [EMAIL]: please respond"
+    assert "git@example.com" not in out
+    assert safe_text("git@example.com:", ctx) == "[EMAIL]:"
+    assert safe_text("git@example.com/ x", ctx) == "[EMAIL]/ x"
+    assert safe_text("git clone git@github.com:org/repo.git", ctx) == (
+        "git clone git@github.com:org/repo.git")
+    assert safe_text("git remote add o git@gitlab.internal.corp:team/service.git", ctx) == (
+        "git remote add o git@gitlab.internal.corp:team/service.git")
+    assert safe_text("git fetch ssh://git@github.com/org/repo", ctx) == (
+        "git fetch ssh://git@github.com/org/repo")

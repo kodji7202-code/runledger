@@ -23,26 +23,37 @@ from typing import Any, List, Optional, Sequence
 
 from .guard import redact
 from .parser import Run
-from .paths import _norm, is_abs, is_windows_style, within
+from .paths import (PATH_CHUNK, PATH_NAME, PATH_REST, SPACED_SUFFIX, _norm, is_abs,
+                    is_windows_style, within)
 from .risk import Risk
 
 ELLIPSIS = "…"
 EMAIL = "[EMAIL]"
+# An scp-style remote (`git@host:org/repo`) is kept, but only with a non-empty remote path,
+# so a real address followed by a prose colon (`git@host: reply`) is still masked.
 _EMAIL_RE = re.compile(
     r"(?<![A-Za-z0-9._%+-])(?<!://)"
-    r"(?!git@[A-Za-z0-9.-]+\.[A-Za-z]{2,}[:/])"
+    r"(?!git@[A-Za-z0-9.-]+\.[A-Za-z]{2,}:(?!//)[\w./~-])"
     r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
     r"(?![A-Za-z0-9.-])"
 )
 _URL_CREDS_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9+.-]*://)(?!git@)[^\s/@]+@")
+# More of a path separated by spaces: a name followed by a separator, then the rest of the
+# folder or file name (`E:\Work\Client X\secret.txt`).
+_SPACED = SPACED_SUFFIX + "*"
+# The user name of a home folder may contain spaces, in any script; it runs to a separator,
+# a quote or the end of the line, so no part of the name can leak. This over-redacts prose
+# after an unknown user name, which is the safe direction.
+_USER = PATH_NAME + r"(?: " + PATH_NAME + r")*"
+_HOME_REST = r"(?:[\\/]" + PATH_REST + r")?"
 # An absolute path in free text: a POSIX path not glued to a word, `~` or `…`, or a Windows
-# drive path. Home folders under /home, /Users or C:\Users may contain spaces in the user name.
-# `//` is not a path start, so URLs (`https://host/x`) are left alone.
+# drive path. `//` is not a path start, so URLs (`https://host/x`) are left alone.
 _TEXT_PATH_RE = re.compile(
-    r"(?<![\w.~/\\…-])/(?:[Hh]ome|[Uu]sers)/(?:[A-Za-z0-9._-]+(?: [A-Za-z0-9._-]+){1,3}[\\/][^\s'\"`<>|;:,(){}\[\]]+|[A-Z][A-Za-z0-9._-]*(?: [A-Z][A-Za-z0-9._-]*){1,2}(?:[\\/][^\s'\"`<>|;:,(){}\[\]]*)?)"
-    r"|(?<![\w])[A-Za-z]:[\\/][Uu]sers[\\/](?:[A-Za-z0-9._-]+(?: [A-Za-z0-9._-]+){1,3}[\\/][^\s'\"`<>|;,(){}\[\]]+|[A-Z][A-Za-z0-9._-]*(?: [A-Z][A-Za-z0-9._-]*){1,2}(?:[\\/][^\s'\"`<>|;,(){}\[\]]*)?)"
-    r"|(?<![\w.~/\\…-])/(?!/)[^\s'\"`<>|;:,(){}\[\]]+"
-    r"|(?<![\w])[A-Za-z]:[\\/][^\s'\"`<>|;,(){}\[\]]*"
+    r"(?<![\w.~/\\…-])/(?:[Hh]ome|[Uu]sers)/" + _USER + _HOME_REST
+    + r"|(?<![\w])[A-Za-z]:[\\/][Uu]sers[\\/]" + _USER + _HOME_REST
+    + r"|(?<![\w])[A-Za-z]:[\\/]" + PATH_CHUNK + _SPACED
+    + r"|(?<![\w.~/\\…-])/(?!/)[^\s'\"`<>|;:,(){}\[\]]+" + _SPACED
+    + r"|(?<![\w])[A-Za-z]:[\\/][^\s'\"`<>|;,(){}\[\]]*"
 )
 _HOME_RE = re.compile(r"^(?:/home/[^/]+|/Users/[^/]+|/root|[A-Za-z]:/Users/[^/]+)(?=/|$)", re.I)
 _TEMP_PREFIXES = ("/tmp", "/var/tmp", "/private/tmp", "/private/var/folders", "/var/folders")

@@ -634,6 +634,28 @@ def _scan(text: str, ps: bool) -> Tuple[List[tuple], List[Tuple[int, int]]]:
     return items, comments
 
 
+def _join_spaced_drive_paths(text: str, words: List[_Word]) -> List[_Word]:
+    """`type E:\\Work\\Client X\\secret.txt`: an unquoted drive path with spaces is read as one
+    word, so a finding names the whole path and safe mode can mask it whole instead of a
+    fragment. Redirection targets keep the shell's own reading (`> E:\\Work\\Client y.txt`),
+    which is what the write check reports."""
+    out: List[_Word] = []
+    i = 0
+    while i < len(words):
+        w = words[i]
+        whole = None if w.quoted or w.role != "word" else paths.spaced_drive_path(text, w.start)
+        if whole is not None and w.start + len(whole) > w.end:
+            end = w.start + len(whole)
+            i += 1
+            while i < len(words) and words[i].role == "word" and words[i].end <= end:
+                i += 1
+            out.append(_Word(whole, w.start, end, False))
+            continue
+        out.append(w)
+        i += 1
+    return out
+
+
 def _redir_role(op: str, value: str) -> str:
     if op in ("<<", "<<-", "<<<"):
         return "skip"  # heredoc delimiter or here-string text
@@ -923,7 +945,7 @@ def _shell_risks(step: Step, cwd: Optional[str], extra: List["re.Pattern"], risk
 
     prepared = _strip_heredocs(cmd, ps)
     items, comments = _scan(prepared, ps)
-    cmds = _simple_commands(items)
+    cmds = [_join_spaced_drive_paths(prepared, words) for words in _simple_commands(items)]
     names = [_plan(words, ps) for words in cmds]
     text_words = [w for words in cmds for w in words if w.role == "text"]
     code = _code_view(prepared, comments, text_words)

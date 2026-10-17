@@ -180,3 +180,37 @@ def test_safe_receipt_masks_spaced_homes_foreign_paths_and_keeps_git_remotes(tmp
         assert "/usr/bin/python3" in text
         assert "/tmp/build.log" in text
 
+
+def test_safe_receipt_masks_spaced_paths_usernames_and_prose_emails(tmp_path, capsys):
+    """CORE-SCR-013/014/015 end to end: a spaced foreign drive path, a spaced or non-ASCII
+    home user name and a real address followed by a colon are masked in both formats."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    steps = [
+        {"tool": "Bash", "input": {"command": r'type "E:\Work\Client X\secret.txt"'}},
+        {"tool": "Bash", "input": {"command": r"type E:\Work\Client X\secret.txt"}},
+        {"tool": "Bash", "input": {"command": "cd /home/john smith/work && ls"}},
+        {"tool": "Bash", "input": {"command": "ls /Users/mary jane doe"}},
+        {"tool": "Bash", "input": {"command": r"cat C:\Users\José Smith\Documents\x.txt"}},
+        {"tool": "Bash", "input": {"command": "Contact git@example.com: please respond"}},
+        {"tool": "Bash", "input": {"command": "git clone git@github.com:org/repo.git"}},
+    ]
+    path = tmp_path / "scr.runledger.json"
+    path.write_text(json.dumps({
+        "runledger_format": 1,
+        "agent": "demo",
+        "session_id": "safe-scr",
+        "cwd": str(repo),
+        "prompts": [r"type E:\Work\Client X\secret.txt then cd /home/john smith/work"],
+        "steps": steps,
+    }), encoding="utf-8")
+    for fmt in ("md", "json"):
+        out, _ = _receipt(capsys, str(path), "--format", fmt, "-o", "-", "--safe")
+        text = out if fmt == "md" else json.dumps(json.loads(out), ensure_ascii=False)
+        for leaked in ("E:", "Work", "john", "smith", "Mary", "Jane", "Doe", "José", "git@example.com"):
+            assert leaked not in text
+        # the last two components stay (VAL-CORE-034); everything above them is gone
+        assert "…/Client X/secret.txt" in text
+        assert "git@github.com:org/repo.git" in text
+        assert "~/work" in text and "~/Documents/x.txt" in text
+        assert "[EMAIL]: please respond" in text
