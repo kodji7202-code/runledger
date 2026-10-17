@@ -265,12 +265,91 @@ def test_adapters_reports_import_error_and_reraises_on_debug(monkeypatch, capsys
 
     monkeypatch.setattr(importlib, "import_module", flaky_import)
     monkeypatch.delenv("RUNLEDGER_DEBUG", raising=False)
-    loaded = adapters.adapters()
-    err = capsys.readouterr().err
-    assert "codex" in err and "boom" in err
-    assert [m.NAME for m in loaded] == ["claude-code", "droid", "aider", "native"]
+    adapters.clear_cache()
+    try:
+        loaded = adapters.adapters()
+        err = capsys.readouterr().err
+        assert "codex" in err and "boom" in err
+        assert [m.NAME for m in loaded] == ["claude-code", "droid", "aider", "native"]
 
-    monkeypatch.setenv("RUNLEDGER_DEBUG", "1")
-    with pytest.raises(ImportError, match="boom"):
-        adapters.adapters()
+        monkeypatch.setenv("RUNLEDGER_DEBUG", "1")
+        with pytest.raises(ImportError, match="boom"):
+            adapters.adapters()
+    finally:
+        adapters.clear_cache()
+
+
+def test_broken_adapter_is_reported_once_per_process(monkeypatch, capsys):
+    """A failing adapter import warns exactly once per process, however many
+    discovery helpers run (VAL-CORE-065)."""
+    import importlib
+    from runledger import adapters
+    real_import = importlib.import_module
+
+    def flaky_import(name, package=None):
+        if name.endswith(".aider"):
+            raise ImportError("No module named 'definitely_missing_stdlib_mod_xyz'")
+        return real_import(name, package)
+
+    monkeypatch.setattr(importlib, "import_module", flaky_import)
+    monkeypatch.delenv("RUNLEDGER_DEBUG", raising=False)
+    adapters.clear_cache()
+    try:
+        for _ in range(3):
+            assert adapters.get("claude-code").NAME == "claude-code"
+            assert adapters.detect(FIX_CLAUDE).NAME == "claude-code"
+            assert adapters.label("droid") == "Factory Droid"
+        assert [m.NAME for m in adapters.adapters()] == ["claude-code", "codex", "droid", "native"]
+        err = capsys.readouterr().err
+
+        assert err.count("runledger: adapter 'aider' failed to load") == 1, err
+        assert "definitely_missing_stdlib_mod_xyz" in err
+    finally:
+        adapters.clear_cache()
+
+
+def test_cli_list_reports_a_broken_adapter_once(tmp_path):
+    """The real CLI prints one stderr line for a broken adapter and still lists the
+    session; RUNLEDGER_DEBUG=1 raises instead (VAL-CORE-065)."""
+    import subprocess
+    import sys
+
+    import runledger
+
+    pkg_src = Path(runledger.__file__).resolve().parent
+    shadow_root = tmp_path / "shadow"
+    shutil.copytree(pkg_src, shadow_root / "runledger", ignore=shutil.ignore_patterns("__pycache__"))
+    aider = shadow_root / "runledger" / "adapters" / "aider.py"
+    text = aider.read_text(encoding="utf-8")
+    marker = "from __future__ import annotations\n"
+    assert marker in text  # the broken import must stay below the future import
+    aider.write_text(text.replace(marker, marker + "import definitely_missing_stdlib_mod_xyz\n", 1),
+                     encoding="utf-8")
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    sessions = tmp_path / "claude" / "projects" / encode_project_path(str(project))
+    sessions.mkdir(parents=True)
+    shutil.copy(FIX_CLAUDE, sessions / "s1.jsonl")
+
+    env = dict(os.environ)
+    env.pop("RUNLEDGER_DEBUG", None)
+    env["PYTHONPATH"] = str(shadow_root)
+    env["CLAUDE_CONFIG_DIR"] = str(tmp_path / "claude")
+    env["CODEX_HOME"] = str(tmp_path / "codex")
+    env["FACTORY_HOME"] = str(tmp_path / "factory")
+    env["HOME"] = env["USERPROFILE"] = str(tmp_path / "home")
+    argv = [sys.executable, "-m", "runledger", "list", "--agent", "claude-code", "--project", str(project)]
+
+    res = subprocess.run(argv, capture_output=True, text=True, env=env, cwd=str(tmp_path), timeout=120)
+    assert res.returncode == 0, res.stderr
+    failures = [line for line in res.stderr.splitlines() if "failed to load" in line]
+    assert len(failures) == 1, res.stderr
+    assert failures[0].startswith("runledger: adapter 'aider' failed to load:")
+    assert "claude-code" in res.stdout
+
+    env["RUNLEDGER_DEBUG"] = "1"
+    debug = subprocess.run(argv, capture_output=True, text=True, env=env, cwd=str(tmp_path), timeout=120)
+    assert debug.returncode != 0
+    assert "definitely_missing_stdlib_mod_xyz" in debug.stderr
 

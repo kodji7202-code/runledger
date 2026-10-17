@@ -48,7 +48,8 @@ change behavior, so read the entry before you upgrade.
   summary cache in `~/.runledger/cache/sessions.json` keyed by file modification time and size,
   Droid project discovery filters by encoded folder name before reading unrelated directories,
   Aider discovery walks up from project subfolders to the Git top-level directory, and
-  `adapters()` logs broken adapter imports to `stderr` (or re-raises when `RUNLEDGER_DEBUG=1`).
+  `adapters()` reports a broken adapter import once per process on `stderr` (or re-raises when
+  `RUNLEDGER_DEBUG=1`).
 - **Guard project root resolution and subfolder support (`runledger.guard`, `runledger.guard_receipt`, `runledger.risk`):**
   the guard resolves the project root from `CLAUDE_PROJECT_DIR` / `FACTORY_PROJECT_DIR` /
   `DROID_PROJECT_DIR`, else the nearest ancestor of the event's `cwd` (including the `cwd` itself)
