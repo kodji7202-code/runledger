@@ -20,8 +20,22 @@ change behavior, so read the entry before you upgrade.
   earlier bare `runledger ...` hook entries in place, and verifies the configured command exits `0`
   on empty JSON input. Pass `--portable` to write bare `runledger ...` commands for checked-in
   settings files.
+- **HTML receipts inside a Git work tree are safe by default, and default receipt filenames
+  auto-increment (`runledger.cli`):** `runledger receipt` now enables safe mode by default for HTML
+  files written inside a Git repository (matching Markdown and JSON; pass `--no-safe` for full
+  paths), and when `-o` is omitted it writes `runledger-<stem>-2.<ext>`, `runledger-<stem>-3.<ext>`,
+  and so on instead of overwriting an existing receipt file.
 
 ### Fixed
+
+- **CLI flag validation, non-colliding receipts, and atomic stem-scoped backups (`runledger.cli`,
+  `runledger.server.db`):** `--latest` on `receipt` and `push` is now mutually exclusive with an
+  explicit `session` argument (exits `2`); `--open` with `--format md` or `--format json` prints a
+  warning to `stderr` instead of being silently ignored; `list --limit` requires a positive integer
+  and `checkpoints prune --keep` requires a non-negative integer via `argparse` (exits `2`); and
+  `runledger backup` writes stem-qualified `runledger-<db-stem>-YYYYmmdd-HHMMSS[-N].db` files via a
+  temporary file and atomic rename (leaving no `.db` or `.tmp` file on failure) while pruning only
+  matching database stems.
 
 - **Session discovery, sub-agent merging, and fast `list` (`runledger.parser`, `runledger.session_cache`, `runledger.adapters`):**
   Claude Code sub-agent transcripts (`<project>/<session>/subagents/**/*.jsonl` and legacy

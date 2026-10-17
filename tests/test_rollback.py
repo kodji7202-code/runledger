@@ -771,7 +771,9 @@ def test_checkpoints_listing_and_pruning_only_owned_refs(committed_repo, capsys)
     assert git(repo.root, "rev-parse", "refs/runledger/other").decode().strip() == first.oid
     assert main(["checkpoints", "--cwd", str(repo.root), "prune", "--keep", "0"]) == 0
     assert repo.checkpoints() == []
-    assert main(["checkpoints", "prune", "--cwd", str(repo.root), "--keep", "-1"]) == 1
+    with pytest.raises(SystemExit) as exc:
+        main(["checkpoints", "prune", "--cwd", str(repo.root), "--keep", "-1"])
+    assert exc.value.code == 2
     assert "--keep" in capsys.readouterr().err
 
 

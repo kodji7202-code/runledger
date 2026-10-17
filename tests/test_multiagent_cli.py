@@ -118,6 +118,29 @@ def test_default_file_name_is_safe_for_any_session_id(tmp_path, monkeypatch):
     assert "/" not in written[0].name and "\\" not in written[0].name
 
 
+def test_default_output_does_not_overwrite(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    expected = [
+        "runledger-demo-000.html",
+        "runledger-demo-000-2.html",
+        "runledger-demo-000-3.html",
+    ]
+    for name in expected:
+        assert main(["receipt", str(FIX_NATIVE)]) == 0
+        out = capsys.readouterr().out
+        assert f"Receipt: {name}" in out
+        assert (tmp_path / name).is_file() and (tmp_path / name).stat().st_size > 0
+
+    fixed = tmp_path / "fixed.html"
+    for _ in range(2):
+        assert main(["receipt", str(FIX_NATIVE), "-o", "fixed.html"]) == 0
+        out = capsys.readouterr().out
+        assert "Receipt: fixed.html" in out
+    assert fixed.is_file() and fixed.stat().st_size > 0
+    assert not (tmp_path / "fixed-2.html").exists()
+
+
+
 def test_invalid_native_file_is_reported_not_raised(tmp_path, capsys):
     bad = tmp_path / "bad.runledger.jsonl"
     bad.write_text(json.dumps({"runledger_format": 1}) + "\n" + json.dumps({"tool": ""}) + "\n", encoding="utf-8")

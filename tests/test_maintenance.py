@@ -137,3 +137,122 @@ def test_backup_copies_the_database_and_keeps_the_newest(tmp_path, capsys):
 def test_backup_needs_an_existing_database(tmp_path, capsys):
     assert main(["backup", "--db", str(tmp_path / "missing.db"), "--dir", str(tmp_path / "b")]) == 1
     assert "no database" in capsys.readouterr().err
+
+
+def test_backup_same_second_no_collision(tmp_path, capsys):
+    from contextlib import closing
+    import re
+    db_path = tmp_path / "team_a.db"
+    db = Database(str(db_path))
+    db.create_team("Team A")
+    db.close()
+
+    folder = tmp_path / "bkp"
+    outs = []
+    for _ in range(2):
+        assert main(["backup", "--db", str(db_path), "--dir", str(folder)]) == 0
+        outs.append(capsys.readouterr().out)
+
+    files = sorted(folder.glob("runledger-team_a-*.db"))
+    assert len(files) == 2
+    combined_out = "\n".join(outs)
+    for f in files:
+        assert re.fullmatch(r"runledger-team_a-\d{8}-\d{6}(-\d+)?\.db", f.name)
+        assert str(f) in combined_out
+        with closing(sqlite3.connect(str(f))) as conn:
+            assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+    # Rapid backups with --keep 2 in the same second must never reuse a pruned sequence number.
+    keep2_folder = tmp_path / "bkp_keep2"
+    for _ in range(5):
+        assert main(["backup", "--db", str(db_path), "--dir", str(keep2_folder), "--keep", "2"]) == 0
+        capsys.readouterr()
+    assert len(list(keep2_folder.glob("runledger-team_a-*.db"))) == 2
+
+
+def test_backup_prune_only_own_stem(tmp_path, capsys):
+    a_db = tmp_path / "a.db"
+    b_db = tmp_path / "b.db"
+    for p, name in ((a_db, "TeamA"), (b_db, "TeamB")):
+        db = Database(str(p))
+        db.create_team(name)
+        db.close()
+
+    folder = tmp_path / "shared_bkp"
+    folder.mkdir()
+    legacy = folder / "runledger-20200101-000000.db"
+    legacy.write_bytes(b"legacy-backup")
+
+    for _ in range(4):
+        assert main(["backup", "--db", str(a_db), "--dir", str(folder), "--keep", "10"]) == 0
+        assert main(["backup", "--db", str(b_db), "--dir", str(folder), "--keep", "10"]) == 0
+    capsys.readouterr()
+
+    assert main(["backup", "--db", str(a_db), "--dir", str(folder), "--keep", "2"]) == 0
+    assert main(["backup", "--db", str(b_db), "--dir", str(folder), "--keep", "2"]) == 0
+    capsys.readouterr()
+
+    a_files = sorted(folder.glob("runledger-a-*.db"))
+    b_files = sorted(folder.glob("runledger-b-*.db"))
+    assert len(a_files) == 2
+    assert len(b_files) == 2
+    assert legacy.exists()  # legacy file preserved when multiple DB stems share the folder
+
+    single_folder = tmp_path / "single_bkp"
+    single_folder.mkdir()
+    single_legacy = single_folder / "runledger-20200101-000000.db"
+    single_legacy.write_bytes(b"legacy-backup")
+    assert main(["backup", "--db", str(a_db), "--dir", str(single_folder), "--keep", "1"]) == 0
+    assert not single_legacy.exists()
+    assert len(list(single_folder.glob("runledger-a-*.db"))) == 1
+
+
+def test_failed_backup_leaves_no_partial_file(tmp_path, monkeypatch, capsys):
+    folder = tmp_path / "bkp"
+    bad_db = tmp_path / "corrupt.db"
+    bad_db.write_bytes(b"not-a-sqlite-db")
+
+    assert main(["backup", "--db", str(bad_db), "--dir", str(folder)]) == 1
+    assert "error:" in capsys.readouterr().err
+    assert list(folder.glob("runledger-*.db")) == []
+    assert list(folder.glob("*.tmp")) == []
+
+    good_db = tmp_path / "good.db"
+    db = Database(str(good_db))
+    db.create_team("Good")
+    db.close()
+
+    def broken_backup(self, path):
+        tmp = folder / "runledger-good-broken.db.tmp"
+        tmp.write_bytes(b"partial")
+        try:
+            raise sqlite3.OperationalError("simulated disk failure mid-backup")
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    # Also test Database.backup_to directly when _conn.backup fails mid-copy
+    live = Database(str(good_db))
+    try:
+        class FailingConn:
+            def __init__(self, real):
+                self._real = real
+
+            def backup(self, target):
+                target.execute("CREATE TABLE partial_data (x INT)")
+                raise sqlite3.OperationalError("simulated mid-copy failure")
+
+            def close(self):
+                self._real.close()
+
+        real_conn = live._conn
+        live._conn = FailingConn(real_conn)
+        dest = folder / "runledger-good-20261016-000000.db"
+        with pytest.raises(sqlite3.OperationalError, match="mid-copy"):
+            live.backup_to(str(dest))
+        live._conn = real_conn
+    finally:
+        live.close()
+
+    assert list(folder.glob("runledger-*.db")) == []
+    assert list(folder.glob("*.tmp")) == []
+
