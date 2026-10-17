@@ -121,3 +121,20 @@ def test_find_sessions_tolerates_a_file_removed_during_sort(tmp_path, monkeypatc
 
     monkeypatch.setattr(adapters, "adapters", lambda: [OneAdapter])
     assert adapters.find_sessions(str(tmp_path)) == [a, b]
+
+
+def test_guard_with_tty_stdin_prints_help_and_exits_2(monkeypatch, capsys):
+    class FakeTTY:
+        def isatty(self):
+            return True
+
+        def read(self, *args, **kwargs):
+            raise AssertionError("must not read from TTY stdin")
+
+    monkeypatch.setattr(sys, "stdin", FakeTTY())
+    rc = main(["guard"])
+    captured = capsys.readouterr()
+    assert rc == 2
+    for subcmd in ("install", "uninstall", "test"):
+        assert subcmd in captured.out
+

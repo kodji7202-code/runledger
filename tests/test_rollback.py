@@ -4,6 +4,7 @@ import json
 import os
 import stat
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -897,7 +898,7 @@ def test_install_uninstall_preserves_other_lifecycle_hooks(tmp_path):
     for event in rollback.HOOK_EVENTS:
         assert data["hooks"][event][0] == original["hooks"][event][0]
         assert data["hooks"][event][1] == {"hooks": [
-            {"type": "command", "command": "runledger checkpoint --hook", "timeout": 120}]}
+            {"type": "command", "command": f'"{sys.executable}" -m runledger checkpoint --hook', "timeout": 120}]}
     assert guard.install_hook(path) == (False, None)
     guard.uninstall_hook(path)
     assert json.loads(path.read_text(encoding="utf-8")) == original
@@ -924,6 +925,7 @@ def test_install_covers_all_sessions_when_existing_checkpoint_hook_is_restricted
     "'/a folder/runledger' checkpoint --hook",
     "python -m runledger checkpoint --hook",
     '"/a folder/python3.9" -m runledger checkpoint --hook',
+    r'"C:\Program Files\Python 3\python.exe" -m runledger checkpoint --hook',
 ])
 def test_checkpoint_hook_recognises_exact_commands(command):
     assert rollback.is_checkpoint_hook({"type": "command", "command": command})
