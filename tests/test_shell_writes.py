@@ -87,6 +87,19 @@ def test_unquoted_spaced_drive_path_is_one_write_target(command, expected):
     assert _paths(command) == expected
 
 
+@pytest.mark.parametrize("command, deleted, written", [
+    (r"rm C:/repo/a.txt ../outside.txt", [r"C:\repo\a.txt", "../outside.txt"], []),
+    (r"rm C:/repo/a.txt > C:/repo/log ../outside.txt",
+     [r"C:\repo\a.txt", "../outside.txt"], [r"C:\repo\log"]),
+    (r"rm < C:/repo/input ../outside.txt", ["../outside.txt"], []),
+])
+def test_spaced_drive_path_does_not_swallow_a_relative_operand(command, deleted, written):
+    """CORE-SCR-R2-004: `../outside.txt` is an argument of its own, so the delete stays visible
+    instead of being read as the tail of the drive path (or of a redirect target) before it."""
+    assert shell_deletes(command) == deleted
+    assert [w.path for w in shell_writes(command)] == written
+
+
 @pytest.mark.parametrize("command, expected", [
     ("echo ok # <<EOF\nrm k.txt", ["k.txt"]),
     ("echo a#b; rm k.txt", ["k.txt"]),

@@ -18,9 +18,13 @@ _UNC_RE = re.compile(r"^[\\/]{2}(?![?.][\\/])[^\\/]+[\\/][^\\/]")
 PATH_NAME = r"[^\s\\/'\"`<>|;:,(){}\[\]]+"
 PATH_REST = r"[^\s'\"`<>|;:,(){}\[\]]*"
 PATH_CHUNK = r"[^\s'\"`<>|;,(){}\[\]]+"
-# More of a path, separated by a space: a name followed by a separator, then the rest of
-# the folder or file name (`Client X\secret.txt` in `E:\Work\Client X\secret.txt`).
-SPACED_SUFFIX = r"(?: " + PATH_NAME + r"[\\/]" + PATH_REST + r")"
+# A continuation word of a spaced path is part of the folder or file name above it, so it is
+# never a relative operand of its own: `rm C:/repo/a.txt ../outside.txt` is two arguments.
+SPACED_NAME = r"(?![.]{1,2}[\\/]|~[\\/])" + PATH_NAME
+# A name may contain spaces, and a name with several words is still one path
+# (`E:\Work\Client X Corp\secret.txt`): the words before the last one carry no separator,
+# the last one does.
+SPACED_SUFFIX = r"(?: (?:" + SPACED_NAME + r" )*" + SPACED_NAME + r"[\\/]" + PATH_REST + r")"
 # A Windows drive path containing spaces, read as one token: an unquoted path like
 # `type E:\Work\Client X\secret.txt` is two arguments to a shell, but a folder name may
 # contain spaces, so RunLedger reads (and safe mode masks) the whole path, never a fragment.

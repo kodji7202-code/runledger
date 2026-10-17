@@ -26,9 +26,9 @@ class Heredoc:
 
 
 def ansi_c_end(text: str, start: int) -> int:
-    """Index just past the closing quote of the `$'...'` string at `start`, or `-1` when
-    the string is not closed on its own line. A backslash escapes the next character,
-    so `$'it\\'s'` is one word."""
+    """Index just past the closing quote of the `$'...'` string at `start`, or `-1` when the
+    string is not closed. A backslash escapes the next character, so `$'it\\'s'` is one word,
+    and a literal newline is part of the string, as it is in Bash."""
     n = len(text)
     i = start + 2
     while i < n:
@@ -38,8 +38,6 @@ def ansi_c_end(text: str, start: int) -> int:
             continue
         if ch == "'":
             return i + 1
-        if ch == "\n":
-            return -1
         i += 1
     return -1
 
@@ -47,15 +45,16 @@ def ansi_c_end(text: str, start: int) -> int:
 def find_heredocs(text: str) -> List[Heredoc]:
     """Return every unquoted POSIX heredoc in `text` with its operator and body spans.
 
-    Ignores `<<` inside `'...'`, ANSI-C `$'...'` (where `\\'` does not end the string),
-    plain `"..."`, `#` comments, `$((...))` arithmetic, and `<<<` here-strings, while
-    recognizing `<<` inside `"$(...)"` command substitutions.
+    Ignores `<<` inside `'...'`, ANSI-C `$'...'` (where `\\'` does not end the string and a
+    literal newline does not either), plain `"..."`, `#` comments, `$((...))` arithmetic, and
+    `<<<` here-strings, while recognizing `<<` inside `"$(...)"` command substitutions.
     """
     if "<<" not in text:
         return []
     n = len(text)
     i = 0
     line_start = 0
+    ansic_start = 0
     stack: List[str] = ["root"]
     pending: List[Tuple[int, int, str, bool]] = []
     out: List[Heredoc] = []
@@ -120,11 +119,13 @@ def find_heredocs(text: str) -> List[Heredoc]:
             continue
 
         if mode == "ansic":
-            close = ansi_c_end(text, i - 2)
+            close = ansi_c_end(text, ansic_start)
             nl = text.find("\n", i) if pending else -1
             if nl != -1 and (close == -1 or nl < close):
                 i = consume_pending(nl)
                 line_start = i
+                if close != -1 and close <= i:
+                    stack.pop()
                 continue
             if close == -1:
                 break
@@ -210,6 +211,7 @@ def find_heredocs(text: str) -> List[Heredoc]:
             continue
         if text.startswith("$'", i):
             stack.append("ansic")
+            ansic_start = i
             i += 2
             continue
         if text.startswith("$((", i):

@@ -212,6 +212,60 @@ def test_safe_receipt_masks_an_unquoted_spaced_redirect_target(tmp_path, capsys)
     assert json.loads(full)["risk"]["reasons"][0]["reason"].endswith("(E:\\Work\\Client y\\z.txt)")
 
 
+def test_safe_receipt_masks_three_word_folders_and_repeated_spaces(tmp_path, capsys):
+    """CORE-SCR-R2-005/006 end to end: a three-word folder name and a home user name with
+    repeated spaces leak no part of themselves in safe Markdown or JSON receipts."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    steps = [
+        {"tool": "Bash", "input": {"command": r'type "E:\Work\Client X Corp\secret.txt"'}},
+        {"tool": "Bash", "input": {"command": r"type E:\Work\Client X Corp\secret.txt"}},
+        {"tool": "Bash", "input": {"command": r'cat "C:\Users\John  Smith\Documents\x.txt"'}},
+        {"tool": "Bash", "input": {"command": 'cat "/home/john  smith/notes.txt"'}},
+    ]
+    path = tmp_path / "scr2.runledger.json"
+    path.write_text(json.dumps({
+        "runledger_format": 1,
+        "agent": "demo",
+        "session_id": "safe-scr2",
+        "cwd": str(repo),
+        "prompts": [r"type E:\Work\Client X Corp\secret.txt and C:\Users\John  Smith\Documents\x.txt"],
+        "steps": steps,
+    }), encoding="utf-8")
+    for fmt in ("md", "json"):
+        out, _ = _receipt(capsys, str(path), "--format", fmt, "-o", "-", "--safe")
+        text = out if fmt == "md" else json.dumps(json.loads(out), ensure_ascii=False)
+        for leaked in ("E:", "Work", "John", "Smith", "john", "smith"):
+            assert leaked not in text
+        assert "…/Client X Corp/secret.txt" in text
+        assert "~/Documents/x.txt" in text and "~/notes.txt" in text
+    full, _ = _receipt(capsys, str(path), "--format", "json", "-o", "-", "--no-safe")
+    assert json.loads(full)["safe"] is False
+    for kept in (r"E:\Work\Client X Corp\secret.txt", r"C:\Users\John  Smith\Documents\x.txt"):
+        assert json.dumps(kept)[1:-1] in full  # JSON escapes the backslashes
+
+
+def test_receipt_flags_a_delete_operand_after_a_spaced_drive_path(tmp_path, capsys):
+    """CORE-SCR-R2-004: `../outside.txt` after a drive path is an operand of its own, so the
+    receipt keeps the high outside-delete finding for it."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    command = f"rm {str(repo).replace(chr(92), '/')}/a.txt ../outside.txt"
+    path = tmp_path / "del.runledger.json"
+    path.write_text(json.dumps({
+        "runledger_format": 1,
+        "agent": "demo",
+        "session_id": "safe-del",
+        "cwd": str(repo),
+        "prompts": [command],
+        "steps": [{"tool": "Bash", "input": {"command": command}}],
+    }), encoding="utf-8")
+    out, _ = _receipt(capsys, str(path), "--format", "json", "-o", "-")
+    outside = [r for r in json.loads(out)["risk"]["reasons"] if r["code"] == "shell_outside"]
+    assert [(r["severity"], r["reason"]) for r in outside] == [
+        ("high", "Shell command referenced a path outside the working folder (../outside.txt)")]
+
+
 def test_safe_receipt_masks_spaced_paths_usernames_and_prose_emails(tmp_path, capsys):
     """CORE-SCR-013/014/015 end to end: a spaced foreign drive path, a spaced or non-ASCII
     home user name and a real address followed by a colon are masked in both formats."""

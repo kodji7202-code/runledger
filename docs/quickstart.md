@@ -53,13 +53,14 @@ folder) or when Markdown or JSON is written to stdout (`-o -`):
   plus the subfolder the run started in (`app/src`);
 - the home folder (`/home/<user>`, `/Users/<user>`, `C:\Users\<user>`, including user names with
   spaces or non-ASCII characters) becomes `~`, and an unknown user name is consumed up to the next
-  separator, quote or end of line;
+  separator, quote or end of line (a run of spaces counts as part of the name);
 - other paths that share leading folders with the repository have that prefix shortened to `…`,
   as do prefixes you list in `RUNLEDGER_SAFE_PREFIXES` (separated by `:`, or `;` on Windows), and
   unrelated non-system paths with more than two segments are trimmed to `…/<last two parts>`; a
   path that contains spaces counts as one path, so a shell redirect target such as
   `E:\Work\Client y\z.txt` is trimmed to `…/Client y/z.txt` instead of surviving as an unmasked
-  fragment;
+  fragment, and a folder name with several words (`E:\Work\Client X Corp\secret.txt`) is one path
+  in the same way;
 - temp paths such as `/tmp/...` and standard system paths such as `/usr/bin/...` stay as they are;
 - e-mail addresses become `[EMAIL]` (a prose colon does not exempt one) and `user:pass@` in URLs
   becomes `[REDACTED]@`, while scp-style `git@host:org/repo` remotes (with a non-empty path after

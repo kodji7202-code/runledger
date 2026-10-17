@@ -126,8 +126,6 @@ def _shell_code(text: str) -> str:
                 if text[j] == "\\" and j + 1 < n:
                     j += 2
                     continue
-                if text[j] == "\n":
-                    break
                 j += 1
             end = j + 1 if j < n and text[j] == '"' else j
         elif ch == "#" and (text.rfind("\n", 0, i) + 1 == i or text[i - 1] in " \t\r;&|()<>"):
