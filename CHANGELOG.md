@@ -72,6 +72,14 @@ change behavior, so read the entry before you upgrade.
   cache repository context per run. `runledger checkpoints` reads checkpoint metadata in a single
   `for-each-ref` call, and `runledger checkpoint --hook` stays silent outside a Git repository
   while still warning on failures inside a repository.
+- **Repository failures are no longer reported as "not a repository" (`runledger.rollback`):**
+  `Repository` now distinguishes Git's "not a git repository" message (checked with the C locale)
+  from other discovery failures, so a repository Git cannot read (a malformed `.git/config`, a
+  permission or ownership error) warns from the checkpoint hook and prints Git's own reason from
+  `runledger checkpoint`, instead of being silently swallowed. Checkpoint listing frames each
+  `for-each-ref` record with its declared contents size, and any record whose body contains the
+  raw record separator is rejected whole, so a malformed foreign commit can no longer truncate
+  into a listed checkpoint.
 - **PowerShell file write and delete analysis (`runledger.ps_writes`):** `PowerShell` tool steps
   and PowerShell cmdlets inside `Bash` steps (`Set-Content`, `Add-Content`, `Out-File`,
   `Tee-Object`, `Export-Csv`, `New-Item`, `Copy-Item`, `Move-Item`, `Rename-Item`, `Remove-Item`,
