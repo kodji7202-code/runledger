@@ -1580,5 +1580,89 @@ def test_guard_install_round_trips_with_a_free_threaded_interpreter(tmp_path, mo
     assert json.loads(settings.read_text(encoding="utf-8")) == {}
 
 
+@pytest.mark.parametrize("command", [
+    "true;/usr/bin/python3.13t -m runledger guard",
+    "true&&/usr/bin/python3.13t -m runledger guard",
+    "true||/usr/bin/python3.13t -m runledger guard",
+    "true|/usr/bin/python3.13t -m runledger guard",
+    "true&/usr/bin/python3.13t -m runledger guard",
+    '"/usr/bin/python3.13t" -m runledger guard > hook.log',
+    '"/usr/bin/python3.13t" -m runledger guard 2>&1',
+    "(/usr/bin/python3.13t -m runledger guard)",
+    "/usr/bin/python3.13t -m runledger guard\nrm -rf ./build",
+    "/usr/bin/python3.13t -m runledger guard;echo hi",
+    "true;runledger guard",
+])
+def test_is_guard_hook_rejects_attached_shell_operators(command):
+    """CORE-SCR-R3-004: an operator written without spaces is still an operator, so the
+    basename of the first word must never decide ownership of a compound command."""
+    assert guard._is_guard_hook({"type": "command", "command": command}) is False
+
+
+def test_guard_install_preserves_a_compound_interpreter_hook(tmp_path):
+    """The installer writes one simple command, so a compound entry that mentions ours is a
+    foreign hook: install appends beside it and uninstall leaves it in place (VAL-CORE-036)."""
+    settings = tmp_path / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    foreign = [{"matcher": "Bash", "hooks": [
+        {"type": "command", "command": "true;/usr/bin/python3.13t -m runledger guard"}]}]
+    settings.write_text(json.dumps({"hooks": {"PreToolUse": foreign}}), encoding="utf-8")
+
+    assert guard.install_hook(settings)[0] is True
+    pre = json.loads(settings.read_text(encoding="utf-8"))["hooks"]["PreToolUse"]
+    assert pre[0] == foreign[0]
+    owned = [h for group in pre for h in group["hooks"] if guard._is_guard_hook(h)]
+    assert len(owned) == 1 and owned[0]["command"] == guard.guard_hook_command()
+
+    assert guard.uninstall_hook(settings)[0] is True
+    assert json.loads(settings.read_text(encoding="utf-8"))["hooks"]["PreToolUse"] == foreign
+
+
+@pytest.mark.parametrize("executable, command, owned", [
+    (r"D:\tools\bin\agent-python.exe", r'"D:\tools\bin\agent-python.exe" -m runledger guard', True),
+    (r"D:\tools\bin\agent-python.exe", '"D:/tools/bin/agent-python.exe" -m runledger guard', True),
+    (r"D:\Tools\Agent Python\agent-python.exe",
+     r'"d:\tools\agent python\AGENT-PYTHON.EXE" -m runledger guard', True),
+    ("/opt/agents/bin/agent-python", '"/opt/agents/bin/agent-python" -m runledger guard', True),
+    (r"D:\Tools & Runtimes\agent-python.exe",
+     r'"D:\Tools & Runtimes\agent-python.exe" -m runledger guard', True),
+    ("/opt/agents/bin/agent-python", '"/opt/Agents/bin/agent-python" -m runledger guard', False),
+    (r"D:\tools\bin\agent-python.exe", r'"D:\other\bin\agent-python.exe" -m runledger guard', False),
+    (r"D:\tools\bin\agent-python.exe",
+     r'"D:\tools\bin\agent-python.exe" -m runledger checkpoint --hook', False),
+])
+def test_is_guard_hook_follows_the_current_interpreter(monkeypatch, executable, command, owned):
+    """CORE-SCR-R3-003: the installer writes the literal `sys.executable`, so a copied
+    interpreter that does not look like python is our own entry, and another path is not."""
+    monkeypatch.setattr(sys, "executable", executable)
+    assert guard._is_guard_hook({"type": "command", "command": command}) is owned
+
+
+def test_guard_install_round_trips_with_a_renamed_interpreter(tmp_path, monkeypatch):
+    """The whole lifecycle of an installer-emitted command for a renamed interpreter:
+    idempotent install, recognised verification and uninstall without leftovers."""
+    renamed = r"D:\tools\bin\agent-python.exe"
+    monkeypatch.setattr(sys, "executable", renamed)
+    settings = tmp_path / ".claude" / "settings.json"
+
+    assert guard.install_hook(settings)[0] is True
+    data = json.loads(settings.read_text(encoding="utf-8"))
+    stored = data["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+    assert stored == fr'"{renamed}" -m runledger guard'
+    assert data["hooks"]["SessionStart"][0]["hooks"][0]["command"] == \
+        fr'"{renamed}" -m runledger checkpoint --hook'
+
+    assert guard.install_hook(settings) == (False, None)      # no duplicate entry
+    data = json.loads(settings.read_text(encoding="utf-8"))
+    assert len(data["hooks"]["PreToolUse"]) == 1
+    assert len(data["hooks"]["SessionStart"]) == 1
+
+    _, message = guard.verify_hook_command(stored)            # recognised, not refused
+    assert "not a RunLedger guard command" not in message
+
+    assert guard.uninstall_hook(settings)[0] is True
+    assert json.loads(settings.read_text(encoding="utf-8")) == {}
+
+
 
 

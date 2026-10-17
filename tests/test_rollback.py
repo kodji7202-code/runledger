@@ -1057,6 +1057,77 @@ def test_unrelated_checkpoint_commands_are_not_removed(tmp_path, command):
     assert json.loads(path.read_text(encoding="utf-8")) == original
 
 
+@pytest.mark.parametrize("command", [
+    "true;/usr/bin/python3.13t -m runledger checkpoint --hook",
+    "true&&/usr/bin/python3.13t -m runledger checkpoint --hook",
+    "true||/usr/bin/python3.13t -m runledger checkpoint --hook",
+    "true|/usr/bin/python3.13t -m runledger checkpoint --hook",
+    "true&/usr/bin/python3.13t -m runledger checkpoint --hook",
+    '"/usr/bin/python3.13t" -m runledger checkpoint --hook > hook.log',
+    "(/usr/bin/python3.13t -m runledger checkpoint --hook)",
+    "/usr/bin/python3.13t -m runledger checkpoint --hook\nrm -rf ./build",
+    "/usr/bin/python3.13t -m runledger checkpoint --hook;echo hi",
+    "true;runledger checkpoint --hook",
+])
+def test_checkpoint_hook_rejects_attached_shell_operators(command):
+    """CORE-SCR-R3-004: `shlex.split(posix=False)` leaves `true;/usr/bin/python3.13t` in one
+    word, so the operator has to be rejected before any basename handling."""
+    assert rollback.is_checkpoint_hook({"type": "command", "command": command}) is False
+
+
+def test_install_preserves_a_compound_checkpoint_hook(tmp_path):
+    """The round-3 reproducer: v0.6.0 preserved this foreign entry, so install must append
+    beside it and uninstall must leave it (VAL-CORE-036/037)."""
+    path = tmp_path / "settings.json"
+    original = {"hooks": {"SessionStart": [{"hooks": [
+        {"type": "command",
+         "command": "true;/usr/bin/python3.13t -m runledger checkpoint --hook"}]}]}}
+    path.write_text(json.dumps(original), encoding="utf-8")
+
+    assert guard.install_hook(path)[0] is True
+    groups = json.loads(path.read_text(encoding="utf-8"))["hooks"]["SessionStart"]
+    assert groups[0] == original["hooks"]["SessionStart"][0]
+    assert len(groups) == 2
+
+    assert guard.uninstall_hook(path)[0] is True
+    assert json.loads(path.read_text(encoding="utf-8")) == original
+
+
+@pytest.mark.parametrize("executable, command, owned", [
+    (r"D:\tools\bin\agent-python.exe",
+     r'"D:\tools\bin\agent-python.exe" -m runledger checkpoint --hook', True),
+    (r"D:\Tools\Agent Python\agent-python.exe",
+     r'"d:\tools\agent python\AGENT-PYTHON.EXE" -m runledger checkpoint --hook', True),
+    ("/opt/agents/bin/agent-python", '"/opt/agents/bin/agent-python" -m runledger checkpoint --hook', True),
+    (r"D:\Tools & Runtimes\agent-python.exe",
+     r'"D:\Tools & Runtimes\agent-python.exe" -m runledger checkpoint --hook', True),
+    ("/opt/agents/bin/agent-python", '"/opt/Agents/bin/agent-python" -m runledger checkpoint --hook', False),
+    (r"D:\tools\bin\agent-python.exe",
+     r'"D:\other\bin\agent-python.exe" -m runledger checkpoint --hook', False),
+    (r"D:\tools\bin\agent-python.exe", r'"D:\tools\bin\agent-python.exe" -m runledger guard', False),
+])
+def test_checkpoint_hook_follows_the_current_interpreter(monkeypatch, executable, command, owned):
+    """CORE-SCR-R3-003: `checkpoint_hook_command` also stores the literal `sys.executable`."""
+    monkeypatch.setattr(sys, "executable", executable)
+    assert rollback.is_checkpoint_hook({"type": "command", "command": command}) is owned
+
+
+def test_checkpoint_hook_round_trips_with_a_renamed_interpreter(tmp_path, monkeypatch):
+    """A renamed interpreter is a complete lifecycle: install, a no-op second install and
+    uninstall, exactly as for `python3.13t.exe`."""
+    renamed = r"D:\rl-ready\bin\agent-python.exe"
+    monkeypatch.setattr(sys, "executable", renamed)
+    path = tmp_path / "settings.json"
+
+    assert guard.install_hook(path)[0] is True
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["hooks"]["SessionStart"][0]["hooks"][0]["command"] == \
+        fr'"{renamed}" -m runledger checkpoint --hook'
+    assert guard.install_hook(path) == (False, None)
+    assert guard.uninstall_hook(path)[0] is True
+    assert json.loads(path.read_text(encoding="utf-8")) == {}
+
+
 def test_install_invalid_lifecycle_list_leaves_file_untouched(tmp_path):
     path = tmp_path / "settings.json"
     original = json.dumps({"hooks": {"SessionStart": {}}})

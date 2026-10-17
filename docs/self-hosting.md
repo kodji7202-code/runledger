@@ -324,7 +324,9 @@ Each database keeps its own retention namespace: the stem is its file name with 
 `A-Za-z0-9._-` percent-encoded, so `team a.db` and `team_a.db` do not prune each other. Concurrent
 backups in the same second reserve different names (`<name>.db.lock` markers), and retention never
 counts an unfinished copy: the marker, an empty placeholder or a `.tmp` file stays out of the count,
-so two overlapping `--keep 1` runs still leave at least one finished backup:
+so two overlapping `--keep 1` runs still leave at least one finished backup. A run that read the
+names before another run finished checks the final name again while it holds its own marker, so a
+completed copy is never overwritten by a delayed run:
 
 ```bash
 runledger backup --db /var/lib/runledger/runledger.db --dir /var/backups/runledger --keep 14

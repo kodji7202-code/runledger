@@ -80,6 +80,24 @@ change behavior, so read the entry before you upgrade.
   recursive-force-delete command finding and the default guard denies it, instead of treating the
   delete as quoted heredoc data.
 
+- **Hook ownership reads the whole command, and follows the interpreter that is running
+  (`runledger.paths`, `runledger.guard`, `runledger.rollback`):** the command is rejected as
+  foreign before any basename is read when it holds an unquoted shell operator, redirection,
+  command substitution, sub-shell or second line, so `true;/usr/bin/python3.13t -m runledger
+  checkpoint --hook` (and the `guard` form, with `&&`, `||`, `|`, `&`, `>` or a second line) is
+  preserved again: `guard install` appends beside it and `guard uninstall` leaves it, as v0.6.0
+  did. A single command is also ours when its executable word is the interpreter that runs
+  `install`, which writes that path literally: a copied or renamed interpreter
+  (`agent-python.exe`) now works through install, the no-op second install, the install self-test
+  and uninstall. Other interpreters still match the python/pypy name pattern
+  (`python3.13t.exe`, `pythonw.exe`, `pypy3`).
+
+- **A completed backup is never overwritten by a delayed run (`runledger.cli`):** the backup
+  sequence is read before the name marker exists, so a run that paused there could claim a number
+  another run had since used, finished and released, and the atomic rename then replaced that
+  finished copy. The marker claim now checks the final target as well and moves to the next suffix
+  when it is taken, so overlapping backups in the same second still leave one copy per run.
+
 - **CLI flag validation, non-colliding receipts, and atomic stem-scoped backups (`runledger.cli`,
   `runledger.server.db`):** `--latest` on `receipt` and `push` is now mutually exclusive with an
   explicit `session` argument (exits `2`); `--open` with `--format md` or `--format json` prints a

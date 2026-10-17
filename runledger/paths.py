@@ -1,10 +1,15 @@
-"""Path helpers for session paths, which may be POSIX or Windows whatever the host OS."""
+"""Path helpers for session paths, which may be POSIX or Windows whatever the host OS.
+
+It also holds the one reading of the hook command a RunLedger installer writes, which the guard
+and the checkpoint installer share."""
 from __future__ import annotations
 
 import ntpath
 import posixpath
 import re
-from typing import Optional
+import shlex
+import sys
+from typing import Any, List, Optional, Sequence
 
 _WIN_DRIVE_RE = re.compile(r"^[A-Za-z]:")
 _WIN_ABS_RE = re.compile(r"^[A-Za-z]:[\\/]")
@@ -84,6 +89,93 @@ def is_python_executable(name: str) -> bool:
         return False
     stem = name[:-4] if name[-4:].lower() == ".exe" else name
     return _PYTHON_EXE_RE.fullmatch(stem) is not None
+
+
+# Outside quotes these characters make a shell run a second command, redirect output, substitute
+# a command or open a sub-shell. A hook entry that holds one is not the single command the
+# installer writes, so it stays foreign.
+_SHELL_OPERATORS = frozenset(";&|<>`\n\r()")
+_SUBSTITUTION_HEADS = frozenset("({")
+
+
+def has_shell_operator(command: str) -> bool:
+    """True when `command` holds an unquoted shell operator, redirection, command substitution
+    or sub-shell. Quoted text is data: a quoted executable path may contain any of them."""
+    quote = ""
+    index, length = 0, len(command)
+    while index < length:
+        char = command[index]
+        if quote:
+            if char == quote:
+                quote = ""
+            elif quote == '"' and char == "\\" and index + 1 < length and command[index + 1] in '\\"':
+                index += 1
+            index += 1
+            continue
+        if char in ("'", '"'):
+            quote = char
+        elif char in _SHELL_OPERATORS:
+            return True
+        elif char == "$" and index + 1 < length and command[index + 1] in _SUBSTITUTION_HEADS:
+            return True
+        index += 1
+    return False
+
+
+def command_words(command: str) -> Optional[List[str]]:
+    """The words of `command` when it is exactly one simple command, else None. `shlex` is used
+    in its POSIX-off mode, which keeps Windows backslashes and the quotes around a word."""
+    if has_shell_operator(command):
+        return None
+    try:
+        return shlex.split(command, posix=False)
+    except ValueError:
+        return None
+
+
+def _file_name(token: str) -> str:
+    """The file name of a command word, with either kind of separator."""
+    return token.replace("\\", "/").rsplit("/", 1)[-1]
+
+
+def is_current_interpreter(token: str) -> bool:
+    """True when the command word names the interpreter that is running (`sys.executable`). The
+    installer writes that literal path, so a renamed copy of the interpreter (`agent-python.exe`)
+    is a RunLedger interpreter command too. Paths are normalised, and compared case-insensitively
+    when either looks like a Windows path."""
+    current = sys.executable
+    if not current:
+        return False
+    win = is_windows_style(token, current)
+    return key(token, win) == key(current, win)
+
+
+def is_runledger_executable(token: str) -> bool:
+    """True for the `runledger` command word, with or without a path or an `.exe` suffix."""
+    return _file_name(token).casefold() in ("runledger", "runledger.exe")
+
+
+def owned_hook_command(command: Any, tail: Sequence[str]) -> Optional[List[str]]:
+    """The words of `command` when it is exactly one RunLedger hook command ending in `tail`,
+    else None. `tail` is `("guard",)` or `("checkpoint", "--hook")`, and the accepted forms are
+    the two the installer writes: `<runledger>` + tail, and `<interpreter> -m runledger` + tail
+    for `sys.executable` itself (whatever its file is called) or an interpreter-looking name
+    (`python3.13t.exe`, `pythonw`, `pypy3`). A command with a shell operator, a redirection, a
+    second command or any other tail is a foreign hook: install must append beside it and
+    uninstall must leave it alone."""
+    if not isinstance(command, str):
+        return None
+    words = command_words(command)
+    if not words:
+        return None
+    words = [w[1:-1] if len(w) >= 2 and w[0] in ("'", '"') and w[-1] == w[0] else w for w in words]
+    suffix = list(tail)
+    if words[1:] == suffix and is_runledger_executable(words[0]):
+        return words
+    if (words[1:3] == ["-m", "runledger"] and words[3:] == suffix
+            and (is_current_interpreter(words[0]) or is_python_executable(_file_name(words[0])))):
+        return words
+    return None
 
 
 def _norm(p: str, win: bool) -> str:
