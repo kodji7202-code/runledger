@@ -43,6 +43,15 @@ def _paths(command):
     ("python3 - <<'EOF'\np='a.py'\nopen(p).read()\nopen(p,'w').write('x')\np='b.md'\nopen(p, mode='a').write('y')\nEOF",
      [("a.py", 0, False), ("b.md", 0, False)]),
     ("python - <<EOF\nfrom pathlib import Path\nPath('c.txt').write_text('x')\nEOF", [("c.txt", 0, False)]),
+    ("echo '<<EOF'\necho x > a.txt", [("a.txt", 0, False)]),
+    ('echo "<<EOF"\necho x > b.txt', [("b.txt", 0, False)]),
+    ("cat <<<word\necho x > c.txt", [("c.txt", 0, False)]),
+    ("echo $((1<<2))\necho x > d.txt", [("d.txt", 0, False)]),
+    ("# <<EOF\necho x > e.txt", [("e.txt", 0, False)]),
+    ("python3 - <<'EOF'\nopen('a.py', 'w').write('1\\n')\nEOF\necho x > b.txt", [("a.py", 0, False), ("b.txt", 0, False)]),
+    ('cat <<"EOF" > c.txt\nhi\nEOF', [("c.txt", 1, False)]),
+    ("cat <<-EOF > d.txt\n\thi\n\tEOF", [("d.txt", 1, False)]),
+    ("cat <<EOF > u.txt\nline1\nline2", [("u.txt", 2, False)]),
 ])
 def test_detects_shell_writes(command, expected):
     assert _paths(command) == expected

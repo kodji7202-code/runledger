@@ -32,6 +32,21 @@ change behavior, so read the entry before you upgrade.
   cache repository context per run. `runledger checkpoints` reads checkpoint metadata in a single
   `for-each-ref` call, and `runledger checkpoint --hook` stays silent outside a Git repository
   while still warning on failures inside a repository.
+- **PowerShell file write and delete analysis (`runledger.ps_writes`):** `PowerShell` tool steps
+  and PowerShell cmdlets inside `Bash` steps (`Set-Content`, `Add-Content`, `Out-File`,
+  `Tee-Object`, `Export-Csv`, `New-Item`, `Copy-Item`, `Move-Item`, `Rename-Item`, `Remove-Item`,
+  `Invoke-WebRequest -OutFile`, their aliases, `>`/`>>` redirections and `[System.IO.File]` writes)
+  now populate `files` in receipts and trigger the same file-path risk rules (`secret_file`,
+  `git_internals`, `db_migration`, `shell_outside`, `temp_copy`, `test_deleted`) and guard
+  decisions as POSIX shell writes, while skipping variable, wildcard and `-WhatIf` targets.
+- **Quote- and comment-aware heredoc scanning (`runledger.shell_syntax`):** `<<` inside single or
+  double quotes, `#` comments, `<<<` here-strings and `$((...))` arithmetic expansions no longer
+  start a fake heredoc that hides later commands on subsequent lines from `shell_writes` and
+  `risk`.
+- **Tightened `test_skipped` detection:** `sys.exit(`, `process.exit(`, `os._exit(`, `foo.xit(`,
+  `taxit(`, `@pytest.mark.xfail` and `.todo(` in test diffs or edits are no longer misclassified
+  as disabled tests, while `xit(`, `xdescribe(`, `xtest(`, `xcontext(`, `xspecify(`, `t.Skip(`,
+  `t.SkipNow(`, `self.skipTest(`, `it.only(`, `@Disabled` and `@Ignore` are flagged.
 
 ## [0.6.0] - 2026-10-15
 

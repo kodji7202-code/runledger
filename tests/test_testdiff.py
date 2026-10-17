@@ -9,7 +9,7 @@ from runledger import gitinfo
 from runledger.cli import reconcile_git
 from runledger.parser import Run, Step, Usage
 from runledger.quality import score_run
-from runledger.risk import assess
+from runledger.risk import assess, assess_step
 from runledger.summarize import file_changes
 from runledger.testdiff import analyze, classify
 
@@ -61,6 +61,45 @@ def test_changed_assertion_is_neutral():
 
 def test_skip_marker_added():
     assert classify("t.py", _diff([], ["@pytest.mark.skip", "def test_new():"])).verdict == "skipped"
+
+
+@pytest.mark.parametrize("line", [
+    "sys.exit(1)",
+    "process.exit(0)",
+    "os._exit(1)",
+    "foo.xit('not a test')",
+    "taxit('not a test')",
+    "@pytest.mark.xfail",
+    "test.todo('later')",
+    "it.todo('later')",
+])
+def test_exit_calls_xfail_and_todo_are_not_flagged_as_skips(line):
+    assert classify("tests/test_a.py", _diff(["def test_a():", "    pass"], ["def test_a():", f"    {line}"])) is None
+    step = Step(1, "Edit", {"file_path": "tests/test_a.py", "old_string": "pass", "new_string": line}, "t", "m", None)
+    assert not any(r.code == "test_skipped" for r in assess_step(step, "/repo"))
+
+
+@pytest.mark.parametrize("line", [
+    "xit('a', () => {})",
+    "xdescribe('b', () => {})",
+    "xtest('c', () => {})",
+    "xcontext('d', () => {})",
+    "xspecify('e', () => {})",
+    't.Skip("x")',
+    't.SkipNow()',
+    'self.skipTest("x")',
+    "it.only('f', () => {})",
+    "@Disabled",
+    "@Ignore",
+    "@pytest.mark.skip",
+    'pytest.skip("x")',
+    '@unittest.skip("x")',
+    "describe.skip('g', () => {})",
+])
+def test_real_skip_and_disabled_markers_are_flagged(line):
+    assert classify("tests/test_a.py", _diff([], [line])).verdict == "skipped"
+    step = Step(1, "Edit", {"file_path": "tests/test_a.py", "old_string": "pass", "new_string": line}, "t", "m", None)
+    assert any(r.code == "test_skipped" and r.severity == "high" for r in assess_step(step, "/repo"))
 
 
 def test_js_tests_are_named_by_their_title():

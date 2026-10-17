@@ -19,7 +19,14 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Set, Tuple
 
-SKIP_RE = re.compile(r"\.(skip|only)\(|@pytest\.mark\.skip|xit\(|xdescribe\(|@Ignore|@Disabled")
+SKIP_RE = re.compile(
+    r"\.(skip|only)\("
+    r"|@pytest\.mark\.skip(?!\w)"
+    r"|(?<![\w.])(?:xit|xdescribe|xtest|xcontext|xspecify)\("
+    r"|\bt\.Skip(?:Now)?\("
+    r"|\bself\.skipTest\("
+    r"|@(?:Ignore|Disabled)\b"
+)
 _ASSERT_RE = re.compile(r"\bassert\w*\b|\bexpect\s*\(|\bpytest\.raises\b|\bt\.(?:Error|Errorf|Fatal|Fatalf)\b")
 _TEST_DEF_RES = [
     re.compile(r"^\s*(?:async\s+)?def\s+(test\w*)\s*\("),
