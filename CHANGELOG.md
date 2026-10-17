@@ -69,7 +69,8 @@ change behavior, so read the entry before you upgrade.
   `nested/../../outside.txt` again, and the default guard asks instead of allowing, as it did
   before the spaced-path rule existed. A word the join swallowed is only dropped when the joined
   word already reported a finding at least as severe, so the whole-path finding (and its safe-mode
-  masking) is unchanged.
+  masking) is unchanged; an operand that climbs out of its folder is named even next to that
+  whole-path finding (`rm C:\a b\x nested/../../outside.txt` reports both readings).
 
 - **A queued heredoc starts at the newline that ends the command line (`runledger.shell_syntax`):**
   a newline inside a multiline `$'...'` or `"..."` string is part of that word, so a pending

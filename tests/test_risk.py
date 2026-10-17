@@ -236,6 +236,20 @@ def test_traversing_operand_after_a_spaced_drive_path_stays_a_high_delete(comman
         r"Shell command referenced a path outside the working folder (nested/../../outside.txt)"]
 
 
+@pytest.mark.parametrize("command", [
+    r"rm C:\a b\x nested/../../outside.txt",
+    r"rm C:\a b\x > C:\a b\log nested/../../outside.txt",
+    r"rm < C:\a b\input nested/../../outside.txt",
+])
+def test_traversing_operand_is_named_when_the_joined_path_is_itself_outside(command):
+    """CORE-SCR-R3-001: the shell reads `C:\\a b\\x` and `nested/../../outside.txt` as two
+    arguments, so the escaping operand keeps a finding naming it next to the whole-path finding
+    the display reading makes for the same text."""
+    reasons = [r.reason for r in _risks("Bash", cwd="C:/repo", command=command)
+               if r.code == "shell_outside" and r.severity == "high"]
+    assert any(reason.endswith("(nested/../../outside.txt)") for reason in reasons)
+
+
 def test_spaced_drive_path_with_several_words_is_still_one_path():
     """CORE-SCR-R2-005: a folder name may hold more than one extra word, and the finding names
     the whole path so safe mode can mask it."""

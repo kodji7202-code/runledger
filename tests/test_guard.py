@@ -121,6 +121,17 @@ def test_default_asks_again_for_a_traversing_operand_after_a_spaced_drive_path(t
     assert len(outside) == 1
 
 
+def test_default_asks_and_names_the_traversing_operand_of_a_backslash_drive_path(tmp_path):
+    """CORE-SCR-R3-001, the literal reproducer: `rm C:\\a b\\x nested/../../outside.txt` asks
+    again, and the escaping operand is named next to the whole-path finding."""
+    d = guard.decide(bash_event(tmp_path, r"rm C:\a b\x nested/../../outside.txt"), {})
+    assert d["policy_decision"] == "ask"
+    assert d["decision"] == "ask"
+    reasons = [r["reason"] for r in d["risks"]
+               if r["code"] == "shell_outside" and r["severity"] == "high"]
+    assert any(reason.endswith("(nested/../../outside.txt)") for reason in reasons)
+
+
 def test_default_denies_a_delete_after_a_queued_heredoc_past_a_multiline_ansi_c_string(tmp_path):
     """CORE-SCR-R3-002: a newline inside `$'...'` is part of that word, not the end of the
     command line, so the queued heredoc starts after the real terminator and the `rm -rf`
