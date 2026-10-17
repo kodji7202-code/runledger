@@ -52,13 +52,15 @@ folder) or when Markdown or JSON is written to stdout (`-o -`):
 - paths inside the repository become relative, and the folder is shown as the repository name
   plus the subfolder the run started in (`app/src`);
 - the home folder (`/home/<user>`, `/Users/<user>`, `C:\Users\<user>`, including user names with
-  spaces) becomes `~`;
+  spaces or non-ASCII characters) becomes `~`, and an unknown user name is consumed up to the next
+  separator, quote or end of line;
 - other paths that share leading folders with the repository have that prefix shortened to `…`,
   as do prefixes you list in `RUNLEDGER_SAFE_PREFIXES` (separated by `:`, or `;` on Windows), and
   unrelated non-system paths with more than two segments are trimmed to `…/<last two parts>`;
 - temp paths such as `/tmp/...` and standard system paths such as `/usr/bin/...` stay as they are;
-- e-mail addresses become `[EMAIL]` and `user:pass@` in URLs becomes `[REDACTED]@`, while
-  `git@host:org/repo` and `ssh://git@host/...` Git remotes are kept verbatim.
+- e-mail addresses become `[EMAIL]` (a prose colon does not exempt one) and `user:pass@` in URLs
+  becomes `[REDACTED]@`, while scp-style `git@host:org/repo` remotes (with a non-empty path after
+  the colon) and `ssh://git@host/...` Git remotes are kept verbatim.
 
 Files written outside any repository (and HTML sent to stdout) keep full paths, which help debugging.
 `--safe` and `--no-safe` override the default. After writing a file, `receipt` prints the mode

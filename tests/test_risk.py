@@ -172,6 +172,21 @@ def test_bash_shell_outside_windows_path_is_high_when_deleting():
     assert outside and outside[0].severity == "high"
 
 
+def test_unquoted_spaced_drive_path_is_read_as_one_path():
+    """CORE-SCR-013: a folder name with spaces stays one path in the finding, so safe mode can
+    mask the whole path instead of leaking the folders above the last two parts."""
+    risks = _risks("Bash", command=r"type E:\Work\Client X\secret.txt")
+    assert _reasons(risks) == [r"Shell command referenced a path outside the working folder (E:\Work\Client X\secret.txt)"]
+    quoted = _risks("Bash", command=r'type "E:\Work\Client X\secret.txt"')
+    assert _reasons(quoted) == _reasons(risks)
+
+
+def test_spaced_drive_path_does_not_merge_two_paths():
+    assert _reasons(_risks("Bash", command=r"copy E:\a\b.txt F:\c\d.txt")) == [
+        r"Shell command referenced a path outside the working folder (E:\a\b.txt)",
+        r"Shell command referenced a path outside the working folder (F:\c\d.txt)"]
+
+
 def test_git_dash_c_rm_resolves_delete_operand_against_git_working_folder():
     risks = _risks("Bash", cwd=POSIX_CWD, command="git -C /opt/other-repo rm victim.txt")
     outside = [r for r in risks if r.code == "shell_outside" and r.severity == "high"]

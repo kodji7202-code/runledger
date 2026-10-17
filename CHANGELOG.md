@@ -124,6 +124,16 @@ change behavior, so read the entry before you upgrade.
   preserved instead of being redacted as `[EMAIL]` or `[REDACTED]@`; and foreign non-system
   absolute paths with more than two segments are trimmed to `…/<last two parts>` even when the
   repository root is known.
+- **Safe mode fully masks spaced paths and unknown user names (`runledger.safe`, `runledger.risk`):**
+  a foreign drive path that contains spaces is masked as one path, quoted (`type "E:\Work\Client
+  X\secret.txt"`) or bare, instead of surviving in the step text; an unknown home user name with
+  spaces or non-ASCII characters (`/home/john smith`, `/Users/mary jane doe`,
+  `C:\Users\José Smith\Documents`) is consumed up to a separator, quote or end of line, so no
+  surname fragment reaches a receipt; and the scp-remote exemption now needs a non-empty path after
+  the colon, so a real address followed by a prose colon (`git@example.com: please respond`) is
+  masked as `[EMAIL]` while `git@github.com:org/repo.git` is still kept. A shell command's unquoted
+  drive path with spaces is read as one path, so the risk reason names the whole path (which safe
+  mode can then mask) instead of a fragment.
 - **Model normalization, verified OpenAI/Google prices, 1h cache writes and long-context tiers (`runledger.pricing`, `runledger/prices.json`):**
   `normalize_model` strips trailing `[...]` context tags (`claude-opus-4-6[1m]`), `custom:` and
   proxy suffixes (`custom:Claude-Opus-4.5-[Proxy]-0`), Bedrock/Vertex prefixes and `-latest` while
