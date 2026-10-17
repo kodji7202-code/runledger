@@ -44,7 +44,7 @@ _SPACED = SPACED_SUFFIX + "*"
 # The user name of a home folder may contain spaces, in any script; it runs to a separator,
 # a quote or the end of the line, so no part of the name can leak. This over-redacts prose
 # after an unknown user name, which is the safe direction.
-_USER = PATH_NAME + r"(?: " + PATH_NAME + r")*"
+_USER = PATH_NAME + r"(?:[ \t]+" + PATH_NAME + r")*"
 _HOME_REST = r"(?:[\\/]" + PATH_REST + r")?"
 # An absolute path in free text: a POSIX path not glued to a word, `~` or `…`, or a Windows
 # drive path. `//` is not a path start, so URLs (`https://host/x`) are left alone.

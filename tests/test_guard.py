@@ -82,6 +82,26 @@ def test_default_still_denies_rm_rf_under_sudo(tmp_path):
     assert d["decision"] == "deny"
 
 
+def test_default_denies_a_delete_after_a_multiline_ansi_c_string(tmp_path):
+    """CORE-SCR-R2-002: a `$'...'` string may contain literal newlines; the `rm -rf` after its
+    closing quote is still read, so the default deny stays in effect."""
+    d = guard.decide(bash_event(tmp_path, "echo $'first\nsecond'\nrm -rf ./build"), {})
+    assert d["decision"] == "deny"
+    assert "command" in d["codes"]
+
+
+def test_default_asks_again_for_an_operand_after_a_spaced_drive_path(tmp_path):
+    """CORE-SCR-R2-004: `../outside.txt` is an argument of its own, so deleting it is still a
+    high finding and the guard asks instead of allowing the command."""
+    repo = tmp_path / "client work"
+    repo.mkdir()
+    command = "rm " + str(repo).replace(chr(92), "/") + "/a.txt ../outside.txt"
+    d = guard.decide(bash_event(repo, command), {})
+    assert d["policy_decision"] == "ask"
+    assert d["decision"] == "ask"
+    assert any(r["code"] == "shell_outside" and r["severity"] == "high" for r in d["risks"])
+
+
 def test_default_allows_ls_and_prints_nothing(tmp_path):
     d = guard.decide(bash_event(tmp_path, "ls"), {})
     assert d["decision"] == "allow"

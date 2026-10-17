@@ -244,6 +244,35 @@ def test_spaced_and_non_ascii_home_usernames_are_fully_masked():
         assert leaked not in posix + mac + win
 
 
+def test_three_word_spaced_foreign_paths_are_fully_masked():
+    """CORE-SCR-R2-005: a folder name may hold several words, and the whole path is still one
+    path, so nothing above the last two components survives in safe text."""
+    ctx = SafeContext(root="D:/repo", home="C:/Users/local")
+    assert safe_text(r'type "E:\Work\Client X Corp\secret.txt"', ctx) == 'type "…/Client X Corp/secret.txt"'
+    assert safe_text(r"type E:\Work\Client X Corp\secret.txt", ctx) == "type …/Client X Corp/secret.txt"
+    assert safe_text(r"type E:\Work\Client X Corp\secret.txt now", ctx) == "type …/Client X Corp/secret.txt now"
+    assert safe_text("type E:/Work/Client X Corp/secret.txt", ctx) == "type …/Client X Corp/secret.txt"
+    assert safe_text("ls /opt/My Client Docs/x.txt now", ctx) == "ls …/My Client Docs/x.txt now"
+    for leaked in ("E:", "Work"):
+        assert leaked not in safe_text(
+            r'type "E:\Work\Client X Corp\secret.txt" and E:\Work\Client X Corp\secret.txt', ctx)
+
+
+def test_home_user_names_with_repeated_spaces_are_fully_masked():
+    """CORE-SCR-R2-006: a whitespace run inside an unknown user name is consumed too, so no
+    surname fragment reaches a receipt on Windows or POSIX."""
+    ctx = SafeContext(root="D:/repo", home="C:/Users/local")
+    win = safe_text(r'cat "C:\Users\John  Smith\Documents\x.txt"', ctx)
+    assert win == 'cat "~/Documents/x.txt"'
+    posix = safe_text('cat "/home/john  smith/notes.txt"', ctx)
+    assert posix == 'cat "~/notes.txt"'
+    mac = safe_text("ls /Users/mary   jane  doe", ctx)
+    assert mac == "ls ~"
+    assert safe_text("cat /home/john\tsmith/x.txt", ctx) == "cat ~/x.txt"
+    for leaked in ("John", "Smith", "john", "smith", "mary", "jane", "doe"):
+        assert leaked not in win + posix + mac
+
+
 def test_git_scp_exemption_needs_a_remote_path():
     """CORE-SCR-015: only `git@host:path` with a non-empty path is an scp remote; a real
     address followed by a prose colon, a bare colon or a slash is still masked."""

@@ -37,7 +37,11 @@ change behavior, so read the entry before you upgrade.
   the whole path and the safe receipt shows `…/Client y/z.txt` instead of the unmasked fragment
   `E:\Work\Client`; each redirect target keeps exactly one outside-the-working-folder finding,
   because the shell write check de-duplicates by the flagged path instead of reading the path
-  back out of the reason text.
+  back out of the reason text. A folder name may hold several words
+  (`E:\Work\Client X Corp\secret.txt` is one path), and an independently rooted operand after a
+  drive path is never read as part of it: `rm C:/repo/a.txt ../outside.txt` still reports the
+  high outside-the-working-folder finding for `../outside.txt` (plain, `>` and `<` forms) and
+  the guard asks again, as it did before the spaced-path rule existed.
 
 - **CLI flag validation, non-colliding receipts, and atomic stem-scoped backups (`runledger.cli`,
   `runledger.server.db`):** `--latest` on `receipt` and `push` is now mutually exclusive with an
@@ -118,7 +122,9 @@ change behavior, so read the entry before you upgrade.
 - **ANSI-C strings do not start a heredoc (`runledger.shell_syntax`, `runledger.shell_writes`,
   `runledger.risk`):** `echo $'it\'s <<EOF'` is one word, because a backslash escapes the quote
   inside `$'...'`, so the commands on the following lines are analysed again in the guard and in
-  receipts instead of being swallowed as a heredoc body.
+  receipts instead of being swallowed as a heredoc body. A literal newline is part of the string
+  until its closing quote, so `echo $'first` / `second'` followed by `rm -rf ./build` still
+  reports the recursive force delete (guard: deny).
 - **A `#` comment ends at the newline (`runledger.shell_writes`):** the shell tokenizer no
   longer reads the line after a comment as arguments of the commented command, so
   `echo ok # <<EOF` followed by `rm k.txt` still lists `k.txt` as deleted, and `echo a#b` is
@@ -131,6 +137,9 @@ change behavior, so read the entry before you upgrade.
   only cmdlet-looking text is quoted or commented (`echo 'Set-Content is a cmdlet'; touch t.txt;
   rm r.txt`) stays POSIX, so its writes and deletes are listed instead of being lost to the
   PowerShell extractor, while a real `Set-Content` command word is still analysed as PowerShell.
+  Quoted text is blanked through its closing quote even across newlines, so a multiline quoted
+  example (`echo "example:` / `Set-Content -Path demo.txt"` / `; touch t.txt`) cannot flip a
+  POSIX step to PowerShell either.
 - **Tightened `test_skipped` detection:** `sys.exit(`, `process.exit(`, `os._exit(`, `foo.xit(`,
   `taxit(`, `@pytest.mark.xfail` and `.todo(` in test diffs or edits are no longer misclassified
   as disabled tests, while `xit(`, `xdescribe(`, `xtest(`, `xcontext(`, `xspecify(`, `t.Skip(`,
@@ -150,9 +159,12 @@ change behavior, so read the entry before you upgrade.
   repository root is known.
 - **Safe mode fully masks spaced paths and unknown user names (`runledger.safe`, `runledger.risk`):**
   a foreign drive path that contains spaces is masked as one path, quoted (`type "E:\Work\Client
-  X\secret.txt"`) or bare, instead of surviving in the step text; an unknown home user name with
+  X\secret.txt"`) or bare, instead of surviving in the step text, and a folder name with several
+  words (`E:\Work\Client X Corp\secret.txt`) is one path too, so it is trimmed to
+  `…/Client X Corp/secret.txt`; an unknown home user name with
   spaces or non-ASCII characters (`/home/john smith`, `/Users/mary jane doe`,
-  `C:\Users\José Smith\Documents`) is consumed up to a separator, quote or end of line, so no
+  `C:\Users\José Smith\Documents`, including runs of spaces such as
+  `C:\Users\John  Smith\Documents`) is consumed up to a separator, quote or end of line, so no
   surname fragment reaches a receipt; and the scp-remote exemption now needs a non-empty path after
   the colon, so a real address followed by a prose colon (`git@example.com: please respond`) is
   masked as `[EMAIL]` while `git@github.com:org/repo.git` is still kept. A shell command's unquoted

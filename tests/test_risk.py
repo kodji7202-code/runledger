@@ -208,6 +208,34 @@ def test_unquoted_spaced_drive_read_redirect_names_the_whole_path():
         r"Shell command referenced a path outside the working folder (E:\Work\Client y\z.txt)"]
 
 
+@pytest.mark.parametrize("command", [
+    r"rm C:/repo/a.txt ../outside.txt",
+    r"rm C:/repo/a.txt > C:/repo/log ../outside.txt",
+    r"rm < C:/repo/input ../outside.txt",
+])
+def test_spaced_drive_path_does_not_absorb_a_relative_operand(command):
+    """CORE-SCR-R2-004: `../outside.txt` is its own argument, not the tail of the drive path
+    before it, so deleting it is still a high finding (and the guard asks again)."""
+    assert [(r.severity, r.code, r.reason) for r in _risks("Bash", cwd="C:/repo", command=command)] == [
+        ("high", "shell_outside",
+         r"Shell command referenced a path outside the working folder (../outside.txt)")]
+
+
+def test_spaced_drive_path_with_several_words_is_still_one_path():
+    """CORE-SCR-R2-005: a folder name may hold more than one extra word, and the finding names
+    the whole path so safe mode can mask it."""
+    assert _reasons(_risks("Bash", command=r"type E:\Work\Client X Corp\secret.txt")) == [
+        r"Shell command referenced a path outside the working folder (E:\Work\Client X Corp\secret.txt)"]
+
+
+def test_multiline_ansi_c_string_keeps_the_next_command_visible():
+    """CORE-SCR-R2-002: a `$'...'` string may contain literal newlines, so the `rm -rf` after
+    the closing quote is still a high command finding (the guard denies it)."""
+    risks = _risks("Bash", cwd="C:/repo", command="echo $'first\nsecond'\nrm -rf ./build")
+    assert [(r.severity, r.code, r.reason) for r in risks] == [
+        ("high", "command", "Recursive force delete (rm -rf)")]
+
+
 def test_git_dash_c_rm_resolves_delete_operand_against_git_working_folder():
     risks = _risks("Bash", cwd=POSIX_CWD, command="git -C /opt/other-repo rm victim.txt")
     outside = [r for r in risks if r.code == "shell_outside" and r.severity == "high"]

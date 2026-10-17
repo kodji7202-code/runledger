@@ -151,6 +151,34 @@ def test_unquoted_spaced_drive_path_is_one_write_target(command, expected):
     assert [(w.path, w.deleted) for w in ps_writes(command)] == expected
 
 
+def test_multiline_quoted_cmdlet_text_does_not_flip_a_bash_step():
+    """CORE-SCR-R2-003: a double-quoted string may span newlines, so literal cmdlet text inside
+    it never classifies a Bash step as PowerShell and the real writes stay listed."""
+    cmd = 'echo "example:\nSet-Content -Path demo.txt -Value x\n"; touch t.txt; rm r.txt'
+    assert shell_kind("Bash", cmd) == "posix"
+    step = Step(1, "Bash", {"command": cmd}, "t1", None, None)
+    run = Run("s", "p", r"C:\proj", "main", None, None, ["go"], [step], "", Usage(), {})
+    assert sorted(file_changes(run)) == ["r.txt", "t.txt"]
+
+
+def test_multiline_ansi_c_string_does_not_flip_a_bash_step():
+    """The same rule for `$'...'` strings, whose content also ends at its closing quote."""
+    cmd = "echo $'first\nRemove-Item -Recurse -Force x'\ntouch t.txt"
+    assert shell_kind("Bash", cmd) == "posix"
+    step = Step(1, "Bash", {"command": cmd}, "t1", None, None)
+    run = Run("s", "p", r"C:\proj", "main", None, None, ["go"], [step], "", Usage(), {})
+    assert sorted(file_changes(run)) == ["t.txt"]
+
+
+@pytest.mark.parametrize("command", [
+    r"Remove-Item C:\repo\a.txt ..\outside.txt",
+    r"Remove-Item C:\repo\a.txt > C:\repo\log ..\outside.txt",
+])
+def test_spaced_drive_path_does_not_swallow_a_relative_operand(command):
+    """CORE-SCR-R2-004 for PowerShell: `..\\outside.txt` stays a delete target of its own."""
+    assert [w.path for w in ps_writes(command) if w.deleted] == [r"C:\repo\a.txt", "../outside.txt"]
+
+
 def test_spaced_drive_redirect_target_is_one_write_finding():
     risks = _risks("PowerShell", command=r"'x' > E:\Work\Client y\z.txt")
     assert [(r.severity, r.code, r.reason) for r in risks] == [
