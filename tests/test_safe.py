@@ -149,3 +149,68 @@ def test_truncated_path_inside_root_is_hidden():
     assert safe_text("Ran `cd /private/var/folders/ab/T/pytest-0/case/r…`", ctx) == "Ran `cd …`"
     assert safe_text("cat /private/var/folders/ab/T/pytest-0/case/repo/src/app.…", ctx) == "cat src/app.…"
     assert safe_text("cat /home/alice/notes/to…", SafeContext(root="/work/repo")) == "cat ~/notes/to…"
+
+
+# ---------------------------------------------------------------- Spaced homes, git@ remotes, foreign paths (VAL-CORE-032..034)
+
+def test_home_folders_with_spaces_are_fully_masked():
+    ctx = SafeContext(root="D:/work/repo")
+    win_out = safe_text(r"edited C:\Users\John Smith\proj\a.py today", ctx)
+    assert win_out == "edited ~/proj/a.py today"
+    assert "John" not in win_out and "Smith" not in win_out
+
+    posix_out = safe_text("cat /home/john smith/notes.txt", ctx)
+    assert posix_out == "cat ~/notes.txt"
+    assert "john" not in posix_out and "smith" not in posix_out
+
+    mac_out = safe_text("open /Users/Mary Jane Doe/notes.txt", ctx)
+    assert mac_out == "open ~/notes.txt"
+    for name in ("Mary", "Jane", "Doe"):
+        assert name not in mac_out
+
+
+def test_scp_and_ssh_git_remotes_are_not_redacted_as_emails():
+    ctx = SafeContext(root=ROOT)
+    cmd = (
+        "git clone git@github.com:org/repo.git && "
+        "git remote set-url origin git@gitlab.internal.corp:team/service.git && "
+        "git fetch ssh://git@github.com/org/repo.git && "
+        "git fetch ssh://alice@host.example.com/repo.git && "
+        "git config user.email bob@example.com && "
+        "echo 'Co-authored-by: alice@corp.io' && "
+        "git clone https://user:pass@github.com/org/repo.git"
+    )
+    out = safe_text(cmd, ctx)
+    assert "git@github.com:org/repo.git" in out
+    assert "git@gitlab.internal.corp:team/service.git" in out
+    assert "ssh://git@github.com/org/repo.git" in out
+    assert "ssh://[REDACTED]@host.example.com/repo.git" in out
+    assert "alice@host.example.com" not in out
+    assert "git config user.email [EMAIL]" in out
+    assert "Co-authored-by: [EMAIL]" in out
+    assert "bob@example.com" not in out and "alice@corp.io" not in out
+    assert "https://[REDACTED]@github.com/org/repo.git" in out
+    assert "user:pass" not in out
+
+
+def test_foreign_absolute_paths_are_trimmed_when_root_is_known():
+    for root in ("C:/Users/dev/proj", "/home/dev/proj"):
+        ctx = SafeContext(root=root)
+        win_foreign = safe_path(r"D:\secret-corp\client-acme\payroll\q1.xlsx", ctx)
+        assert win_foreign == "…/payroll/q1.xlsx"
+        assert "secret-corp" not in win_foreign and "client-acme" not in win_foreign
+
+        posix_foreign = safe_path("/opt/proprietary-vendor/sdk-v3/include/header.h", ctx)
+        assert posix_foreign == "…/include/header.h"
+        assert "proprietary-vendor" not in posix_foreign and "sdk-v3" not in posix_foreign
+
+        text_out = safe_text(
+            r"copied D:\secret-corp\client-acme\payroll\q1.xlsx and /opt/proprietary-vendor/sdk-v3/include/header.h",
+            ctx,
+        )
+        assert text_out == "copied …/payroll/q1.xlsx and …/include/header.h"
+
+        for sys_path in ("/usr/bin/python3", "/etc/hosts", "/bin/sh"):
+            assert safe_path(sys_path, ctx) == sys_path
+        assert safe_path("/tmp/build.log", ctx) == "/tmp/build.log"
+

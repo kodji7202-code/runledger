@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 
-from .paths import native
+from .paths import is_unc, native
 
 # The session log names the folder, so its repository config is not trusted:
 # these options keep git from running fsmonitor hooks, external diff tools or textconv filters.
@@ -76,7 +76,7 @@ def _git(cwd: str, *args: str) -> Optional[str]:
 
 def _valid_cwd(cwd: Optional[str]) -> bool:
     # A relative cwd from a log (Droid can record ".") would resolve against RunLedger's own folder.
-    return bool(cwd) and os.path.isabs(cwd) and os.path.isdir(cwd)
+    return bool(cwd) and not is_unc(cwd) and os.path.isabs(cwd) and os.path.isdir(cwd)
 
 
 def _norm_cwd(cwd: str) -> str:

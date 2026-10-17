@@ -47,6 +47,19 @@ change behavior, so read the entry before you upgrade.
   `taxit(`, `@pytest.mark.xfail` and `.todo(` in test diffs or edits are no longer misclassified
   as disabled tests, while `xit(`, `xdescribe(`, `xtest(`, `xcontext(`, `xspecify(`, `t.Skip(`,
   `t.SkipNow(`, `self.skipTest(`, `it.only(`, `@Disabled` and `@Ignore` are flagged.
+- **UNC, `\\?\` long-path and symlink/junction path handling (`runledger.paths`, `runledger.risk`):**
+  UNC paths (`\\srv\share\...` and `//srv/share/...`) and Windows `\\?\` / `\\?\UNC\` long-path
+  prefixes are recognized as Windows-style absolute paths across `paths`, `risk` and `guard` while
+  keeping device paths (`\\.\...`, `\\?\GLOBALROOT...`) excluded. When a path and working directory
+  exist on the local host (non-UNC, matching the host OS style), `_outside` also resolves
+  `os.path.realpath` to flag symlink and Windows junction escapes outside the project without
+  hanging on unreachable UNC shares.
+- **Safe-mode path and Git remote masking (`runledger.safe`):** home folders with spaces in the
+  user name (`C:\Users\John Smith\...`, `/home/john smith/...`, `/Users/Mary Jane Doe/...`) are
+  masked in full to `~/...`; scp-style `git@host:org/repo` and `ssh://git@host/...` Git remotes are
+  preserved instead of being redacted as `[EMAIL]` or `[REDACTED]@`; and foreign non-system
+  absolute paths with more than two segments are trimmed to `…/<last two parts>` even when the
+  repository root is known.
 
 ## [0.6.0] - 2026-10-15
 

@@ -6,14 +6,16 @@ Path rules, applied to path fields and to every absolute path found in free text
   - a prefix listed in RUNLEDGER_SAFE_PREFIXES (os.pathsep-separated): `…` plus the rest
   - temp folders (/tmp, /var/tmp, the system temp dir): kept as they are
   - a path sharing leading folders with the repository root: that prefix becomes `…`
-  - with no known root (a relative cwd), other non-system paths keep their last two parts: `…/a/b`
-Free text then gets the usual secret masking, e-mail addresses become [EMAIL] and the
-`user:pass@` part of URLs becomes [REDACTED]@. Session id, branch and models are kept.
+  - other non-system paths with more than two segments keep their last two parts: `…/a/b`
+Free text then gets the usual secret masking, e-mail addresses become [EMAIL] (except
+scp-style `git@host:org/repo` remotes) and the `user:pass@` part of URLs becomes
+[REDACTED]@ (except `ssh://git@host/...`). Session id, branch and models are kept.
 Every function is idempotent: applying it to its own output changes nothing.
 """
 from __future__ import annotations
 
 import dataclasses
+from functools import lru_cache
 import os
 import re
 import tempfile
@@ -26,14 +28,22 @@ from .risk import Risk
 
 ELLIPSIS = "…"
 EMAIL = "[EMAIL]"
-_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
-_URL_CREDS_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9+.-]*://)[^\s/@]+@")
+_EMAIL_RE = re.compile(
+    r"(?<![A-Za-z0-9._%+-])(?<!://)"
+    r"(?!git@[A-Za-z0-9.-]+\.[A-Za-z]{2,}[:/])"
+    r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
+    r"(?![A-Za-z0-9.-])"
+)
+_URL_CREDS_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9+.-]*://)(?!git@)[^\s/@]+@")
 # An absolute path in free text: a POSIX path not glued to a word, `~` or `…`, or a Windows
-# drive path. It ends at whitespace, quotes, shell punctuation or `:` (PATH-style lists).
+# drive path. Home folders under /home, /Users or C:\Users may contain spaces in the user name.
 # `//` is not a path start, so URLs (`https://host/x`) are left alone.
 _TEXT_PATH_RE = re.compile(
-    r"(?<![\w.~/\\…-])/(?!/)[^\s'\"`<>|;:,(){}\[\]]+"
-    r"|(?<![\w])[A-Za-z]:[\\/][^\s'\"`<>|;,(){}\[\]]*")
+    r"(?<![\w.~/\\…-])/(?:[Hh]ome|[Uu]sers)/(?:[A-Za-z0-9._-]+(?: [A-Za-z0-9._-]+){1,3}[\\/][^\s'\"`<>|;:,(){}\[\]]+|[A-Z][A-Za-z0-9._-]*(?: [A-Z][A-Za-z0-9._-]*){1,2}(?:[\\/][^\s'\"`<>|;:,(){}\[\]]*)?)"
+    r"|(?<![\w])[A-Za-z]:[\\/][Uu]sers[\\/](?:[A-Za-z0-9._-]+(?: [A-Za-z0-9._-]+){1,3}[\\/][^\s'\"`<>|;,(){}\[\]]+|[A-Z][A-Za-z0-9._-]*(?: [A-Z][A-Za-z0-9._-]*){1,2}(?:[\\/][^\s'\"`<>|;,(){}\[\]]*)?)"
+    r"|(?<![\w.~/\\…-])/(?!/)[^\s'\"`<>|;:,(){}\[\]]+"
+    r"|(?<![\w])[A-Za-z]:[\\/][^\s'\"`<>|;,(){}\[\]]*"
+)
 _HOME_RE = re.compile(r"^(?:/home/[^/]+|/Users/[^/]+|/root|[A-Za-z]:/Users/[^/]+)(?=/|$)", re.I)
 _TEMP_PREFIXES = ("/tmp", "/var/tmp", "/private/tmp", "/private/var/folders", "/var/folders")
 
@@ -74,7 +84,10 @@ def _temp_dirs() -> List[str]:
     return dirs
 
 
-_SYSTEM_PREFIXES = ("/usr", "/bin", "/sbin", "/etc", "/dev", "/proc", "/sys", "/opt/homebrew", "/lib")
+_SYSTEM_PREFIXES = (
+    "/usr", "/bin", "/sbin", "/etc", "/dev", "/proc", "/sys", "/opt/homebrew", "/lib",
+    "C:/Windows", "C:/Program Files", "C:/Program Files (x86)",
+)
 
 
 def _is_system(p: str) -> bool:
@@ -106,12 +119,11 @@ def safe_path(path: str, ctx: SafeContext) -> str:
         shared = 0
         while shared < min(len(a), len(b)) and (a[shared].lower() == b[shared].lower() if win else a[shared] == b[shared]):
             shared += 1
-        if shared >= 2:  # at least one folder below the filesystem root or drive is shared
+        if shared >= 2 and len(a) - shared <= 2:  # at least one folder below the filesystem root or drive is shared
             return ELLIPSIS + "/" + "/".join(a[shared:]) if shared < len(a) else ELLIPSIS
-    elif not _is_system(p):
-        # No known root (the log records a relative cwd): the folder layout cannot be told
-        # apart from the project, so only the last two parts are kept.
-        parts = [x for x in p.split("/") if x]
+    if not _is_system(p):
+        # Foreign paths (or any path when no root is known) keep only their last two parts.
+        parts = [x for x in p.split("/") if x and not re.match(r"^[A-Za-z]:$", x)]
         if len(parts) > 2:
             return ELLIPSIS + "/" + "/".join(parts[-2:])
     return path
@@ -149,8 +161,25 @@ def _truncated_path(base: str, ctx: SafeContext) -> Optional[str]:
     return None if shown == base else shown + ELLIPSIS
 
 
+@lru_cache(maxsize=64)
+def _compile_spaced_re(spaced: tuple[str, ...]) -> "re.Pattern[str]":
+    alts = [re.escape(p).replace("/", r"[\\/]") + r"(?:[\\/][^\s'\"`<>|;,(){}\[\]]*)?"
+            for p in sorted(spaced, key=len, reverse=True)]
+    flags = re.I if any(is_windows_style(p) for p in spaced) else 0
+    return re.compile("|".join(alts), flags)
+
+
+def _spaced_ctx_re(ctx: SafeContext) -> Optional["re.Pattern[str]"]:
+    spaced = tuple(p for p in (ctx.root, ctx.home, *ctx.prefixes) if p and " " in p)
+    return _compile_spaced_re(spaced) if spaced else None
+
+
 def safe_text(text: Any, ctx: SafeContext) -> str:
     s = "" if text is None else str(text)
+    if " " in s:
+        spaced_re = _spaced_ctx_re(ctx)
+        if spaced_re is not None:
+            s = spaced_re.sub(lambda m: _path_in_text(m, ctx), s)
     s = _TEXT_PATH_RE.sub(lambda m: _path_in_text(m, ctx), s)
     s = redact(s)
     s = _URL_CREDS_RE.sub(r"\1[REDACTED]@", s)

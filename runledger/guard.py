@@ -46,6 +46,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from . import paths as _paths
 from . import risk as _risk
 from .parser import Step
 from .risk import POLICY_FILE, SEVERITY_POINTS, Risk, assess_step
@@ -209,6 +210,8 @@ def _section(data: Any, key: str) -> Dict[str, Any]:
 
 def read_policy(cwd: str) -> Dict[str, Any]:
     """The project's `<cwd>/.runledger.json` as a dict. Missing or invalid gives {}."""
+    if not cwd or _paths.is_unc(cwd):
+        return {}
     try:
         data = json.loads((Path(cwd) / POLICY_FILE).read_text(encoding="utf-8-sig"))
     except (OSError, ValueError, TypeError, RecursionError):
@@ -756,6 +759,8 @@ def http_approver(request: Dict[str, Any], approval: Dict[str, Any]) -> str:
 # ---------------------------------------------------------------- log
 
 def _append_log(cwd: str, fields: Dict[str, Any]) -> None:
+    if not cwd or _paths.is_unc(cwd):
+        return
     path = Path(cwd) / LOG_DIR / LOG_FILE
     path.parent.mkdir(parents=True, exist_ok=True)
     rec: Dict[str, Any] = {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds")}
