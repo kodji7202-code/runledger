@@ -256,3 +256,81 @@ def test_failed_backup_leaves_no_partial_file(tmp_path, monkeypatch, capsys):
     assert list(folder.glob("runledger-*.db")) == []
     assert list(folder.glob("*.tmp")) == []
 
+
+def test_backup_stems_keep_distinct_database_names():
+    """Databases that differ in characters the stem cannot carry stay in separate namespaces."""
+    from runledger.cli import _backup_stem
+
+    stems = {name: _backup_stem(name) for name in (
+        "team a.db", "team_a.db", "team%20a.db", "a.db", "A.db", "team (1).db", "team-1.db",
+        "José.db", "team+two.db",
+    )}
+    assert len(set(stems.values())) == len(stems)
+    assert stems["a.db"] == "a"
+    assert stems["team_a.db"] == "team_a"
+
+
+def test_backup_retention_keeps_similar_stems_apart(tmp_path, capsys):
+    spaced_db = tmp_path / "team a.db"
+    plain_db = tmp_path / "team_a.db"
+    for path, name in ((spaced_db, "Spaced"), (plain_db, "Plain")):
+        db = Database(str(path))
+        db.create_team(name)
+        db.close()
+
+    folder = tmp_path / "shared"
+    for _ in range(2):
+        assert main(["backup", "--db", str(spaced_db), "--dir", str(folder), "--keep", "1"]) == 0
+        assert main(["backup", "--db", str(plain_db), "--dir", str(folder), "--keep", "1"]) == 0
+    capsys.readouterr()
+
+    files = sorted(folder.glob("runledger-*.db"))
+    assert len(files) == 2
+    teams = []
+    for path in files:
+        copy = Database(str(path))
+        try:
+            teams.append(copy.team_name(1))
+        finally:
+            copy.close()
+    assert sorted(teams) == ["Plain", "Spaced"]
+
+
+def test_concurrent_backups_never_share_a_target(tmp_path, monkeypatch):
+    from contextlib import closing
+
+    db_path = tmp_path / "team.db"
+    db = Database(str(db_path))
+    db.create_team("Concurrent")
+    db.close()
+    folder = tmp_path / "bkp"
+
+    barrier = threading.Barrier(2, timeout=15)
+    real_backup_to = Database.backup_to
+
+    def slow_backup_to(self, path):
+        barrier.wait()
+        return real_backup_to(self, path)
+
+    monkeypatch.setattr(Database, "backup_to", slow_backup_to)
+    codes = []
+
+    def worker():
+        codes.append(main(["backup", "--db", str(db_path), "--dir", str(folder)]))
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+        assert not thread.is_alive()
+
+    assert codes == [0, 0]
+    files = sorted(folder.glob("runledger-*.db"))
+    assert len(files) == 2
+    assert list(folder.glob("*.tmp")) == []
+    for path in files:
+        with closing(sqlite3.connect(str(path))) as conn:
+            assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+            assert conn.execute("SELECT COUNT(*) FROM teams").fetchone()[0] == 1
+
