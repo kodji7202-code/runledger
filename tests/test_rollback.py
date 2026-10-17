@@ -904,7 +904,7 @@ def forge_checkpoint_with_separator(repo, checkpoint_id, tree, tail=b"\x1e" + b"
     return oid
 
 
-def test_checkpoints_listing_spawn_count_constant(repo, monkeypatch):
+def test_checkpoints_listing_spawn_count_constant(repo, tmp_path, monkeypatch):
     created = [repo.create(label=f"cp-{i}", run_id=f"run-{i}") for i in range(15)]
 
     # Inject a symbolic ref, a non-commit ref, a malformed ref name, a foreign commit, and a malformed commit body under PREFIX.
@@ -929,10 +929,25 @@ def test_checkpoints_listing_spawn_count_constant(repo, monkeypatch):
         calls.append(list(cmd))
         return real_run(cmd, *args, **kwargs)
 
-    monkeypatch.setattr(rollback.subprocess, "run", spy_run)
-    listed = rollback.Repository(str(repo.root)).checkpoints()
+    single = tmp_path / "single"
+    single.mkdir()
+    git(single, "init", "-q")
+    git(single, "config", "core.autocrlf", "false")
+    (single / "file.txt").write_text("only\n", encoding="utf-8")
+    git(single, "add", ".")
+    many = rollback.Repository(str(repo.root))
+    one = rollback.Repository(str(single))
+    one.create(label="only", run_id="run-only")
+
+    calls.clear()
+    listed = many.checkpoints()
     assert [cp.id for cp in listed] == [cp.id for cp in reversed(created)]
     assert len(calls) <= 3
+    many_refs = len(calls)
+
+    calls.clear()
+    assert [cp.id for cp in one.checkpoints()] != []
+    assert len(calls) == many_refs
 
 
 def test_records_containing_the_record_separator_are_rejected(repo, capsys):
