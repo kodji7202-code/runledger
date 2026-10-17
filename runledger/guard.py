@@ -247,11 +247,11 @@ def project_root(event_or_cwd: Any = None) -> str:
     return cwd
 
 
-def read_policy(cwd: str) -> Dict[str, Any]:
+def read_policy(cwd: str, *, _resolved: bool = False) -> Dict[str, Any]:
     """The project's `<project_root>/.runledger.json` as a dict. Missing or invalid gives {}."""
     if not cwd or _paths.is_unc(cwd):
         return {}
-    root = project_root(cwd)
+    root = cwd if _resolved else project_root(cwd)
     if not root or _paths.is_unc(root):
         return {}
     try:
@@ -649,7 +649,7 @@ def decide(event: dict, policy: Optional[dict] = None, approver: Optional[Approv
     event = event if isinstance(event, dict) else {}
     event_cwd = _event_cwd(event)
     cwd = project_root(event)
-    project = policy if isinstance(policy, dict) else read_policy(cwd)
+    project = policy if isinstance(policy, dict) else read_policy(cwd, _resolved=True)
     user = load_user_config()
     cfg, warnings = _effective_guard(project, user, trusted_approval_settings(user))
     warnings = _project_key_warnings(project) + warnings
@@ -711,8 +711,7 @@ def decide(event: dict, policy: Optional[dict] = None, approver: Optional[Approv
 def evaluate(event: dict, policy: Optional[dict] = None, approver: Optional[ApproverFn] = None) -> _DecisionDict:
     """Evaluate a PreToolUse event and write warnings + the decision record to `.runledger/guard.log`."""
     decision = decide(event, policy=policy, approver=approver)
-    _log_quietly(lambda: _log_warnings(decision))
-    _log_quietly(lambda: _log_decision(decision))
+    _log_quietly(lambda: _log_warnings_and_decision(decision))
     return decision
 
 
@@ -806,32 +805,53 @@ def http_approver(request: Dict[str, Any], approval: Dict[str, Any]) -> str:
 
 # ---------------------------------------------------------------- log
 
-def _append_log(cwd: str, fields: Dict[str, Any]) -> None:
-    if not cwd or _paths.is_unc(cwd):
+def _append_logs(cwd: str, records: List[Dict[str, Any]]) -> None:
+    if not cwd or not records or _paths.is_unc(cwd):
         return
     path = Path(cwd) / LOG_DIR / LOG_FILE
     path.parent.mkdir(parents=True, exist_ok=True)
-    rec: Dict[str, Any] = {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds")}
-    for k, v in fields.items():
-        rec[k] = clean(v, 200) if isinstance(v, str) else v
+    ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    lines: List[str] = []
+    for fields in records:
+        rec: Dict[str, Any] = {"ts": ts}
+        for k, v in fields.items():
+            rec[k] = clean(v, 200) if isinstance(v, str) else v
+        lines.append(json.dumps(rec, ensure_ascii=False) + "\n")
     with path.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        fh.writelines(lines)
 
 
-def _log_decision(decision: dict) -> None:
-    _append_log(decision["cwd"], {
+def _append_log(cwd: str, fields: Dict[str, Any]) -> None:
+    _append_logs(cwd, [fields])
+
+
+def _decision_record(decision: dict) -> Dict[str, Any]:
+    return {
         "session_id": decision["session_id"], "tool": decision["tool"], "mode": decision["mode"],
         "tool_use_id": decision.get("tool_use_id", ""),
         "decision": decision["decision"], "policy_decision": decision["policy_decision"],
         "codes": decision["codes"], "approval": decision["approval"],
         "summary": decision["summary"], "reason": decision["reason"],
-    })
+    }
+
+
+def _warning_records(decision: dict) -> List[Dict[str, Any]]:
+    return [
+        {"session_id": decision["session_id"], "decision": "warning", "reason": text}
+        for text in (decision.get("warnings") or [])
+    ]
+
+
+def _log_decision(decision: dict) -> None:
+    _append_log(decision["cwd"], _decision_record(decision))
 
 
 def _log_warnings(decision: dict) -> None:
-    for text in decision.get("warnings") or []:
-        _append_log(decision["cwd"], {"session_id": decision["session_id"],
-                                      "decision": "warning", "reason": text})
+    _append_logs(decision["cwd"], _warning_records(decision))
+
+
+def _log_warnings_and_decision(decision: dict) -> None:
+    _append_logs(decision["cwd"], _warning_records(decision) + [_decision_record(decision)])
 
 
 def _log_quietly(fn: Callable[[], None]) -> None:
@@ -854,12 +874,11 @@ def handle(raw: str) -> Optional[dict]:
             raise ValueError("hook input is not a JSON object")
         if not event:
             return None
-        policy = read_policy(project_root(event))
+        policy = read_policy(project_root(event), _resolved=True)
         decision = decide(event, policy)
     except Exception as exc:
         return _on_error(event, policy, exc)
-    _log_quietly(lambda: _log_warnings(decision))
-    _log_quietly(lambda: _log_decision(decision))
+    _log_quietly(lambda: _log_warnings_and_decision(decision))
     return hook_output(decision)
 
 
