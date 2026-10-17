@@ -495,14 +495,22 @@ def cmd_team_create(args) -> int:
 
 _LEGACY_BACKUP_RE = re.compile(r"^runledger-(\d{8}-\d{6})(?:-(\d+))?\.db$")
 _STEM_BACKUP_RE = re.compile(r"^runledger-(.+)-(\d{8}-\d{6})(?:-(\d+))?\.db$")
+_BACKUP_STEM_SAFE = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-")
 
 
 def _backup_stem(db_path: str) -> str:
+    """A file-name-safe stem for the backups of one database. Characters outside the safe set are
+    percent-encoded, so every database file keeps its own retention namespace (`team a.db` and
+    `team_a.db` no longer share one) and the encoding can be reversed exactly."""
     raw = Path(db_path).stem or "runledger"
-    return re.sub(r"[^A-Za-z0-9._-]", "_", raw) or "runledger"
+    encoded = []
+    for byte in raw.encode("utf-8"):
+        char = chr(byte)
+        encoded.append(char if char in _BACKUP_STEM_SAFE else "%%%02X" % byte)
+    return "".join(encoded) or "runledger"
 
 
-def _next_backup_target(folder: Path, stem: str, stamp: str) -> Path:
+def _next_backup_seq(folder: Path, stem: str, stamp: str) -> int:
     max_seq = -1
     for path in folder.glob(f"runledger-{stem}-{stamp}*.db"):
         m = _STEM_BACKUP_RE.match(path.name)
@@ -510,17 +518,35 @@ def _next_backup_target(folder: Path, stem: str, stamp: str) -> Path:
             seq = int(m.group(3) or 0)
             if seq > max_seq:
                 max_seq = seq
-    if max_seq < 0:
-        base = folder / f"runledger-{stem}-{stamp}.db"
-        if not base.exists() and not base.with_name(f"{base.name}.tmp").exists():
-            return base
-        max_seq = 0
-    seq = max_seq + 1
+    return max_seq + 1
+
+
+def _reserve_backup_target(folder: Path, stem: str, stamp: str) -> Path:
+    """Reserve the next backup name by creating the file exclusively. Concurrent backups in the
+    same second then take different names instead of writing over each other, and a sequence
+    number freed by pruning is never reused. The caller removes the empty placeholder when the
+    copy fails."""
+    seq = _next_backup_seq(folder, stem, stamp)
     while True:
-        candidate = folder / f"runledger-{stem}-{stamp}-{seq}.db"
-        if not candidate.exists() and not candidate.with_name(f"{candidate.name}.tmp").exists():
-            return candidate
-        seq += 1
+        suffix = "" if seq == 0 else f"-{seq}"
+        target = folder / f"runledger-{stem}-{stamp}{suffix}.db"
+        try:
+            handle = os.open(str(target), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            seq += 1
+            continue
+        os.close(handle)
+        return target
+
+
+def _discard_reserved_backup(target: Optional[Path]) -> None:
+    """Drop a reserved name that never became a backup, so a failed run leaves no empty file."""
+    if target is None:
+        return
+    try:
+        target.unlink()
+    except OSError:
+        pass
 
 
 def _prune_backups(folder: Path, stem: str, keep: int) -> List[Path]:
@@ -562,16 +588,18 @@ def cmd_backup(args) -> int:
         print(f"error: no database at {args.db}", file=sys.stderr)
         return 1
     stem = _backup_stem(args.db)
+    target: Optional[Path] = None
     try:
         folder.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        target = _next_backup_target(folder, stem, stamp)
+        target = _reserve_backup_target(folder, stem, stamp)
         db = Database(args.db)
         try:
             db.backup_to(str(target))
         finally:
             db.close()
     except (OSError, sqlite3.Error) as exc:
+        _discard_reserved_backup(target)
         print(f"error: backup failed: {exc}", file=sys.stderr)
         return 1
     old = _prune_backups(folder, stem, args.keep)

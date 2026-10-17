@@ -179,6 +179,14 @@ change behavior, so read the entry before you upgrade.
   `<system-reminder>`, etc.); and Aider parses `cache write` and `cache hit` token counts in either
   order without double-counting `sent` and distributes per-step integer remainders so step tokens
   sum to `totals.tokens`.
+- **Backup names are reserved exclusively and stems stay unique per database (`runledger.cli`):**
+  `runledger backup` reserves its `runledger-<stem>-YYYYmmdd-HHMMSS[-N].db` name with an exclusive
+  create before copying, so two backups started in the same second take different names instead of
+  one silently replacing the other, and a failed copy removes the reservation, still leaving no
+  `.db` or `.tmp` file behind. The stem percent-encodes every character outside `A-Za-z0-9._-`
+  instead of replacing it with `_`, so databases whose names differ only by such a character
+  (`team a.db` and `team_a.db`) keep separate backup namespaces and retention for one never
+  prunes the other database's copies.
 
 ## [0.6.0] - 2026-10-15
 
