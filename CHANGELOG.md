@@ -29,6 +29,24 @@ change behavior, so read the entry before you upgrade.
 
 ### Fixed
 
+- **Secrets in assignments whose name only contains a keyword (`runledger.secrets`,
+  `runledger.guard`):** `MYTOKEN=abc123`, `TOKEN2=abc123` and `MY_ACCESS_TOKEN2=abc123` are masked
+  again in `guard.log`, receipts and the text sent to an LLM, as they were in v0.6.0. The redaction
+  patterns accept a bounded identifier prefix and suffix around the keyword
+  (`[A-Za-z0-9_.-]{0,40}` on each side), so a long name without a keyword cannot cause
+  backtracking; variable references, placeholders, all-caps names and digit-only values stay
+  readable. Detection (`find_secrets`, and the risk findings built on it) keeps its word-anchored
+  12-character threshold.
+
+- **Guard hook ownership with versioned or free-threaded interpreters (`runledger.guard`,
+  `runledger.rollback`):** `guard install` stores the literal `sys.executable`, so the recognizers
+  now accept every interpreter name it can write, including `python3.13t.exe`, `python3.14t`,
+  `pythonw.exe` and `pypy3`. Installing again updates the existing entry instead of adding a second
+  one, `guard uninstall` removes the guard and both lifecycle checkpoint hooks, and the install
+  self-test recognises the stored command instead of warning that it is not a RunLedger guard
+  command. Foreign hooks (`echo runledger guard`, `other.sh && runledger guard`, another
+  executable) are still left alone.
+
 - **Spaced drive paths in shell writes, redirects and PowerShell paths (`runledger.shell_writes`,
   `runledger.ps_writes`, `runledger.risk`):** an unquoted drive path that contains spaces is read
   as one path whether it is a redirect target (`echo hi > E:\Work\Client y\z.txt`), a shell

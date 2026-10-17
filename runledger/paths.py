@@ -73,6 +73,19 @@ def is_abs(p: str) -> bool:
     return bool(_WIN_ABS_RE.match(q)) or q.startswith(("/", "\\"))
 
 
+# The basename of an interpreter executable a hook installer can write: it stores the literal
+# `sys.executable`, so versioned, free-threaded and debug names are interpreter commands too.
+_PYTHON_EXE_RE = re.compile(r"(?:python|pypy)[0-9]*(?:\.[0-9]+)*[a-z0-9_]*\Z", re.I)
+
+
+def is_python_executable(name: str) -> bool:
+    """True for an interpreter name such as `python3.13t.exe`, `pythonw` or `pypy3`."""
+    if not name:
+        return False
+    stem = name[:-4] if name[-4:].lower() == ".exe" else name
+    return _PYTHON_EXE_RE.fullmatch(stem) is not None
+
+
 def _norm(p: str, win: bool) -> str:
     """'/' separators and no '.' or '..' segments; case is kept."""
     q = strip_long_prefix(p)

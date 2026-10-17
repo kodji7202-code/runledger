@@ -1505,5 +1505,40 @@ def test_guard_install_default_uses_a_policy_only_project_root(tmp_path, monkeyp
     assert not (sub / ".claude").exists()
 
 
+@pytest.mark.parametrize("command, owned", [
+    (r'"C:\Python313\python3.13t.exe" -m runledger guard', True),
+    ('"/opt/py313t/bin/python3.13t" -m runledger guard', True),
+    ('"python3.14t" -m runledger guard', True),
+    (r'"C:\Python313\pythonw.exe" -m runledger guard', True),
+    (r'"C:\Python313\node.exe" -m runledger guard', False),
+    ('"python3.13t" -m runledger checkpoint --hook', False),
+])
+def test_is_guard_hook_accepts_the_interpreter_names_the_installer_can_write(command, owned):
+    """CORE-SCR-R2-007: `guard_hook_command` stores the literal `sys.executable`, so a
+    free-threaded or versioned interpreter name is still our own entry, while a foreign
+    executable or another hook stays foreign."""
+    assert guard._is_guard_hook({"type": "command", "command": command}) is owned
+
+
+def test_guard_install_round_trips_with_a_free_threaded_interpreter(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys, "executable", r"C:\Python313\python3.13t.exe")
+    settings = tmp_path / ".claude" / "settings.json"
+
+    changed, _ = guard.install_hook(settings)
+    assert changed is True
+    data = json.loads(settings.read_text(encoding="utf-8"))
+    stored = data["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+    assert stored == r'"C:\Python313\python3.13t.exe" -m runledger guard'
+    assert data["hooks"]["SessionStart"][0]["hooks"][0]["command"] == \
+        r'"C:\Python313\python3.13t.exe" -m runledger checkpoint --hook'
+
+    assert guard.install_hook(settings) == (False, None)      # a second install changes nothing
+    _, message = guard.verify_hook_command(stored)            # the self-test recognises it
+    assert "not a RunLedger guard command" not in message
+
+    assert guard.uninstall_hook(settings)[0] is True          # nothing is left behind
+    assert json.loads(settings.read_text(encoding="utf-8")) == {}
+
+
 
 

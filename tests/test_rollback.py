@@ -1027,6 +1027,17 @@ def test_checkpoint_hook_recognises_exact_commands(command):
 
 
 @pytest.mark.parametrize("command", [
+    r'"C:\Python313\python3.13t.exe" -m runledger checkpoint --hook',
+    '"/opt/py313t/bin/python3.13t" -m runledger checkpoint --hook',
+    '"pythonw.exe" -m runledger checkpoint --hook',
+])
+def test_checkpoint_hook_recognises_free_threaded_interpreters(command):
+    """CORE-SCR-R2-007: the installer writes the literal sys.executable, so the
+    checkpoint recognizer must accept the same suffixed interpreter names as guard."""
+    assert rollback.is_checkpoint_hook({"type": "command", "command": command})
+
+
+@pytest.mark.parametrize("command", [
     "echo runledger checkpoint --hook",
     "echo python -m runledger checkpoint --hook",
     "runledger checkpoint --hook && echo keep",

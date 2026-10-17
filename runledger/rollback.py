@@ -17,11 +17,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Tuple
 
+from .paths import is_python_executable
+
 PREFIX = "refs/runledger/checkpoints/"
 ID_RE = re.compile(r"[0-9]{8}T[0-9]{12}Z-[0-9a-f]{8}\Z")
 HOOK_COMMAND = "runledger checkpoint --hook"
 HOOK_EVENTS = ("SessionStart", "UserPromptSubmit")
-_PYTHON_RE = re.compile(r"python(?:w|[0-9]+(?:\.[0-9]+)*)?(?:\.exe)?\Z", re.I)
 
 
 class CheckpointError(RuntimeError):
@@ -540,7 +541,7 @@ def is_checkpoint_hook(hook) -> bool:
     executable = parts[0].replace("\\", "/").rsplit("/", 1)[-1]
     # Match only our complete command, never an echo, pipeline, or compound user hook.
     return ((len(parts) == 3 and executable.casefold() in ("runledger", "runledger.exe"))
-            or (len(parts) == 5 and _PYTHON_RE.fullmatch(executable) is not None
+            or (len(parts) == 5 and is_python_executable(executable)
                 and parts[1:3] == ["-m", "runledger"]))
 
 
