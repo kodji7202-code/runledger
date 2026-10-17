@@ -36,6 +36,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -64,7 +65,7 @@ except Exception:  # pragma: no cover - standalone fallback when runledger.secre
 
 HOOK_COMMAND = "runledger guard"
 HOOK_MARGIN_S = 15             # the hook entry allows the approval wait plus this many seconds
-_GUARD_CMD_RE = re.compile(r"\brunledger(?:\.exe)?\"?\s+guard\b|-m\s+runledger\s+guard\b", re.I)
+_PYTHON_RE = re.compile(r"python(?:w|[0-9]+(?:\.[0-9]+)*)?(?:\.exe)?\Z", re.I)
 PROJECT_DIR_ENV_VARS = ("CLAUDE_PROJECT_DIR", "FACTORY_PROJECT_DIR", "DROID_PROJECT_DIR")
 
 LOG_DIR = ".runledger"
@@ -241,7 +242,7 @@ def project_root(event_or_cwd: Any = None) -> str:
         try:
             p = Path(cwd)
             for d in (p, *p.parents):
-                if (d / ".git").exists():
+                if (d / ".git").exists() or (d / POLICY_FILE).exists():
                     return str(d)
         except OSError:
             pass
@@ -957,9 +958,13 @@ def cmd_test(event_json: str) -> int:
 
 def settings_path(project: Optional[str] = None, global_scope: bool = False,
                   home: Optional[Path] = None) -> Path:
+    """The Claude Code settings file this install writes: `~/.claude/settings.json` for a
+    global install, else `<project>/.claude/settings.json`. Without `--project` the folder
+    is the project root (nearest ancestor with `.runledger.json` or `.git`), not the cwd."""
     if global_scope:
         return (Path(home) if home is not None else Path.home()) / ".claude" / "settings.json"
-    return Path(project or os.getcwd()) / ".claude" / "settings.json"
+    base = Path(project) if project else Path(project_root())
+    return base / ".claude" / "settings.json"
 
 
 def hook_timeout_for(approval_timeout_s: Optional[float] = None) -> int:
@@ -987,8 +992,33 @@ def hook_entry(hook_seconds: int, portable: bool = False) -> Dict[str, Any]:
     return {"matcher": "*", "hooks": [{"type": "command", "command": guard_hook_command(portable=portable), "timeout": hook_seconds}]}
 
 
+def _owned_command_parts(command: Any) -> Optional[List[str]]:
+    """The words of a complete RunLedger guard hook command, else None.
+
+    Only the two forms the installer writes count: bare `runledger guard` (optionally with a
+    path or `.exe`) and `"<python>" -m runledger guard`. A foreign hook that merely mentions
+    the words (`echo runledger guard`, `other.sh && runledger guard`, a pipeline) is not ours
+    and must never be replaced or removed."""
+    if not isinstance(command, str):
+        return None
+    try:
+        # Keep Windows backslashes, and accept quoted executable paths on either platform.
+        parts = shlex.split(command, posix=False)
+    except ValueError:
+        return None
+    parts = [p[1:-1] if len(p) >= 2 and p[0] in ("'", '"') and p[-1] == p[0] else p for p in parts]
+    if not parts:
+        return None
+    executable = parts[0].replace("\\", "/").rsplit("/", 1)[-1]
+    if len(parts) == 2 and parts[1] == "guard" and executable.casefold() in ("runledger", "runledger.exe"):
+        return parts
+    if len(parts) == 4 and parts[1:3] == ["-m", "runledger"] and parts[3] == "guard" and _PYTHON_RE.fullmatch(executable):
+        return parts
+    return None
+
+
 def _is_guard_hook(h: Any) -> bool:
-    return isinstance(h, dict) and isinstance(h.get("command"), str) and bool(_GUARD_CMD_RE.search(h["command"]))
+    return isinstance(h, dict) and _owned_command_parts(h.get("command")) is not None
 
 
 def _group_has_guard(group: Any) -> bool:
@@ -1144,32 +1174,33 @@ def _write_settings(path: Path, settings: Dict[str, Any], existed: bool) -> Opti
     return backup
 
 
-def verify_hook_command(command: str, portable: bool = False) -> Tuple[bool, str]:
-    """Run the configured hook command in a subprocess with `{}` on stdin and timeout <= 15 s.
+def verify_hook_command(command: str, cwd: Optional[str] = None) -> Tuple[bool, str]:
+    """Run the configured hook command once (`{}` on stdin, timeout 15 s) the way the agent
+    will: the stored command itself, in `cwd` (the project folder), with the environment as
+    it is. Nothing is added to PYTHONPATH, so a command that cannot import RunLedger there
+    is reported instead of passing on the installer's own checkout.
     Returns `(ok, message)`."""
-    if portable or command.strip() == HOOK_COMMAND:
-        exe = shutil.which("runledger")
+    parts = _owned_command_parts(command)
+    if parts is None:
+        return False, f"Warning: configured hook command `{command}` is not a RunLedger guard command."
+    if len(parts) == 2:
+        exe = shutil.which(parts[0])
         if not exe:
             return False, (
                 f"Warning: configured hook command `{command}` could not be run "
                 "(runledger was not found on PATH). Re-run `runledger guard install` "
                 "without `--portable` or add runledger to PATH."
             )
-        argv = [exe, "guard"]
+        argv = [exe, parts[1]]
     else:
-        argv = [sys.executable, "-m", "runledger", "guard"]
-    env = os.environ.copy()
-    repo_root = str(Path(__file__).resolve().parents[1])
-    existing_pp = env.get("PYTHONPATH", "")
-    if repo_root not in existing_pp.split(os.pathsep):
-        env["PYTHONPATH"] = f"{repo_root}{os.pathsep}{existing_pp}" if existing_pp else repo_root
+        argv = list(parts)
     try:
         proc = subprocess.run(
             argv,
             input=b"{}",
             capture_output=True,
             timeout=15,
-            env=env,
+            cwd=cwd,
         )
     except Exception as exc:
         return False, f"Warning: configured hook command `{command}` could not be run ({exc})."
@@ -1183,9 +1214,12 @@ def verify_hook_command(command: str, portable: bool = False) -> Tuple[bool, str
 def cmd_install(project: Optional[str] = None, global_scope: bool = False,
                 home: Optional[Path] = None, portable: bool = False) -> int:
     """Install or update the hook. The hook timeout follows the approval wait: the project's
-    timeout_s for a project install, the user's or the default for a global install."""
+    timeout_s for a project install, the user's or the default for a global install. Without
+    `--project` the settings file is written at the project root, so installing from a
+    subfolder configures the whole project."""
+    project_dir = None if global_scope else (Path(project) if project else Path(project_root()))
     target = settings_path(project, global_scope, home)
-    project_policy = {} if global_scope else read_policy(str(Path(project or os.getcwd())))
+    project_policy = {} if global_scope else read_policy(str(project_dir))
     timeout_s = approval_timeout(project_policy)
     try:
         changed, backup = install_hook(target, timeout_s, portable=portable)
@@ -1203,14 +1237,16 @@ def cmd_install(project: Optional[str] = None, global_scope: bool = False,
             print(f"Backup of the previous file: {backup}")
     else:
         print(f"The RunLedger guard hook and checkpoint hooks in {target} are already up to date (hook timeout {hook_s} s). Nothing changed.")
-    ok, verify_msg = verify_hook_command(cmd, portable=portable)
+    verify_cwd = str(Path(home) if home is not None else Path.home()) if global_scope else str(project_dir)
+    ok, verify_msg = verify_hook_command(cmd, cwd=verify_cwd)
     print(verify_msg)
     return 0
 
 
 def cmd_uninstall(project: Optional[str] = None, global_scope: bool = False,
                   home: Optional[Path] = None) -> int:
-    """Remove the hook from the project's or the user's Claude Code settings."""
+    """Remove the hook from the project's or the user's Claude Code settings. Without
+    `--project` the settings file is the project root's, exactly as for `install`."""
     target = settings_path(project, global_scope, home)
     try:
         changed, backup = uninstall_hook(target)

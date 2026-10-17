@@ -18,8 +18,9 @@ change behavior, so read the entry before you upgrade.
   writes `"<sys.executable>" -m runledger guard` and `"<sys.executable>" -m runledger checkpoint --hook`
   so the hooks run without `runledger` on `PATH` and when the Python path contains spaces, upgrades
   earlier bare `runledger ...` hook entries in place, and verifies the configured command exits `0`
-  on empty JSON input. Pass `--portable` to write bare `runledger ...` commands for checked-in
-  settings files.
+  on empty JSON input, run from the project folder with your environment unchanged (a command that
+  cannot start RunLedger there is reported as a warning, not as a success). Pass `--portable` to
+  write bare `runledger ...` commands for checked-in settings files.
 - **HTML receipts inside a Git work tree are safe by default, and default receipt filenames
   auto-increment (`runledger.cli`):** `runledger receipt` now enables safe mode by default for HTML
   files written inside a Git repository (matching Markdown and JSON; pass `--no-safe` for full
@@ -50,12 +51,24 @@ change behavior, so read the entry before you upgrade.
   `adapters()` logs broken adapter imports to `stderr` (or re-raises when `RUNLEDGER_DEBUG=1`).
 - **Guard project root resolution and subfolder support (`runledger.guard`, `runledger.guard_receipt`, `runledger.risk`):**
   the guard resolves the project root from `CLAUDE_PROJECT_DIR` / `FACTORY_PROJECT_DIR` /
-  `DROID_PROJECT_DIR`, else the Git top-level walked up from the event's `cwd`, else `cwd`. Policy
+  `DROID_PROJECT_DIR`, else the nearest ancestor of the event's `cwd` (including the `cwd` itself)
+  that contains `.runledger.json` or `.git`, else `cwd`. Policy
   is read from `<project_root>/.runledger.json`, `.runledger/guard.log` is written only at the
   project root, `write_outside` / `read_outside` / `shell_outside` use the project root as the
   boundary while resolving relative paths against the event's `cwd`, and receipts load both root
   and legacy subfolder guard logs with de-duplication. Running `runledger guard` interactively with
   a TTY stdin now prints help and exits `2` instead of blocking.
+
+- **Guard roots, foreign hooks, and the install self-test (`runledger.guard`):** a project whose
+  root holds only `.runledger.json` (no Git) now enforces its policy and writes one
+  `.runledger/guard.log` at that root when the agent runs in a subfolder; `guard install` and
+  `guard uninstall` recognise only the complete RunLedger commands, so a foreign hook that merely
+  mentions the words (`echo runledger guard`, `other-check.sh && runledger guard`) is kept intact
+  instead of being replaced or removed; `guard install` without `--project` writes
+  `.claude/settings.json` at the project root (git top level or policy marker) instead of in the
+  subfolder it was run from; and the install self-test runs the stored command from the project
+  folder without adding the installer's checkout to `PYTHONPATH`, so a hook that cannot start
+  RunLedger there is reported as a warning rather than verified.
 
 - **Unified secret detection and redaction (`runledger.secrets`):** `risk`, `guard` and `llm` share
   one leaf rule set for secret content and secret file paths, resolving `sk-proj-` and 30-character

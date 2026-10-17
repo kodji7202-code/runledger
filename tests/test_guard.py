@@ -1093,20 +1093,26 @@ def test_guard_project_root_resolution_order(tmp_path, monkeypatch):
     assert guard.project_root(ev) == str(r_droid)
     monkeypatch.delenv("DROID_PROJECT_DIR")
 
-    # (c) Neither env var nor .git -> falls back to event cwd
+    # (b) Env vars unset, R holds only the policy marker (no .git): the nearest ancestor
+    # with `.runledger.json` or `.git` is the project root, so the root policy applies here too
     (r / ".runledger" / "guard.log").unlink()
-    out_c = guard.handle(json.dumps(ev))
-    assert out_c is None
-    assert (nested / ".runledger" / "guard.log").exists()
-    (nested / ".runledger" / "guard.log").unlink()
-    (nested / ".runledger").rmdir()
-
-    # (b) Env vars unset, R initialized as git repo (.git exists) -> resolves to R
-    (r / ".git").mkdir()
     out_b = guard.handle(json.dumps(ev))
     assert out_b is not None and out_b["hookSpecificOutput"]["permissionDecision"] == "deny"
     assert (r / ".runledger" / "guard.log").exists()
     assert not (nested / ".runledger").exists()
+    (r / ".runledger" / "guard.log").unlink()
+
+    # (c) Env vars unset, R initialized as git repo (.git exists) -> resolves to R as well
+    (r / ".git").mkdir()
+    out_c = guard.handle(json.dumps(ev))
+    assert out_c is not None and out_c["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert (r / ".runledger" / "guard.log").exists()
+    assert not (nested / ".runledger").exists()
+
+    # (d) No env var and no marker anywhere above -> falls back to the event cwd
+    plain = tmp_path / "plain" / "deep"
+    plain.mkdir(parents=True)
+    assert guard.project_root(bash_event(plain, "ls")) == str(plain)
 
 
 def test_guard_log_written_only_at_project_root(tmp_path):
@@ -1357,6 +1363,126 @@ def test_guard_cold_start_when_secrets_module_raises_import_error(tmp_path):
     assert res_write.returncode == 0, res_write.stderr
     out_data = json.loads(res_write.stdout)
     assert out_data["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+# ---------------------------------------------------------------- scrutiny fixes: policy-only roots, foreign hooks, install checks
+
+def test_guard_project_root_prefers_the_nearest_policy_marker_or_git(tmp_path):
+    outer = tmp_path / "outer"
+    inner = outer / "pkg"
+    deep = inner / "sub"
+    deep.mkdir(parents=True)
+    (outer / ".git").mkdir()
+    write_project(inner, {})
+
+    assert guard.project_root(str(deep)) == str(inner)        # the nearest marker wins
+
+    (inner / ".runledger.json").unlink()
+    assert guard.project_root(str(deep)) == str(outer)        # a policy-only ancestor is a root too
+
+
+def test_guard_policy_only_project_is_enforced_from_a_subfolder(tmp_path):
+    r = tmp_path / "policy-only"
+    pkg = r / "pkg"
+    deep = pkg / "deep"
+    deep.mkdir(parents=True)
+    write_project(r, {"guard": {"deny": ["secret_file"]},
+                      "extra_secret_paths": [r"(^|/)vault\.txt$"]})
+
+    for folder in (r, pkg, deep):
+        out = guard.handle(json.dumps(bash_event(folder, "cat vault.txt")))
+        assert out is not None
+        assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    log_file = r / ".runledger" / "guard.log"
+    assert len(log_file.read_text(encoding="utf-8").splitlines()) == 3
+    assert not (pkg / ".runledger").exists()
+
+
+@pytest.mark.parametrize("command, owned", [
+    ("runledger guard", True),
+    ("runledger.exe guard", True),
+    (f'"{sys.executable}" -m runledger guard', True),
+    ('"C:\\Program Files\\Python 3\\python.exe" -m runledger guard', True),
+    ("echo runledger guard", False),
+    ("my-audit.sh && runledger guard", False),
+    ("runledger guard | tee hook.log", False),
+    ("sudo runledger guard", False),
+    ("runledger guard-extra", False),
+    ("runledger checkpoint --hook", False),
+    ("echo 'runledger guard'", False),
+])
+def test_is_guard_hook_matches_only_a_complete_owned_command(command, owned):
+    assert guard._is_guard_hook({"type": "command", "command": command}) is owned
+
+
+def test_guard_install_keeps_foreign_hooks_that_mention_the_command(tmp_path):
+    settings = tmp_path / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    foreign = [
+        {"matcher": "Bash", "hooks": [{"type": "command", "command": "echo runledger guard"}]},
+        {"matcher": "Edit", "hooks": [{"type": "command", "command": "my-audit.sh && runledger guard"}]},
+    ]
+    settings.write_text(json.dumps({"hooks": {"PreToolUse": foreign}}), encoding="utf-8")
+
+    changed, _ = guard.install_hook(settings)
+    assert changed is True
+    pre = json.loads(settings.read_text(encoding="utf-8"))["hooks"]["PreToolUse"]
+    assert pre[:2] == foreign                                  # neither foreign hook was touched
+    owned = [h for g in pre for h in g["hooks"] if guard._is_guard_hook(h)]
+    assert len(owned) == 1
+    assert owned[0]["command"] == guard.guard_hook_command()
+
+    assert guard.uninstall_hook(settings)[0] is True
+    assert json.loads(settings.read_text(encoding="utf-8"))["hooks"]["PreToolUse"] == foreign
+
+
+def test_guard_install_verification_uses_the_project_environment(tmp_path, monkeypatch, capsys):
+    """The self-test must probe the stored command where the hook runs: no injected
+    PYTHONPATH and no installer cwd, so an interpreter that cannot import RunLedger
+    from the project is reported as a warning instead of a false success."""
+    shadow = tmp_path / "shadow"
+    (shadow / "runledger").mkdir(parents=True)
+    (shadow / "runledger" / "__init__.py").write_text(
+        "raise ImportError('runledger is not installed here')\n", encoding="utf-8")
+    monkeypatch.setenv("PYTHONPATH", str(shadow))
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    assert cli_main(["guard", "install", "--project", str(proj)]) == 0
+    out = capsys.readouterr().out
+    assert (proj / ".claude" / "settings.json").exists()
+    assert "Verified hook command:" not in out
+    assert "Warning" in out and "exit" in out
+
+
+def test_guard_install_default_writes_settings_at_the_project_root(tmp_path, monkeypatch, capsys):
+    repo = tmp_path / "repo"
+    sub = repo / "pkg" / "sub"
+    sub.mkdir(parents=True)
+    (repo / ".git").mkdir()
+    monkeypatch.chdir(sub)
+
+    assert cli_main(["guard", "install"]) == 0
+    capsys.readouterr()
+    assert (repo / ".claude" / "settings.json").exists()
+    assert not (sub / ".claude").exists()
+    assert not (repo / "pkg" / ".claude").exists()
+
+    assert cli_main(["guard", "uninstall"]) == 0
+    assert "hooks" not in json.loads((repo / ".claude" / "settings.json").read_text(encoding="utf-8"))
+
+
+def test_guard_install_default_uses_a_policy_only_project_root(tmp_path, monkeypatch):
+    policy_only = tmp_path / "policy"
+    sub = policy_only / "pkg"
+    sub.mkdir(parents=True)
+    write_project(policy_only, {})
+    monkeypatch.chdir(sub)
+
+    assert cli_main(["guard", "install"]) == 0
+    assert (policy_only / ".claude" / "settings.json").exists()
+    assert not (sub / ".claude").exists()
 
 
 
