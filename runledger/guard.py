@@ -36,7 +36,6 @@ import json
 import math
 import os
 import re
-import shlex
 import shutil
 import subprocess
 import sys
@@ -995,28 +994,12 @@ def _owned_command_parts(command: Any) -> Optional[List[str]]:
     """The words of a complete RunLedger guard hook command, else None.
 
     Only the two forms the installer writes count: bare `runledger guard` (optionally with a
-    path or `.exe`) and `"<interpreter>" -m runledger guard`, for every interpreter name the
-    installer can write (`python3.13t.exe` included, since it stores `sys.executable`). A
-    foreign hook that merely mentions the words (`echo runledger guard`,
-    `other.sh && runledger guard`, a pipeline) is not ours and must never be replaced or
-    removed."""
-    if not isinstance(command, str):
-        return None
-    try:
-        # Keep Windows backslashes, and accept quoted executable paths on either platform.
-        parts = shlex.split(command, posix=False)
-    except ValueError:
-        return None
-    parts = [p[1:-1] if len(p) >= 2 and p[0] in ("'", '"') and p[-1] == p[0] else p for p in parts]
-    if not parts:
-        return None
-    executable = parts[0].replace("\\", "/").rsplit("/", 1)[-1]
-    if len(parts) == 2 and parts[1] == "guard" and executable.casefold() in ("runledger", "runledger.exe"):
-        return parts
-    if len(parts) == 4 and parts[1:3] == ["-m", "runledger"] and parts[3] == "guard" \
-            and _paths.is_python_executable(executable):
-        return parts
-    return None
+    path or `.exe`) and `"<interpreter>" -m runledger guard`, for every interpreter it can write
+    (`sys.executable` itself, whatever the file is called, plus `python3.13t.exe` and the other
+    interpreter names). A foreign hook that merely mentions the words (`echo runledger guard`,
+    `other.sh && runledger guard`, a pipeline, a redirection, a command with an attached shell
+    operator) is not ours and must never be replaced or removed."""
+    return _paths.owned_hook_command(command, ("guard",))
 
 
 def _is_guard_hook(h: Any) -> bool:

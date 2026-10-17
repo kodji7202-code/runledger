@@ -398,6 +398,53 @@ def test_retention_ignores_a_backup_that_is_still_copying(tmp_path, monkeypatch,
     assert list(folder.glob("*.lock")) == []
 
 
+def test_a_completed_backup_is_never_overwritten_by_a_delayed_allocator(tmp_path, monkeypatch, capsys):
+    """CORE-SCR-R3-005: the sequence is scanned before the marker is claimed, so a writer that
+    paused in between can carry a stale number past another writer's whole marker lifetime. The
+    claim must re-check the final target and move on instead of letting os.replace overwrite a
+    completed backup (VAL-CORE-078)."""
+    from runledger import cli
+
+    db_path = tmp_path / "team.db"
+    db = Database(str(db_path))
+    db.create_team("First")
+    db.close()
+    folder = tmp_path / "bkp"
+
+    real_next_seq = cli._next_backup_seq
+    neighbour = {}
+    paused = []
+
+    def scan_then_complete(folder_arg, stem, stamp):
+        seq = real_next_seq(folder_arg, stem, stamp)
+        if paused:
+            return seq
+        paused.append(True)
+        # B takes the sequence A just read, finishes its copy and removes its marker, all
+        # while A has not claimed anything yet.
+        target, reservation = cli._reserve_backup_target(folder_arg, stem, stamp)
+        assert reservation.name == target.name + ".lock"
+        writer = Database(str(db_path))
+        writer.backup_to(str(target))
+        writer.close()
+        reservation.unlink()
+        neighbour["target"] = target
+        later = Database(str(db_path))          # A's copy is taken later, so the two must differ
+        later.create_team("Second")
+        later.close()
+        return seq
+
+    monkeypatch.setattr(cli, "_next_backup_seq", scan_then_complete)
+    assert main(["backup", "--db", str(db_path), "--dir", str(folder)]) == 0
+    assert neighbour["target"].exists()
+
+    files = sorted(folder.glob("runledger-*.db"))
+    assert len(files) == 2
+    assert sorted(_valid_backup(path) for path in files) == [1, 2]
+    assert list(folder.glob("*.tmp")) == []
+    assert list(folder.glob("*.lock")) == []
+
+
 def test_retention_leaves_an_empty_placeholder_alone(tmp_path, capsys):
     """A zero-byte `.db` is not a backup: it neither counts against --keep nor gets pruned, so a
     reservation an interrupted older run left behind cannot displace a finished copy."""

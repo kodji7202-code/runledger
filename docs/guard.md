@@ -47,12 +47,17 @@ It keeps every other setting. Before it changes a file it copies the file to
 `settings.json.bak`, replacing any earlier backup. If the file already has a guard or checkpoint entry, its
 command and timeout are updated in place and no second entry is added. If nothing would change, the file is not
 written. If the file is not valid JSON or is not an object, `install` stops with an error and
-changes nothing. A hook that only mentions the words (for example `echo runledger guard` or
-`other-check.sh && runledger guard`) is treated as your own hook and left alone; only the complete
-commands `runledger guard` and `"<python>" -m runledger guard` count as RunLedger's. Every Python
-interpreter name `install` can write counts, versioned and free-threaded ones included
-(`python3.13t.exe`), so an entry written by this installer is always recognised by a later
-`install`, `uninstall` or self-test.
+changes nothing. Only the complete commands the installer writes count as RunLedger's, and they
+count only when the whole entry is that one command: `runledger guard` (optionally with a path or
+`.exe`) and `"<interpreter>" -m runledger guard`. `<interpreter>` is either the interpreter that
+runs `install` (it writes the literal `sys.executable`, so a renamed copy such as
+`agent-python.exe` is recognised too) or an interpreter name such as `python3.13t.exe`, `pythonw.exe`
+or `pypy3`, so an entry written by this installer is always recognised by a later `install`,
+`uninstall` or self-test. Any other entry is left alone: `echo runledger guard`,
+`other-check.sh && runledger guard`, a pipeline, a redirection, a sub-shell, a second line, or a
+command with an operator attached to it without spaces
+(`true;/usr/bin/python3.13t -m runledger guard`) keeps its own entry, and `uninstall` never removes
+it.
 
 `uninstall` removes every complete `runledger guard` hook and both lifecycle checkpoint hooks (both interpreter-form
 and bare `--portable` entries) from the

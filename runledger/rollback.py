@@ -4,7 +4,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import shlex
 import shutil
 import stat
 import subprocess
@@ -17,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Tuple
 
-from .paths import is_python_executable
+from .paths import owned_hook_command
 
 PREFIX = "refs/runledger/checkpoints/"
 ID_RE = re.compile(r"[0-9]{8}T[0-9]{12}Z-[0-9a-f]{8}\Z")
@@ -526,23 +525,13 @@ def checkpoint_for_run(cwd: Optional[str], run_id: str) -> Optional[str]:
 
 
 def is_checkpoint_hook(hook) -> bool:
-    if (not isinstance(hook, dict) or hook.get("type") != "command"
-            or not isinstance(hook.get("command"), str)):
+    """True for the complete RunLedger checkpoint hook command, written with either the
+    `runledger` command or the interpreter the installer stores. A compound entry (an attached
+    shell operator, a pipeline, a redirection, a second command) or an unrelated hook stays
+    foreign, so install appends beside it and uninstall leaves it alone."""
+    if not isinstance(hook, dict) or hook.get("type") != "command":
         return False
-    try:
-        # Keep Windows backslashes, and accept quoted executable paths on either platform.
-        parts = shlex.split(hook["command"], posix=False)
-    except ValueError:
-        return False
-    parts = [p[1:-1] if len(p) >= 2 and p[0] in ("'", '"') and p[-1] == p[0] else p
-             for p in parts]
-    if not parts or parts[-2:] != ["checkpoint", "--hook"]:
-        return False
-    executable = parts[0].replace("\\", "/").rsplit("/", 1)[-1]
-    # Match only our complete command, never an echo, pipeline, or compound user hook.
-    return ((len(parts) == 3 and executable.casefold() in ("runledger", "runledger.exe"))
-            or (len(parts) == 5 and is_python_executable(executable)
-                and parts[1:3] == ["-m", "runledger"]))
+    return owned_hook_command(hook.get("command"), ("checkpoint", "--hook")) is not None
 
 
 def hook_main() -> int:

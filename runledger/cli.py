@@ -536,7 +536,11 @@ def _reserve_backup_target(folder: Path, stem: str, stamp: str) -> Tuple[Path, P
     marker file beside the target, never the `.db` name itself: concurrent backups in the same
     second take different names, and a copy that has not finished yet is invisible to retention
     (which lists `.db` files only), so it cannot consume the retention allowance. The caller
-    removes its own marker."""
+    removes its own marker.
+
+    The sequence is read before the marker exists, so a run that paused there can read a number
+    another run has since used, finished and released. The claim therefore also checks the final
+    target, which the other run's completed copy keeps after its marker is gone."""
     seq = _next_backup_seq(folder, stem, stamp)
     while True:
         suffix = "" if seq == 0 else f"-{seq}"
@@ -548,7 +552,10 @@ def _reserve_backup_target(folder: Path, stem: str, stamp: str) -> Tuple[Path, P
             seq += 1
             continue
         os.close(handle)
-        return target, reservation
+        if not os.path.lexists(str(target)):
+            return target, reservation
+        _discard_reserved_backup(reservation)
+        seq += 1
 
 
 def _discard_reserved_backup(reservation: Optional[Path]) -> None:
