@@ -221,12 +221,25 @@ change behavior, so read the entry before you upgrade.
   sum to `totals.tokens`.
 - **Backup names are reserved exclusively and stems stay unique per database (`runledger.cli`):**
   `runledger backup` reserves its `runledger-<stem>-YYYYmmdd-HHMMSS[-N].db` name with an exclusive
-  create before copying, so two backups started in the same second take different names instead of
-  one silently replacing the other, and a failed copy removes the reservation, still leaving no
-  `.db` or `.tmp` file behind. The stem percent-encodes every character outside `A-Za-z0-9._-`
-  instead of replacing it with `_`, so databases whose names differ only by such a character
-  (`team a.db` and `team_a.db`) keep separate backup namespaces and retention for one never
-  prunes the other database's copies.
+  marker create before copying, so two backups started in the same second take different names
+  instead of one silently replacing the other, and a failed copy removes the reservation, still
+  leaving no `.db` or `.tmp` file behind. The stem percent-encodes every character outside
+  `A-Za-z0-9._-` instead of replacing it with `_`, so databases whose names differ only by such a
+  character (`team a.db` and `team_a.db`) keep separate backup namespaces and retention for one
+  never prunes the other database's copies.
+- **Backup retention ignores unfinished copies (`runledger.cli`):** an unfinished backup is a
+  `.lock` name reservation beside the target, never an empty `.db` placeholder, and retention
+  counts only non-empty `.db` files. Overlapping `runledger backup --keep 1` runs can therefore no
+  longer keep an unfinished copy while deleting the finished one (which also failed the run with
+  "cannot find the file specified" when it printed its own result), and a copy that fails removes
+  its own marker only, leaving every finished backup untouched. A zero-byte placeholder left by an
+  interrupted older version is never counted and never pruned.
+- **Droid sub-agent totals stay on the base tier (`runledger.adapters.droid`):** a child session's
+  cumulative `inclusiveTokenUsage` is marked as a cumulative estimate before it is aggregated, so
+  its usage cannot be billed at the long-context tier just because a genuinely long parent request
+  shares its model bucket. A known 300K-token parent request next to a cumulative-only 500K-token
+  child now costs $11 (tier 2 for the parent, base tier for the child) instead of $16, and the
+  receipt, the advisor figures and the `push` payload all show that value.
 
 ## [0.6.0] - 2026-10-15
 

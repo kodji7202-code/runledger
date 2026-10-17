@@ -684,6 +684,31 @@ def test_known_message_and_settings_remainder_are_priced_separately(tmp_path):
     assert run.cost == pytest.approx(7.0)
 
 
+def test_cumulative_child_usage_keeps_the_base_tier_next_to_a_known_parent_request(tmp_path, capsys):
+    (tmp_path / "child-1.settings.json").write_text(json.dumps({"model": "gpt-6-astra"}), encoding="utf-8")
+    rows = [_message([_call("Read", {"file_path": "a.py"}, "c1")], modelId="gpt-6-astra",
+                     usage={"input_tokens": 300_000, "output_tokens": 0})]
+    path = _session(tmp_path, rows, settings={
+        "model": "gpt-6-astra", "tokenUsage": {"inputTokens": 300_000, "outputTokens": 0},
+        "inclusiveTokenUsage": {"inputTokens": 800_000, "outputTokens": 0},
+        "childInclusiveTokenUsageBySessionId": {"child-1": {"inputTokens": 500_000}},
+    })
+    run = droid.parse(path)
+    apply_costs(run)
+    assert run.usage_source == "settings"
+    assert run.models == {"gpt-6-astra": Usage(800_000)}
+    # The known 300k parent request keeps tier 2 ($20/MTok = $6); the child's 500k total exists
+    # only as a cumulative estimate, so it stays on the base tier ($10/MTok = $5) even though a
+    # long request sits next to it in the same model bucket.
+    assert run.cost == pytest.approx(11.0)
+    payload = build_payload(path, user="dev", project="demo")
+    assert payload["totals"]["cost_usd"] == pytest.approx(11.0)
+    assert payload["models"]["gpt-6-astra"]["cost_usd"] == pytest.approx(11.0)
+    md = _receipt(capsys, path, "md")
+    assert "long-context tier not applied" in md
+    assert "$11.00" in md
+
+
 def test_settings_only_cost_matches_the_pushed_payload(tmp_path):
     rows = [_message([_call("Read", {"file_path": "a.py"}, "c1")])]
     path = _session(tmp_path, rows, settings={

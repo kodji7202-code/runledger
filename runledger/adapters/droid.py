@@ -311,7 +311,9 @@ def _child_model(settings_path: Optional[Path], child_id: Any) -> Optional[str]:
 def _child_usage(settings: Dict[str, Any], own: Usage, settings_path: Optional[Path]) -> Dict[str, Usage]:
     """Sub-agent usage: inclusiveTokenUsage minus the session's own tokenUsage. Each child
     session is credited to the model in its own settings file when that file is found;
-    the rest is unattributed, never priced as the parent's model."""
+    the rest is unattributed, never priced as the parent's model. Every child total is a
+    cumulative estimate, so it is marked before aggregation: the mark then travels with the
+    leaf snapshot, and a large child next to a genuinely long parent request is not tiered."""
     raw = settings.get("inclusiveTokenUsage")
     if not isinstance(raw, dict):
         return {}
@@ -328,9 +330,11 @@ def _child_usage(settings: Dict[str, Any], own: Usage, settings_path: Optional[P
         if not model or not isinstance(child_raw, dict):
             continue
         share = Usage(*(min(getattr(_usage(child_raw), f), getattr(extra, f)) for f in _USAGE_FIELDS))
+        share._cumulative_only = True
         out.setdefault(model, Usage()).add(share)
         extra = _minus(extra, share)
     if extra.total:
+        extra._cumulative_only = True
         out.setdefault(UNATTRIBUTED, Usage()).add(extra)
     return out
 
