@@ -26,6 +26,12 @@ change behavior, so read the entry before you upgrade.
   (rejecting nested quantifiers, backreferences and patterns over 200 characters, capped at 20
   patterns and 1,024-character path inputs) and support a `glob:` prefix. Unsafe patterns are
   skipped and logged as warnings by the guard.
+- **Git plumbing hardening and faster checkpoint listing:** receipt Git calls strip inherited
+  `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE` and related environment overrides, disable optional
+  locks (`GIT_OPTIONAL_LOCKS=0`), treat pathspec magic characters (`[`, `*`, `:`) literally, and
+  cache repository context per run. `runledger checkpoints` reads checkpoint metadata in a single
+  `for-each-ref` call, and `runledger checkpoint --hook` stays silent outside a Git repository
+  while still warning on failures inside a repository.
 
 ## [0.6.0] - 2026-10-15
 

@@ -28,6 +28,10 @@ class CheckpointError(RuntimeError):
     """A safe-to-display checkpoint or rollback failure."""
 
 
+class NotAGitRepository(CheckpointError):
+    """Raised when the target directory is not inside a Git working tree."""
+
+
 def _unsupported_reparse_point(path: Path, info: os.stat_result) -> bool:
     """Detect directory junctions without following them, on old and new Python versions."""
     if stat.S_ISLNK(info.st_mode):
@@ -74,14 +78,21 @@ class Repository:
                      "GIT_ICASE_PATHSPECS"):
             self.env.pop(name, None)
         self.env["GIT_OPTIONAL_LOCKS"] = "0"
-        result = self._git("rev-parse", "--show-toplevel", check=False)
+        result = self._git("rev-parse", "--show-toplevel", "--absolute-git-dir", "--git-common-dir", check=False)
         if result.returncode:
-            raise CheckpointError("Not a Git working tree. Use --cwd DIR inside a Git repository.")
-        self.root = Path(os.fsdecode(result.stdout).rstrip("\r\n")).resolve()
-        self.git_dirs = []
-        for flag in ("--absolute-git-dir", "--git-common-dir"):
-            folder = Path(os.fsdecode(self._git("rev-parse", flag).stdout).rstrip("\r\n"))
-            self.git_dirs.append((self.root / folder).resolve())
+            raise NotAGitRepository("Not a Git working tree. Use --cwd DIR inside a Git repository.")
+        lines = [ln.rstrip("\r") for ln in os.fsdecode(result.stdout).rstrip("\r\n").split("\n")]
+        if len(lines) == 3 and all(lines):
+            top, abs_git_dir, common_git_dir = lines
+            self.root = Path(top).resolve()
+            self.git_dirs = [(self.root / Path(abs_git_dir)).resolve(),
+                             (self.root / Path(common_git_dir)).resolve()]
+        else:
+            self.root = Path(os.fsdecode(self._git("rev-parse", "--show-toplevel").stdout).rstrip("\r\n")).resolve()
+            self.git_dirs = []
+            for flag in ("--absolute-git-dir", "--git-common-dir"):
+                folder = Path(os.fsdecode(self._git("rev-parse", flag).stdout).rstrip("\r\n"))
+                self.git_dirs.append((self.root / folder).resolve())
         if self._git("config", "--bool", "--get", "core.sparseCheckout", check=False).stdout.strip() == b"true":
             raise CheckpointError("Sparse checkouts are not supported; use a full working tree.")
 
@@ -240,9 +251,56 @@ class Repository:
         self._git("update-ref", "--no-deref", checkpoint.ref, oid, "")
         return checkpoint
 
+    @staticmethod
+    def _parse_checkpoint_body(checkpoint_id: str, oid: str, tree: str, body: bytes) -> Optional[Checkpoint]:
+        try:
+            text = body.decode("utf-8").replace("\r\n", "\n")
+            title, metadata = text.split("\n\n", 1)
+            meta = json.loads(metadata)
+            if (title != "RunLedger checkpoint" or meta["version"] != 1
+                    or meta["id"] != checkpoint_id
+                    or not isinstance(meta["label"], str)
+                    or not isinstance(meta["created_at"], str)
+                    or not (meta["run_id"] is None or isinstance(meta["run_id"], str))
+                    or meta["kind"] not in ("checkpoint", "safety")):
+                return None
+            return Checkpoint(checkpoint_id, oid, tree, meta["created_at"],
+                              meta["label"], meta["run_id"], meta["kind"])
+        except (ValueError, KeyError, TypeError, UnicodeError):
+            return None
+
     def checkpoints(self) -> List[Checkpoint]:
         result = []
-        refs = self._git("for-each-ref", "--format=%(refname) %(objectname) %(objecttype) %(symref)", PREFIX).stdout
+        fmt = "%(refname)%00%(objectname)%00%(objecttype)%00%(symref)%00%(tree)%00%(contents)%1e"
+        probe = self._git("for-each-ref", f"--format={fmt}", PREFIX, check=False)
+        if probe.returncode == 0 and (not probe.stdout or b"\x00" in probe.stdout):
+            for raw_rec in probe.stdout.split(b"\x1e"):
+                raw_rec = raw_rec.lstrip(b"\r\n")
+                if not raw_rec:
+                    continue
+                parts = raw_rec.split(b"\x00", 5)
+                if len(parts) != 6:
+                    continue
+                ref_b, oid_b, obj_type_b, symref_b, tree_b, contents_b = parts
+                if obj_type_b != b"commit" or symref_b:
+                    continue  # symbolic refs must never redirect a rollback/prune to a branch
+                try:
+                    ref = os.fsdecode(ref_b)
+                    oid = oid_b.decode("ascii").strip()
+                    tree = tree_b.decode("ascii").strip()
+                except UnicodeError:
+                    continue
+                if not ref.startswith(PREFIX) or not oid or not tree:
+                    continue
+                checkpoint_id = ref[len(PREFIX):]
+                if not ID_RE.fullmatch(checkpoint_id):
+                    continue
+                cp = self._parse_checkpoint_body(checkpoint_id, oid, tree, contents_b)
+                if cp is not None:
+                    result.append(cp)
+            return sorted(result, key=lambda cp: cp.id, reverse=True)
+        refs = (probe.stdout if probe.returncode == 0 else
+                self._git("for-each-ref", "--format=%(refname) %(objectname) %(objecttype) %(symref)", PREFIX).stdout)
         for line in os.fsdecode(refs).splitlines():
             fields = line.split()
             if len(fields) != 3 or fields[2] != "commit":
@@ -254,20 +312,12 @@ class Repository:
             raw = self._git("cat-file", "commit", oid).stdout
             try:
                 header, body = raw.split(b"\n\n", 1)
-                title, metadata = body.decode("utf-8").split("\n\n", 1)
-                meta = json.loads(metadata)
-                if (title != "RunLedger checkpoint" or meta["version"] != 1
-                        or meta["id"] != checkpoint_id
-                        or not isinstance(meta["label"], str)
-                        or not isinstance(meta["created_at"], str)
-                        or not (meta["run_id"] is None or isinstance(meta["run_id"], str))
-                        or meta["kind"] not in ("checkpoint", "safety")):
-                    continue
                 tree = header.splitlines()[0].decode("ascii").removeprefix("tree ")
-                result.append(Checkpoint(checkpoint_id, oid, tree, meta["created_at"],
-                                         meta["label"], meta["run_id"], meta["kind"]))
-            except (ValueError, KeyError, TypeError, UnicodeError):
+            except (ValueError, IndexError, UnicodeError):
                 continue
+            cp = self._parse_checkpoint_body(checkpoint_id, oid, tree, body)
+            if cp is not None:
+                result.append(cp)
         return sorted(result, key=lambda cp: cp.id, reverse=True)
 
     def select(self, checkpoint_id: Optional[str] = None, *,
@@ -391,10 +441,29 @@ class Repository:
         return removed
 
 
+_DEFAULT_SELECT = Repository.select
+
+
 def checkpoint_for_run(cwd: Optional[str], run_id: str) -> Optional[str]:
     """Read-only lookup; missing Git or pruned checkpoints must not break receipts."""
     if not cwd or not run_id or not os.path.isabs(cwd):
         return None
+    if Repository.select is _DEFAULT_SELECT:
+        from .gitinfo import toplevel
+        top = toplevel(cwd)
+        if not top:
+            return None
+        dot_git = Path(top) / ".git"
+        if (dot_git.is_dir()
+                and not (dot_git / "refs" / "runledger" / "checkpoints").exists()
+                and not (dot_git / "reftable").exists()):
+            packed = dot_git / "packed-refs"
+            try:
+                has_packed = packed.is_file() and b"refs/runledger/checkpoints/" in packed.read_bytes()
+            except OSError:
+                has_packed = True
+            if not has_packed:
+                return None
     try:
         return Repository(cwd).select(run_id=run_id).id
     except (CheckpointError, OSError, ValueError):
@@ -431,6 +500,8 @@ def hook_main() -> int:
         if not isinstance(cwd, str) or not cwd or not isinstance(run_id, str) or not run_id:
             return 0
         Repository(cwd).create(label=event["hook_event_name"], run_id=run_id)
+    except NotAGitRepository:
+        return 0
     except (CheckpointError, OSError, ValueError):
         print("RunLedger checkpoint unavailable. Run 'runledger checkpoint' manually for details.",
               file=sys.stderr)

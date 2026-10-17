@@ -73,6 +73,7 @@ def file_changes(run: Run) -> Dict[str, FileChange]:
     if run.frozen_changes is not None:
         return {p: replace(fc) for p, fc in run.frozen_changes.items()}
     changes: Dict[str, FileChange] = {}
+    uncounted = set()
     for s in run.steps:
         p = _str(s.input.get("file_path")) or _str(s.input.get("notebook_path"))
         p = _short(p, run.cwd) if p else p
@@ -80,10 +81,19 @@ def file_changes(run: Run) -> Dict[str, FileChange]:
             fc = changes.setdefault(p, FileChange(p))
             if not fc.added and not fc.removed:
                 fc.created = "created" in _str(s.result_text).lower() or not s.result_text
-            fc.added += _lines(s.input.get("content"))
+            if "content" in s.input:
+                fc.added += _lines(s.input.get("content"))
+                uncounted.discard(p)
+            elif not fc.added and not fc.removed:
+                uncounted.add(p)
         elif s.tool in ("Edit", "MultiEdit") and p:
             fc = changes.setdefault(p, FileChange(p))
-            for e in _edits(s.input):
+            edits = _edits(s.input)
+            if not any("old_string" in e or "new_string" in e for e in edits) and not fc.added and not fc.removed:
+                uncounted.add(p)
+            else:
+                uncounted.discard(p)
+            for e in edits:
                 o, n = e.get("old_string"), e.get("new_string")
                 fc.removed += _lines(o)
                 fc.added += _lines(n)
@@ -108,7 +118,7 @@ def file_changes(run: Run) -> Dict[str, FileChange]:
                 fc.deleted = w.deleted
                 fc.added += w.added
     for p, fc in changes.items():
-        git = run.git_changes.get(p) if fc.shell else None
+        git = run.git_changes.get(p) if (fc.shell or p in uncounted) else None
         if git:
             fc.added, fc.removed = int(git.get("added") or 0), int(git.get("removed") or 0)
             fc.created = git.get("status") in ("untracked", "added")
