@@ -187,6 +187,27 @@ def test_spaced_drive_path_does_not_merge_two_paths():
         r"Shell command referenced a path outside the working folder (F:\c\d.txt)"]
 
 
+def test_unquoted_spaced_drive_redirect_target_is_one_write_finding():
+    """The redirect target is read whole, like the rest of the command, so the finding names the
+    path safe mode can mask and no fragment or second finding is left behind."""
+    risks = _risks("Bash", command=r"echo hi > E:\Work\Client y\z.txt")
+    assert [(r.severity, r.code, r.reason) for r in risks] == [
+        ("low", "shell_outside", r"Shell command wrote outside the working folder (E:\Work\Client y\z.txt)")]
+
+
+def test_spaced_drive_redirect_target_with_forward_slashes_is_one_write_finding():
+    outside = [r for r in _risks("Bash", command=r"echo hi > E:/Work/Client y/z.txt")
+               if r.code == "shell_outside"]
+    assert len(outside) == 1
+    assert outside[0].reason.replace("\\", "/") == \
+        "Shell command wrote outside the working folder (E:/Work/Client y/z.txt)"
+
+
+def test_unquoted_spaced_drive_read_redirect_names_the_whole_path():
+    assert _reasons(_risks("Bash", command=r"cat < E:\Work\Client y\z.txt")) == [
+        r"Shell command referenced a path outside the working folder (E:\Work\Client y\z.txt)"]
+
+
 def test_git_dash_c_rm_resolves_delete_operand_against_git_working_folder():
     risks = _risks("Bash", cwd=POSIX_CWD, command="git -C /opt/other-repo rm victim.txt")
     outside = [r for r in risks if r.code == "shell_outside" and r.severity == "high"]

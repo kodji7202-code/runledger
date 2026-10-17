@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import List, Optional, Tuple
 
-from .paths import is_abs, is_windows_style, join
+from .paths import is_abs, is_windows_style, join, spaced_drive_path
 from .shell_syntax import ansi_c_end, strip_heredocs
 
 _HEREDOC = re.compile(r"(?<!<)<<(-?)[ \t]*(['\"]?)([A-Za-z_][\w.-]*)\2")
@@ -71,9 +71,11 @@ def _heredocs(command: str) -> Tuple[str, List[str]]:
 
 
 def _keep_windows_paths(text: str) -> str:
-    """Double the backslashes of unquoted words that start with a drive ('C:\\x'), so POSIX
-    tokenizing keeps them: on Windows they are separators, not escapes."""
-    if ":\\" not in text:
+    """Windows paths the POSIX tokenizer would otherwise mangle: the backslashes of an
+    unquoted word that starts with a drive ('C:\\x') are doubled, and a drive path with
+    spaces ('E:\\Work\\Client y\\z.txt') is quoted, because a folder name may contain
+    spaces and the shell's own reading would cut the path into several words."""
+    if ":\\" not in text and ":/" not in text:
         return text
     out: List[str] = []
     quote: Optional[str] = None
@@ -94,6 +96,11 @@ def _keep_windows_paths(text: str) -> str:
             i += 2
             continue
         elif i == 0 or text[i - 1] in _WORD_BREAKS:
+            whole = spaced_drive_path(text, i)
+            if whole is not None:
+                out.append("'" + whole + "'")
+                i += len(whole)
+                continue
             m = _WIN_WORD.match(text, i)
             if m:
                 out.append(m.group().replace("\\", "\\\\"))
