@@ -155,3 +155,123 @@ def test_receipt_in_a_repo_without_commits(tmp_path, capsys):
     for fmt in ("html", "md", "json"):
         assert main(["receipt", str(path), "--format", fmt, "-o", "-"]) == 0
     capsys.readouterr()
+
+
+@needs_git
+def test_pathspec_magic_is_literal(tmp_path, capsys):
+    repo = _init(tmp_path)
+    for name, content in (("[id].py", "x = 1\n"), ("d.py", "d0 = 0\n"), ("a[1].py", "a = 1\n"), ("a1.py", "a = 0\n")):
+        (repo / name).write_text(content)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "magic")
+    (repo / "d.py").write_text("d0 = 0\nd1 = 1\nd2 = 2\nd3 = 3\nd4 = 4\nd5 = 5\n")
+    (repo / "a1.py").write_text("a = 0\nb1 = 1\nb2 = 2\nb3 = 3\nb4 = 4\nb5 = 5\n")
+    (repo / "[id].py").write_text("x = 1\ny = 2\n")
+    (repo / "a[1].py").write_text("a = 1\nb = 2\n")
+
+    wc = gitinfo.working_changes(str(repo), ["[id].py"])
+    assert list(wc) == ["[id].py"]
+    assert wc["[id].py"]["added"] == 1 and wc["[id].py"]["removed"] == 0
+
+    diffs = gitinfo.file_diffs(str(repo), ["[id].py"])
+    assert list(diffs) == ["[id].py"]
+    assert "+y = 2" in diffs["[id].py"] and "d1 = 1" not in diffs["[id].py"]
+
+    for target in ("[id].py", "a[1].py"):
+        sess = repo / f"sess-{target}.runledger.json"
+        sess.write_text(json.dumps({
+            "runledger_format": 1,
+            "session_id": "s-magic",
+            "cwd": str(repo),
+            "steps": [{"tool": "Edit", "input": {"file_path": str(repo / target)}}],
+        }), encoding="utf-8")
+        assert main(["receipt", str(sess), "--format", "json", "-o", "-", "--no-safe"]) == 0
+        data = json.loads(capsys.readouterr().out)
+        assert [f["path"] for f in data["files"]] == [target]
+        assert data["files"][0]["added"] == 1
+
+    if os.name != "nt":
+        colon = repo / ":!a.py"
+        colon.write_text("c = 1\n")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-q", "-m", "colon")
+        colon.write_text("c = 1\nc = 2\n")
+        wc_colon = gitinfo.working_changes(str(repo), [":!a.py"])
+        assert wc_colon == {":!a.py": {"added": 1, "removed": 0, "status": "modified", "binary": False}}
+        diff_colon = gitinfo.file_diffs(str(repo), [":!a.py"])
+        assert ":!a.py" in diff_colon and "+c = 2" in diff_colon[":!a.py"]
+
+
+@needs_git
+def test_git_env_hardened(tmp_path, monkeypatch):
+    (tmp_path / "repo_a").mkdir()
+    (tmp_path / "repo_b").mkdir()
+    repo_a = _init(tmp_path / "repo_a")
+    repo_b = _init(tmp_path / "repo_b")
+    _git(repo_b, "checkout", "-q", "-b", "bogus-branch")
+    (repo_a / "app.py").write_text("a\nb\nc\n")
+    (repo_b / "app.py").write_text("a\nb\nc\nd\ne\n")
+
+    monkeypatch.setenv("GIT_DIR", str(repo_b / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(repo_b))
+    monkeypatch.setenv("GIT_INDEX_FILE", str(repo_b / ".git" / "index"))
+    monkeypatch.setenv("GIT_PREFIX", "sub/")
+
+    seen_envs = []
+    real_run = subprocess.run
+
+    def spy_run(*args, **kwargs):
+        if "env" in kwargs and kwargs["env"] is not None:
+            seen_envs.append(dict(kwargs["env"]))
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(gitinfo.subprocess, "run", spy_run)
+    if hasattr(gitinfo, "clear_cache"):
+        gitinfo.clear_cache()
+
+    assert gitinfo.current_branch(str(repo_a)) == "main"
+    changes = gitinfo.working_changes(str(repo_a), ["app.py"])
+    assert changes == {"app.py": {"added": 1, "removed": 0, "status": "modified", "binary": False}}
+    assert seen_envs
+    for env in seen_envs:
+        assert env.get("GIT_OPTIONAL_LOCKS") == "0"
+        assert env.get("GIT_LITERAL_PATHSPECS") == "1"
+        assert env.get("GIT_TERMINAL_PROMPT") == "0"
+        assert env.get("GIT_PAGER") == "cat"
+        for forbidden in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_PREFIX"):
+            assert forbidden not in env
+
+
+@needs_git
+def test_reconcile_spawn_count_bounded(tmp_path, monkeypatch):
+    from datetime import datetime, timezone
+
+    repo = _init(tmp_path)
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_app.py").write_text("def test_a():\n    assert True\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "add test")
+    (repo / "app.py").write_text("a\nb\nc\n")
+    (repo / "new.txt").write_text("hello\n")
+    (repo / "tests" / "test_app.py").write_text("def test_a():\n    pass\n")
+
+    if hasattr(gitinfo, "clear_cache"):
+        gitinfo.clear_cache()
+    calls = []
+    real_run = subprocess.run
+
+    def spy_run(cmd, *args, **kwargs):
+        calls.append(list(cmd))
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(gitinfo.subprocess, "run", spy_run)
+    run = _run(repo, "echo x > app.py && echo hello > new.txt && echo pass > tests/test_app.py")
+    run.started = datetime(2099, 1, 1, tzinfo=timezone.utc)
+    reconcile_git(run)
+
+    assert run.git_branch == "main"
+    assert run.git_changes["app.py"]["added"] == 1
+    assert run.git_changes["new.txt"]["status"] == "untracked"
+    assert "tests/test_app.py" in run.test_diffs
+    assert len(calls) <= 5
+
