@@ -12,10 +12,12 @@ in the sessions table as SHA-256 hashes of their tokens, so they survive a resta
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ..pricing import friendly_model
@@ -290,18 +292,22 @@ class Database:
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(self.path, check_same_thread=False, timeout=10)
         self._conn.row_factory = sqlite3.Row
-        with self._lock:
-            self._conn.execute("PRAGMA foreign_keys = ON")
-            try:
-                self._conn.execute("PRAGMA journal_mode = WAL")
-            except sqlite3.DatabaseError:
-                pass  # some filesystems refuse WAL; the default journal still works
-            self._conn.executescript(SCHEMA)
-            self._add_missing_columns("teams", TEAM_SETTING_COLUMNS)
-            self._add_missing_columns("runs", RUN_COLUMNS)
-            self._add_missing_columns("approvals", APPROVAL_IDENTITY_COLUMNS)
-            self._upgrade_review_columns()
-            self._migrate_api_keys()
+        try:
+            with self._lock:
+                self._conn.execute("PRAGMA foreign_keys = ON")
+                try:
+                    self._conn.execute("PRAGMA journal_mode = WAL")
+                except sqlite3.DatabaseError:
+                    pass  # some filesystems refuse WAL; the default journal still works
+                self._conn.executescript(SCHEMA)
+                self._add_missing_columns("teams", TEAM_SETTING_COLUMNS)
+                self._add_missing_columns("runs", RUN_COLUMNS)
+                self._add_missing_columns("approvals", APPROVAL_IDENTITY_COLUMNS)
+                self._upgrade_review_columns()
+                self._migrate_api_keys()
+        except BaseException:
+            self._conn.close()
+            raise
 
     def close(self) -> None:
         with self._lock:
@@ -309,12 +315,34 @@ class Database:
 
     def backup_to(self, path: str) -> None:
         """A consistent copy of the database at `path`, taken while the server keeps running."""
-        target = sqlite3.connect(str(path))
+        dest = Path(path)
+        tmp = dest.with_name(f"{dest.name}.tmp")
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        target = sqlite3.connect(str(tmp))
+        ok = False
         try:
             with self._lock:
                 self._conn.backup(target)
+            ok = True
         finally:
             target.close()
+            if not ok:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+        try:
+            os.replace(str(tmp), str(dest))
+        except BaseException:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            raise
 
     def _add_missing_columns(self, table: str, columns: Tuple[Tuple[str, str], ...]) -> None:
         """Upgrade a database created before these columns existed."""

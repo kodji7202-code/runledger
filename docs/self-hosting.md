@@ -317,8 +317,9 @@ mechanism instead.
 sudo sqlite3 /var/lib/runledger/runledger.db ".backup '/var/backups/runledger-$(date +%F).db'"
 ```
 
-**Any install**, with `runledger backup` (0.4.0 and later). It uses SQLite's online backup, so the
-server keeps running, writes `runledger-YYYYmmdd-HHMMSS.db` and keeps the newest 14 copies:
+**Any install**, with `runledger backup` (0.4.0 and later). It uses SQLite's online backup via a
+temporary file and atomic rename so the server keeps running, writes
+`runledger-<db-stem>-YYYYmmdd-HHMMSS[-N].db`, and keeps the newest 14 copies for that database stem:
 
 ```bash
 runledger backup --db /var/lib/runledger/runledger.db --dir /var/backups/runledger --keep 14

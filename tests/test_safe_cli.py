@@ -75,6 +75,28 @@ def test_file_inside_a_repository_is_safe_by_default(tmp_path, capsys):
     assert str(tmp_path) not in target.read_text(encoding="utf-8")
 
 
+@needs_git
+def test_html_safe_inside_repo(tmp_path, capsys):
+    sess = str(_session(tmp_path))
+    out_repo = tmp_path / "repo_out"
+    out_repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(out_repo)], check=True)
+    target = out_repo / "r.html"
+    _, err = _receipt(capsys, sess, "--format", "html", "-o", str(target))
+    body = target.read_text(encoding="utf-8")
+    assert str(tmp_path) not in body
+    assert "dev@example.com" not in body and "[EMAIL]" in body
+    assert "src/app.py" in body
+    assert "Safe mode: on" in err and "--no-safe" in err
+
+    _, err_full = _receipt(capsys, sess, "--format", "html", "--no-safe", "-o", str(target))
+    body_full = target.read_text(encoding="utf-8")
+    assert str(tmp_path / "repo") in body_full
+    assert "dev@example.com" in body_full
+    assert "Safe mode: off" in err_full and "--safe" in err_full
+
+
+
 def test_overrides(tmp_path, capsys):
     session = str(_session(tmp_path))
     out, _ = _receipt(capsys, session, "--format", "json", "-o", "-", "--no-safe")

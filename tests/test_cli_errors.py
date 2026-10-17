@@ -138,3 +138,59 @@ def test_guard_with_tty_stdin_prints_help_and_exits_2(monkeypatch, capsys):
     for subcmd in ("install", "uninstall", "test"):
         assert subcmd in captured.out
 
+
+@pytest.mark.parametrize("bad", ["0", "-1", "-2", "abc", "1.5"])
+def test_limit_must_be_positive(tmp_path, capsys, bad):
+    with pytest.raises(SystemExit) as exc:
+        main(["list", "--project", str(tmp_path), "--limit", bad])
+    assert exc.value.code == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "positive integer" in captured.err
+
+
+@pytest.mark.parametrize("bad", ["-1", "-5", "abc", "1.5"])
+def test_checkpoints_prune_keep_must_be_valid_integer(tmp_path, capsys, bad):
+    with pytest.raises(SystemExit) as exc:
+        main(["checkpoints", "prune", "--keep", bad, "--cwd", str(tmp_path)])
+    assert exc.value.code == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "--keep" in captured.err and "integer" in captured.err
+
+
+@pytest.mark.parametrize("argv", [
+    ["receipt", "--latest", str(SAMPLE)],
+    ["receipt", str(SAMPLE), "--latest"],
+    ["push", "--latest", str(SAMPLE)],
+    ["push", str(SAMPLE), "--latest"],
+])
+def test_latest_with_session_errors(tmp_path, monkeypatch, capsys, argv):
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(SystemExit) as exc:
+        main(argv)
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "--latest" in err and "not allowed with argument" in err
+
+
+def test_open_with_markdown_warns(tmp_path, monkeypatch, capsys):
+    opened = []
+    monkeypatch.setattr(cli.webbrowser, "open", lambda url: opened.append(url))
+
+    for fmt in ("md", "json"):
+        out_path = tmp_path / f"out.{fmt}"
+        assert main(["receipt", str(SAMPLE), "--format", fmt, "--open", "-o", str(out_path)]) == 0
+        captured = capsys.readouterr()
+        assert out_path.is_file() and out_path.stat().st_size > 0
+        assert "--open" in captured.err and "HTML" in captured.err
+        assert opened == []
+
+    out_html = tmp_path / "out.html"
+    assert main(["receipt", str(SAMPLE), "--format", "html", "--open", "-o", str(out_html)]) == 0
+    captured = capsys.readouterr()
+    assert out_html.is_file()
+    assert "--open is ignored" not in captured.err
+    assert len(opened) == 1
+
+
