@@ -29,6 +29,16 @@ change behavior, so read the entry before you upgrade.
 
 ### Fixed
 
+- **Spaced drive paths in shell writes, redirects and PowerShell paths (`runledger.shell_writes`,
+  `runledger.ps_writes`, `runledger.risk`):** an unquoted drive path that contains spaces is read
+  as one path whether it is a redirect target (`echo hi > E:\Work\Client y\z.txt`), a shell
+  operand (`touch E:\Work\Client y\z.txt`) or a PowerShell path argument
+  (`Set-Content -Path E:\Work\Client y\z.txt -Value x`), so the finding and the files list name
+  the whole path and the safe receipt shows `…/Client y/z.txt` instead of the unmasked fragment
+  `E:\Work\Client`; each redirect target keeps exactly one outside-the-working-folder finding,
+  because the shell write check de-duplicates by the flagged path instead of reading the path
+  back out of the reason text.
+
 - **CLI flag validation, non-colliding receipts, and atomic stem-scoped backups (`runledger.cli`,
   `runledger.server.db`):** `--latest` on `receipt` and `push` is now mutually exclusive with an
   explicit `session` argument (exits `2`); `--open` with `--format md` or `--format json` prints a

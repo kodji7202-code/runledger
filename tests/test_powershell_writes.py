@@ -139,6 +139,24 @@ def test_powershell_aliases_redirections_and_dotnet_writes():
         assert bogus not in files
 
 
+@pytest.mark.parametrize("command, expected", [
+    (r"Set-Content -Path E:\Work\Client y\z.txt -Value x", [("E:\\Work\\Client y\\z.txt", False)]),
+    (r"Set-Content E:\Work\Client y\z.txt x", [("E:\\Work\\Client y\\z.txt", False)]),
+    (r"'x' > E:\Work\Client y\z.txt", [("E:\\Work\\Client y\\z.txt", False)]),
+    (r"Copy-Item a.txt E:\Work\Client y\z.txt", [("E:\\Work\\Client y\\z.txt", False)]),
+    (r"Remove-Item E:\Work\Client y\z.txt", [("E:\\Work\\Client y\\z.txt", True)]),
+])
+def test_unquoted_spaced_drive_path_is_one_write_target(command, expected):
+    """A PowerShell path argument with spaces is one path, never its first fragment."""
+    assert [(w.path, w.deleted) for w in ps_writes(command)] == expected
+
+
+def test_spaced_drive_redirect_target_is_one_write_finding():
+    risks = _risks("PowerShell", command=r"'x' > E:\Work\Client y\z.txt")
+    assert [(r.severity, r.code, r.reason) for r in risks] == [
+        ("low", "shell_outside", "Shell command wrote outside the working folder (E:\\Work\\Client y\\z.txt)")]
+
+
 @pytest.mark.parametrize("command", [
     "Set-Content $target 'x'",
     r"Out-File -FilePath $env:TEMP\x.txt",

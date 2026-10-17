@@ -181,6 +181,37 @@ def test_safe_receipt_masks_spaced_homes_foreign_paths_and_keeps_git_remotes(tmp
         assert "/tmp/build.log" in text
 
 
+def test_safe_receipt_masks_an_unquoted_spaced_redirect_target(tmp_path, capsys):
+    """The residual leak from the paths/safe scrutiny: `echo hi > E:\\Work\\Client y\\z.txt` showed
+    the fragment `E:\\Work\\Client` in the safe receipt, with no part of it masked."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    path = tmp_path / "scr.runledger.json"
+    path.write_text(json.dumps({
+        "runledger_format": 1,
+        "agent": "demo",
+        "session_id": "safe-redirect",
+        "cwd": str(repo),
+        "prompts": [r"echo hi > E:\Work\Client y\z.txt"],
+        "steps": [{"tool": "Bash", "input": {"command": r"echo hi > E:\Work\Client y\z.txt"}}],
+    }), encoding="utf-8")
+
+    md, _ = _receipt(capsys, str(path), "--format", "md", "-o", "-", "--safe")
+    assert "E:" not in md and "Work" not in md
+    assert "…/Client y/z.txt" in md
+
+    raw, _ = _receipt(capsys, str(path), "--format", "json", "-o", "-", "--safe")
+    assert "E:" not in raw and "Work" not in raw
+    data = json.loads(raw)
+    assert data["safe"] is True
+    outside = [r for r in data["risk"]["reasons"] if r["code"] == "shell_outside"]
+    assert [(r["severity"], r["reason"]) for r in outside] == [
+        ("low", "Shell command wrote outside the working folder (…/Client y/z.txt)")]
+
+    full, _ = _receipt(capsys, str(path), "--format", "json", "-o", "-", "--no-safe")
+    assert json.loads(full)["risk"]["reasons"][0]["reason"].endswith("(E:\\Work\\Client y\\z.txt)")
+
+
 def test_safe_receipt_masks_spaced_paths_usernames_and_prose_emails(tmp_path, capsys):
     """CORE-SCR-013/014/015 end to end: a spaced foreign drive path, a spaced or non-ASCII
     home user name and a real address followed by a colon are masked in both formats."""

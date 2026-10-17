@@ -307,6 +307,12 @@ _key = paths.key
 _within = paths.within
 
 
+def _path_key(p: str) -> str:
+    """Comparable form of a path for the per-step `shell_outside` de-duplication: Windows
+    paths compare case-insensitively with either separator, POSIX paths compare exactly."""
+    return _key(p, _is_windows_style(p))
+
+
 def _in_temp(target: str, self_only: bool = False, cwd: Optional[str] = None) -> bool:
     for env_var in ("HOME", "USERPROFILE"):
         h = os.environ.get(env_var)
@@ -635,21 +641,22 @@ def _scan(text: str, ps: bool) -> Tuple[List[tuple], List[Tuple[int, int]]]:
 
 
 def _join_spaced_drive_paths(text: str, words: List[_Word]) -> List[_Word]:
-    """`type E:\\Work\\Client X\\secret.txt`: an unquoted drive path with spaces is read as one
-    word, so a finding names the whole path and safe mode can mask it whole instead of a
-    fragment. Redirection targets keep the shell's own reading (`> E:\\Work\\Client y.txt`),
-    which is what the write check reports."""
+    """`type E:\\Work\\Client X\\secret.txt` and `echo hi > E:\\Work\\Client y\\z.txt`: an unquoted
+    drive path with spaces is read as one word, so a finding names the whole path and safe mode
+    can mask it whole instead of a fragment. Redirection targets are joined too, and the merged
+    word keeps the redirect's role so the write check reads the same path the tokenizers do."""
     out: List[_Word] = []
+    mergeable = ("word", "write", "read")
     i = 0
     while i < len(words):
         w = words[i]
-        whole = None if w.quoted or w.role != "word" else paths.spaced_drive_path(text, w.start)
+        whole = None if w.quoted or w.role not in mergeable else paths.spaced_drive_path(text, w.start)
         if whole is not None and w.start + len(whole) > w.end:
             end = w.start + len(whole)
             i += 1
             while i < len(words) and words[i].role == "word" and words[i].end <= end:
                 i += 1
-            out.append(_Word(whole, w.start, end, False))
+            out.append(_Word(whole, w.start, end, False, w.role, w.delete, w.base))
             continue
         out.append(w)
         i += 1
@@ -871,7 +878,7 @@ def _expand(value: str, assigns: Dict[str, Optional[str]]) -> Optional[str]:
 
 def _check_shell_word(w: _Word, name: str, cwd: Optional[str], workdir: Optional[str],
                       extra: List["re.Pattern"], assigns: Dict[str, Optional[str]],
-                      step: Step, risks: List[Risk]) -> None:
+                      step: Step, risks: List[Risk], flagged: Set[str]) -> None:
     mode = "delete" if w.delete else ("write" if w.role == "write" else "read")
     raw = w.value
     if raw.startswith("-"):
@@ -910,6 +917,7 @@ def _check_shell_word(w: _Word, name: str, cwd: Optional[str], workdir: Optional
     if not _outside(target, cwd, base):
         return
     shown = _resolved(target, base)
+    flagged.add(_path_key(shown))
     if mode == "write":
         risks.append(Risk("low", "shell_outside", f"Shell command wrote outside the working folder ({shown})", step.index))
     elif mode == "delete":
@@ -932,14 +940,20 @@ def _code_view(text: str, comments: List[Tuple[int, int]], text_words: List[_Wor
 
 
 def _shell_risks(step: Step, cwd: Optional[str], extra: List["re.Pattern"], risks: List[Risk],
-                 default_workdir: Optional[str] = None) -> None:
+                 default_workdir: Optional[str] = None) -> Set[str]:
+    """Risks for the words of a shell command. Returns the paths reported as outside this step
+    (`_path_key` form), so `_shell_write_risks` does not report the same write twice."""
     cmd = str(step.input.get("command") or "")
     ps = shell_kind(step) == "powershell"
 
     wd = step.input.get("workdir")
     explicit_wd = wd.strip() if isinstance(wd, str) and _is_abs(wd.strip()) else None
+    # Paths this step already reported as outside. `_shell_write_risks` compares against the
+    # paths themselves, so a write that the word check already named is not reported twice.
+    flagged: Set[str] = set()
     if explicit_wd and cwd and _outside(explicit_wd, cwd):
         risks.append(Risk("medium", "shell_outside", f"Ran a command outside the working folder ({explicit_wd})", step.index))
+        flagged.add(_path_key(explicit_wd))
     sub_wd = default_workdir if (default_workdir and default_workdir != cwd and _is_abs(default_workdir)) else None
     workdir = explicit_wd or sub_wd
 
@@ -972,7 +986,8 @@ def _shell_risks(step: Step, cwd: Optional[str], extra: List["re.Pattern"], risk
                 var, _, val = w.value.partition("=")
                 assigns[var] = _expand(val, assigns)
             elif w.role in ("word", "write", "read"):
-                _check_shell_word(w, name or "", cwd, workdir, extra, assigns, step, risks)
+                _check_shell_word(w, name or "", cwd, workdir, extra, assigns, step, risks, flagged)
+    return flagged
 
 
 def _project_path(path: str, cwd: Optional[str]) -> str:
@@ -990,14 +1005,13 @@ def _migration_risk(path: str, verb: str, cwd: Optional[str], index: int, risks:
 
 
 def _shell_write_risks(step: Step, cwd: Optional[str], extra: List["re.Pattern"], risks: List[Risk],
-                       default_workdir: Optional[str] = None) -> None:
+                       default_workdir: Optional[str] = None, flagged: Optional[Set[str]] = None) -> None:
     """The files a shell command writes (shell_writes / ps_writes) get the checks edit-tool
-    writes get, and commands that change a database file or run migrations are reported."""
+    writes get, and commands that change a database file or run migrations are reported.
+    `flagged` holds the paths `_shell_risks` already reported as outside (`_path_key` form)."""
     cmd = str(step.input.get("command") or "")
     wd = step.input.get("workdir")
     base = wd.strip() if isinstance(wd, str) and _is_abs(wd.strip()) else (default_workdir or cwd)
-    flagged_outside = {_key(r.reason.rsplit("(", 1)[-1].rstrip(")"), False)
-                       for r in risks if r.code == "shell_outside" and r.step == step.index}
     is_ps = shell_kind(step) == "powershell"
     writes = ps_writes(cmd) if is_ps else shell_writes(cmd)
     moved_away = {w.path for w in writes if w.deleted}
@@ -1013,7 +1027,7 @@ def _shell_write_risks(step: Step, cwd: Optional[str], extra: List["re.Pattern"]
         if not w.deleted:
             _migration_risk(target, "Wrote", cwd, step.index, risks)
         if not w.deleted and _outside(target, cwd, self_temp_only=True):
-            if _key(target, False) not in flagged_outside:
+            if _path_key(target) not in flagged:
                 risks.append(Risk("low", "shell_outside", f"Shell command wrote outside the working folder ({target})", step.index))
         elif w.source and cwd and _is_abs(target) and _in_temp(target, self_only=True):
             source = _resolved(w.source, base)
@@ -1275,8 +1289,8 @@ def assess_step(step: Step, cwd: Optional[str], policy: Optional[Dict[str, Any]]
                 risks.append(Risk("high", "secret_in_content", f"Wrote a hardcoded {kind} into {name}", step.index))
 
     if tool in SHELL_TOOLS:
-        _shell_risks(step, cwd, extra, risks, default_workdir=base)
-        _shell_write_risks(step, cwd, extra, risks, default_workdir=base)
+        flagged = _shell_risks(step, cwd, extra, risks, default_workdir=base)
+        _shell_write_risks(step, cwd, extra, risks, default_workdir=base, flagged=flagged)
 
     if tool.startswith("mcp__"):
         risks.append(Risk("low", "mcp", f"Called an external MCP tool ({tool.split('__', 2)[-1]})", step.index))

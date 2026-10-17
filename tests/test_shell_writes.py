@@ -75,6 +75,19 @@ def test_ignores_reads_and_unresolvable_targets(command):
 
 
 @pytest.mark.parametrize("command, expected", [
+    (r"echo hi > E:\Work\Client y\z.txt", [("E:\\Work\\Client y\\z.txt", 0, False)]),
+    (r"echo hi > E:/Work/Client y/z.txt", [("E:\\Work\\Client y\\z.txt", 0, False)]),
+    (r"echo hi >> 'E:\Work\Client y\z.txt'", [("E:\\Work\\Client y\\z.txt", 0, False)]),
+    (r"echo hi > E:\Work\Client X\secret.txt", [("E:\\Work\\Client X\\secret.txt", 0, False)]),
+    (r"touch E:\Work\Client y\z.txt", [("E:\\Work\\Client y\\z.txt", 0, False)]),
+])
+def test_unquoted_spaced_drive_path_is_one_write_target(command, expected):
+    """A folder name may contain spaces, so an unquoted drive path is read as one path: a
+    redirect target is never reported as its first fragment."""
+    assert _paths(command) == expected
+
+
+@pytest.mark.parametrize("command, expected", [
     ("echo ok # <<EOF\nrm k.txt", ["k.txt"]),
     ("echo a#b; rm k.txt", ["k.txt"]),
     ("printf x # note\nrm k.txt", ["k.txt"]),
