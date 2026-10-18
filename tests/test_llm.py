@@ -454,6 +454,15 @@ def test_scrub_masks_emails_and_home_paths():
     assert "git config user.email" in out and "cat" in out      # the command shape stays
 
 
+def test_scrub_masks_an_email_that_ends_a_sentence_without_eating_the_punctuation():
+    """VAL-PUSH-001: the same matcher guards the Claude API boundary, so an address followed by
+    sentence punctuation must be masked there too, and the punctuation must stay."""
+    assert llm.scrub("contact me@example.com. Done.") == "contact [EMAIL]. Done."
+    assert llm.scrub("mail me@example.com, bob@example.org.") == "mail [EMAIL], [EMAIL]."
+    assert llm.scrub('asked "me@example.com"?') == 'asked "[EMAIL]"?'
+    assert llm.scrub("see (me@example.com), then me@example.com;") == "see ([EMAIL]), then [EMAIL];"
+
+
 def test_scrub_keeps_ordinary_text_and_is_idempotent():
     assert llm.scrub("npm test -- --watch") == "npm test -- --watch"
     assert llm.scrub(None) == ""

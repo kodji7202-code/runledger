@@ -131,6 +131,23 @@ change behavior, so read the entry before you upgrade.
 
 ### Fixed
 
+- **Safe mode masks an e-mail address that ends a sentence (`runledger.safe`):** an address
+  followed by a full stop was left as it was typed, so a prompt such as `contact me@example.com.`
+  reached the Markdown, JSON and HTML receipts, the body of `push --safe`, the stored run and the
+  served run page with the address in it, while the same address followed by a space was masked.
+  The address now ends at its last label, so the punctuation after it stays in the text
+  (`contact [EMAIL].`) and an address followed by a comma, semicolon, colon, question or
+  exclamation mark, or a closing bracket or quote, is masked in the same way. The same matcher at
+  the Claude API boundary already masked these addresses and is unchanged.
+
+- **The pull request comment keeps an SSH remote byte-for-byte (`runledger.github`):** every `@` in
+  session text was split with an invisible separator, which changed a remote such as
+  `git@github.com:org/repo.git` in the comment even though GitHub does not read an at-sign inside a
+  word as a mention. The separator is now used only where GitHub would read one (at the start of the
+  text or after a character that is not a letter, digit or underscore), so a remote and an address
+  in a session's text are shown exactly as they were written, while `@someone` after a space or an
+  opening bracket is still not a live mention.
+
 - **The README's safe-mode sentence matches the code (`README.md`):** it promised that "HTML
   receipts keep full paths", while `runledger.cli.default_safe` writes every format safe by default
   inside a Git repository, HTML included, and only Markdown and JSON to stdout are always safe. The

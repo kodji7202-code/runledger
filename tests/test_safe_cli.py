@@ -147,6 +147,31 @@ def test_summary_path_cut_inside_a_long_root_is_hidden(tmp_path, capsys):
         assert "very-long-folder-name" not in out
 
 
+def test_sentence_final_email_is_masked_in_md_json_and_html(tmp_path, capsys):
+    """VAL-PUSH-001 / VAL-CROSS-009: an address that ends a sentence is masked in every
+    receipt format, and the full stop that ends the sentence stays in the text."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    path = tmp_path / "sf.runledger.json"
+    path.write_text(json.dumps({
+        "runledger_format": 1,
+        "agent": "demo",
+        "session_id": "safe-sentence-final",
+        "cwd": str(repo),
+        "prompts": ["Fix src/app.py and mail dev@example.com."],
+        "final_message": "Pinged dev@example.com, then stopped.",
+        "steps": [{"tool": "Bash", "input": {"command": "git config user.email dev@example.com."}}],
+    }), encoding="utf-8")
+    for fmt in ("md", "json"):
+        out, _ = _receipt(capsys, str(path), "--format", fmt, "-o", "-", "--safe")
+        assert "example.com" not in out and "dev@example.com" not in out
+        assert "[EMAIL]." in out
+    target = tmp_path / "r.html"
+    _receipt(capsys, str(path), "--format", "html", "-o", str(target), "--safe")
+    body = target.read_text(encoding="utf-8")
+    assert "dev@example.com" not in body and "[EMAIL]." in body
+
+
 def test_safe_receipt_masks_spaced_homes_foreign_paths_and_keeps_git_remotes(tmp_path, capsys):
     steps = [
         {"tool": "Write", "input": {"file_path": r"C:\Users\John Smith\proj\a.py", "content": "x = 1\n"}},

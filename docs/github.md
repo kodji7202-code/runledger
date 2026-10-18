@@ -117,7 +117,11 @@ python -m runledger.github comment --sessions-dir .runledger/sessions \
 - **Session text cannot link anywhere.** The titles, risk reasons and model names taken from a
   session are escaped for Markdown, and a bare URL in them (`https://…`, `http://…`, `www.…`) is
   shown with an invisible separator inside the scheme, because GitHub links such a URL on its own.
-  The footer's link to `https://runledger.site` is the only live link in the comment.
+  An `@` is split with the same separator only where GitHub would read a mention (at the start of
+  the text or after a character that is not a letter, digit or underscore), so `@someone` in a
+  session's text is not a mention while a remote such as `git@github.com:org/repo.git` is shown
+  exactly as it was written. The footer's link to `https://runledger.site` is the only live link in
+  the comment.
 - **Test verdict.** The `Tests:` line describes the session's *final* test command: the number of
   test commands, that run's summary and the verdict (`last run 3 passed, 0 failed · verdict:
   passed`). When the final command's output has no readable summary, the line says `last run
