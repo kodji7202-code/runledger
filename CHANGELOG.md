@@ -9,6 +9,16 @@ change behavior, so read the entry before you upgrade.
 
 ### Changed
 
+- **Quality score: an install word inside a test argument no longer hides the run
+  (`runledger.quality`):** an install verb (`install`, `uninstall`, `add`, `i`, `remove`)
+  disqualifies a segment only when it is a package manager's subcommand in the command word or
+  wrapper chain (`pip install pytest`, `python -m pip install pytest`, `uv pip install`, `uv add`,
+  `poetry add`, `npm install`, `npm i`, `pnpm add`, `yarn add`, `bun add`). Real runs whose
+  arguments contain those words earn their `tests_run` credit again, as they did in v0.6.0:
+  `pytest -k add`, `pytest -k "install and not slow"`, `npm test -- --grep install` and
+  `jest -t uninstall` are runs. Inspection flags (`--version`, `--help`, `--collect-only`,
+  `--list-tests` and the rest) and every other install and inspection case behave as before.
+
 - **Text sent to Claude masks e-mail addresses and home folders, with no opt-out
   (`runledger.llm`, `runledger.review`, `runledger.summarize`):** every request body, from `--ai`
   summaries as well as from `--review`, replaces e-mail addresses with `[EMAIL]` and the user name of

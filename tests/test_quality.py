@@ -138,8 +138,10 @@ def test_other_commands_are_not_test_runs(command):
 
 
 @pytest.mark.parametrize("command", [
-    "pip install pytest", "python -m pip install pytest",
-    "npm install --save-dev jest", "npm uninstall -y pytest",
+    "pip install pytest", "pip3 install pytest", "python -m pip install pytest",
+    "npm install --save-dev jest", "npm uninstall -y pytest", "npm i jest", "yarn remove jest",
+    "uv pip install pytest", "uv add pytest", "poetry add pytest", "pnpm add jest", "yarn add jest",
+    "bun add jest",
 ])
 def test_installing_a_runner_is_not_a_test_run(command):
     assert not _is_test_command(command)
@@ -147,7 +149,7 @@ def test_installing_a_runner_is_not_a_test_run(command):
 
 @pytest.mark.parametrize("command", [
     "pytest --version", "pytest --help", "pytest -h", "pytest --collect-only", "pytest --co",
-    "jest --list-tests",
+    "jest --list-tests", "python -m pytest --version", "npx jest --list-tests",
 ])
 def test_inspecting_a_runner_is_not_a_test_run(command):
     assert not _is_test_command(command)
@@ -165,6 +167,16 @@ def test_real_runner_invocations_are_still_test_runs(command):
 def test_a_path_containing_install_does_not_disqualify_a_run():
     assert _is_test_command("python -m pytest -q tests/test_install.py")
     assert _is_test_command("pytest tests/test_add_user.py")
+
+
+@pytest.mark.parametrize("command", [
+    "pytest -k add", 'pytest -k "install and not slow"', "pytest -k install", "pytest -k uninstall",
+    "python -m pytest -q -k add", "npm test -- --grep install", "npm test -- --grep add",
+    "jest -t uninstall", "vitest run -t remove", "npx jest --grep install",
+    "poetry run pytest -k add", "pip install pytest && pytest -k add",
+])
+def test_an_install_word_in_a_runner_argument_does_not_disqualify_a_run(command):
+    assert _is_test_command(command)
 
 
 # ---------------------------------------------------------------- test signals
@@ -202,6 +214,8 @@ def test_test_run_without_any_result_is_not_measured():
     ("python -m pip install pytest", "Successfully installed pytest-8.0.0"),
     ("npm install --save-dev jest", "added 40 packages"),
     ("npm uninstall -y pytest", "removed 1 package"),
+    ("uv add pytest", "Resolved 12 packages"),
+    ("poetry add pytest", "Installing dependencies"),
 ])
 def test_installs_earn_no_test_points(command, result):
     q = score_run(_run([_write(1, "src/a.py"), _bash(2, command, result=result)]), [])
@@ -210,6 +224,16 @@ def test_installs_earn_no_test_points(command, result):
         "note": "1 file(s) changed and no test command ran.",
     }
     assert _sig(q, "test_outcome") is None
+
+
+@pytest.mark.parametrize("command", [
+    "pytest -k add", 'pytest -k "install and not slow"', "npm test -- --grep install",
+])
+def test_install_words_in_runner_arguments_earn_test_points(command):
+    q = score_run(_run([_write(1, "src/a.py"), _bash(2, command, result="3 passed in 0.10s")]), [])
+    assert _sig(q, "tests_run")["value"] == 1
+    assert _sig(q, "tests_run")["impact"] == 10
+    assert _sig(q, "test_outcome")["value"] == "pass"
 
 
 @pytest.mark.parametrize("command", ["pytest --version", "pytest --collect-only", "jest --list-tests"])
