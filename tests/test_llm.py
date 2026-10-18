@@ -484,6 +484,36 @@ def test_scrub_keeps_command_boundaries_after_a_spaced_home():
     assert llm.scrub_paths(f"cat {SPACED_WIN} | wc -l") == "cat ~\\app\\x.py | wc -l"
 
 
+PAREN_WIN = "C:" + "\\" + "Users" + "\\" + "Jane (Smith)" + "\\" + "app" + "\\" + "x.py"
+PAREN_WIN_HOME = "C:" + "\\" + "Users" + "\\" + "Jane (Smith)"
+PAREN_MAC = "/Users/Jane (Smith)/app/x"
+PAREN_NAMES = ("Jane", "Smith")
+
+
+def test_scrub_masks_a_quoted_home_name_with_punctuation():
+    """SGD-021: inside quotes the name runs to the next separator, so 'Jane (Smith)' goes whole."""
+    text = 'type "' + PAREN_WIN + '"' + " && cat '" + PAREN_MAC + "' && git status"
+    out = llm.scrub_paths(text)
+    assert out == 'type "~\\app\\x.py" && cat \'~/app/x\' && git status', out
+    assert not any(name in out for name in PAREN_NAMES)
+
+
+def test_scrub_masks_a_quoted_home_folder_without_a_trailing_file():
+    assert llm.scrub_paths('"' + PAREN_WIN_HOME + '"') == '"~"'
+    assert llm.scrub_paths("'" + "/Users/Jane (Smith)" + "'") == "'~'"
+
+
+def test_scrub_masks_an_unquoted_home_name_with_punctuation():
+    assert llm.scrub_paths(f"cd {PAREN_WIN_HOME}") == "cd ~"
+    assert llm.scrub_paths("cd /Users/Jane (Smith)/app && ls | wc -l") == "cd ~/app && ls | wc -l"
+
+
+def test_scrub_masks_a_quoted_home_name_inside_json_text():
+    out = llm.scrub(json.dumps({"command": PAREN_WIN}))
+    assert out == '{"command": "~\\\\app\\\\x.py"}', out
+    assert not any(name in out for name in PAREN_NAMES)
+
+
 def test_scrub_masks_a_home_path_inside_json_text():
     """Serialized JSON doubles the separators; the API-boundary scrub still masks the name."""
     doubled = json.dumps({"new_string": SPACED_WIN})[len('{"new_string": "'):-2]
@@ -532,6 +562,22 @@ def test_summary_prompt_masks_nested_step_inputs(stub, tmp_path):
     assert not any(name in raw for name in SPACED_NAMES)
     assert "Users" not in raw
     assert "old = 1" in raw and "keep me" in raw      # the readable shape stays
+
+
+def test_summary_prompt_masks_a_punctuated_quoted_home(stub, tmp_path):
+    """SGD-021: no part of a quoted 'Jane (Smith)' home reaches the summary request body."""
+    step = {"tool": "MultiEdit",
+            "input": {"file_path": "src/a.py",
+                      "edits": [{"old_string": "old = 1",
+                                 "new_string": 'path = r"' + PAREN_WIN + '"'}],
+                      "notes": ['keep "' + PAREN_MAC + '" private']},
+            "model": "claude-haiku-5-5", "result_text": "wrote " + PAREN_WIN_HOME, "is_error": False}
+    run = _native_run(tmp_path, [step], prompts=['fix "' + PAREN_WIN + '" then test'])
+    stub.queue(body=message_reply(json.dumps({"overview": "Edited.", "steps": [{"n": 1, "summary": "Edited it."}]})))
+    summarize.ai_summaries(run, api_key=ANTHROPIC_KEY, model="claude-haiku-5-5")
+    raw = stub.requests[0]["raw"]
+    assert not any(name in raw for name in PAREN_NAMES)
+    assert "old = 1" in raw and "keep" in raw and "private" in raw   # the readable shape stays
 
 
 # ---------------------------------------------------------------- summary JSON (LLM5)

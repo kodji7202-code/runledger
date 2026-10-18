@@ -141,6 +141,29 @@ def test_a_prefixed_log_line_is_not_a_summary(text):
     assert parse_test_output(text, "pytest") is None
 
 
+@pytest.mark.parametrize("text, counts", [
+    ("==== 3 passed in 75.12s (0:01:15) ====", (3, 0)),
+    ("1 failed, 2 passed in 3700.00s (1:01:40)", (2, 1)),
+    ("2745 passed, 12 skipped in 103.73s (0:01:43)", (2745, 0)),
+    ("app  | 12 passed in 61.00s (0:01:01)", (12, 0)),
+    ("============ 1 passed, 1 warning in 62.50s (0:01:02) ============", (1, 0)),
+])
+def test_a_pytest_footer_with_an_elapsed_suffix_is_read(text, counts):
+    """SGD-020: pytest appends '(H:MM:SS)' to every summary of a session that ran a minute."""
+    assert parse_test_output(text, "pytest") == counts
+
+
+@pytest.mark.parametrize("text", [
+    "retried after 3 errors in 0.10s (0:01:15)",
+    "3 passed in 0.10s (0:1:15)",
+    "3 passed in 0.10s (0:01:15) trailing",
+    "3 passed in 0.10s (0:01:15",
+    "3 passed in 0.10s 0:01:15",
+])
+def test_an_elapsed_suffix_outside_the_summary_shape_is_not_a_summary(text):
+    assert parse_test_output(text, "pytest") is None
+
+
 def test_noise_lines_parse_fast():
     # 20 KB lines: the prefix alternatives, the count phrases and the count fallbacks must
     # stay linear, so one long line of output cannot stall the score.
@@ -164,6 +187,13 @@ def test_noise_lines_parse_fast():
     assert len(footer) >= 20_000
     assert parse_test_output(footer, "pytest") == (2_000, 0)
     assert parse_test_output("1 passed in " + "9" * 20_000 + "s", "pytest") == (1, 0)
+    # The elapsed-time suffix stays linear too: an unclosed one is not a summary, a long
+    # count list with one still is.
+    assert parse_test_output("1 passed in 0.5s (" + "9" * 20_000, "pytest") is None
+    assert parse_test_output("1 passed in 61.00s (0:01:01) " * 800, "pytest") is None
+    suffix_footer = "app  | " + ", ".join(["1 passed"] * 2_000) + " in 61.0s (0:01:01)"
+    assert len(suffix_footer) >= 20_000
+    assert parse_test_output(suffix_footer, "pytest") == (2_000, 0)
     assert time.perf_counter() - start < 0.1
 
 
@@ -229,6 +259,8 @@ def test_real_runner_invocations_are_still_test_runs(command):
 
 @pytest.mark.parametrize("command", [
     "& pytest -q", '& "pytest" -q', '& "C:\\Python312\\python.exe" -m pytest -q',
+    '& "C:\\Program Files\\Python312\\python.exe" -m pytest -q',
+    '& "C:\\Program Files\\Python 3.12\\python.exe" -m pytest',
     '& "C:\\Users\\dev\\.venv\\Scripts\\python.exe" -m pytest -q tests',
     "& .\\venv\\Scripts\\pytest.exe -q", "cd app; & pytest -q",
 ])
@@ -238,6 +270,8 @@ def test_powershell_call_operator_invocations_are_test_runs(command):
 
 @pytest.mark.parametrize("command", [
     "echo 'pytest'", 'Write-Output "pytest"', "& echo pytest", "& 'echo' pytest",
+    'echo "C:\\Program Files\\Python312\\python.exe" -m pytest -q',
+    'Write-Output "python -m pytest -q"',
 ])
 def test_a_call_operator_before_a_non_runner_is_not_a_test_run(command):
     assert not _is_test_command(command)
@@ -361,6 +395,7 @@ def test_timed_log_errors_before_a_passing_summary_end_as_a_pass():
 
 @pytest.mark.parametrize("command", [
     "& pytest -q", '& "C:\\Python312\\python.exe" -m pytest -q',
+    '& "C:\\Program Files\\Python312\\python.exe" -m pytest -q',
 ])
 def test_powershell_call_operator_earns_test_credit_and_outcome(command):
     q = score_run(_run([_write(1, "src/a.py"),
@@ -371,6 +406,16 @@ def test_powershell_call_operator_earns_test_credit_and_outcome(command):
     }
     assert _sig(q, "test_outcome")["value"] == "pass"
     assert _sig(q, "test_outcome")["impact"] == 15
+    assert q["score"] == 100 and q["grade"] == "A"
+
+
+def test_a_quoted_exe_mention_earns_no_test_points():
+    q = score_run(_run([_write(1, "src/a.py"),
+                        _step(2, "PowerShell",
+                              {"command": 'echo "C:\\Program Files\\Python312\\python.exe" -m pytest -q'},
+                              result="3 passed in 0.10s")]), [])
+    assert _sig(q, "tests_run")["impact"] == -10
+    assert _sig(q, "test_outcome") is None
 
 
 def test_explicit_failed_counts_after_a_pass_end_the_run_as_failed():
