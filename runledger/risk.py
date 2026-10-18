@@ -1366,7 +1366,8 @@ def assess(run: Run) -> Tuple[int, str, List[Risk]]:
             if status:
                 verb = "Added" if status in ("untracked", "added") else "Changed"
                 r.reason = f"{verb} a database migration ({m.group(1)})"
-    _apply_test_verdicts(run, analyze_test_diffs(run.test_diffs, run.prompts), policy, refused_project)
+    run.test_verdicts = analyze_test_diffs(run.test_diffs, run.prompts)
+    _apply_test_verdicts(run, run.test_verdicts, policy, refused_project)
     for s in run.steps:
         all_risks.extend(s.risks)
     rejected = _project_ignored_or_lowered_kinds(run.cwd, refused_project)

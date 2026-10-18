@@ -12,14 +12,16 @@ has no tool-based signals. A run with nothing measurable still gets a score (70,
 
 Signals and their points:
   tests_run             +10 when a test command ran; -10 when files changed and none did
-  test_outcome          +15 the last readable test run passed; -15 it failed
+  test_outcome          +15 the last readable test run passed; -15 it failed (output with
+                        no readable summary is unknown: it earns no test points either way)
   failing_then_passing  +5 a failing run followed by a passing run, ending green
   failing_streak        -5 per failing test run beyond the first in a row, at most -15
   test_tampering        -10 per deleted or skipped test file, -5 per weakened one, at most -25
   test_changes          0: tests replaced by tests that cover the same behaviour, or assertions
                         changed with no net loss (read from the Git diff, see testdiff.py)
   error_rate            +5 with no errored steps, down 60 points per 100%, at least -15
-  retry_loops           -5 per non-test command repeated 3+ times or file edited 5+ times, at most -15
+  retry_loops           -5 per non-test command repeated 3+ times or file edited 5+ times
+                        (through an edit tool or a shell command), at most -15
   scope                 -1 per unrelated changed file past the fourth, at most -10 (mild)
   unfinished            -10 the final message says work is unfinished
   cost_efficiency       +5 / 0 / -5 / -10 at up to $0.02 / $0.10 / $0.25 / more per changed line
@@ -39,8 +41,11 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .advisor import estimated_cost, recommend
 from .parser import Run, Step
+from .paths import relative
 from .pricing import unpriced
+from .ps_writes import ps_writes, shell_kind
 from .risk import Risk, _score as _risk_score
+from .shell_writes import shell_writes
 from .summarize import file_changes
 from .testdiff import analyze as analyze_test_diffs
 
@@ -51,25 +56,32 @@ TEST_RISK_CODES = ("test_deleted", "test_skipped", "test_weakened")
 LOOP_COMMAND_REPEATS = 3         # the same non-test command this many times is a loop
 LOOP_FILE_EDITS = 5              # the same file edited this many times is a loop
 
-_TEST_COMMAND = re.compile(
-    r"\b(pytest|py\.test|unittest|jest|vitest|mocha|go\s+test|cargo\s+test"
-    r"|(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?test)\b", re.I)
-# commands that print or search text and never run a test suite
-_NOT_A_RUN = {
-    "grep", "rg", "egrep", "cat", "echo", "printf", "head", "tail", "less", "more", "sed", "awk",
-    "git", "type", "ls", "dir", "which", "where", "select-string", "write-output", "write-host",
-    "findstr", "code", "notepad",
-}
-_RUNNERS = [
-    ("go test", r"\bgo\s+test\b"),
-    ("cargo test", r"\bcargo\s+test\b"),
-    ("pytest", r"\bpy\.?test\b|pytest"),
-    ("unittest", r"\bunittest\b"),
-    ("vitest", r"\bvitest\b"),
-    ("jest", r"\bjest\b"),
-    ("mocha", r"\bmocha\b"),
-]
+# A test run invokes a runner. Installing, inspecting or merely mentioning one is not a run,
+# so every `&&`/`;`/`|` segment is judged by the command word it starts with, after env
+# assignments (`FOO=1`) and wrappers (`uv run`, `npx`, `python -m`) are stripped.
+_ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_PYTHON = re.compile(r"^(?:python|py|pythonw)[\d.]*$")
+_PYTHON_VERSION = re.compile(r"^-\d[\d.]*$")
+_COMMAND_WRAPPERS = {"time", "env", "nohup", "nice", "sudo", "doas", "command", "exec",
+                     "stdbuf", "setsid"}
+_RUNNER_PREFIXES = {"uv", "poetry", "pipenv", "pdm", "hatch", "rye", "npx", "pnpx", "bunx",
+                    "yarn", "pnpm", "npm", "bun", "bundle", "deno"}
+_RUN_SUBWORDS = {"run", "exec", "x", "dlx", "tool"}
+_RUNNER_NAMES = {"pytest", "py.test", "unittest", "tox", "nox", "jest", "vitest", "mocha", "rspec"}
+_PACKAGE_MANAGERS = {"npm", "pnpm", "yarn", "bun", "deno"}
+_TEST_TOOLS = {"go", "cargo", "dotnet", "mvn", "maven", "gradle", "make", "rake", "mix"}
+# flags and verbs that inspect or install a runner instead of running the suite.
+# `-v` is pytest's verbose flag, so the single-letter ones keep their case.
+_INSPECT_FLAGS = {"-V", "-h"}
+_INSPECT_FLAGS_LOWER = {"--version", "--help", "--collect-only", "--co", "--list", "--list-tests",
+                        "--listtests", "--dry-run", "--dryrun"}
+_INSTALL_VERBS = {"install", "uninstall", "add"}
 _TESTS_LINE = re.compile(r"^\s*Tests:?\s+(.+)$", re.M)  # jest and vitest summary line
+_COUNT_WORD = re.compile(
+    r"\d+\s+(?:passed|failed|errors?|skipped|xfailed|xpassed|deselected|warnings?)\b")
+_SUMMARY_TIME = re.compile(r"\bin \d+(?:\.\d+)?s\b")     # pytest footer and quiet form
+_MOCHA_SUMMARY = re.compile(r"^\s*\d+\s+(?:passing|failing|pending)\b")
+
 _UNFINISHED = [
     ("couldn't or could not finish", re.compile(r"couldn['’]t|could not", re.I)),
     ("unable to do something", re.compile(r"\bunable\b", re.I)),
@@ -127,35 +139,125 @@ def parse_test_output(text: str, runner: str = "") -> Optional[Tuple[int, int]]:
             bad = sum(int(n) for n in re.findall(r"(?:failures|errors)=(\d+)", broken.group(1)))
             return max(0, total - bad), bad
     line = _TESTS_LINE.search(text)  # jest/vitest: count the "Tests:" line, not "Test Suites:"
-    return _count(line.group(1) if line else text)
+    if line:
+        counts = _count(line.group(1))
+        if counts:
+            return counts
+    passed = failed = 0
+    found = False
+    for segment in _summary_segments(text):  # mocha splits its counts over two lines
+        counts = _count(segment)
+        if counts:
+            found = True
+            passed += counts[0]
+            failed += counts[1]
+    return (passed, failed) if found else None
+
+
+def _summary_segments(text: str) -> List[str]:
+    """The lines a runner writes its counts on: a pytest-style `... in 0.12s` line or a mocha
+    `N passing` line. A count in free-form log text ("retried after 3 errors") is not one."""
+    out = []
+    for line in text.splitlines():
+        if _COUNT_WORD.search(line) and _SUMMARY_TIME.search(line):
+            out.append(line)
+        elif _MOCHA_SUMMARY.match(line):
+            out.append(line)
+    return out
 
 
 def _count(segment: str) -> Optional[Tuple[int, int]]:
-    passed = re.findall(r"(\d+) (?:passed|passing)\b", segment)
-    failed = re.findall(r"(\d+) (?:failed|failing|errors?)\b", segment)
+    passed = [int(n) for n in re.findall(r"(\d+) (?:passed|passing)\b", segment)]
+    failed = [int(n) for n in re.findall(r"(\d+) (?:failed|failing)\b", segment)]
+    failed += [int(n) for n in re.findall(r"(\d+) errors?\b", segment) if int(n)]
     if not passed and not failed:
         return None
-    return sum(int(n) for n in passed), sum(int(n) for n in failed)
+    return sum(passed), sum(failed)
 
 
-def _runner(command: str) -> str:
-    for label, pattern in _RUNNERS:
-        if re.search(pattern, command, re.I):
-            return label
-    return "npm test" if re.search(r"\b(npm|pnpm|yarn|bun)\b", command, re.I) else "test command"
+def _head_word(word: str) -> str:
+    """The command word a token names: quotes, a directory and a Windows `.exe` removed."""
+    w = word.strip().strip("'\"").replace("\\", "/").rsplit("/", 1)[-1].lower()
+    return w[:-4] if w.endswith(".exe") else w
+
+
+def _test_script(rest: List[str]) -> bool:
+    """`test`, `run test` or `run test:unit`: a package manager's test script, not a mention."""
+    if not rest:
+        return False
+    head = _head_word(rest[0])
+    if head == "test" or head.startswith("test:"):
+        return True
+    if len(rest) > 1 and head in _RUN_SUBWORDS:
+        script = _head_word(rest[1])
+        return script == "test" or script.startswith("test:")
+    return False
+
+
+def _runner_from(words: List[str]) -> Optional[str]:
+    head = _head_word(words[0])
+    if head in _RUNNER_NAMES:
+        return head
+    if head in _PACKAGE_MANAGERS:
+        return "npm test" if _test_script(words[1:]) else None
+    if head in _TEST_TOOLS and len(words) > 1 and _head_word(words[1]) == "test":
+        return head + " test"
+    return None
+
+
+def _runner_of(words: List[str]) -> Optional[str]:
+    """The runner a simple command invokes, or None when it installs, inspects or only
+    mentions one. Leading env assignments and wrappers (`uv run`, `python -m`) are skipped."""
+    i = 0
+    while i < len(words):
+        head = _head_word(words[i])
+        if _ENV_ASSIGN.match(words[i]) or head in _COMMAND_WRAPPERS:
+            i += 1
+            continue
+        if _PYTHON.match(head):
+            i += 1
+            while i < len(words) and _PYTHON_VERSION.match(words[i]):
+                i += 1
+            if i < len(words) and _head_word(words[i]) in ("-m", "-M"):
+                i += 1
+                continue
+            return None
+        runner = _runner_from(words[i:])
+        if runner:
+            return runner
+        if head in _RUNNER_PREFIXES:
+            i += 1
+            if i < len(words) and _head_word(words[i]) in _RUN_SUBWORDS:
+                i += 1
+            continue
+        return None
+    return None
+
+
+def _inspecting(words: List[str]) -> bool:
+    """True when a segment installs a runner or asks one about itself instead of running."""
+    for w in words:
+        low = w.lower()
+        if w in _INSPECT_FLAGS or low in _INSPECT_FLAGS_LOWER or low in _INSTALL_VERBS:
+            return True
+    return False
+
+
+def _test_runner(command: str) -> Optional[str]:
+    """The test runner a shell command runs, or None when it only installs, inspects or
+    mentions one. Each `&&`/`;`/`|`/newline segment is judged on its own command word."""
+    for segment in re.split(r"&&|\|\||;|\||\n", command):
+        words = segment.split()
+        if not words or _inspecting(words):
+            continue
+        runner = _runner_of(words)
+        if runner:
+            return runner
+    return None
 
 
 def _is_test_command(command: str) -> bool:
-    for segment in re.split(r"&&|\|\||;|\||\n", command):
-        words = segment.strip().split()
-        if not words:
-            continue
-        head = words[0].lower().replace("\\", "/").rsplit("/", 1)[-1]
-        if head in _NOT_A_RUN:
-            continue
-        if _TEST_COMMAND.search(segment):
-            return True
-    return False
+    return _test_runner(command) is not None
 
 
 @dataclass
@@ -177,12 +279,12 @@ class _TestRun:
 
 
 def _outcome(counts: Optional[Tuple[int, int]], step: Step) -> Optional[str]:
+    """A run with no readable summary is unknown, never a pass: only a parsed summary or an
+    errored command says how the suite ended."""
     if step.is_error or (counts is not None and counts[1] > 0):
         return "fail"
     if counts is not None and counts[0] > 0:
         return "pass"
-    if counts is None and (step.result_text or "").strip():
-        return "pass"  # exit code 0 and some output, but no summary line
     return None
 
 
@@ -191,10 +293,9 @@ def _test_runs(run: Run) -> List[_TestRun]:
     for s in run.steps:
         if s.tool not in SHELL_TOOLS:
             continue
-        command = str(s.input.get("command") or "")
-        if not _is_test_command(command):
+        runner = _test_runner(str(s.input.get("command") or ""))
+        if runner is None:
             continue
-        runner = _runner(command)
         counts = parse_test_output(s.result_text or "", runner)
         found.append(_TestRun(s, runner, _outcome(counts, s), counts))
     return found
@@ -208,6 +309,33 @@ def _shell_commands(run: Run) -> List[str]:
             if text:
                 out.append(text)
     return out
+
+
+def _test_verdicts(run: Run) -> List[Any]:
+    """The run's test-file verdicts, computed once per build by risk.assess and cached on the
+    run. A caller that scores a run without assessing it gets them computed here."""
+    if run.test_verdicts is None:
+        run.test_verdicts = analyze_test_diffs(run.test_diffs, run.prompts)
+    return run.test_verdicts
+
+
+def _edit_counts(run: Run) -> Dict[str, int]:
+    """How often each file was rewritten: by an edit tool, or by a shell command whose writes
+    the shell parsers find (a redirect, `sed -i`, `Set-Content`). Deletes are not edits."""
+    edits: Dict[str, int] = {}
+    for s in run.steps:
+        if s.tool in WRITE_TOOLS and s.input.get("file_path"):
+            path = relative(str(s.input["file_path"]), run.cwd)
+            edits[path] = edits.get(path, 0) + 1
+        elif s.tool in SHELL_TOOLS:
+            command = str(s.input.get("command") or "")
+            writes = ps_writes(command) if shell_kind(s) == "powershell" else shell_writes(command)
+            for w in writes:
+                if w.deleted:
+                    continue
+                path = relative(w.path, run.cwd)
+                edits[path] = edits.get(path, 0) + 1
+    return edits
 
 
 def _stem(word: str) -> str:
@@ -298,7 +426,7 @@ def score_run(run: Run, risks: Optional[Sequence[Risk]] = None) -> Dict[str, Any
                 f"{counted} test change(s) flagged: deleted, skipped or weakened.")
         add("test_tampering", counted, -min(25, points), note)
 
-    neutral = [c for c in analyze_test_diffs(run.test_diffs, run.prompts) if c.verdict in ("replaced", "changed")]
+    neutral = [c for c in _test_verdicts(run) if c.verdict in ("replaced", "changed")]
     if neutral:
         add("test_changes", len(neutral), 0, " ".join(c.note for c in neutral))
 
@@ -311,10 +439,7 @@ def score_run(run: Run, risks: Optional[Sequence[Risk]] = None) -> Dict[str, Any
 
         command_counts = Counter(c for c in _shell_commands(run) if not _is_test_command(c))
         repeated = [c for c, n in command_counts.items() if n >= LOOP_COMMAND_REPEATS]
-        edits: Dict[str, int] = {}
-        for s in run.steps:
-            if s.tool in WRITE_TOOLS and s.input.get("file_path"):
-                edits[str(s.input["file_path"])] = edits.get(str(s.input["file_path"]), 0) + 1
+        edits = _edit_counts(run)
         looping_files = [p for p, n in edits.items() if n >= LOOP_FILE_EDITS]
         loops = len(repeated) + len(looping_files)
         if loops:

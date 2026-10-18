@@ -100,6 +100,28 @@ def test_output_without_a_summary_is_none():
     assert parse_test_output("", "pytest") is None
 
 
+def test_parse_ignores_error_counts_outside_a_summary_line():
+    assert parse_test_output("retried after 3 errors\n3 passed in 0.10s", "pytest") == (3, 0)
+    assert parse_test_output("lint found 7 errors", "pytest") is None
+    assert parse_test_output("0 errors", "pytest") is None
+
+
+def test_parse_zero_errors_is_not_a_failure():
+    assert parse_test_output("5 passed, 0 errors in 1.2s", "pytest") == (5, 0)
+
+
+@pytest.mark.parametrize("text, runner, counts", [
+    ("=== 2 failed, 3 passed, 1 error in 0.50s ===", "pytest", (3, 3)),
+    ("2 failed, 3 passed in 0.5s", "pytest", (3, 2)),
+    ("Tests:       1 failed, 4 passed, 5 total", "jest", (4, 1)),
+    ("Ran 5 tests in 0.1s\n\nFAILED (failures=1, errors=1)", "unittest", (3, 2)),
+    ("FAIL\tpkg\t0.01s", "go test", (0, 1)),
+    ("test result: FAILED. 4 passed; 1 failed", "cargo test", (4, 1)),
+])
+def test_real_summary_lines_with_failures_still_count(text, runner, counts):
+    assert parse_test_output(text, runner) == counts
+
+
 @pytest.mark.parametrize("command", [
     "npm test", "pnpm run test:unit", "yarn test", "go test ./...", "cargo test --all",
     "python -m pytest -q", "pytest tests/test_x.py", "cat ~/.npmrc && npm test",
@@ -113,6 +135,36 @@ def test_test_commands_are_recognised(command):
 ])
 def test_other_commands_are_not_test_runs(command):
     assert not _is_test_command(command)
+
+
+@pytest.mark.parametrize("command", [
+    "pip install pytest", "python -m pip install pytest",
+    "npm install --save-dev jest", "npm uninstall -y pytest",
+])
+def test_installing_a_runner_is_not_a_test_run(command):
+    assert not _is_test_command(command)
+
+
+@pytest.mark.parametrize("command", [
+    "pytest --version", "pytest --help", "pytest -h", "pytest --collect-only", "pytest --co",
+    "jest --list-tests",
+])
+def test_inspecting_a_runner_is_not_a_test_run(command):
+    assert not _is_test_command(command)
+
+
+@pytest.mark.parametrize("command", [
+    "FOO=1 pytest -q", "uv run pytest", "poetry run pytest -q", "npx jest", "npm test",
+    "pnpm run test:unit", "go test ./...", "cargo test --all", "dotnet test", "make test",
+    "cd app && pytest", "pytest | tee out.txt", "python -m pytest -q", "time pytest -q",
+])
+def test_real_runner_invocations_are_still_test_runs(command):
+    assert _is_test_command(command)
+
+
+def test_a_path_containing_install_does_not_disqualify_a_run():
+    assert _is_test_command("python -m pytest -q tests/test_install.py")
+    assert _is_test_command("pytest tests/test_add_user.py")
 
 
 # ---------------------------------------------------------------- test signals
@@ -133,10 +185,9 @@ def test_failed_command_without_a_summary_counts_as_failing():
     assert _sig(q, "test_outcome")["impact"] == -15
 
 
-def test_exit_zero_with_output_but_no_summary_counts_as_passing():
+def test_exit_zero_with_output_but_no_summary_is_unknown():
     q = score_run(_run([_bash(1, "pytest -q", result="all good")]), [])
-    assert _sig(q, "test_outcome")["value"] == "pass"
-    assert "exit code 0" in _sig(q, "test_outcome")["note"]
+    assert _sig(q, "test_outcome") is None
 
 
 def test_test_run_without_any_result_is_not_measured():
@@ -144,6 +195,56 @@ def test_test_run_without_any_result_is_not_measured():
     assert _sig(q, "tests_run")["impact"] == 10
     assert "no readable result" in _sig(q, "tests_run")["note"]
     assert _sig(q, "test_outcome") is None
+
+
+@pytest.mark.parametrize("command, result", [
+    ("pip install pytest", "Successfully installed pytest-8.0.0"),
+    ("python -m pip install pytest", "Successfully installed pytest-8.0.0"),
+    ("npm install --save-dev jest", "added 40 packages"),
+    ("npm uninstall -y pytest", "removed 1 package"),
+])
+def test_installs_earn_no_test_points(command, result):
+    q = score_run(_run([_write(1, "src/a.py"), _bash(2, command, result=result)]), [])
+    assert _sig(q, "tests_run") == {
+        "name": "tests_run", "value": 0, "impact": -10,
+        "note": "1 file(s) changed and no test command ran.",
+    }
+    assert _sig(q, "test_outcome") is None
+
+
+@pytest.mark.parametrize("command", ["pytest --version", "pytest --collect-only", "jest --list-tests"])
+def test_inspecting_a_runner_earns_no_test_points(command):
+    q = score_run(_run([_write(1, "src/a.py"), _bash(2, command, result="pytest 8.0.0")]), [])
+    assert _sig(q, "tests_run")["impact"] == -10
+    assert _sig(q, "test_outcome") is None
+
+
+def test_unreadable_test_output_is_unknown_not_pass():
+    readable = score_run(_run([_write(1, "src/a.py"),
+                               _bash(2, "python -m pytest -q", result="3 passed in 0.10s")]), [])
+    unknown = score_run(_run([_write(1, "src/a.py"),
+                              _bash(2, "python -m pytest -q", result="Done.")]), [])
+    assert _sig(unknown, "tests_run")["value"] == 1
+    assert _sig(unknown, "tests_run")["impact"] == 10
+    assert _sig(unknown, "test_outcome") is None
+    assert readable["score"] - unknown["score"] == 15
+
+
+def test_free_text_error_counts_are_not_test_failures():
+    q = score_run(_run([_bash(1, "python -m pytest -q", result="lint found 7 errors")]), [])
+    assert _sig(q, "tests_run")["value"] == 1
+    assert _sig(q, "test_outcome") is None
+
+
+def test_log_errors_before_a_passing_summary_are_not_a_failure():
+    q = score_run(_run([_bash(1, "python -m pytest -q", result="retried after 3 errors\n3 passed in 0.10s")]), [])
+    assert _sig(q, "test_outcome")["value"] == "pass"
+    assert _sig(q, "test_outcome")["impact"] == 15
+
+
+def test_zero_errors_footer_still_passes():
+    q = score_run(_run([_bash(1, "python -m pytest -q", result="5 passed, 0 errors in 1.2s")]), [])
+    assert _sig(q, "test_outcome")["value"] == "pass"
 
 
 def test_fail_then_pass_is_a_recovery():
@@ -171,9 +272,9 @@ def test_three_failures_in_a_row_are_penalised():
 
 def test_pass_then_fail_is_not_a_recovery():
     steps = [
-        _bash(1, "npm test", result="1 failed, 9 passed", is_error=True),
-        _bash(2, "npm test", result="10 passed"),
-        _bash(3, "npm test", result="1 failed, 9 passed", is_error=True),
+        _bash(1, "npm test", result="1 failed, 9 passed in 0.1s", is_error=True),
+        _bash(2, "npm test", result="10 passed in 0.1s"),
+        _bash(3, "npm test", result="1 failed, 9 passed in 0.1s", is_error=True),
     ]
     sig = _sig(score_run(_run(steps), []), "failing_then_passing")
     assert sig["value"] == 1 and sig["impact"] == 0
@@ -249,6 +350,33 @@ def test_repeated_test_runs_are_not_retry_loops():
 def test_file_edited_five_times_is_a_retry_loop():
     steps = [_step(i, "Edit", {"file_path": f"{ROOT}/src/a.py", "old_string": "a", "new_string": f"b{i}"})
              for i in range(1, 6)]
+    sig = _sig(score_run(_run(steps), []), "retry_loops")
+    assert sig["value"] == 1 and sig["impact"] == -5
+
+
+def test_shell_write_loops_are_counted():
+    steps = [_bash(i, f"echo {i} >> src/a.py", result="ok") for i in range(1, 6)]
+    sig = _sig(score_run(_run(steps), []), "retry_loops")
+    assert sig["value"] == 1 and sig["impact"] == -5
+    assert "file(s) edited 5+ times" in sig["note"]
+
+
+def test_four_shell_writes_to_one_file_are_not_a_loop():
+    steps = [_bash(i, f"echo {i} >> src/a.py", result="ok") for i in range(1, 5)]
+    assert _sig(score_run(_run(steps), []), "retry_loops")["value"] == 0
+
+
+def test_powershell_writes_count_toward_file_loops():
+    steps = [_step(i, "PowerShell", {"command": f"Set-Content src/a.py -Value {i}"}) for i in range(1, 6)]
+    sig = _sig(score_run(_run(steps), []), "retry_loops")
+    assert sig["value"] == 1 and sig["impact"] == -5
+
+
+def test_edits_and_shell_writes_combine_into_one_file_loop():
+    steps = [_step(i, "Edit", {"file_path": f"{ROOT}/src/a.py", "old_string": "a", "new_string": f"b{i}"})
+             for i in range(1, 4)]
+    steps += [_bash(4, "echo x >> src/a.py", result="ok"),
+              _bash(5, "sed -i s/a/b/ src/a.py", result="ok")]
     sig = _sig(score_run(_run(steps), []), "retry_loops")
     assert sig["value"] == 1 and sig["impact"] == -5
 
@@ -434,6 +562,59 @@ def test_analyze_uses_the_steps_own_risks_when_none_are_given():
     analyze(run)
     assert _sig(run.quality, "risk_level")["value"] == "Medium"
     assert isinstance(run.recommendations, list)
+
+
+# ---------------------------------------------------------------- test verdicts computed once
+
+def _test_diff():
+    return {"tests/test_x.py": "diff --git a/tests/test_x.py b/tests/test_x.py\n"
+                               "--- a/tests/test_x.py\n+++ b/tests/test_x.py\n@@ -1 +1 @@\n"
+                               "-def test_refund_rejects_negative(client):\n"
+                               "+def test_refund_is_soft(client):\n+    assert kept == 3\n"}
+
+
+def test_test_verdicts_are_computed_once_per_build(monkeypatch, tmp_path):
+    from runledger import cli, quality, risk
+    run = _run([_step(1, "Edit", {"file_path": f"{ROOT}/tests/test_x.py",
+                                  "old_string": "a", "new_string": "b"})])
+    run.cwd = str(tmp_path)
+    run.test_diffs = _test_diff()
+    calls = []
+
+    class _Adapter:
+        def parse(self, path):
+            return run
+
+    def fake(diffs, prompts=()):
+        calls.append(dict(diffs))
+        return []
+
+    monkeypatch.setattr(cli.adapters, "detect", lambda path: _Adapter())
+    monkeypatch.setattr(risk, "analyze_test_diffs", fake)
+    monkeypatch.setattr(quality, "analyze_test_diffs", fake)
+    cli.build(str(tmp_path / "s.json"))
+    assert len(calls) == 1
+
+
+def test_assess_caches_the_test_verdicts_on_the_run():
+    run = _run([_step(1, "Read", {"file_path": f"{ROOT}/x.py"})])
+    run.test_diffs = _test_diff()
+    assess(run)
+    assert [c.path for c in run.test_verdicts] == ["tests/test_x.py"]
+
+
+def test_score_run_reads_the_cached_verdicts(monkeypatch):
+    from runledger import quality
+    calls = []
+    monkeypatch.setattr(quality, "analyze_test_diffs",
+                        lambda diffs, prompts=(): calls.append(1) or [])
+    run = _run([])
+    run.test_diffs = _test_diff()
+    score_run(run, [])
+    assert calls == [1]  # no cached list yet: computed on demand
+    run.test_verdicts = []
+    score_run(run, [])
+    assert calls == [1]  # the cached list is read, not recomputed
 
 
 # ---------------------------------------------------------------- sample fixture
