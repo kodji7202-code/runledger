@@ -37,6 +37,7 @@ import webbrowser
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
+from urllib.parse import quote
 
 from . import __version__
 from . import adapters
@@ -739,8 +740,12 @@ def cmd_push(args) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     _print_notes(notes)
-    print(f"Pushed {result.get('id', '?')}  ·  risk {result.get('risk_score', '?')}/100 "
-          f"({result.get('risk_level', '?')})  ·  {server.rstrip('/')}{result.get('url', '')}")
+    if result.get("status") == "updated":  # the session grew and replaced the version already pushed
+        print(f"Updated {result.get('id', '?')}  ·  revision {result.get('revision', '?')}  ·  "
+              f"{server.rstrip('/')}/runs/{quote(str(result.get('id', '')), safe='')}")
+    else:
+        print(f"Pushed {result.get('id', '?')}  ·  risk {result.get('risk_score', '?')}/100 "
+              f"({result.get('risk_level', '?')})  ·  {server.rstrip('/')}{result.get('url', '')}")
     return 0
 
 

@@ -76,6 +76,8 @@ MAX_BODY_BYTES = 10 * 1024 * 1024
 COOKIE_NAME = "rl_session"
 LEVELS = ("low", "medium", "high")
 SEVERITIES = ("low", "medium", "high")
+# How the agent reported token usage (see the Droid adapter); anything else reads as unknown.
+USAGE_SOURCES = ("messages", "settings", "missing")
 CSRF_HEADER = "X-Requested-With"
 CSRF_VALUE = "runledger"
 PUBLIC_URL_ENV = "RUNLEDGER_PUBLIC_URL"
@@ -643,20 +645,30 @@ class _Handler(BaseHTTPRequestHandler):
             run,
             actor=ident.actor(),
             key_id=ident.key_id,
+            role=ident.role,
         )
         outcome = result["outcome"]
         if outcome == "conflict":
             raise _HttpError(
                 409,
                 "run_conflict",
-                "A different receipt already exists for this session_id. Run receipts are immutable; use a new session_id.",
+                "A different key already pushed this session, or the new receipt is older. "
+                "Push the newest version of a session with the key that pushed it first.",
             )
         self._check_budget_alerts(ident)
-        self._send_json(201, {
+        if outcome == "updated":
+            self._send_json(200, {
+                "status": "updated",
+                "id": run["id"],
+                "revision": result["revision"],
+            })
+            return
+        self._send_json(201 if outcome == "inserted" else 200, {
             "id": run["id"],
             "url": "/runs/" + quote(run["id"], safe=""),
             "risk_score": result["risk_score"],
             "risk_level": result["risk_level"],
+            "revision": result["revision"],
         })
 
     def _list_runs(self, query: Dict[str, List[str]]) -> None:
@@ -1119,6 +1131,12 @@ def _money(value: Any) -> Optional[float]:
     return round(max(0.0, float(value)), 6)
 
 
+def _enum(value: Any, allowed: Tuple[str, ...]) -> Optional[str]:
+    """A value from `allowed` (matched without case or padding), or None."""
+    text = value.strip().lower() if isinstance(value, str) else ""
+    return text if text in allowed else None
+
+
 def _iso(value: Any) -> Optional[str]:
     when = _parse_ts(value)
     return when.strftime(TIME_FORMAT) if when else None
@@ -1200,6 +1218,7 @@ def receipt_to_run(payload: Dict[str, Any]) -> Dict[str, Any]:
         "user": user,
         "project": project,
         "agent": agent,
+        "agent_id": _text(payload.get("agent_id"), 100),
         "title": _title(payload),
         "started_at": _iso(payload.get("started")),
         "ended_at": _iso(payload.get("ended")),
@@ -1208,6 +1227,8 @@ def receipt_to_run(payload: Dict[str, Any]) -> Dict[str, Any]:
         "tokens": _int(totals.get("tokens"), 0) or 0,
         "files_changed": _int(totals.get("files_changed"), 0) or 0,
         "cost": _money(totals.get("cost_usd")),
+        "usage_source": _enum(totals.get("usage_source"), USAGE_SOURCES),
+        "cost_partial": totals.get("cost_partial") is True,
         "risk_score": score,
         "risk_level": level,
         "risks": risks,
@@ -1215,6 +1236,8 @@ def receipt_to_run(payload: Dict[str, Any]) -> Dict[str, Any]:
         "quality_grade": review["quality_grade"],
         "ai_verdict": review["ai_verdict"],
         "est_savings_usd": review["est_savings_usd"],
+        "recommendations": json.dumps(review["recommendation_counts"], ensure_ascii=False),
+        "ai_assessment": json.dumps(review["assessment_counts"]),
         "receipt": receipt,
         "receipt_html": html,
     }

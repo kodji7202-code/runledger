@@ -55,6 +55,23 @@ RUN_COLUMNS = (
     ("pushed_by_key_id", "TEXT"),
 )
 
+# Run columns and the version history added with superseding runs and the extracted insight
+# inputs: revisions, how the cost was measured, the agent id, the window key and the copies of
+# the recommendations and AI assessment the summary counts. Older databases get them (with a
+# backfill) in _upgrade_run_store().
+RUN_STORE_COLUMNS = (
+    ("revision", "INTEGER NOT NULL DEFAULT 1"),
+    ("usage_source", "TEXT"),
+    ("cost_partial", "INTEGER NOT NULL DEFAULT 0"),
+    ("agent_id", "TEXT"),
+    ("sort_at", "TEXT NOT NULL DEFAULT ''"),
+    ("recommendations", "TEXT"),
+    ("ai_assessment", "TEXT"),
+)
+RUN_STORE_KEYS = ("recommendations", "ai_assessment")
+# How many replaced versions of one run are kept. The run itself is always the newest version.
+RUN_REVISION_LIMIT = 20
+
 # Approval requester identity was added after the first approval release. It is
 # internal provenance: API views expose the attested display value, not the key id.
 APPROVAL_IDENTITY_COLUMNS = (
@@ -109,20 +126,27 @@ CREATE TABLE IF NOT EXISTS runs (
     user           TEXT NOT NULL,
     project        TEXT NOT NULL,
     agent          TEXT,
+    agent_id       TEXT,
     title          TEXT,
     started_at     TEXT,
     ended_at       TEXT,
+    sort_at        TEXT NOT NULL DEFAULT '',
     models         TEXT NOT NULL DEFAULT '{}',
     steps          INTEGER NOT NULL DEFAULT 0,
     tokens         INTEGER NOT NULL DEFAULT 0,
     files_changed  INTEGER NOT NULL DEFAULT 0,
     cost           REAL,
+    usage_source   TEXT,
+    cost_partial   INTEGER NOT NULL DEFAULT 0,
     risk_score     INTEGER NOT NULL DEFAULT 0,
     risk_level     TEXT NOT NULL DEFAULT 'low',
     quality_score  INTEGER,
     quality_grade  TEXT,
     ai_verdict     TEXT,
     est_savings_usd REAL,
+    recommendations TEXT,
+    ai_assessment  TEXT,
+    revision       INTEGER NOT NULL DEFAULT 1,
     receipt_json   TEXT NOT NULL,
     receipt_html   TEXT,
     pushed_by_key_id TEXT,
@@ -131,6 +155,21 @@ CREATE TABLE IF NOT EXISTS runs (
     PRIMARY KEY (team_id, id)
 );
 CREATE INDEX IF NOT EXISTS runs_by_time ON runs (team_id, started_at);
+-- One row per replaced version of a run. A session pushed again by its own key (or by an admin
+-- key) keeps the version it replaced here, newest RUN_REVISION_LIMIT versions only. The purge
+-- deletes these rows with their run.
+CREATE TABLE IF NOT EXISTS run_revisions (
+    team_id      INTEGER NOT NULL,
+    run_id       TEXT NOT NULL,
+    revision     INTEGER NOT NULL,
+    replaced_at  TEXT NOT NULL,
+    receipt_json TEXT NOT NULL,
+    receipt_html TEXT,
+    risk_score   INTEGER,
+    cost         REAL,
+    pushed_by_key_id TEXT,
+    PRIMARY KEY (team_id, run_id, revision)
+);
 CREATE TABLE IF NOT EXISTS risks (
     team_id   INTEGER NOT NULL,
     run_id    TEXT NOT NULL,
@@ -187,9 +226,9 @@ CREATE TABLE IF NOT EXISTS budget_alerts (
 """
 
 _SUMMARY_COLUMNS = (
-    "id, user, project, agent, title, started_at, ended_at, steps, tokens, files_changed, "
-    "cost, risk_score, risk_level, quality_score, quality_grade, ai_verdict, est_savings_usd, "
-    "created_at, updated_at, (receipt_html IS NOT NULL) AS has_html"
+    "id, user, project, agent, agent_id, title, started_at, ended_at, steps, tokens, files_changed, "
+    "cost, usage_source, cost_partial, risk_score, risk_level, quality_score, quality_grade, ai_verdict, "
+    "est_savings_usd, revision, created_at, updated_at, (receipt_html IS NOT NULL) AS has_html"
 )
 
 _KEY_COLUMNS = "id, label, role, prefix, created_at, last_used_at, revoked_at"
@@ -225,6 +264,28 @@ _APPROVAL_COLUMNS = (
     "status, decided_by, decided_at, reason, "
     "created_at, created_ts"
 )
+
+
+def _extraction_json(receipt: Dict[str, Any]) -> Tuple[str, str]:
+    """The two extracted insight inputs of a receipt, as the runs columns store them: the
+    recommendation entries the summary counts, and the assessed/false-positive pair of its AI
+    review. Both are always written, so a report never has to read receipt_json."""
+    fields = review_fields(receipt)
+    return (
+        json.dumps(fields["recommendation_counts"], ensure_ascii=False),
+        json.dumps(fields["assessment_counts"]),
+    )
+
+
+def _supersedes(existing: sqlite3.Row, run: Dict[str, Any], key_id: Optional[str], role: Optional[str]) -> bool:
+    """Whether a new push may replace the stored version of a run: the same key pushed it (or an
+    admin key), and the new receipt is not a regression (an older end time, or fewer steps)."""
+    if role != "admin" and existing["pushed_by_key_id"] and existing["pushed_by_key_id"] != key_id:
+        return False
+    old_ended, new_ended = existing["ended_at"], run["ended_at"]
+    if old_ended is not None and new_ended is not None and new_ended < old_ended:
+        return False
+    return int(run["steps"]) >= int(existing["steps"] or 0)
 
 
 def _stamp(ts: float) -> str:
@@ -265,6 +326,7 @@ def _summary(row: sqlite3.Row) -> Dict[str, Any]:
         "user": row["user"],
         "project": row["project"],
         "agent": row["agent"],
+        "agent_id": row["agent_id"],
         "title": row["title"],
         "started_at": row["started_at"],
         "ended_at": row["ended_at"],
@@ -272,12 +334,15 @@ def _summary(row: sqlite3.Row) -> Dict[str, Any]:
         "tokens": row["tokens"],
         "files_changed": row["files_changed"],
         "cost_usd": row["cost"],
+        "usage_source": row["usage_source"],
+        "cost_partial": bool(row["cost_partial"]),
         "risk_score": row["risk_score"],
         "risk_level": row["risk_level"],
         "quality_score": row["quality_score"],
         "quality_grade": row["quality_grade"],
         "ai_verdict": row["ai_verdict"],
         "est_savings_usd": row["est_savings_usd"],
+        "revision": row["revision"],
         "has_html": bool(row["has_html"]),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
@@ -303,6 +368,7 @@ class Database:
                 self._add_missing_columns("teams", TEAM_SETTING_COLUMNS)
                 self._add_missing_columns("runs", RUN_COLUMNS)
                 self._add_missing_columns("approvals", APPROVAL_IDENTITY_COLUMNS)
+                self._upgrade_run_store()
                 self._upgrade_review_columns()
                 self._migrate_api_keys()
         except BaseException:
@@ -390,6 +456,50 @@ class Database:
         except Exception:
             self._conn.rollback()
             raise
+
+    def _upgrade_run_store(self) -> None:
+        """Add the version and window columns, the version table and the window index to a
+        database from before them, and fill them in: `sort_at` from the window key the queries
+        used, and the extracted recommendations and AI assessment from the receipts already
+        stored. The ALTERs, the backfill and the index share one transaction, so a failure
+        leaves the old layout."""
+        present = {row["name"] for row in self._conn.execute("PRAGMA table_info(runs)")}
+        added = {name for name, _ in RUN_STORE_COLUMNS if name not in present}
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            for name, ddl in RUN_STORE_COLUMNS:
+                if name in added:
+                    self._conn.execute(f"ALTER TABLE runs ADD COLUMN {name} {ddl}")
+            self._conn.execute(
+                "UPDATE runs SET sort_at = COALESCE(started_at, created_at) WHERE sort_at IS NULL OR sort_at = ''"
+            )
+            if added & set(RUN_STORE_KEYS):
+                self._backfill_extractions()
+            self._conn.execute("CREATE INDEX IF NOT EXISTS runs_by_sort_at ON runs (team_id, sort_at)")
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def _backfill_extractions(self) -> None:
+        """Fill the extracted recommendation and AI assessment columns from the receipts that
+        hold those keys. Runs with neither key have nothing to extract and keep them empty."""
+        rows = self._conn.execute(
+            "SELECT team_id, id, receipt_json FROM runs WHERE recommendations IS NULL "
+            "AND (receipt_json LIKE ? OR receipt_json LIKE ?)",
+            (RECOMMENDATIONS_LIKE, AI_REVIEW_LIKE),
+        ).fetchall()
+        for row in rows:
+            try:
+                receipt = json.loads(row["receipt_json"])
+            except ValueError:
+                continue
+            if not isinstance(receipt, dict):
+                continue
+            self._conn.execute(
+                "UPDATE runs SET recommendations = ?, ai_assessment = ? WHERE team_id = ? AND id = ?",
+                _extraction_json(receipt) + (row["team_id"], row["id"]),
+            )
 
     def _migrate_api_keys(self) -> None:
         """Before roles, each team had one API key, kept in teams.api_key_hash. That key
@@ -676,23 +786,26 @@ class Database:
         actor: Optional[str] = None,
         *,
         key_id: Optional[str] = None,
+        role: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Store one run immutably.
+        """Store one run, or supersede the version already stored for its session id.
 
-        An identical re-push is idempotent. A different receipt with the same
-        team/session id is rejected instead of replacing evidence. The check and
-        insert share this lock/transaction, so concurrent pushes cannot replace
-        one another.
+        An identical re-push is idempotent. A different receipt for the same team/session id
+        replaces the stored row when the same key pushed it (or the pusher is an admin) and the
+        new version is not a regression, keeping the replaced version in run_revisions and
+        pruning that history to RUN_REVISION_LIMIT versions. Anything else is a conflict. The
+        check, the insert and the update share this lock and one transaction, so concurrent
+        pushes cannot replace one another.
 
-        Returns a result dict whose outcome is inserted, duplicate or conflict.
+        Returns a result dict whose outcome is inserted, duplicate, updated or conflict.
         """
         now = utc_now()
         models_json = json.dumps(run["models"], sort_keys=True)
         receipt_json = json.dumps(run["receipt"], ensure_ascii=False)
         with self._lock, self._conn:
             existing = self._conn.execute(
-                "SELECT receipt_json, receipt_html, risk_score, risk_level "
-                "FROM runs WHERE team_id = ? AND id = ?",
+                "SELECT receipt_json, receipt_html, risk_score, risk_level, cost, steps, ended_at, "
+                "revision, pushed_by_key_id, created_at FROM runs WHERE team_id = ? AND id = ?",
                 (team_id, run["id"]),
             ).fetchone()
             if existing is not None:
@@ -705,23 +818,77 @@ class Database:
                         "outcome": "duplicate",
                         "risk_score": existing["risk_score"],
                         "risk_level": existing["risk_level"],
+                        "revision": int(existing["revision"] or 1),
                     }
-                return {"outcome": "conflict"}
+                if not _supersedes(existing, run, key_id, role):
+                    return {"outcome": "conflict"}
+                revision = int(existing["revision"] or 1) + 1
+                self._conn.execute(
+                    "INSERT INTO run_revisions (team_id, run_id, revision, replaced_at, receipt_json, "
+                    "receipt_html, risk_score, cost, pushed_by_key_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (team_id, run["id"], revision - 1, now, existing["receipt_json"],
+                     existing["receipt_html"], existing["risk_score"], existing["cost"],
+                     existing["pushed_by_key_id"]),
+                )
+                self._conn.execute(
+                    "DELETE FROM run_revisions WHERE team_id = ? AND run_id = ? AND revision <= ?",
+                    (team_id, run["id"], revision - RUN_REVISION_LIMIT - 1),
+                )
+                self._conn.execute(
+                    "UPDATE runs SET user = ?, project = ?, agent = ?, agent_id = ?, title = ?, "
+                    "started_at = ?, ended_at = ?, sort_at = ?, models = ?, steps = ?, tokens = ?, "
+                    "files_changed = ?, cost = ?, usage_source = ?, cost_partial = ?, risk_score = ?, "
+                    "risk_level = ?, quality_score = ?, quality_grade = ?, ai_verdict = ?, "
+                    "est_savings_usd = ?, recommendations = ?, ai_assessment = ?, receipt_json = ?, "
+                    "receipt_html = ?, pushed_by_key_id = ?, revision = ?, updated_at = ? "
+                    "WHERE team_id = ? AND id = ?",
+                    (
+                        run["user"], run["project"], run["agent"], run["agent_id"], run["title"],
+                        run["started_at"], run["ended_at"], run["started_at"] or existing["created_at"],
+                        models_json, run["steps"], run["tokens"], run["files_changed"], run["cost"],
+                        run["usage_source"], run["cost_partial"], run["risk_score"], run["risk_level"],
+                        run["quality_score"], run["quality_grade"], run["ai_verdict"],
+                        run["est_savings_usd"], run["recommendations"], run["ai_assessment"],
+                        receipt_json, run["receipt_html"], key_id, revision, now,
+                        team_id, run["id"],
+                    ),
+                )
+                self._conn.execute("DELETE FROM risks WHERE team_id = ? AND run_id = ?", (team_id, run["id"]))
+                self._conn.executemany(
+                    "INSERT INTO risks (team_id, run_id, severity, code, reason, step) VALUES (?, ?, ?, ?, ?, ?)",
+                    [
+                        (team_id, run["id"], r["severity"], r["code"], r["reason"], r["step"])
+                        for r in run["risks"]
+                    ],
+                )
+                if actor is not None:
+                    self._audit(team_id, actor, "run.supersede", run["id"],
+                                {"revision": revision, "replaced_revision": revision - 1,
+                                 "agent": run["agent"], "project": run["project"]})
+                return {
+                    "outcome": "updated",
+                    "revision": revision,
+                    "risk_score": run["risk_score"],
+                    "risk_level": run["risk_level"],
+                }
 
             self._conn.execute(
                 """
-                INSERT INTO runs (id, team_id, user, project, agent, title, started_at, ended_at, models,
-                                  steps, tokens, files_changed, cost, risk_score, risk_level,
-                                  quality_score, quality_grade, ai_verdict, est_savings_usd,
-                                  receipt_json, receipt_html, pushed_by_key_id, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO runs (id, team_id, user, project, agent, agent_id, title, started_at, ended_at, sort_at, models,
+                                  steps, tokens, files_changed, cost, usage_source, cost_partial,
+                                  risk_score, risk_level,
+                                  quality_score, quality_grade, ai_verdict, est_savings_usd, recommendations,
+                                  ai_assessment, revision, receipt_json, receipt_html, pushed_by_key_id,
+                                  created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
                 """,
                 (
-                    run["id"], team_id, run["user"], run["project"], run["agent"], run["title"],
-                    run["started_at"], run["ended_at"], models_json,
-                    run["steps"], run["tokens"], run["files_changed"], run["cost"],
-                    run["risk_score"], run["risk_level"],
+                    run["id"], team_id, run["user"], run["project"], run["agent"], run["agent_id"],
+                    run["title"], run["started_at"], run["ended_at"], run["started_at"] or now, models_json,
+                    run["steps"], run["tokens"], run["files_changed"], run["cost"], run["usage_source"],
+                    run["cost_partial"], run["risk_score"], run["risk_level"],
                     run["quality_score"], run["quality_grade"], run["ai_verdict"], run["est_savings_usd"],
+                    run["recommendations"], run["ai_assessment"],
                     receipt_json, run["receipt_html"], key_id,
                     now, now,
                 ),
@@ -739,7 +906,12 @@ class Database:
             if actor is not None:
                 self._audit(team_id, actor, "run.push", run["id"],
                             {"agent": run["agent"], "project": run["project"]})
-        return {"outcome": "inserted", "risk_score": run["risk_score"], "risk_level": run["risk_level"]}
+        return {
+            "outcome": "inserted",
+            "risk_score": run["risk_score"],
+            "risk_level": run["risk_level"],
+            "revision": 1,
+        }
 
     def list_runs(
         self,
@@ -780,7 +952,7 @@ class Database:
         params.append(max(1, min(int(limit), 500)))
         sql = (
             f"SELECT {_SUMMARY_COLUMNS} FROM runs WHERE {' AND '.join(clauses)} "
-            "ORDER BY COALESCE(started_at, created_at) DESC, created_at DESC, id LIMIT ?"
+            "ORDER BY sort_at DESC, created_at DESC, id LIMIT ?"
         )
         with self._lock:
             rows = self._conn.execute(sql, params).fetchall()
@@ -817,7 +989,7 @@ class Database:
         days = max(1, int(since_days))
         moment = now or datetime.now(timezone.utc)
         since = (moment - timedelta(days=days)).strftime(TIME_FORMAT)
-        window = "team_id = ? AND COALESCE(started_at, created_at) >= ?"
+        window = "team_id = ? AND sort_at >= ?"
         args = (team_id, since)
         with self._lock:
             totals = self._conn.execute(
@@ -839,7 +1011,7 @@ class Database:
             top = self._conn.execute(
                 "SELECT r.code AS code, COUNT(*) AS occurrences, COUNT(DISTINCT r.run_id) AS runs "
                 "FROM risks r JOIN runs u ON u.team_id = r.team_id AND u.id = r.run_id "
-                "WHERE r.team_id = ? AND COALESCE(u.started_at, u.created_at) >= ? "
+                "WHERE r.team_id = ? AND u.sort_at >= ? "
                 "GROUP BY r.code ORDER BY occurrences DESC, r.code LIMIT 10",
                 args,
             ).fetchall()
@@ -890,17 +1062,18 @@ class Database:
                 "SELECT id, user, project, agent, models, started_at, created_at, steps, tokens, "
                 "files_changed, cost, risk_score, risk_level, title, quality_score, quality_grade, "
                 "ai_verdict, est_savings_usd FROM runs "
-                "WHERE team_id = ? AND COALESCE(started_at, created_at) >= ? "
-                "ORDER BY COALESCE(started_at, created_at), id",
+                "WHERE team_id = ? AND sort_at >= ? "
+                "ORDER BY sort_at, id",
                 (team_id, since),
             ).fetchall()
         return [dict(r) for r in rows]
 
     def insight_parts(self, team_id: int, since: str) -> Dict[str, Any]:
         """The raw rows behind the Insights summary (see insights.compute), for runs that started
-        (or were pushed) at or after `since`. Aggregates are computed in SQL. Only the receipts that
-        can hold recommendations or an AI review are read back as JSON."""
-        window = "team_id = ? AND COALESCE(started_at, created_at) >= ?"
+        (or were pushed) at or after `since`. Aggregates are computed in SQL. The recommendations
+        and the AI assessments come from the copies the server extracted at push time; only the
+        receipts stored before those columns existed are read back as JSON."""
+        window = "team_id = ? AND sort_at >= ?"
         args = (team_id, since)
         with self._lock:
             quality = self._conn.execute(
@@ -913,7 +1086,7 @@ class Database:
                 args,
             ).fetchall()
             trend = self._conn.execute(
-                "SELECT substr(COALESCE(started_at, created_at), 1, 10) AS day, AVG(quality_score) AS avg "
+                "SELECT substr(sort_at, 1, 10) AS day, AVG(quality_score) AS avg "
                 f"FROM runs WHERE {window} AND quality_score IS NOT NULL GROUP BY day ORDER BY day",
                 args,
             ).fetchall()
@@ -934,9 +1107,16 @@ class Database:
             model_rows = self._conn.execute(
                 f"SELECT models, quality_score FROM runs WHERE {window}", args,
             ).fetchall()
-            review_rows = self._conn.execute(
-                f"SELECT receipt_json FROM runs WHERE {window} AND (ai_verdict IS NOT NULL OR receipt_json LIKE ?)",
-                args + (RECOMMENDATIONS_LIKE,),
+            recommendation_rows = self._conn.execute(
+                f"SELECT recommendations FROM runs WHERE {window} AND recommendations IS NOT NULL", args,
+            ).fetchall()
+            assessment_rows = self._conn.execute(
+                f"SELECT ai_assessment FROM runs WHERE {window} AND ai_assessment IS NOT NULL", args,
+            ).fetchall()
+            legacy_receipts = self._conn.execute(
+                f"SELECT receipt_json FROM runs WHERE {window} AND recommendations IS NULL "
+                "AND (receipt_json LIKE ? OR receipt_json LIKE ?)",
+                args + (RECOMMENDATIONS_LIKE, AI_REVIEW_LIKE),
             ).fetchall()
         return {
             "scored": quality["scored"],
@@ -947,14 +1127,16 @@ class Database:
             "est_savings_usd": savings["total"],
             "agents": [dict(r) for r in agents],
             "model_rows": [dict(r) for r in model_rows],
-            "review_receipts": [r["receipt_json"] for r in review_rows],
+            "recommendation_rows": [dict(r) for r in recommendation_rows],
+            "assessment_rows": [dict(r) for r in assessment_rows],
+            "legacy_receipts": [r["receipt_json"] for r in legacy_receipts],
         }
 
     def risk_level_counts(self, team_id: int, since: str) -> Dict[str, int]:
         with self._lock:
             rows = self._conn.execute(
                 "SELECT risk_level, COUNT(*) AS n FROM runs WHERE team_id = ? "
-                "AND COALESCE(started_at, created_at) >= ? GROUP BY risk_level",
+                "AND sort_at >= ? GROUP BY risk_level",
                 (team_id, since),
             ).fetchall()
         counts = {"low": 0, "medium": 0, "high": 0}
@@ -967,8 +1149,8 @@ class Database:
         with self._lock:
             rows = self._conn.execute(
                 f"SELECT {_SUMMARY_COLUMNS} FROM runs WHERE team_id = ? AND risk_level = 'high' "
-                "AND COALESCE(started_at, created_at) >= ? "
-                "ORDER BY risk_score DESC, COALESCE(started_at, created_at) DESC, id LIMIT ?",
+                "AND sort_at >= ? "
+                "ORDER BY risk_score DESC, sort_at DESC, id LIMIT ?",
                 (team_id, since, int(limit)),
             ).fetchall()
         return [_summary(r) for r in rows]
@@ -1017,7 +1199,7 @@ class Database:
     def month_spend(self, team_id: int, start: str, end: str) -> Tuple[float, List[Tuple[str, float]]]:
         """Total run cost for runs whose start (or push time, when there is no start) is in [start, end),
         and the same per developer. Runs without a cost count as zero."""
-        window = "team_id = ? AND COALESCE(started_at, created_at) >= ? AND COALESCE(started_at, created_at) < ?"
+        window = "team_id = ? AND sort_at >= ? AND sort_at < ?"
         args = (team_id, start, end)
         with self._lock:
             total = self._conn.execute(f"SELECT COALESCE(SUM(cost), 0) FROM runs WHERE {window}", args).fetchone()[0]
@@ -1215,16 +1397,20 @@ class Database:
     # Retention
 
     def purge_before(self, cutoff: str) -> Dict[str, int]:
-        """Delete, for every team, runs that started (or were pushed) before `cutoff`, and approvals,
-        audit events and budget alerts older than it. Returns the number of rows removed per table."""
+        """Delete, for every team, runs that started (or were pushed) before `cutoff`, the versions
+        kept of those runs, and approvals, audit events and budget alerts older than it. Returns
+        the number of rows removed per table."""
         counts: Dict[str, int] = {}
         with self._lock, self._conn:
-            old_runs = "SELECT team_id, id FROM runs WHERE COALESCE(started_at, created_at) < ?"
+            old_runs = "SELECT team_id, id FROM runs WHERE sort_at < ?"
             self._conn.execute(
                 f"DELETE FROM risks WHERE (team_id, run_id) IN ({old_runs})", (cutoff,)
             )
+            counts["run_revisions"] = self._conn.execute(
+                f"DELETE FROM run_revisions WHERE (team_id, run_id) IN ({old_runs})", (cutoff,)
+            ).rowcount
             counts["runs"] = self._conn.execute(
-                "DELETE FROM runs WHERE COALESCE(started_at, created_at) < ?", (cutoff,)
+                "DELETE FROM runs WHERE sort_at < ?", (cutoff,)
             ).rowcount
             counts["approvals"] = self._conn.execute(
                 "DELETE FROM approvals WHERE created_at < ?", (cutoff,)

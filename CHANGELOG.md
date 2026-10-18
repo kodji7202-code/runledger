@@ -296,6 +296,28 @@ change behavior, so read the entry before you upgrade.
   are unchanged - the shell's own words still decide - and the whole spaced path stays visible,
   with the assignment inside it masked.
 
+### Added
+
+- **A re-pushed session supersedes the run it replaces, and its history is kept (`runledger.server`):**
+  pushing the same `session_id` again with the same key (or an admin key) replaces the stored run and
+  answers `200 {"status": "updated", "id": ..., "revision": n}` instead of `409 run_conflict`. The
+  replaced version is kept in the new `run_revisions` table with its receipt JSON, HTML, risk score and
+  cost, the newest 20 versions per run; `runledger push` reports the revision it replaced. An identical
+  re-push is still an accepted retry (`200`, no new revision), a different member key still gets `409`,
+  and a receipt older than the stored version (an earlier `ended`, or fewer steps) is still `409`. The
+  run keeps its URL, its `created_at` and its approvals; its risk, quality, AI review, insights,
+  dashboard counts, budget spend and audit log are recomputed from the new version, and the supersede
+  is recorded as the `run.supersede` audit event (revision, replaced_revision). The purge deletes a
+  run's history with the run.
+- **Runs store the client's `agent_id`, `usage_source` and `cost_partial`, and list by `sort_at`
+  (`runledger.server`):** the run list and the receipt carry the agent's id (`claude-code`), how the
+  client measured usage (`messages`, `settings` or `missing`) and whether its cost is a lower bound, so
+  a dashboard can label partial costs; an existing database gains the columns, the version history
+  table and a `(team_id, sort_at)` index in place, and its rows are backfilled from what they already
+  hold (no data is rewritten or dropped). Runs are listed, filtered by window and purged by `sort_at`
+  (the start time, or the push time when a receipt has none), so a run without a start time is no
+  longer sorted or counted by a different column than the one the list uses.
+
 ## [0.6.0] - 2026-10-15
 
 ### Changed

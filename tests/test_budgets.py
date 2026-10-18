@@ -137,8 +137,9 @@ def make_payload(run_id, user="dev@example.com", cost=0.1, started=STARTED, risk
 
 
 def push(base, key, run_id, **kwargs):
+    """Push a receipt. 201 is a new run, 200 a version that replaced the one already stored."""
     status, _, raw = _http(base, "POST", "/api/runs", body=make_payload(run_id, **kwargs), headers=_auth(key))
-    assert status == 201, raw
+    assert status in (200, 201), raw
     return _json(raw)
 
 
@@ -375,8 +376,10 @@ def test_a_run_without_a_start_time_counts_from_its_push_time(env, clock):
     payload["started"] = None
     assert _http(base, "POST", "/api/runs", body=payload, headers=_auth(admin))[0] == 201
     # Put the push time in September. Being pushed "now" then no longer counts for October.
+    # The window key (sort_at) holds that push time, so it moves with created_at.
     with closing(sqlite3.connect(str(srv.db.path))) as conn:
-        conn.execute("UPDATE runs SET created_at = '2026-09-30T23:00:00Z' WHERE id = 'no-start'")
+        conn.execute("UPDATE runs SET created_at = '2026-09-30T23:00:00Z', "
+                     "sort_at = '2026-09-30T23:00:00Z' WHERE id = 'no-start'")
         conn.commit()
     assert _json(_http(base, "GET", "/api/budgets/status", headers=_auth(admin))[2])["spend_usd"] == 0.0
     clock.set(datetime(2026, 9, 15, tzinfo=timezone.utc))
@@ -511,6 +514,29 @@ def test_each_new_alert_is_audited_by_the_system(env):
         ("system", "team", 80), ("system", "team", 50),
     ]
     assert events[0]["details"]["pct"] == 90.0 and events[0]["details"]["limit_usd"] == 1.0
+
+
+def test_a_superseding_push_re_evaluates_the_budget_without_counting_the_old_version(env):
+    srv, base = env
+    _, admin, _, _ = team_with_keys(srv, base)
+    set_budget(base, admin, monthly_usd=1.0, alert_thresholds=[50, 80, 100])
+    with _Hook() as hook:
+        assert _http(base, "PUT", "/api/team/settings", body={"webhook_url": hook.url},
+                     headers={**_auth(admin), **CSRF})[0] == 200
+        push(base, admin, "sess-b", cost=0.10)          # 10%: below every threshold
+        assert _db_rows(srv.db.path, "SELECT COUNT(*) FROM budget_alerts")[0][0] == 0
+
+        grown = make_payload("sess-b", cost=0.90)
+        status, _, raw = _http(base, "POST", "/api/runs", body=grown, headers=_auth(admin))
+        assert status == 200 and _json(raw)["status"] == "updated"
+        delivered = [hook.next_json(), hook.next_json()]
+
+    assert [message["threshold"] for message in delivered] == [50, 80]
+    assert all(message["spend_usd"] == pytest.approx(0.9) for message in delivered)
+    status = _json(_http(base, "GET", "/api/budgets/status", headers=_auth(admin))[2])
+    assert status["spend_usd"] == pytest.approx(0.9)        # not 1.0: the replaced version is gone
+    events = _json(_http(base, "GET", "/api/audit?action=budget.alert", headers=_auth(admin))[2])["events"]
+    assert sorted(e["details"]["threshold"] for e in events) == [50, 80]
 
 
 def test_a_repeated_push_does_not_fire_again(env):

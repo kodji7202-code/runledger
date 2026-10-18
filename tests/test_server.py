@@ -3,11 +3,13 @@
 Each test runs a real server on a free port in a background thread, with a
 temporary SQLite database.
 """
+import copy
 import http.client
 import json
 import sqlite3
 import threading
 from contextlib import closing, contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -20,6 +22,7 @@ from runledger.server.dashboard import DASHBOARD_HTML
 from runledger.server.db import Database
 
 FIX = Path(__file__).parent / "fixtures" / "sample_session.jsonl"
+NATIVE = Path(__file__).parent / "fixtures" / "native_session.json"
 SESSION_ID = "7f3c2a10-9b1e-4c55-a1d2-0e6f8b3c9d42"
 XSS = "<script>alert(1)</script>"
 
@@ -67,6 +70,41 @@ def _auth(key):
 
 def _json(raw):
     return json.loads(raw.decode("utf-8"))
+
+
+def _stored(payload, run_id, *, steps=4, ended="2026-10-15T10:05:00Z", cost=0.1, risk=20, **extra):
+    """A receipt for `run_id` with a chosen step count, end time, cost and risk."""
+    body = copy.deepcopy(payload)
+    body["session_id"] = run_id
+    body["started"] = extra.pop("started", "2026-10-15T10:00:00Z")
+    body["ended"] = ended
+    body["totals"] = dict(body["totals"], steps=steps, cost_usd=cost)
+    body["models"] = {"claude-sonnet-4-5-20250929": {"tokens": 1000, "cost_usd": cost}}
+    level = "high" if risk >= 60 else "medium" if risk >= 25 else "low"
+    body["risk"] = {"score": risk, "level": level, "reasons": []}
+    body["html"] = f"<html><body>{run_id} version {steps}</body></html>"
+    body.update(extra)
+    return body
+
+
+def _push(base, key, payload):
+    status, _, raw = _http(base, "POST", "/api/runs", body=payload, headers=_auth(key))
+    return status, _json(raw)
+
+
+def _run_row(db_path, run_id):
+    """The stored row of a run, for the fields the API does not expose."""
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+        return dict(row) if row is not None else None
+
+
+def _revisions(db_path, run_id):
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        return [row[0] for row in conn.execute(
+            "SELECT revision FROM run_revisions WHERE run_id = ? ORDER BY revision", (run_id,)
+        )]
 
 
 def test_push_then_list_get_and_stats(env):
@@ -170,41 +208,39 @@ def test_same_session_id_in_two_teams_does_not_overwrite(env):
     assert [r["user"] for r in runs_b] == ["bob@example.com"]
 
 
-def test_repushing_is_idempotent_but_cannot_replace_an_existing_receipt(env):
+def test_repushing_is_idempotent_and_another_key_cannot_replace_the_receipt(env):
     srv, base = env
     team_id, key = srv.db.create_team("alpha")
     other = srv.db.create_key(team_id, "other-member", "member", "test")["key"]
     payload = client.build_payload(FIX, user="first@example.com")
 
     assert _http(base, "POST", "/api/runs", body=payload, headers=_auth(key))[0] == 201
-    assert _http(base, "POST", "/api/runs", body=payload, headers=_auth(key))[0] == 201
+    assert _http(base, "POST", "/api/runs", body=payload, headers=_auth(key))[0] == 200
+    # An identical retry is accepted from any key of the team: nothing changes.
+    assert _http(base, "POST", "/api/runs", body=payload, headers=_auth(other))[0] == 200
 
     changed = dict(payload)
     changed["user"] = "second@example.com"
     status, _, raw = _http(base, "POST", "/api/runs", body=changed, headers=_auth(other))
     assert status == 409 and _json(raw)["error"]["code"] == "run_conflict"
+    assert "immutable" not in _json(raw)["error"]["message"]
 
     runs = _json(_http(base, "GET", "/api/runs", headers=_auth(key))[2])["runs"]
-    assert len(runs) == 1 and runs[0]["user"] == "first@example.com"
+    assert len(runs) == 1 and runs[0]["user"] == "first@example.com" and runs[0]["revision"] == 1
     with closing(sqlite3.connect(str(srv.db.path))) as conn:
         pushes = conn.execute(
             "SELECT COUNT(*) FROM audit_log WHERE team_id = ? AND action = 'run.push' AND target = ?",
             (team_id, SESSION_ID),
         ).fetchone()[0]
-    assert pushes == 1
+        history = conn.execute("SELECT COUNT(*) FROM run_revisions").fetchone()[0]
+    assert pushes == 1 and history == 0
 
 
-def test_immutable_receipt_equality_is_type_sensitive_and_duplicate_reply_uses_stored_risk(env):
+def test_receipt_equality_is_type_sensitive_and_a_duplicate_reply_uses_the_stored_risk(env):
     srv, base = env
     _, key = srv.db.create_team("alpha")
     payload = client.build_payload(FIX, user="first@example.com")
-    payload["risk"]["score"] = True
     assert _http(base, "POST", "/api/runs", body=payload, headers=_auth(key))[0] == 201
-
-    typed_differently = json.loads(json.dumps(payload))
-    typed_differently["risk"]["score"] = 1
-    status, _, raw = _http(base, "POST", "/api/runs", body=typed_differently, headers=_auth(key))
-    assert status == 409 and _json(raw)["error"]["code"] == "run_conflict"
 
     # An exact retry reports persisted fields, which matters across parser-version
     # changes where flattened metadata can differ from today's derivation.
@@ -215,9 +251,214 @@ def test_immutable_receipt_equality_is_type_sensitive_and_duplicate_reply_uses_s
         )
         conn.commit()
     status, _, raw = _http(base, "POST", "/api/runs", body=payload, headers=_auth(key))
-    assert status == 201
+    assert status == 200
     reply = _json(raw)
-    assert reply["risk_score"] == 77 and reply["risk_level"] == "high"
+    assert reply["risk_score"] == 77 and reply["risk_level"] == "high" and reply["revision"] == 1
+    assert _revisions(srv.db.path, SESSION_ID) == []
+
+    # Receipt equality is type-sensitive: True is not 1, so this is a new version, not a retry.
+    typed_differently = json.loads(json.dumps(payload))
+    typed_differently["risk"]["score"] = True
+    status, _, raw = _http(base, "POST", "/api/runs", body=typed_differently, headers=_auth(key))
+    assert status == 200
+    assert _json(raw) == {"status": "updated", "id": SESSION_ID, "revision": 2}
+
+
+def test_repush_grown_session_supersedes(env):
+    srv, base = env
+    team_id, key = srv.db.create_team("alpha")
+    key_id = srv.db.key_for_token(key)["id"]
+    payload = client.build_payload(FIX, user="dev@example.com")
+
+    grown_first = _stored(payload, "sess-grow", steps=4, ended="2026-10-15T10:05:00Z", cost=0.1, risk=20)
+    assert _push(base, key, grown_first)[0] == 201
+    created_at = _run_row(srv.db.path, "sess-grow")["created_at"]
+
+    grown = _stored(payload, "sess-grow", steps=9, ended="2026-10-15T10:20:00Z", cost=0.3, risk=60)
+    status, body = _push(base, key, grown)
+    assert status == 200
+    assert body == {"status": "updated", "id": "sess-grow", "revision": 2}
+
+    status, _, raw = _http(base, "GET", "/api/runs/sess-grow", headers=_auth(key))
+    run = _json(raw)["run"]
+    assert status == 200
+    assert run["steps"] == 9 and run["cost_usd"] == 0.3 and run["risk_score"] == 60
+    assert run["revision"] == 2 and run["receipt"]["totals"]["steps"] == 9
+    row = _run_row(srv.db.path, "sess-grow")
+    assert row["created_at"] == created_at and row["updated_at"] >= created_at
+    assert _http(base, "GET", "/runs/sess-grow", headers=_auth(key))[2].count(b"version 9") == 1
+    assert [r["id"] for r in _json(_http(base, "GET", "/api/runs", headers=_auth(key))[2])["runs"]] == ["sess-grow"]
+
+    with closing(sqlite3.connect(str(srv.db.path))) as conn:
+        history = conn.execute(
+            "SELECT revision, receipt_json, risk_score, cost, pushed_by_key_id FROM run_revisions "
+            "WHERE team_id = ? AND run_id = ?", (team_id, "sess-grow"),
+        ).fetchall()
+    assert len(history) == 1
+    revision, receipt_json, risk_score, cost, pushed_by = history[0]
+    assert (revision, risk_score, cost, pushed_by) == (1, 20, 0.1, key_id)
+    assert json.loads(receipt_json)["totals"]["steps"] == 4
+
+    events = _json(_http(base, "GET", "/api/audit?action=run.supersede", headers=_auth(key))[2])["events"]
+    assert [(e["action"], e["target"]) for e in events] == [("run.supersede", "sess-grow")]
+
+
+def test_repush_older_ended_at_or_fewer_steps_conflicts(env):
+    srv, base = env
+    _, key = srv.db.create_team("alpha")
+    payload = client.build_payload(FIX, user="dev@example.com")
+    assert _push(base, key, _stored(payload, "sess-r", steps=9, ended="2026-10-15T10:20:00Z"))[0] == 201
+
+    status, body = _push(base, key, _stored(payload, "sess-r", steps=9, ended="2026-10-15T10:05:00Z"))
+    assert status == 409 and body["error"]["code"] == "run_conflict"
+    status, body = _push(base, key, _stored(payload, "sess-r", steps=5, ended="2026-10-15T10:30:00Z"))
+    assert status == 409 and body["error"]["code"] == "run_conflict"
+
+    row = _run_row(srv.db.path, "sess-r")
+    assert (row["steps"], row["ended_at"], row["revision"]) == (9, "2026-10-15T10:20:00Z", 1)
+    assert _revisions(srv.db.path, "sess-r") == []
+
+    # The same ended time with more steps, and a receipt without an ended time, both supersede.
+    same_end = _push(base, key, _stored(payload, "sess-r", steps=11, ended="2026-10-15T10:20:00Z"))
+    assert same_end == (200, {"status": "updated", "id": "sess-r", "revision": 2})
+    no_end = _push(base, key, _stored(payload, "sess-r", steps=12, ended=None))
+    assert no_end == (200, {"status": "updated", "id": "sess-r", "revision": 3})
+
+
+def test_an_admin_key_may_supersede_a_members_run(env):
+    srv, base = env
+    team_id, admin = srv.db.create_team("alpha")
+    member = srv.db.create_key(team_id, "alice-laptop", "member", "test")["key"]
+    admin_label = srv.db.key_for_token(admin)["label"]
+    payload = client.build_payload(FIX, user="dev@example.com")
+    assert _push(base, member, _stored(payload, "sess-x", steps=4, ended="2026-10-15T10:05:00Z"))[0] == 201
+
+    status, body = _push(base, admin, _stored(payload, "sess-x", steps=6, ended="2026-10-15T10:30:00Z"))
+    assert (status, body["status"], body["revision"]) == (200, "updated", 2)
+    assert _run_row(srv.db.path, "sess-x")["steps"] == 6
+
+    events = _json(_http(base, "GET", "/api/audit?action=run.supersede", headers=_auth(admin))[2])["events"]
+    assert len(events) == 1 and events[0]["actor"].startswith(admin_label)
+    assert admin not in json.dumps(events)  # the key itself is never written to the audit log
+
+
+def test_revision_history_is_capped_at_twenty(env):
+    srv, base = env
+    _, key = srv.db.create_team("alpha")
+    payload = client.build_payload(FIX, user="dev@example.com")
+    for version in range(1, 26):
+        status, body = _push(base, key, _stored(
+            payload, "sess-many", steps=version * 2, ended=f"2026-10-15T10:{version:02d}:00Z",
+        ))
+        assert status in (200, 201), body
+        assert body["revision"] == version
+
+    assert _run_row(srv.db.path, "sess-many")["steps"] == 50
+    assert _revisions(srv.db.path, "sess-many") == list(range(5, 25))
+
+
+def test_superseding_refreshes_the_derived_fields_and_keeps_approvals(env):
+    srv, base = env
+    _, key = srv.db.create_team("alpha")
+    payload = client.build_payload(FIX, user="dev@example.com")
+    status, _, raw = _http(base, "POST", "/api/approvals",
+                           body={"session_id": "sess-d", "tool": "Bash", "summary": "Deploy to production",
+                                 "risks": [{"severity": "high", "code": "deploy", "reason": "Prod"}]},
+                           headers=_auth(key))
+    assert status == 201
+    approval_id = _json(raw)["id"]
+
+    first = _stored(payload, "sess-d", steps=4, ended="2026-10-15T10:05:00Z", cost=0.1, risk=20,
+                    quality={"score": 80, "grade": "B", "signals": []},
+                    ai_review={"verdict": "looks_safe"})
+    assert _push(base, key, first)[0] == 201
+
+    def derived():
+        row = _json(_http(base, "GET", "/api/runs", headers=_auth(key))[2])["runs"][0]
+        return (row["risk_score"], row["risk_level"], row["cost_usd"], row["quality_score"],
+                row["quality_grade"], row["ai_verdict"])
+
+    assert derived() == (20, "low", 0.1, 80, "B", "looks_safe")
+
+    second = _stored(payload, "sess-d", steps=9, ended="2026-10-15T10:30:00Z", cost=0.5, risk=70,
+                     quality={"score": 40, "grade": "D", "signals": []},
+                     ai_review={"verdict": "dangerous"})
+    assert _push(base, key, second)[1]["revision"] == 2
+    assert derived() == (70, "high", 0.5, 40, "D", "dangerous")
+
+    dangerous = _json(_http(base, "GET", "/api/runs?ai_verdict=dangerous", headers=_auth(key))[2])["runs"]
+    safe = _json(_http(base, "GET", "/api/runs?ai_verdict=looks_safe", headers=_auth(key))[2])["runs"]
+    assert [r["id"] for r in dangerous] == ["sess-d"] and safe == []
+
+    approvals = _json(_http(base, "GET", "/api/approvals", headers=_auth(key))[2])["approvals"]
+    assert [a["id"] for a in approvals] == [approval_id] and approvals[0]["status"] == "pending"
+
+
+def test_concurrent_pushes_of_one_session_keep_the_history_consistent(env):
+    srv, base = env
+    _, key = srv.db.create_team("alpha")
+    payload = client.build_payload(FIX, user="dev@example.com")
+    results = []
+    lock = threading.Lock()
+
+    def push_version(version):
+        answer = _push(base, key, _stored(
+            payload, "sess-c", steps=version * 3, ended=f"2026-10-15T10:{version:02d}:00Z",
+        ))
+        with lock:
+            results.append(answer)
+
+    threads = [threading.Thread(target=push_version, args=(version,)) for version in range(1, 13)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(30)
+
+    assert len(results) == 12
+    assert all(status in (200, 201, 409) for status, _ in results)
+    accepted = [body for status, body in results if status in (200, 201)]
+    row = _run_row(srv.db.path, "sess-c")
+    assert row["ended_at"] == "2026-10-15T10:12:00Z"
+    assert row["revision"] == len(accepted)
+    assert _revisions(srv.db.path, "sess-c") == list(range(1, len(accepted)))
+    assert _http(base, "GET", "/health")[0] == 200
+
+
+def test_agent_id_round_trips_and_the_agent_filter_keeps_working(env):
+    srv, base = env
+    _, key = srv.db.create_team("alpha")
+    payload = client.build_payload(FIX, user="dev@example.com")
+    droid = _stored(payload, "run-droid", agent="Factory Droid", agent_id="droid")
+    claude = _stored(payload, "run-claude", agent="Claude Code", agent_id="claude-code")
+    legacy = _stored(payload, "run-legacy")
+    legacy.pop("agent_id")
+    for body in (droid, claude, legacy):
+        assert _push(base, key, body)[0] == 201
+
+    rows = {r["id"]: r for r in _json(_http(base, "GET", "/api/runs", headers=_auth(key))[2])["runs"]}
+    assert rows["run-droid"]["agent_id"] == "droid" and rows["run-droid"]["agent"] == "Factory Droid"
+    assert rows["run-claude"]["agent_id"] == "claude-code"
+    assert rows["run-legacy"]["agent_id"] is None
+    run = _json(_http(base, "GET", "/api/runs/run-droid", headers=_auth(key))[2])["run"]
+    assert run["agent_id"] == "droid"
+    assert [r["id"] for r in _json(_http(base, "GET", "/api/runs?agent=droid", headers=_auth(key))[2])["runs"]] == ["run-droid"]
+
+
+def test_sort_at_drives_the_list_order_and_the_window(env):
+    srv, base = env
+    _, key = srv.db.create_team("alpha")
+    payload = client.build_payload(FIX, user="dev@example.com")
+    now = datetime.now(timezone.utc)
+    recent = (now - timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    old = (now - timedelta(days=40)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    assert _push(base, key, _stored(payload, "R-a", started=recent, ended=recent))[0] == 201
+    assert _push(base, key, _stored(payload, "R-b", started=None, ended=None))[0] == 201
+    assert _push(base, key, _stored(payload, "R-c", started=old, ended=old))[0] == 201
+
+    listed = [r["id"] for r in _json(_http(base, "GET", "/api/runs", headers=_auth(key))[2])["runs"]]
+    assert listed == ["R-b", "R-a", "R-c"]
+    assert _json(_http(base, "GET", "/api/stats?days=30", headers=_auth(key))[2])["totals"]["runs"] == 2
+    assert _json(_http(base, "GET", "/api/stats?days=60", headers=_auth(key))[2])["totals"]["runs"] == 3
 
 
 def _session_copy(tmp_path, session_id):
@@ -365,9 +606,41 @@ def test_cli_team_create_then_push(tmp_path, capsys, monkeypatch):
         assert main(["push", str(FIX), "--server", "http://127.0.0.1:9", "--key", key]) == 1
         assert "Could not reach" in capsys.readouterr().err
 
-        # The environment push is an idempotent retry of the same immutable receipt.
+        # The environment push is an idempotent retry of the same receipt.
         runs = srv.db.list_runs(1)
         assert len(runs) == 1 and runs[0]["user"] == "dev@example.com"
+
+
+def test_cli_push_reports_the_revision_it_replaced(tmp_path, capsys, monkeypatch):
+    db_path = tmp_path / "cli-supersede.db"
+    monkeypatch.delenv("RUNLEDGER_API_KEY", raising=False)
+    monkeypatch.delenv("RUNLEDGER_SERVER", raising=False)
+    assert main(["team", "create", "demo", "--db", str(db_path)]) == 0
+    key = next(line.strip() for line in capsys.readouterr().out.splitlines() if line.strip().startswith("rl_"))
+
+    native = json.loads(NATIVE.read_text(encoding="utf-8"))
+    session = tmp_path / "session.runledger.json"
+    session.write_text(json.dumps(native), encoding="utf-8")
+
+    with running_server(db_path) as (srv, base):
+        assert main(["push", str(session), "--server", base, "--key", key, "--user", "dev@example.com"]) == 0
+        printed = capsys.readouterr().out
+        assert "Pushed demo-0001-native" in printed and "Updated" not in printed
+
+        native["steps"].append({
+            "tool": "Read",
+            "input": {"file_path": "/home/dev/demo-app/src/prices.py"},
+            "model": "claude-sonnet-5-5",
+            "result_text": "def lookup(sku):",
+            "is_error": False,
+        })
+        session.write_text(json.dumps(native), encoding="utf-8")
+        assert main(["push", str(session), "--server", base, "--key", key, "--user", "dev@example.com"]) == 0
+        printed = capsys.readouterr().out
+        assert "Updated demo-0001-native" in printed and "revision 2" in printed
+        run = _json(_http(base, "GET", "/api/runs/demo-0001-native", headers=_auth(key))[2])["run"]
+        assert run["revision"] == 2 and run["steps"] == 5
+        assert _revisions(db_path, "demo-0001-native") == [1]
 
 
 def test_cli_reports_bad_database_path_without_traceback(tmp_path, capsys):

@@ -267,7 +267,12 @@ def world(env):
 def test_role_matrix_for_every_endpoint(world, case, role_index):
     srv, base, team_id, keys, ids = world
     role = ROLES[role_index]
-    method, path, body = _request_for(case, ids, client.build_payload(FIX, user="dev@example.com"))
+    payload = client.build_payload(FIX, user="dev@example.com")
+    if case == "push_run":
+        # A session of its own per role: an identical re-push is an accepted retry (200), so the
+        # same body could not create a second run.
+        payload["session_id"] = f"{SESSION_ID}-{role}"
+    method, path, body = _request_for(case, ids, payload)
     status, _, raw = _http(base, method, path, body=body, headers=_auth(keys[role]))
     assert status == MATRIX[case][role_index], (role, case, raw[:200])
     if status == 403:

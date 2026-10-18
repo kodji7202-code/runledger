@@ -98,7 +98,13 @@ Role: `member`. Pushes one receipt. This is what `runledger push` sends: the JSO
 `runledger receipt --format json`, plus `user`, `project`, `html` and per-model costs.
 
 Only `session_id` is required (1 to 200 characters). Other fields are optional and fall back to safe
-defaults. Pushing a session again with the same `session_id` replaces the earlier run.
+defaults.
+
+A session may be pushed more than once. A session that grew replaces the run already stored when the
+same key pushes it (or an admin key does), and the replaced version is kept in the run history (the
+newest 20 versions per run). An identical re-push is an accepted retry, and a receipt pushed by a
+different member key, or one that is older than the stored version (an earlier `ended`, or fewer
+steps), returns `409 run_conflict`.
 
 ```json
 {
@@ -116,7 +122,7 @@ defaults. Pushing a session again with the same `session_id` replaces the earlie
     "level": "high",
     "reasons": [{"severity": "high", "code": "secret_file", "reason": "Read a secrets file (.env)", "step": 3}]
   },
-  "totals": {"steps": 10, "tokens": 116416, "cost_usd": 0.108408, "files_changed": 3},
+  "totals": {"steps": 10, "tokens": 116416, "cost_usd": 0.108408, "files_changed": 3, "usage_source": "messages"},
   "models": {"claude-sonnet-4-5-20250929": {"tokens": 79661, "cost_usd": 0.103563}},
   "steps": [{"n": 1, "tool": "Read", "summary": "Read src/retry.py", "model": "claude-sonnet-4-5-20250929", "tokens": 1200, "cost_usd": 0.0012, "error": false, "risks": []}],
   "files": [{"path": "src/retry.py", "added": 12, "removed": 4, "created": false, "deleted": false}],
@@ -126,24 +132,32 @@ defaults. Pushing a session again with the same `session_id` replaces the earlie
 }
 ```
 
-Response `201`:
+Response `201` (a new run) and `200` (an identical retry: `revision` stays as stored):
 
 ```json
 {
   "id": "7f3c2a10-9b1e-4c55-a1d2-0e6f8b3c9d42",
   "url": "/runs/7f3c2a10-9b1e-4c55-a1d2-0e6f8b3c9d42",
   "risk_score": 80,
-  "risk_level": "high"
+  "risk_level": "high",
+  "revision": 1
 }
+```
+
+Response `200` when the push replaced the stored version. The URL of a run never changes, and
+`created_at` stays at the first push:
+
+```json
+{"status": "updated", "id": "7f3c2a10-9b1e-4c55-a1d2-0e6f8b3c9d42", "revision": 2}
 ```
 
 Stored fields: `user` defaults to `unknown`; `project` defaults to the last folder name of `cwd`;
 `risk_level` is derived from the score when absent (below 25 low, below 60 medium, otherwise high).
-Runs are immutable: a byte-equivalent/semantically identical re-push is accepted as an idempotent
-retry, while different content for an existing team/session id returns `409 run_conflict`.
+`usage_source` is stored as sent (`messages`, `settings` or `missing`; anything else is `null`), and
+`cost_partial` is `true` only when the receipt says the cost is a lower bound.
 Errors: `400` `empty_body`, `invalid_json`, `invalid_receipt`; `401`;
-`403` (viewer); `409` `run_conflict`; `411`; `413`
-(over 10 MB, "Receipts are limited to 10 MB.").
+`403` (viewer); `409` `run_conflict` (a different key pushed this session, or the new receipt is
+older); `411`; `413` (over 10 MB, "Receipts are limited to 10 MB.").
 
 ### `GET /api/runs`
 
@@ -168,6 +182,7 @@ Each text filter is limited to 200 characters.
     "user": "Ana",
     "project": "payments-service",
     "agent": "Claude Code",
+    "agent_id": "claude-code",
     "title": "The payment retry logic gives up after the first failure. Add exponential backoff (3 attempts) and make the tests pass.",
     "started_at": "2026-10-08T10:00:17Z",
     "ended_at": "2026-10-08T10:06:14Z",
@@ -175,18 +190,26 @@ Each text filter is limited to 200 characters.
     "tokens": 116416,
     "files_changed": 3,
     "cost_usd": 0.108408,
+    "usage_source": "messages",
+    "cost_partial": false,
     "risk_score": 80,
     "risk_level": "high",
     "quality_score": 62,
     "quality_grade": "C",
     "ai_verdict": "needs_review",
     "est_savings_usd": 0.031,
+    "revision": 1,
     "has_html": true,
     "created_at": "2026-10-08T16:37:34Z",
     "updated_at": "2026-10-08T16:37:34Z"
   }
 ]}
 ```
+
+The list is ordered by the run's start time, or by its push time when it has none (`sort_at`), newest
+first. `revision` is 1 until the same session is pushed again and replaces it. Runs stored before
+`agent_id` existed report `null`, and a receipt from a client that did not report how it measured
+usage has `usage_source` `null`.
 
 Errors: `400` `bad_request` (for example `limit=0`, or `min_risk=101`); `401`.
 
@@ -197,10 +220,11 @@ Role: any. One run with its full receipt JSON and its risk reasons.
 ```json
 {"run": {
   "id": "7f3c2a10-9b1e-4c55-a1d2-0e6f8b3c9d42",
-  "user": "Ana", "project": "payments-service", "agent": "Claude Code",
+  "user": "Ana", "project": "payments-service", "agent": "Claude Code", "agent_id": "claude-code",
   "title": "...", "started_at": "2026-10-08T10:00:17Z", "ended_at": "2026-10-08T10:06:14Z",
   "steps": 10, "tokens": 116416, "files_changed": 3, "cost_usd": 0.108408,
-  "risk_score": 80, "risk_level": "high", "has_html": true,
+  "usage_source": "messages", "cost_partial": false,
+  "risk_score": 80, "risk_level": "high", "revision": 1, "has_html": true,
   "created_at": "2026-10-08T16:37:34Z", "updated_at": "2026-10-08T16:37:34Z",
   "receipt": {"runledger_version": "0.6.0", "session_id": "7f3c2a10-...", "...": "..."},
   "risks": [{"severity": "high", "code": "secret_file", "reason": "Read a secrets file (.env)", "step": 3}]
@@ -626,7 +650,7 @@ There is no sign-out endpoint. Revoke or rotate the key to end a session.
 | 405 | `method_not_allowed` | The path does not accept this method. The `Allow` header lists the allowed ones. |
 | 409 | `already_decided` | The approval was already approved or denied. |
 | 409 | `legacy_unverifiable` | The approval predates authenticated requester attribution and must be requested again. |
-| 409 | `run_conflict` | A different receipt already exists with this team's session id. |
+| 409 | `run_conflict` | A different key pushed this team's session id, or the new receipt is older (an earlier `ended`, or fewer steps) than the stored version. |
 | 409 | `expired` | The approval expired before a decision. |
 | 409 | `already_revoked` | The key is already revoked. |
 | 409 | `last_admin` | The team's last active admin key cannot be revoked. |
