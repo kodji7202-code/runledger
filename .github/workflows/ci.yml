@@ -75,14 +75,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Lint the production compose file
-        # The compose file requires both values; this step writes a stub deploy/.env (gitignored)
-        # and exports the same two variables, so `config` validates the real, hardened file
-        # without deploying anything. Docker and Compose are preinstalled on the runner.
+        # The compose file requires both values; this step writes the stub env file Compose reads
+        # next to it (gitignored) and exports the same two variables, so `config` validates the
+        # real, hardened file without deploying anything. Docker and Compose are preinstalled on
+        # the runner.
         env:
           RUNLEDGER_DOMAIN: runledger.example.com
           RUNLEDGER_PUBLIC_URL: https://runledger.example.com
         run: |
-          printf 'RUNLEDGER_DOMAIN=%s\nRUNLEDGER_PUBLIC_URL=%s\n' "$RUNLEDGER_DOMAIN" "$RUNLEDGER_PUBLIC_URL" > deploy/.env
+          env_file="$(dirname deploy/docker-compose.yml)/.env"
+          printf 'RUNLEDGER_DOMAIN=%s\nRUNLEDGER_PUBLIC_URL=%s\n' "$RUNLEDGER_DOMAIN" "$RUNLEDGER_PUBLIC_URL" > "$env_file"
           docker compose -f deploy/docker-compose.yml config -q
 
   docker:

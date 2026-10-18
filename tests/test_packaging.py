@@ -222,6 +222,14 @@ def test_version_references_are_consistent():
     assert minor in first_row and "Yes" in first_row, f"first supported-versions row must be {minor}"
 
 
+def test_ci_lints_the_production_compose_file():
+    ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    assert "docker compose -f deploy/docker-compose.yml config -q" in ci
+    assert (ROOT / "deploy" / "docker-compose.yml").is_file()
+    for name in ("RUNLEDGER_DOMAIN", "RUNLEDGER_PUBLIC_URL"):
+        assert name in ci, f"{name} must be supplied for the compose lint"
+
+
 def test_ci_matrix_has_every_os_and_python():
     ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     assert "os: [ubuntu-latest, windows-latest, macos-latest]" in ci
