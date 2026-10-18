@@ -114,5 +114,14 @@ python -m runledger.github comment --sessions-dir .runledger/sessions \
 - **Safe mode.** The comment is always built in safe mode: paths are shown relative to the
   repository (or with `~` for the home folder) and e-mail addresses are masked. See
   [safe mode](quickstart.md#safe-mode).
+- **Session text cannot link anywhere.** The titles, risk reasons and model names taken from a
+  session are escaped for Markdown, and a bare URL in them (`https://…`, `http://…`, `www.…`) is
+  shown with an invisible separator inside the scheme, because GitHub links such a URL on its own.
+  The footer's link to `https://runledger.site` is the only live link in the comment.
+- **Test verdict.** The `Tests:` line describes the session's *final* test command: the number of
+  test commands, that run's summary and the verdict (`last run 3 passed, 0 failed · verdict:
+  passed`). When the final command's output has no readable summary, the line says `last run
+  unreadable (…) · verdict: unknown` and names any readable earlier run as earlier, so a final
+  unverified run is never reported as a pass. A session with no test command says `no tests run`.
 - **Size.** The comment is kept under 60,000 characters. Long reports are shortened
   with a notice at the end.

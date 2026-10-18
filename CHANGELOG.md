@@ -129,6 +129,20 @@ change behavior, so read the entry before you upgrade.
 
 ### Fixed
 
+- **A bare URL in session text no longer becomes a live link in the pull request comment
+  (`runledger.github`):** GitHub links a bare `https://…` or `www.…` by itself, so escaping the
+  Markdown punctuation around it was not enough: a request such as `See https://evil.example/x`
+  rendered as a clickable address in a comment that everyone who can read the pull request can
+  see. The comment now carries an invisible separator inside the scheme and after `www.`, so the
+  address stays readable while the footer's link to `https://runledger.site` is the only live link
+  left in the comment.
+
+- **The tests line reports the session's final test invocation (`runledger.github`):** a final test
+  command whose captured output has no readable summary is reported as `last run unreadable (…) ·
+  verdict: unknown` instead of borrowing an earlier run's pass; a readable earlier run is named as
+  earlier (`An earlier readable run passed (3 passed, 0 failed).`) and never as the last run. A
+  final run that passed or failed reads as before.
+
 - **Test runs are read from PowerShell call-operator commands and from real summary lines only
   (`runledger.quality`):** `& pytest -q` and `& "C:\Python312\python.exe" -m pytest -q` are runs
   again, with their outcome at score level, while a literal mention (`echo pytest`, `& echo pytest`)
