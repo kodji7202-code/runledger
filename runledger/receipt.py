@@ -449,6 +449,11 @@ def redact_run(run: Run, risks: List[Risk]) -> None:
     """Mask secrets in every text a receipt, a push or a PR comment shows, in place.
     Call it after scoring and analysis: the risk rules need the raw text to find secrets.
     File contents and command output are not shown, so they are left as they are."""
+    # Read the whole-path labels of the raw commands now: masking them takes a spaced drive path
+    # apart, and the renderers put a label on the output copy before it is redacted
+    # (`labels.show_reason`), never after it.
+    if run.show_labels is None:
+        run.show_labels = labels.step_label_map(run)
     run.session_id = redact(run.session_id)
     run.agent = redact(run.agent)
     run.cwd = redact(run.cwd) if run.cwd is not None else None

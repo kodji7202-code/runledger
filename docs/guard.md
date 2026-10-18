@@ -266,9 +266,11 @@ An approval is the only way the guard prints `allow`. A plain allow prints nothi
 own permission rules still decide. An approved call skips Claude Code's prompt for that one call.
 
 The summary sent to the server is cut at 200 characters and has known secrets masked (the same
-masking as the log, described below). Each finding's reason is cut at 300 characters. The session
-id and the folder are sent unchanged. If the team has a Slack or webhook URL set, the server also
-notifies it about each new approval, and those messages include the same summary and findings.
+masking as the log, described below). Each finding's reason is a display copy: the whole spaced
+drive path the command named is shown first, the copy is then masked and cut at 300 characters.
+The session id and the folder are sent unchanged. If the team has a Slack or webhook URL set, the
+server also notifies it about each new approval, and those messages include the same summary and
+findings.
 
 ## Fail-open, fail-closed and monitor mode
 

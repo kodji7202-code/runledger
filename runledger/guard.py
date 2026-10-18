@@ -673,10 +673,12 @@ def decide(event: dict, policy: Optional[dict] = None, approver: Optional[Approv
     policy_decision, drivers = _evaluate(risks, cfg)
     summary = _summary(tool, tool_input)
     # Everything decided above used the shell's own words; the label is the whole spaced drive
-    # path in the reason text this decision shows.
+    # path in the reason text this decision shows. The label names what the command said, so it
+    # goes on before the redaction and the truncation of that output copy, never after them: a
+    # risk list that leaks here also reaches the approval server (see `_ask_approver`).
     shown = labels.command_labels(tool, tool_input.get("command"))
     risks_out = [{"severity": r.severity, "code": r.code,
-                  "reason": labels.show_reason(clean(r.reason, 300), shown)} for r in risks]
+                  "reason": clean(labels.show_reason(r.reason, shown), 300)} for r in risks]
 
     final = policy_decision
     approval: Optional[str] = None

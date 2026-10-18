@@ -11,8 +11,8 @@ from pathlib import Path
 
 import pytest
 
-from runledger import cli, guard, paths, risk, summarize
-from runledger.labels import command_labels, show_risks, step_label_map
+from runledger import cli, github, guard, paths, risk, summarize
+from runledger.labels import command_labels, show_reason, show_risks, step_label_map
 from runledger.parser import Run, Step, Usage
 
 REPO = "C:/repo"
@@ -303,3 +303,72 @@ def test_the_guard_message_shows_the_whole_path_without_changing_the_decision(tm
     assert [(r["severity"], r["code"], r["reason"]) for r in d["risks"]] == [
         ("high", "shell_outside",
          r"Shell command referenced a path outside the working folder (E:\Work\Client y\z.txt)")]
+
+
+# ---------------------------------------------------------------- a secret inside a label
+
+# CORE-SCR-R6-001: a label repeats text from the command, so it must be applied before the
+# redaction of the text a receipt, a PR comment or a guard message shows - never after it.
+SECRET = "TOKEN2=reviewdummy123"
+SECRET_COMMAND = "rm E:/Work/Client " + SECRET + "/file.txt"
+SHOWN_SECRET = "E:/Work/Client TOKEN2=[REDACTED]"
+SHOWN_REASON = "working folder (" + SHOWN_SECRET + ")"
+
+
+def _approver(captured):
+    def call(request, approval_cfg):
+        captured.append(request)
+        return "approved"
+    return call
+
+
+def test_show_reason_labels_first_and_redacts_the_labelled_copy():
+    """The label carries text from the command, so the redaction runs on the labelled copy."""
+    labels = command_labels("Bash", SECRET_COMMAND)
+    assert labels == {"E:/Work/Client": "E:/Work/Client " + SECRET + "/file.txt"}
+    assert show_reason("Shell command referenced a path outside the working folder (E:/Work/Client)",
+                       labels) == "Shell command referenced a path outside the working folder (" \
+                                  + SHOWN_SECRET + ")"
+
+
+def test_guard_risks_and_the_approval_request_redact_a_secret_inside_a_label(tmp_path):
+    """The risks a decision returns are also the body of the approval request."""
+    captured = []
+    d = guard.decide(_event(str(tmp_path), "Bash", SECRET_COMMAND), NO_POLICY,
+                     approver=_approver(captured))
+    assert (d["decision"], d["policy_decision"], d["approval"]) == ("allow", "ask", "approved")
+    assert d["codes"] == ["shell_outside"]
+    reason = d["risks"][0]["reason"]
+    assert "reviewdummy123" not in reason
+    assert SHOWN_REASON in reason
+    assert d["reason"].startswith("Approved in RunLedger:")
+    assert "reviewdummy123" not in d["reason"] and "[REDACTED]" in d["reason"]
+    assert len(captured) == 1
+    assert captured[0]["risks"] == d["risks"]
+    request = json.dumps(captured[0])
+    assert "reviewdummy123" not in request and SHOWN_REASON in request
+
+
+def test_a_receipt_keeps_the_whole_path_and_redacts_the_secret_inside_it(tmp_path, capsys):
+    path = _session(tmp_path, [{"tool": "Bash", "input": {"command": SECRET_COMMAND}}])
+    for fmt in ("md", "json", "html"):
+        out, _ = _receipt(capsys, str(path), "--format", fmt, "-o", "-", "--no-safe")
+        assert "reviewdummy123" not in out, fmt
+        assert SHOWN_REASON in out, fmt
+
+
+def test_a_safe_receipt_redacts_the_secret_inside_the_whole_path(tmp_path, capsys):
+    path = _session(tmp_path, [{"tool": "Bash", "input": {"command": SECRET_COMMAND}}])
+    for fmt in ("md", "json", "html"):
+        out, _ = _receipt(capsys, str(path), "--format", fmt, "-o", "-", "--safe")
+        assert "reviewdummy123" not in out, fmt
+        assert SHOWN_REASON in out, fmt
+
+
+def test_the_pull_request_comment_redacts_a_secret_inside_a_label(tmp_path, capsys):
+    path = _session(tmp_path, [{"tool": "Bash", "input": {"command": SECRET_COMMAND}}])
+    rc = github.main(["comment", "--session", str(path), "--dry-run"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "reviewdummy123" not in out
+    assert SHOWN_REASON in out

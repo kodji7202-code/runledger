@@ -285,6 +285,16 @@ change behavior, so read the entry before you upgrade.
   shares its model bucket. A known 300K-token parent request next to a cumulative-only 500K-token
   child now costs $11 (tier 2 for the parent, base tier for the child) instead of $16, and the
   receipt, the advisor figures and the `push` payload all show that value.
+- **A secret inside a spaced-path label is redacted everywhere the label is shown
+  (`runledger.labels`, `runledger.guard`, `runledger.receipt`, `runledger.safe`):** the label that
+  shows `E:/Work/Client TOKEN2=.../file.txt` as one path repeats text from the command, and
+  applying it after the redaction of a risk reason put the raw assignment back into the risks the
+  guard returns and posts to the approval server. Every render site now applies the label first
+  and the redaction, the truncation and the safe masking on the labelled copy, so that command
+  reads `(E:/Work/Client TOKEN2=[REDACTED])` in the guard's returned risks and reason, in the
+  approval request, in receipts (Markdown, JSON, HTML) and in the pull-request comment. Decisions
+  are unchanged - the shell's own words still decide - and the whole spaced path stays visible,
+  with the assignment inside it masked.
 
 ## [0.6.0] - 2026-10-15
 
