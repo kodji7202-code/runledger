@@ -322,6 +322,69 @@ def test_compose_publishes_ports_only_through_caddy():
     assert "reverse_proxy runledger:8787" in (ROOT / "deploy" / "Caddyfile").read_text(encoding="utf-8")
 
 
+def test_dockerfile_has_oci_labels():
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert "ARG RUNLEDGER_VERSION=" in dockerfile, "the version label needs a build argument"
+    for label in ("org.opencontainers.image.title",
+                  "org.opencontainers.image.description",
+                  "org.opencontainers.image.licenses",
+                  "org.opencontainers.image.source",
+                  "org.opencontainers.image.url"):
+        assert f'{label}="' in dockerfile, f"{label} is missing from the Dockerfile"
+    assert 'org.opencontainers.image.version="${RUNLEDGER_VERSION}"' in dockerfile
+    assert 'org.opencontainers.image.revision="${RUNLEDGER_REVISION}"' in dockerfile
+    # The runtime properties are unchanged, and the base image stays on a tag Dependabot can bump.
+    for kept in ("FROM ${PYTHON_BASE_IMAGE}", "USER runledger", "EXPOSE 8787", "HEALTHCHECK",
+                 'ENTRYPOINT ["runledger"]', '"--trust-proxy"'):
+        assert kept in dockerfile, f"{kept} must stay in the Dockerfile"
+    assert "@sha256:" not in dockerfile, "the base image must not be pinned by digest"
+    # The CI docker job builds with real label values, not with the placeholders.
+    ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    assert '--build-arg RUNLEDGER_VERSION="$version"' in ci
+    assert '--build-arg RUNLEDGER_REVISION="$GITHUB_SHA"' in ci
+
+
+def test_compose_hardening_present():
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    compose = (ROOT / "deploy" / "docker-compose.yml").read_text(encoding="utf-8")
+    runledger_service, caddy_service = compose.split("\n  caddy:\n", 1)
+    assert "    read_only: true\n" in runledger_service
+    assert re.search(r"^    tmpfs:\n(?:      - [^\n]*\n)*      - /tmp\n",
+                     runledger_service, re.M), "the read-only root needs a writable /tmp"
+    assert re.search(r"^    cap_drop:\n      - ALL\n", runledger_service, re.M)
+    assert re.search(r"^    security_opt:\n      - no-new-privileges:true\n",
+                     runledger_service, re.M)
+    # The data volume stays writable, and the healthcheck Caddy waits for comes from the image.
+    assert "      - runledger-data:/data\n" in runledger_service
+    assert "HEALTHCHECK" in dockerfile
+    assert re.search(r"^    depends_on:\n      runledger:\n        condition: service_healthy\n",
+                     caddy_service, re.M), "Caddy must wait for a healthy server"
+    assert "image: caddy:2.8" in caddy_service, "Caddy is pinned to a minor tag"
+    # One user-defined network with a pinned subnet, and that subnet is the trusted proxy.
+    assert re.search(r"^  runledger-net:\n(?:    [^\n]*\n)*?    ipam:\n      config:\n"
+                     r"        - subnet: 172\.28\.0\.0/16\n", compose, re.M)
+    assert "${RUNLEDGER_TRUSTED_PROXIES:-172.28.0.0/16}" in runledger_service
+    assert runledger_service.count("      - runledger-net\n") == 1
+    assert caddy_service.count("      - runledger-net\n") == 1
+    assert "172.28.0.0/16" in (ROOT / "deploy" / ".env.example").read_text(encoding="utf-8")
+
+
+def test_backup_script_uses_portable_commands():
+    script = (ROOT / "deploy" / "backup.sh").read_text(encoding="utf-8")
+    assert script.startswith("#!/bin/sh\n")
+    assert "head -n -" not in script, "BSD and busybox head have no negative count"
+    assert "xargs" not in script, "BSD and busybox xargs have no -r"
+    # Retention: newest first, drop the first `keep` lines, POSIX only.
+    assert "ls -1t backups/runledger-*.db" in script
+    assert "tail -n +$((keep + 1))" in script
+    assert "while read -r f; do" in script and 'rm -f -- "$f"' in script
+    # Two runs in the same second must not overwrite the copy the first one made.
+    assert 'dest="backups/$(basename "$latest")"' in script
+    assert re.search(r'^while \[ -e "\$dest" \]; do$', script, re.M)
+    ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    assert "bash -n deploy/backup.sh" in ci
+
+
 def test_license_file_is_apache_2_0():
     text = (ROOT / "LICENSE").read_text(encoding="utf-8")
     assert "Apache License" in text

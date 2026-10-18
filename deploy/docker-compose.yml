@@ -18,10 +18,11 @@ services:
       RUNLEDGER_PUBLIC_URL: ${RUNLEDGER_PUBLIC_URL:?set RUNLEDGER_PUBLIC_URL in deploy/.env}
       # Sets the Secure flag on the dashboard cookie and sends HSTS. The server reads this variable.
       RUNLEDGER_SECURE_COOKIES: "1"
-      # Recommended: name the Compose network's subnet as a trusted proxy, so the server reads the
-      # client address from X-Forwarded-For and counts each user separately. See ../docs/self-hosting.md
-      # ("Trusted proxy on the Compose network") for how to find the subnet.
-      RUNLEDGER_TRUSTED_PROXIES: ${RUNLEDGER_TRUSTED_PROXIES:-}
+      # The network below is pinned, so its subnet is a stable trusted proxy: the server reads each
+      # client's address from X-Forwarded-For instead of counting everyone under Caddy's address.
+      # Set RUNLEDGER_TRUSTED_PROXIES in deploy/.env to override it. See ../docs/self-hosting.md
+      # ("Trusted proxy on the Compose network").
+      RUNLEDGER_TRUSTED_PROXIES: ${RUNLEDGER_TRUSTED_PROXIES:-172.28.0.0/16}
       # Delete runs, their history, approvals and budget alerts older than this many days.
       # 35 or more; a smaller value is raised to 35. Empty keeps everything.
       RUNLEDGER_RETENTION_DAYS: ${RUNLEDGER_RETENTION_DAYS:-}
@@ -33,12 +34,26 @@ services:
     # Not published on the host. Only the Caddy service can reach this port.
     expose:
       - "8787"
+    # Hardening: the container's own filesystem is read-only, so a compromise cannot rewrite the
+    # installed code. Only the data volume and /tmp are writable.
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - runledger-net
 
   caddy:
-    image: caddy:2
+    # Pinned to a minor version; Dependabot bumps it (docker ecosystem, .github/dependabot.yml).
+    image: caddy:2.8
     restart: unless-stopped
+    # The image's HEALTHCHECK probes /health, so Caddy starts only once the server answers.
     depends_on:
-      - runledger
+      runledger:
+        condition: service_healthy
     environment:
       RUNLEDGER_DOMAIN: ${RUNLEDGER_DOMAIN:?set RUNLEDGER_DOMAIN in deploy/.env}
     ports:
@@ -49,8 +64,18 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
       - caddy-config:/config
+    networks:
+      - runledger-net
 
 volumes:
   runledger-data:
   caddy-data:
   caddy-config:
+
+networks:
+  # A user-defined network with a pinned subnet, so the trusted-proxy range above stays correct
+  # when the stack is recreated. Only Caddy and the server are on it.
+  runledger-net:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
