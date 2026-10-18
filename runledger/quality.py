@@ -64,6 +64,10 @@ _PYTHON = re.compile(r"^(?:python|py|pythonw)[\d.]*$")
 _PYTHON_VERSION = re.compile(r"^-\d[\d.]*$")
 _COMMAND_WRAPPERS = {"time", "env", "nohup", "nice", "sudo", "doas", "command", "exec",
                      "stdbuf", "setsid"}
+# PowerShell invokes an executable through its call operator: `& pytest -q` and
+# `& "C:\Python312\python.exe" -m pytest -q` are runs. The operator is skipped like a
+# wrapper, so the word after it is the one judged: `& echo pytest` is only a mention.
+_CALL_OPERATORS = {"&"}
 _RUNNER_PREFIXES = {"uv", "poetry", "pipenv", "pdm", "hatch", "rye", "npx", "pnpx", "bunx",
                     "yarn", "pnpm", "npm", "bun", "bundle", "deno"}
 _RUN_SUBWORDS = {"run", "exec", "x", "dlx", "tool"}
@@ -80,9 +84,13 @@ _INSPECT_FLAGS = {"-V", "-h"}
 _INSPECT_FLAGS_LOWER = {"--version", "--help", "--collect-only", "--co", "--list", "--list-tests",
                         "--listtests", "--dry-run", "--dryrun"}
 _TESTS_LINE = re.compile(r"^\s*Tests:?\s+(.+)$", re.M)  # jest and vitest summary line
-_COUNT_WORD = re.compile(
-    r"\d+\s+(?:passed|failed|errors?|skipped|xfailed|xpassed|deselected|warnings?)\b")
-_SUMMARY_TIME = re.compile(r"\bin \d+(?:\.\d+)?s\b")     # pytest footer and quiet form
+# A line a runner writes its counts on: counts and a timing and nothing else, as in
+# `3 passed in 0.20s` or `=== 2 failed, 3 passed in 0.50s ===`. A timed log line
+# (`retried after 3 errors in 0.10s`) has no such shape and is not a summary.
+_COUNT_PHRASE = r"\d+\s+(?:passed|failed|errors?|skipped|xfailed|xpassed|deselected|warnings?)"
+_PYTEST_SUMMARY = re.compile(
+    r"^[\s=]*(?:" + _COUNT_PHRASE + r")(?:[\s,|]+" + _COUNT_PHRASE + r")*"
+    r"\s+in\s+\d+(?:\.\d+)?s[\s=]*$")
 _MOCHA_SUMMARY = re.compile(r"^\s*\d+\s+(?:passing|failing|pending)\b")
 
 _UNFINISHED = [
@@ -154,17 +162,29 @@ def parse_test_output(text: str, runner: str = "") -> Optional[Tuple[int, int]]:
             found = True
             passed += counts[0]
             failed += counts[1]
-    return (passed, failed) if found else None
+    if found:
+        return passed, failed
+    return _failed_counts(text)
+
+
+def _failed_counts(text: str) -> Optional[Tuple[int, int]]:
+    """The v0.6.0 fallback, kept for failed counts only: an explicit `N failed` says the suite
+    failed even when the runner wrote no summary line. Error counts are not read here, so free
+    text (`retried after 3 errors`) and unreadable output stay unknown."""
+    failed = [int(n) for n in re.findall(r"(\d+) (?:failed|failing)\b", text)]
+    if not failed:
+        return None
+    passed = [int(n) for n in re.findall(r"(\d+) (?:passed|passing)\b", text)]
+    return sum(passed), sum(failed)
 
 
 def _summary_segments(text: str) -> List[str]:
-    """The lines a runner writes its counts on: a pytest-style `... in 0.12s` line or a mocha
-    `N passing` line. A count in free-form log text ("retried after 3 errors") is not one."""
+    """The lines a runner writes its counts on: a pytest-style counts-and-timing footer or a
+    mocha `N passing` line. A count in free-form log text (`retried after 3 errors in 0.10s`)
+    is not a summary, however it is timed."""
     out = []
     for line in text.splitlines():
-        if _COUNT_WORD.search(line) and _SUMMARY_TIME.search(line):
-            out.append(line)
-        elif _MOCHA_SUMMARY.match(line):
+        if _PYTEST_SUMMARY.match(line) or _MOCHA_SUMMARY.match(line):
             out.append(line)
     return out
 
@@ -216,14 +236,16 @@ def _installs(words: List[str], i: int) -> bool:
 
 def _runner_of(words: List[str]) -> Optional[str]:
     """The runner a simple command invokes, or None when it installs, inspects or only
-    mentions one. Leading env assignments and wrappers (`uv run`, `python -m`) are skipped.
+    mentions one. Leading env assignments, wrappers (`uv run`, `python -m`) and PowerShell's
+    call operator are skipped.
     An install verb disqualifies the segment only in a package manager's subcommand slot
     (`pip install`, `uv add`, `npm i`), so a word that is an argument to a runner
     (`pytest -k add`, `npm test -- --grep install`) is not read as an install."""
     i = 0
     while i < len(words):
         head = _head_word(words[i])
-        if _ENV_ASSIGN.match(words[i]) or head in _COMMAND_WRAPPERS:
+        if (_ENV_ASSIGN.match(words[i]) or head in _COMMAND_WRAPPERS
+                or head in _CALL_OPERATORS):
             i += 1
             continue
         if _installs(words, i):

@@ -38,20 +38,23 @@ The diff is read once per receipt and shared with the risk rules.
 | `risk_level` | -20 High, -8 Medium, 0 Low | The rule-based risk level from `risk.py`. |
 
 A test command is a command that runs a runner: each `&&`, `;`, `|` or newline segment is judged by
-the command word it starts with, after `FOO=1` assignments and wrappers (`uv run`, `poetry run`,
-`npx`, `python -m`) are stripped. Runners are pytest, `py.test`, unittest, tox, nox, jest, vitest,
-mocha, rspec, `go test`, `cargo test`, `dotnet test`, `mvn test`, `gradle test`, `make test` and a
+the command word it starts with, after `FOO=1` assignments, wrappers (`uv run`, `poetry run`,
+`npx`, `python -m`) and PowerShell's call operator (`& pytest -q`,
+`& "C:\Python312\python.exe" -m pytest -q`) are stripped. Runners are pytest, `py.test`, unittest,
+tox, nox, jest, vitest, mocha, rspec, `go test`, `cargo test`, `dotnet test`, `mvn test`,
+`gradle test`, `make test` and a
 `npm`/`pnpm`/`yarn`/`bun` `test` script. Installing (`pip install pytest`, `npm install jest`),
 inspecting (`pytest --version`, `--help`, `--collect-only`, `jest --list-tests`) and merely
 mentioning a runner (`grep pytest`, `echo npm test`) is not a run. An install verb (`install`,
 `uninstall`, `add`, `i`, `remove`) only counts as an install when it is a package manager's
 subcommand (`pip install pytest`, `uv add pytest`, `npm i jest`), so a run whose arguments contain
 one of those words (`pytest -k add`, `npm test -- --grep install`) still counts. Results are read
-from the
-runner's summary lines: the pytest footer or quiet form (`... in 0.12s`), the jest/vitest `Tests:`
+from the runner's summary lines: the pytest footer or quiet form (counts and a timing and nothing
+else, as in `3 passed in 0.20s` or `=== 2 failed, 3 passed in 0.50s ===`), the jest/vitest `Tests:`
 line, mocha's `N passing`/`N failing`, go's `ok`/`FAIL` lines, cargo's `test result:` line and
-unittest's `Ran N tests` footer. A count in free-form text (`retried after 3 errors`) is not a
-summary, and `0 errors` is not a failure. A failed command with no summary counts as a failure;
+unittest's `Ran N tests` footer. A count in free-form text (`retried after 3 errors in 0.10s`) is
+not a summary, and `0 errors` is not a failure. An explicit `N failed` still marks the run failed
+when there is no summary line, as in v0.6.0. A failed command with no summary counts as a failure;
 a successful command whose output has no readable summary is unknown, so it adds no test points.
 
 ## Cost recommendations

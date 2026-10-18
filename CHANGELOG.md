@@ -120,6 +120,15 @@ change behavior, so read the entry before you upgrade.
 
 ### Fixed
 
+- **Test runs are read from PowerShell call-operator commands and from real summary lines only
+  (`runledger.quality`):** `& pytest -q` and `& "C:\Python312\python.exe" -m pytest -q` are runs
+  again, with their outcome at score level, while a literal mention (`echo pytest`, `& echo pytest`)
+  still earns nothing. A line counts as a runner summary only when it has a summary shape (counts
+  and a timing and nothing else), so `retried after 3 errors in 0.10s` no longer turns a following
+  `3 passed in 0.20s` into a failure, and free-text error counts stay ignored. The v0.6.0 fallback
+  for an explicit failed count is back: `2 failed, 3 passed` without a timing marks the run failed
+  even when the step reports no error, while unreadable output (`Done.`) stays unknown.
+
 - **A failed Opus escalation keeps the first review (`runledger.review`):** when
   `RUNLEDGER_ESCALATE_OPUS=1` re-runs a `dangerous` verdict on Opus and that call fails, the receipt
   keeps the Sonnet review instead of losing it and printing "AI risk review skipped".
