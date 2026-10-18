@@ -16,9 +16,11 @@ import os
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+from urllib.parse import quote
 
 from ..pricing import friendly_model
 from .insights import AI_REVIEW_LIKE, QUALITY_LIKE, RECOMMENDATIONS_LIKE, review_fields
@@ -38,6 +40,10 @@ from .auth import (
 TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 LAST_USED_WRITE_INTERVAL_S = 60
 DEFAULT_ALERT_THRESHOLDS = "[50, 80, 100]"
+# A backup copies in small steps and waits between them, so a busy server answers requests
+# while it runs (and a push that lands mid-copy only restarts the copy, never the server).
+BACKUP_PAGES = 256
+BACKUP_SLEEP_S = 0.01
 PRIVATE_FILE_MODE = 0o600
 
 
@@ -379,12 +385,29 @@ def _group_row(row: sqlite3.Row, name_key: str) -> Dict[str, Any]:
     }
 
 
+def _in_memory(path: str) -> bool:
+    """Whether a second connection would be a different, empty database."""
+    return path == ":memory:" or ":memory:" in path
+
+
+def _read_only_uri(path: str) -> str:
+    """A `file:` URI for a second, read-only connection to the same database file. SQLite
+    percent-decodes the path, so a Windows drive letter, a space or a non-ASCII name works."""
+    text = path.replace("\\", "/") if os.sep == "\\" else path
+    return "file:" + quote(text, safe="/:") + "?mode=ro"
+
+
 class Database:
-    """One SQLite connection shared by all request threads, guarded by a lock."""
+    """One SQLite connection shared by all request threads, guarded by a lock, and a second,
+    read-only connection for reports and exports: a long report never holds the lock the writers
+    need, and a writer never holds up a report. An in-memory database keeps the single
+    connection, because a second connection to ":memory:" would be a different database."""
 
     def __init__(self, path: str = "runledger.db") -> None:
         self.path = str(path)
         self._lock = threading.RLock()
+        self._read_lock = threading.Lock()
+        self._read_conn: Optional[sqlite3.Connection] = None
         self._conn = sqlite3.connect(self.path, check_same_thread=False, timeout=10)
         self._conn.row_factory = sqlite3.Row
         _restrict_file(self.path)
@@ -407,11 +430,52 @@ class Database:
             raise
 
     def close(self) -> None:
-        with self._lock:
+        with self._lock, self._read_lock:
+            if self._read_conn is not None:
+                self._read_conn.close()
+                self._read_conn = None
             self._conn.close()
 
+    def _read_connection(self) -> Optional[sqlite3.Connection]:
+        """The second, read-only connection, opened on first use. None when there is no second
+        connection to open: an in-memory database, or a file this process cannot reopen."""
+        if _in_memory(self.path):
+            return None
+        with self._read_lock:
+            if self._read_conn is None:
+                try:
+                    self._read_conn = sqlite3.connect(
+                        _read_only_uri(self.path), uri=True, check_same_thread=False, timeout=10
+                    )
+                    self._read_conn.row_factory = sqlite3.Row
+                except sqlite3.Error:
+                    self._read_conn = None  # fall back to the shared connection, never fail a read
+            return self._read_conn
+
+    @contextmanager
+    def _reading(self) -> Iterator[sqlite3.Connection]:
+        """Run a read-only query. On the second connection the report never waits for a writer
+        (and never sees an uncommitted one); without one it uses the shared connection."""
+        conn = self._read_connection()
+        if conn is None:
+            with self._lock:
+                yield self._conn
+            return
+        with self._read_lock:
+            yield conn
+
+    def _backup_source(self) -> sqlite3.Connection:
+        """The connection a backup copies from: its own connection to the same file, so the copy
+        never holds the lock the writers and reports need. An in-memory database has no second
+        connection and copies through the shared one."""
+        if _in_memory(self.path):
+            return self._conn
+        return sqlite3.connect(self.path, check_same_thread=False, timeout=10)
+
     def backup_to(self, path: str) -> None:
-        """A consistent copy of the database at `path`, taken while the server keeps running."""
+        """A consistent copy of the database at `path`, taken while the server keeps running.
+        The copy reads through its own connection in small steps, so pushes and reports go
+        through while it runs."""
         dest = Path(path)
         tmp = dest.with_name(f"{dest.name}.tmp")
         if tmp.exists():
@@ -420,13 +484,16 @@ class Database:
             except OSError:
                 pass
         target = sqlite3.connect(str(tmp))
+        source: Optional[sqlite3.Connection] = None
         ok = False
         try:
-            with self._lock:
-                self._conn.backup(target)
+            source = self._backup_source()
+            source.backup(target, pages=BACKUP_PAGES, sleep=BACKUP_SLEEP_S)
             ok = True
         finally:
             target.close()
+            if source is not None and source is not self._conn:
+                source.close()
             if not ok:
                 try:
                     tmp.unlink()
@@ -704,8 +771,8 @@ class Database:
 
     def list_keys(self, team_id: int) -> List[Dict[str, Any]]:
         """The team's keys, oldest first. Never includes a secret or a hash."""
-        with self._lock:
-            rows = self._conn.execute(
+        with self._reading() as conn:
+            rows = conn.execute(
                 f"SELECT {_KEY_COLUMNS} FROM api_keys WHERE team_id = ? ORDER BY created_at, rowid",
                 (team_id,),
             ).fetchall()
@@ -808,8 +875,8 @@ class Database:
         if limit is not None:
             sql += " LIMIT ?"
             params.append(int(limit))
-        with self._lock:
-            rows = self._conn.execute(sql, params).fetchall()
+        with self._reading() as conn:
+            rows = conn.execute(sql, params).fetchall()
         return [
             {"id": r["id"], "at": r["at"], "actor": r["actor"], "action": r["action"],
              "target": r["target"], "details": json.loads(r["details"] or "{}")}
@@ -993,20 +1060,20 @@ class Database:
             f"SELECT {_SUMMARY_COLUMNS} FROM runs WHERE {' AND '.join(clauses)} "
             "ORDER BY sort_at DESC, created_at DESC, id LIMIT ?"
         )
-        with self._lock:
-            rows = self._conn.execute(sql, params).fetchall()
+        with self._reading() as conn:
+            rows = conn.execute(sql, params).fetchall()
         return [_summary(r) for r in rows]
 
     def get_run(self, team_id: int, run_id: str) -> Optional[Dict[str, Any]]:
         """One run with its receipt (parsed) and risk reasons. The HTML is fetched separately."""
-        with self._lock:
-            row = self._conn.execute(
+        with self._reading() as conn:
+            row = conn.execute(
                 f"SELECT {_SUMMARY_COLUMNS}, receipt_json FROM runs WHERE team_id = ? AND id = ?",
                 (team_id, run_id),
             ).fetchone()
             if row is None:
                 return None
-            risks = self._conn.execute(
+            risks = conn.execute(
                 "SELECT severity, code, reason, step FROM risks WHERE team_id = ? AND run_id = ? ORDER BY rowid",
                 (team_id, run_id),
             ).fetchall()
@@ -1016,8 +1083,8 @@ class Database:
         return run
 
     def get_receipt_html(self, team_id: int, run_id: str) -> Optional[str]:
-        with self._lock:
-            row = self._conn.execute(
+        with self._reading() as conn:
+            row = conn.execute(
                 "SELECT receipt_html FROM runs WHERE team_id = ? AND id = ?", (team_id, run_id)
             ).fetchone()
         return row["receipt_html"] if row else None
@@ -1030,8 +1097,8 @@ class Database:
         since = (moment - timedelta(days=days)).strftime(TIME_FORMAT)
         window = "team_id = ? AND sort_at >= ?"
         args = (team_id, since)
-        with self._lock:
-            totals = self._conn.execute(
+        with self._reading() as conn:
+            totals = conn.execute(
                 "SELECT COUNT(*) AS runs, SUM(cost) AS cost_usd, "
                 "COALESCE(SUM(CASE WHEN cost IS NOT NULL THEN 1 ELSE 0 END), 0) AS priced_runs, "
                 "COALESCE(SUM(CASE WHEN cost IS NULL OR cost_partial THEN 1 ELSE 0 END), 0) AS unpriced_runs, "
@@ -1044,13 +1111,13 @@ class Database:
                 f"FROM runs WHERE {window}",
                 args,
             ).fetchone()
-            by_user = self._group("user", window, args)
-            by_project = self._group("project", window, args)
-            by_agent = self._group("COALESCE(agent, 'unknown')", window, args)
-            model_rows = self._conn.execute(
+            by_user = self._group(conn, "user", window, args)
+            by_project = self._group(conn, "project", window, args)
+            by_agent = self._group(conn, "COALESCE(agent, 'unknown')", window, args)
+            model_rows = conn.execute(
                 f"SELECT models FROM runs WHERE {window}", args
             ).fetchall()
-            top = self._conn.execute(
+            top = conn.execute(
                 "SELECT r.code AS code, COUNT(*) AS occurrences, COUNT(DISTINCT r.run_id) AS runs "
                 "FROM risks r JOIN runs u ON u.team_id = r.team_id AND u.id = r.run_id "
                 "WHERE r.team_id = ? AND u.sort_at >= ? "
@@ -1112,8 +1179,8 @@ class Database:
     def export_runs(self, team_id: int, since: str) -> List[Dict[str, Any]]:
         """Every run that started (or was pushed) at or after `since`, oldest first, with its
         models. Never the receipt JSON or the HTML."""
-        with self._lock:
-            rows = self._conn.execute(
+        with self._reading() as conn:
+            rows = conn.execute(
                 "SELECT id, user, project, agent, models, started_at, created_at, steps, tokens, "
                 "files_changed, cost, risk_score, risk_level, title, quality_score, quality_grade, "
                 "ai_verdict, est_savings_usd FROM runs "
@@ -1130,46 +1197,46 @@ class Database:
         receipts stored before those columns existed are read back as JSON."""
         window = "team_id = ? AND sort_at >= ?"
         args = (team_id, since)
-        with self._lock:
-            quality = self._conn.execute(
+        with self._reading() as conn:
+            quality = conn.execute(
                 f"SELECT COUNT(quality_score) AS scored, AVG(quality_score) AS avg FROM runs WHERE {window}",
                 args,
             ).fetchone()
-            grades = self._conn.execute(
+            grades = conn.execute(
                 f"SELECT quality_grade AS grade, COUNT(*) AS n FROM runs "
                 f"WHERE {window} AND quality_grade IS NOT NULL GROUP BY quality_grade",
                 args,
             ).fetchall()
-            trend = self._conn.execute(
+            trend = conn.execute(
                 "SELECT substr(sort_at, 1, 10) AS day, AVG(quality_score) AS avg "
                 f"FROM runs WHERE {window} AND quality_score IS NOT NULL GROUP BY day ORDER BY day",
                 args,
             ).fetchall()
-            verdicts = self._conn.execute(
+            verdicts = conn.execute(
                 f"SELECT ai_verdict AS verdict, COUNT(*) AS n FROM runs "
                 f"WHERE {window} AND ai_verdict IS NOT NULL GROUP BY ai_verdict",
                 args,
             ).fetchall()
-            savings = self._conn.execute(
+            savings = conn.execute(
                 f"SELECT COALESCE(SUM(est_savings_usd), 0) AS total FROM runs WHERE {window}", args,
             ).fetchone()
-            agents = self._conn.execute(
+            agents = conn.execute(
                 "SELECT COALESCE(agent, 'unknown') AS name, COUNT(*) AS runs, AVG(quality_score) AS avg_quality, "
                 "AVG(risk_score) AS avg_risk, SUM(cost) AS cost_usd, COUNT(cost) AS priced_runs "
                 f"FROM runs WHERE {window} GROUP BY name "
                 "ORDER BY cost_usd IS NULL, cost_usd DESC, runs DESC, name",
                 args,
             ).fetchall()
-            model_rows = self._conn.execute(
+            model_rows = conn.execute(
                 f"SELECT models, quality_score FROM runs WHERE {window}", args,
             ).fetchall()
-            recommendation_rows = self._conn.execute(
+            recommendation_rows = conn.execute(
                 f"SELECT recommendations FROM runs WHERE {window} AND recommendations IS NOT NULL", args,
             ).fetchall()
-            assessment_rows = self._conn.execute(
+            assessment_rows = conn.execute(
                 f"SELECT ai_assessment FROM runs WHERE {window} AND ai_assessment IS NOT NULL", args,
             ).fetchall()
-            legacy_receipts = self._conn.execute(
+            legacy_receipts = conn.execute(
                 f"SELECT receipt_json FROM runs WHERE {window} AND recommendations IS NULL "
                 "AND (receipt_json LIKE ? OR receipt_json LIKE ?)",
                 args + (RECOMMENDATIONS_LIKE, AI_REVIEW_LIKE),
@@ -1189,8 +1256,8 @@ class Database:
         }
 
     def risk_level_counts(self, team_id: int, since: str) -> Dict[str, int]:
-        with self._lock:
-            rows = self._conn.execute(
+        with self._reading() as conn:
+            rows = conn.execute(
                 "SELECT risk_level, COUNT(*) AS n FROM runs WHERE team_id = ? "
                 "AND sort_at >= ? GROUP BY risk_level",
                 (team_id, since),
@@ -1202,8 +1269,8 @@ class Database:
 
     def high_risk_runs(self, team_id: int, since: str, limit: int) -> List[Dict[str, Any]]:
         """Up to `limit` high-risk runs since `since`, riskiest first."""
-        with self._lock:
-            rows = self._conn.execute(
+        with self._reading() as conn:
+            rows = conn.execute(
                 f"SELECT {_SUMMARY_COLUMNS} FROM runs WHERE team_id = ? AND risk_level = 'high' "
                 "AND sort_at >= ? "
                 "ORDER BY risk_score DESC, sort_at DESC, id LIMIT ?",
@@ -1213,8 +1280,8 @@ class Database:
 
     def decided_approvals(self, team_id: int, since: str, limit: int) -> List[Dict[str, Any]]:
         """Approvals decided at or after `since`, newest decision first."""
-        with self._lock:
-            rows = self._conn.execute(
+        with self._reading() as conn:
+            rows = conn.execute(
                 "SELECT id, tool, status, decided_by, decided_at FROM approvals "
                 "WHERE team_id = ? AND decided_at IS NOT NULL AND decided_at >= ? "
                 "ORDER BY decided_at DESC, id LIMIT ?",
@@ -1259,14 +1326,14 @@ class Database:
         `partial_runs` the runs whose cost is a lower bound."""
         window = "team_id = ? AND sort_at >= ? AND sort_at < ?"
         args = (team_id, start, end)
-        with self._lock:
-            total = self._conn.execute(
+        with self._reading() as conn:
+            total = conn.execute(
                 f"SELECT COUNT(*) AS runs, SUM(cost) AS spend_usd, COUNT(cost) AS priced_runs, "
                 "COALESCE(SUM(CASE WHEN cost_partial THEN 1 ELSE 0 END), 0) AS partial_runs "
                 f"FROM runs WHERE {window}",
                 args,
             ).fetchone()
-            rows = self._conn.execute(
+            rows = conn.execute(
                 "SELECT user AS name, COUNT(*) AS runs, SUM(cost) AS spend_usd, COUNT(cost) AS priced_runs, "
                 "COALESCE(SUM(CASE WHEN cost_partial THEN 1 ELSE 0 END), 0) AS partial_runs "
                 f"FROM runs WHERE {window} GROUP BY user "
@@ -1314,9 +1381,9 @@ class Database:
                     fired.append(item)
         return fired
 
-    def _group(self, column: str, window: str, args: Tuple[Any, ...]) -> List[sqlite3.Row]:
+    def _group(self, conn: sqlite3.Connection, column: str, window: str, args: Tuple[Any, ...]) -> List[sqlite3.Row]:
         # column is always a fixed expression from this module ("user", "project", ...)
-        return self._conn.execute(
+        return conn.execute(
             f"SELECT {column} AS name, COUNT(*) AS runs, SUM(cost) AS cost_usd, "
             "COALESCE(SUM(CASE WHEN cost IS NOT NULL THEN 1 ELSE 0 END), 0) AS priced_runs, "
             "COALESCE(SUM(CASE WHEN cost IS NULL OR cost_partial THEN 1 ELSE 0 END), 0) AS unpriced_runs "
@@ -1434,8 +1501,8 @@ class Database:
             f"SELECT {_APPROVAL_COLUMNS} FROM approvals WHERE {' AND '.join(clauses)} "
             "ORDER BY created_ts DESC, id LIMIT ?"
         )
-        with self._lock:
-            rows = self._conn.execute(sql, params).fetchall()
+        with self._reading() as conn:
+            rows = conn.execute(sql, params).fetchall()
         return [_approval_row_view(r, ttl_s, now) for r in rows]
 
     def decide_approval(

@@ -957,6 +957,54 @@ def test_query_key_does_not_override_existing_session(env):
     assert status == 302 and "set-cookie" in headers
 
 
+def test_cross_site_query_key_sign_in_is_refused(env, tmp_path, capsys):
+    """The legacy GET sign-in refuses a browser request that comes from another origin, exactly
+    like POST /session: no cookie, no session row, and never a redirect that replaces one."""
+    srv, base = env
+    db_path = tmp_path / "rl.db"
+    port = srv.server_address[1]
+    _, admin_a = srv.db.create_team("alpha")
+    _, admin_b = srv.db.create_team("beta")
+    capsys.readouterr()
+
+    cross_site = [
+        {"Sec-Fetch-Site": "cross-site"},                       # another site
+        {"Sec-Fetch-Site": "same-site"},                        # another port or subdomain
+        {"Sec-Fetch-Site": "same-site", "Origin": f"http://127.0.0.1:{port + 1}"},
+        {"Origin": "http://evil.example"},
+        {"Origin": "null", "Sec-Fetch-Site": "cross-site"},
+        {"Origin": f"https://127.0.0.1:{port}"},                # right host, wrong scheme
+    ]
+    for extra in cross_site:
+        status, headers, raw = _http(base, "GET", f"/?key={admin_b}", headers=extra)
+        assert status == 403, extra
+        assert "set-cookie" not in headers, extra
+        assert _json(raw)["error"]["code"] == "cross_site"
+        assert headers["connection"] == "close"
+    assert _sessions(db_path) == 0
+
+    # A session cookie that arrives anyway is not replaced either.
+    _, headers, _ = _http(base, "GET", f"/?key={admin_a}")
+    cookie_a = headers["set-cookie"].split(";")[0]
+    status, headers, _ = _http(
+        base, "GET", f"/?key={admin_b}", headers={"Cookie": cookie_a, "Sec-Fetch-Site": "cross-site"},
+    )
+    assert status == 403 and "set-cookie" not in headers
+    assert _json(_http(base, "GET", "/api/me", headers={"Cookie": cookie_a})[2])["team"]["name"] == "alpha"
+
+    # A plain link, a pasted URL or a non-browser client keeps the old behaviour.
+    allowed = [{}, {"Sec-Fetch-Site": "none"}, {"Sec-Fetch-Site": "same-origin"},
+               {"Origin": f"http://127.0.0.1:{port}", "Sec-Fetch-Site": "same-origin"}]
+    before = _sessions(db_path)
+    for extra in allowed:
+        status, headers, _ = _http(base, "GET", f"/?key={admin_b}", headers=extra)
+        assert status == 302 and headers["location"] == "/", extra
+        assert "set-cookie" in headers, extra
+    assert _sessions(db_path) == before + len(allowed)
+    err = capsys.readouterr().err
+    assert "cross-site sign-in" in err and admin_b not in err
+
+
 def test_query_key_deprecation_logged_once(env, capsys):
     srv, base = env
     _, admin = srv.db.create_team("alpha")

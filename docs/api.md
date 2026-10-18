@@ -704,6 +704,12 @@ server logs one warning per process) and strips the key from the address bar by 
 - An unknown key returns the sign-in page with status `401`, and the failure counts toward the rate
   limit.
 
+The cross-site rule of `POST /session` applies here too, so a link on another page cannot sign a
+visitor into a team. A request that carries `Sec-Fetch-Site: cross-site` or `same-site`, or an
+`Origin` header that is not this server's own origin, is refused with `403 cross_site` before any key
+is checked: no cookie is set and no session row is created. A plain link click, a pasted URL or any
+non-browser client sends no such headers (`Sec-Fetch-Site: none`), so those keep working as above.
+
 At most 20 sessions are kept per key; signing in again past that cap drops the oldest session of that
 key, and other keys are unaffected.
 

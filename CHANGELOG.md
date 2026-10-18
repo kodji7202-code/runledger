@@ -9,6 +9,38 @@ change behavior, so read the entry before you upgrade.
 
 ### Changed
 
+- **The dashboard reads a second, read-only connection, and a backup no longer stops writes
+  (`runledger.server`):** reports, stats, insights, the run list and the exports read from their own
+  read-only connection (`file:...?mode=ro`), so a long report or a `runledger backup` running beside
+  the server cannot hold the write lock and block pushed runs. `runledger backup` copies through that
+  connection in pages with a short sleep, so it stays cheap on a busy store. Test databases that live
+  in memory keep their single connection. A read never sees uncommitted rows, which is what the
+  approval decision flow needs.
+- **Dashboard: unknown costs show `n/a`, partial costs show `≥$X`, and the unpriced hint names the
+  real cause (`runledger.server`):** a run with no recorded token usage or no known model price shows
+  `n/a` (never `$0.00`), with a tooltip saying token usage was not recorded when that is the reason,
+  and a figure that leaves unpriced tokens out is prefixed with `≥` in the run list, the KPI card and
+  the by-user, by-project, by-agent, by-model, insights and cost-per-run cells. The hint under the cost
+  KPI now splits the unpriced runs into those without recorded usage and those with an unknown model
+  price instead of always blaming the price.
+- **Dashboard filters: Max quality and AI verdict, kept in the URL (`runledger.server`):** the filter
+  bar next to Min quality has a Max quality number input and an AI verdict select
+  (`looks_safe`, `needs_review`, `dangerous`, or any), and the whole filter set (developer, project,
+  agent, min risk, min quality, max quality, verdict) is written to the URL hash and restored from it,
+  so a reload or a shared link shows the same runs.
+- **Dashboard polling pauses while the tab is hidden and backs off after a failure
+  (`runledger.server`):** the pending-approvals poll on the dashboard and the poll on the individual
+  approval page now stop while the page is hidden, refresh at once when it becomes visible again, and
+  grow the delay from 3 s to 6 s, 12 s and so on up to 30 s after a failed request (a 429 included)
+  instead of hammering a server that is down. The first success returns to the 3 s delay.
+- **Grade E is gone from the quality distribution (`runledger.server`):** `GET /api/insights` returns
+  the `quality.by_grade` buckets A, B, C, D and F, the dashboard shows five buckets and no E badge, and
+  a run stored earlier with grade E keeps its score but shows no grade badge.
+- **Dashboard comments and the run detail panel match the real page (`runledger.server`):** the header
+  comment no longer claims features hide on 404/403 because endpoints may not exist (only admin-only
+  panels hide, on 403), and a run row opens a detail dialog that names the developer, the key that
+  pushed the run ("Pushed by alice-laptop"), the cost, risk, quality, AI verdict, steps, tokens and
+  revision, with a link to the receipt.
 - **Project `.runledger.json` is tighten-only in receipts as well as the guard:** `ignore` and
   lowering `severity_overrides` are read only from your user config (`~/.runledger/config.json` or
   `RUNLEDGER_CONFIG`). A project `.runledger.json` may raise severities and add safe
@@ -329,6 +361,13 @@ change behavior, so read the entry before you upgrade.
 
 ### Security
 
+- **A cross-site `GET /?key=` link cannot sign the browser in to another team (`runledger.server`):**
+  the legacy sign-in now applies the same origin check as `POST /session`. A request a browser marks
+  as coming from another origin (`Sec-Fetch-Site: cross-site` or `same-site`, or an `Origin` header
+  that is not this server's own origin) is refused with `403 cross_site` before the key is checked:
+  no cookie, no session row and a warning line on stderr that never contains the key. Plain links
+  (a click, a pasted URL, curl or any client that sends no `Sec-Fetch-Site`) are unchanged, so
+  `runledger serve` and `team create` links keep working.
 - **A cross-site form cannot sign the browser in to another team (`runledger.server`):** `POST /session`
   now refuses a request that a browser marks as coming from another origin, before the body is read,
   with `403 cross_site`, no cookie and no session row, and a warning line on the server's stderr that

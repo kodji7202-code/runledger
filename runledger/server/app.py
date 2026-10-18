@@ -802,7 +802,10 @@ class _Handler(BaseHTTPRequestHandler):
         key = (query.get("key") or [""])[0].strip()
         if key:
             # Legacy sign-in: trade the key for an opaque cookie and redirect so the key leaves
-            # the URL. A session of another team is never replaced without a confirming click.
+            # the URL. A session of another team is never replaced without a confirming click,
+            # and a browser navigation that comes from another origin is refused outright: the
+            # Set-Cookie that would follow replaces the visitor's session for another team.
+            self._refuse_cross_origin_sign_in()
             self.server.warn_query_key_once()
             row = self.server.db.key_for_token(key)
             if row is None:
@@ -822,13 +825,14 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_html(200, DASHBOARD_HTML.replace("__CSP_NONCE__", nonce), {"Content-Security-Policy": _page_csp(nonce)})
 
     def _refuse_cross_origin_sign_in(self) -> None:
-        """Refuse a sign-in POST that a browser marks as coming from another origin.
+        """Refuse a sign-in request that a browser marks as coming from another origin.
 
-        The session cookie is SameSite=Strict, so a cross-site form arrives without the cookie
-        the visitor already holds: the server cannot show the confirmation page (see
-        _switch_team_page) and the Set-Cookie that would follow replaces the visitor's session
-        for another team. A browser describes a POST with Origin and Sec-Fetch-Site, so a
-        mismatch is refused here, before the body is read.
+        This covers the sign-in form (POST /session) and the legacy key-in-URL link
+        (GET /?key=). The session cookie is SameSite=Strict, so a cross-site request arrives
+        without the cookie the visitor already holds: the server cannot show the confirmation
+        page (see _switch_team_page) and the Set-Cookie that would follow replaces the visitor's
+        session for another team. A browser describes such a request with Origin and
+        Sec-Fetch-Site, so a mismatch is refused here, before the body is read.
 
         Sec-Fetch-Site is the browser's own statement and page script cannot set it, so
         "same-origin" is trusted on its own: every response carries `Referrer-Policy:
@@ -836,8 +840,9 @@ class _Handler(BaseHTTPRequestHandler):
         "null" (measured with Chrome 155). Without the header, the Origin is compared with the
         Host header at the scheme the server believes the client used, so a request behind a
         reverse proxy still matches when the server already trusts X-Forwarded-Proto (see
-        RunLedgerServer.secure_for). A client that sends neither header is not a browser (curl,
-        an agent) and keeps working."""
+        RunLedgerServer.secure_for). A request with neither header is not a browser (curl, a
+        pasted link, an agent) and keeps working; a browser navigation from another origin
+        sends Sec-Fetch-Site: same-site or cross-site, never "none"."""
         site = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
         if site in CROSS_ORIGIN_FETCH_SITES:
             self._refuse_sign_in(f"Sec-Fetch-Site: {site}")
@@ -854,7 +859,7 @@ class _Handler(BaseHTTPRequestHandler):
     def _refuse_sign_in(self, reason: str) -> None:
         """403 without a cookie and without a session row. The line names the header that
         refused the request, never the key."""
-        sys.stderr.write(f"warning: refused a cross-site sign-in POST ({reason})\n")
+        sys.stderr.write(f"warning: refused a cross-site sign-in request ({reason})\n")
         raise _HttpError(
             403, "cross_site",
             "Sign-in must come from this site. Open the dashboard in a new tab and use the form there.",
