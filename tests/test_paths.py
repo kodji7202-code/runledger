@@ -4,9 +4,9 @@ import pytest
 
 from runledger.cli import main
 from runledger.parser import Run, Step, Usage
-from runledger.paths import (is_unc, is_windows_style, join, label_spaced_drive_path, native,
-                             relative, show_spaced_drive_paths, spaced_drive_labels,
-                             strip_long_prefix, within)
+from runledger.paths import (is_unc, is_windows_style, join, native, relative,
+                             show_spaced_drive_paths, spaced_drive_labels, strip_long_prefix,
+                             within)
 from runledger.shell_writes import shell_deletes, shell_writes
 from runledger.summarize import file_changes
 
@@ -160,13 +160,6 @@ def test_show_spaced_drive_paths_never_relabels_a_whole_path_twice():
     assert show_spaced_drive_paths(reason, labels) == reason
     assert show_spaced_drive_paths(r"a fragment E:\Work\Client here", labels) == \
         r"a fragment E:\Work\Client y\z.txt here"
-
-
-def test_label_spaced_drive_path_matches_a_normalised_fragment():
-    labels = spaced_drive_labels(r"touch C:/repo/My Folder/x.txt")
-    assert label_spaced_drive_path(r"C:\repo\My", labels) == r"C:/repo/My Folder/x.txt"
-    assert label_spaced_drive_path(r"C:\repo\My Folder\x.txt", labels) == r"C:\repo\My Folder\x.txt"
-    assert label_spaced_drive_path(r"C:\repo\Other", labels) == r"C:\repo\Other"
 
 
 def test_windows_shell_writes_are_listed_relative_to_the_project():

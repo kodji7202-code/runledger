@@ -5,6 +5,7 @@ import json
 import pytest
 
 from runledger import guard
+from runledger.labels import command_labels, show_reason
 from runledger.parser import Run, Step, Usage
 from runledger.ps_writes import ps_deletes, ps_writes, shell_kind
 from runledger.receipt import to_dict
@@ -182,9 +183,13 @@ def test_spaced_drive_path_does_not_swallow_a_relative_operand(command):
 
 
 def test_spaced_drive_redirect_target_is_one_write_finding():
-    risks = _risks("PowerShell", command=r"'x' > E:\Work\Client y\z.txt")
+    command = r"'x' > E:\Work\Client y\z.txt"
+    risks = _risks("PowerShell", command=command)
     assert [(r.severity, r.code, r.reason) for r in risks] == [
-        ("low", "shell_outside", "Shell command wrote outside the working folder (E:\\Work\\Client y\\z.txt)")]
+        ("low", "shell_outside", "Shell command wrote outside the working folder (E:\\Work\\Client)")]
+    labels = command_labels("PowerShell", command)
+    assert [show_reason(r.reason, labels) for r in risks] == [
+        "Shell command wrote outside the working folder (E:\\Work\\Client y\\z.txt)"]
 
 
 @pytest.mark.parametrize("command", [

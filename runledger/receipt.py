@@ -8,6 +8,7 @@ from dataclasses import asdict
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import __version__
+from . import labels
 from .adapters import label as agent_label
 from .guard import redact
 from .guard_receipt import guard_counts, guard_summary
@@ -543,6 +544,7 @@ def _pricing_note(run: Run) -> Optional[str]:
 
 def to_dict(run: Run, score: int, level: str, risks: List[Risk]) -> Dict:
     changes = file_changes(run)
+    by_step = labels.step_label_map(run)
     data = {
         "schema_version": SCHEMA_VERSION,
         "runledger_version": __version__,
@@ -557,7 +559,7 @@ def to_dict(run: Run, score: int, level: str, risks: List[Risk]) -> Dict:
         "request": run.prompts[:3],
         "overview": run.overall_summary,
         "risk": {"score": score, "level": level,
-                 "reasons": [asdict(r) for r in risks]},
+                 "reasons": [asdict(r) for r in labels.show_risks(risks, by_step)]},
         "totals": {"steps": len(run.steps), "tokens": run.usage.total,
                    "input_tokens": run.usage.input_tokens, "output_tokens": run.usage.output_tokens,
                    "cache_write_tokens": run.usage.cache_write_tokens,
@@ -572,7 +574,8 @@ def to_dict(run: Run, score: int, level: str, risks: List[Risk]) -> Dict:
                    "tokens": s.usage.total, "tokens_known": _step_known(run, s),
                    "tokens_estimated": s.usage_estimated,
                    "cost_usd": s.cost, "error": s.is_error,
-                   "risks": [asdict(r) for r in s.risks]} for s in run.steps],
+                   "risks": [asdict(r) for r in labels.show_risks(s.risks, by_step)]}
+                  for s in run.steps],
         "quality": run.quality,
         "recommendations": _recs_list(run),
         "ai_review": run.ai_review if run.ai_review else None,
@@ -587,6 +590,7 @@ def to_dict(run: Run, score: int, level: str, risks: List[Risk]) -> Dict:
 
 def to_markdown(run: Run, score: int, level: str, risks: List[Risk]) -> str:
     changes = file_changes(run)
+    by_step = labels.step_label_map(run)
     out = [f"# Run receipt · {run.session_id[:8]}", ""]
     out.append(f"- **Agent:** {agent_label(run.agent)}  ·  **Folder:** {_md_code(run.cwd) if run.cwd else '-'}  ·  **Branch:** {_md_code(run.git_branch or '-')}  ·  **Duration:** {_dur(run.duration_seconds)}")
     out.append(f"- **Risk:** {score}/100 ({level})  ·  **Cost:** {_cost_text(run)}  ·  **Tokens:** {_run_tok(run, run.usage.total)}  ·  **Files changed:** {len(changes)}")
@@ -609,7 +613,7 @@ def to_markdown(run: Run, score: int, level: str, risks: List[Risk]) -> str:
     ai_map = _ai_map(ai) if ai else {}
     if risks:
         out.append("## Why it was flagged")
-        for r in risks:
+        for r in labels.show_risks(risks, by_step):
             out.append(f"- **{r.severity.upper()}** · step {r.step}: {_md_inline(r.reason)}{_ai_md_suffix(r, ai_map)}")
         out.append("")
     out += _ai_md(ai, risks)
@@ -664,6 +668,7 @@ footer{margin-top:40px;color:var(--muted);font-size:12px}
 def to_html(run: Run, score: int, level: str, risks: List[Risk]) -> str:
     e = html.escape
     changes = file_changes(run)
+    by_step = labels.step_label_map(run)
     color = "var(--accent)" if level == "Low" else "var(--amber)" if level == "Medium" else "var(--red)"
 
     ai = _ai_dict(run)
@@ -671,7 +676,7 @@ def to_html(run: Run, score: int, level: str, risks: List[Risk]) -> str:
     risk_html = "".join(
         f'<div class="risk"><span class="sev {r.severity}">{r.severity.upper()}</span>'
         f'<div>{e(r.reason)} <span class="meta">· step {r.step}</span>{_ai_badge_html(r, ai_map)}</div></div>'
-        for r in risks
+        for r in labels.show_risks(risks, by_step)
     ) or '<div class="risk"><span class="sev low">OK</span><div>No risky actions detected by the rules.</div></div>'
     recs = _recs_list(run)
     has_analysis = run.quality is not None or bool(recs) or bool(ai)
@@ -689,6 +694,7 @@ def to_html(run: Run, score: int, level: str, risks: List[Risk]) -> str:
 
     rows = []
     for s in run.steps:
+        step_risks = labels.show_risks(s.risks, by_step)
         worst = "high" if any(r.severity == "high" for r in s.risks) else ("medium" if s.risks else "")
         cls = f' class="flag {worst}"' if s.risks else ""
         summary = e(s.summary)
@@ -697,7 +703,7 @@ def to_html(run: Run, score: int, level: str, risks: List[Risk]) -> str:
         summary = "".join(f"<code>{p}</code>" if i % 2 else p for i, p in enumerate(parts))
         rows.append(
             f"<tr{cls}><td class='num'>{s.index}</td><td>{summary}"
-            + ("".join(f" <span class='sev {r.severity}'>{e(r.reason)}</span>" for r in s.risks))
+            + ("".join(f" <span class='sev {r.severity}'>{e(r.reason)}</span>" for r in step_risks))
             + ("" if not s.is_error else " <span class='pill'>error</span>")
             + f"</td><td><span class='pill'>{e(friendly_model(s.model))}</span></td>"
             f"<td class='num'>{_step_tok(run, s)}</td><td class='num'>{_money(s.cost)}</td></tr>"

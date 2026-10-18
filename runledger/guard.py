@@ -47,6 +47,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from . import labels
 from . import paths as _paths
 from . import risk as _risk
 from .parser import Step
@@ -671,7 +672,11 @@ def decide(event: dict, policy: Optional[dict] = None, approver: Optional[Approv
 
     policy_decision, drivers = _evaluate(risks, cfg)
     summary = _summary(tool, tool_input)
-    risks_out = [{"severity": r.severity, "code": r.code, "reason": clean(r.reason, 300)} for r in risks]
+    # Everything decided above used the shell's own words; the label is the whole spaced drive
+    # path in the reason text this decision shows.
+    shown = labels.command_labels(tool, tool_input.get("command"))
+    risks_out = [{"severity": r.severity, "code": r.code,
+                  "reason": labels.show_reason(clean(r.reason, 300), shown)} for r in risks]
 
     final = policy_decision
     approval: Optional[str] = None
@@ -699,7 +704,7 @@ def decide(event: dict, policy: Optional[dict] = None, approver: Optional[Approv
         "tool_use_id": step.tool_use_id,
         "session_id": session_id,
         "cwd": cwd,
-        "reason": clean(reason, 500),
+        "reason": clean(labels.show_reason(reason, shown), 500),
         "codes": sorted({r.code for r in risks}),
         "risks": risks_out,
         "approval": approval,

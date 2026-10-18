@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional
 
 from . import llm
 from .parser import Run, Step, Usage
-from .paths import is_abs, label_spaced_drive_path, relative, spaced_drive_labels
+from .paths import is_abs, relative
 from .ps_writes import ps_deletes, ps_writes, shell_kind
 from .shell_writes import shell_deletes, shell_writes
 
@@ -105,20 +105,18 @@ def file_changes(run: Run) -> Dict[str, FileChange]:
         elif s.tool in ("Bash", "PowerShell"):
             cmd = _str(s.input.get("command"))
             is_ps = shell_kind(s) == "powershell"
-            # The shell's own words decide which files changed; a path that is the leading
-            # fragment of a spaced drive path is shown as the whole path (`My` -> `My Folder/x`)
-            # only in the entry a receipt lists.
-            labels = spaced_drive_labels(cmd)
+            # The shell's own words decide which files changed: `touch C:/repo/My Folder/x.txt`
+            # writes `My` and `Folder/x.txt`, and a receipt counts exactly those.
             deletes = ps_deletes(cmd) if is_ps else shell_deletes(cmd)
             writes = ps_writes(cmd) if is_ps else shell_writes(cmd)
             for target in deletes:
-                p = _short(label_spaced_drive_path(target, labels), run.cwd)
+                p = _short(target, run.cwd)
                 if run.cwd and is_abs(p):
                     continue  # outside the project, such as a scratch file in /tmp
                 fc = changes.setdefault(p, FileChange(p))
                 fc.deleted = fc.shell = True
             for w in writes:
-                p = _short(label_spaced_drive_path(w.path, labels), run.cwd)
+                p = _short(w.path, run.cwd)
                 if run.cwd and is_abs(p):
                     continue  # outside the project, such as a backup in /tmp
                 fc = changes.setdefault(p, FileChange(p))

@@ -47,17 +47,22 @@ change behavior, so read the entry before you upgrade.
   command. Foreign hooks (`echo runledger guard`, `other.sh && runledger guard`, another
   executable) are still left alone.
 
-- **Spaced drive paths are a display label, never the reading findings come from
-  (`runledger.paths`, `runledger.risk`, `runledger.shell_writes`, `runledger.ps_writes`,
-  `runledger.summarize`):** an unquoted path that contains spaces (`echo hi > E:\Work\Client
-  y\z.txt`) is two words to a shell, and risk findings, file changes and guard decisions are
-  computed from exactly those words again. Reading the whole folder name
-  (`E:\Work\Client X\secret.txt`) is now a display step applied afterwards: a finding or a file
-  entry whose path is the leading fragment of a spaced drive path shows the whole path, so a safe
-  receipt shows `…/Client X/secret.txt` instead of the unmasked `E:\Work\Client`, and a quoted
-  path (`"E:\Work\Client X\secret.txt"`) is one word already and is left as written. The label
-  never adds, removes or merges a finding, never changes a code or a severity, and never changes
-  a guard decision.
+- **Spaced drive paths are a label output shows, never an input to a decision
+  (`runledger.paths`, `runledger.risk`, `runledger.summarize`, `runledger.receipt`,
+  `runledger.safe`, `runledger.guard`, `runledger.labels`):** an unquoted path that contains
+  spaces (`echo hi > E:\Work\Client y\z.txt`) is two words to a shell, and findings, their
+  de-duplication, severities, user `ignore` rules, guard rules and decisions, file keys,
+  deletion state, counts and Git lookups are computed from exactly those words. Reading the
+  whole folder name (`E:\Work\Client X\secret.txt`) happens when a receipt, a push payload or a
+  guard message is rendered, so a finding shows the whole path and a safe receipt shows
+  `…/Client X/secret.txt` instead of the unmasked `E:\Work\Client`, while the files a receipt
+  lists stay the files the shell wrote (`touch C:/repo/My Folder/x.txt` writes `My` and
+  `Folder/x.txt`). A quoted path (`"E:\Work\Client X\secret.txt"`) is one word already and is
+  left as written. A label can therefore no longer merge two findings or hide one:
+  `cat E:/Work/Client y/z.txt; rm 'E:/Work/Client y/z.txt'` keeps the low read and the high
+  outside delete and the default guard asks again, a user `{"ignore": ["y/z.txt"]}` cannot hide
+  the delete of `E:/Work/Client`, and a guard `reason:` rule matches the raw reason
+  (`reason:(e:/work/client)` still denies it).
 
 - **Findings beside a spaced path are the shell's own reading again (`runledger.risk`):** the
   joined/unjoined "union" this milestone added between the two readings is gone, which restores

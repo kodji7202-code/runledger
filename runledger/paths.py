@@ -35,7 +35,8 @@ SPACED_SUFFIX = r"(?: (?:" + SPACED_NAME + r" )*" + SPACED_NAME + r"[\\/]" + PAT
 # contain spaces, so a receipt shows `type E:\Work\Client X\secret.txt` as one path and safe
 # mode masks the whole of it. A shell splits the same text at its spaces, and that shell
 # reading is what findings, file changes and guard decisions are computed from; the join is
-# applied to the paths a receipt shows only (`spaced_drive_labels` and the two users below).
+# applied when output is rendered only (`labels.show_risks` and `labels.show_reason` are its
+# two callers, both after every decision).
 SPACED_DRIVE_RE = re.compile(r"[A-Za-z]:[\\/]" + PATH_CHUNK + SPACED_SUFFIX + "+")
 
 
@@ -92,22 +93,6 @@ def show_spaced_drive_paths(text: str, labels: Dict[str, str]) -> str:
     if not hits:
         return text
     return _labels_re(hits).sub(lambda m: labels[m.group(0)], text)
-
-
-def label_spaced_drive_path(path: str, labels: Dict[str, str]) -> str:
-    """One path shown as the whole spaced drive path when it is that path's leading fragment.
-
-    The tokenized path may be normalised (`E:/Work/Client` -> `E:\\Work\\Client`), so the
-    comparison is normalised too. Display only, exactly as `show_spaced_drive_paths`."""
-    if not path or not labels:
-        return path
-    if path in labels:
-        return labels[path]
-    norm = _norm(path, is_windows_style(path))
-    for head, whole in labels.items():
-        if _norm(head, is_windows_style(head)) == norm:
-            return whole
-    return path
 
 
 def strip_long_prefix(p: str) -> str:
