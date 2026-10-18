@@ -525,6 +525,25 @@ change behavior, so read the entry before you upgrade.
   the Droid `.settings.json` sidecar that carries usage, and two inputs are new: `allow-empty`
   (default `false`) and `python-version` (default `3.11`), which the setup step now uses.
 
+- **A colon in a PowerShell target no longer hides a real file write (`runledger.ps_writes`):** the
+  skip for non-filesystem provider targets now matches the providers' own names (`HKLM:`, `HKCU:`,
+  `Cert:`, `Env:`, `Function:`, `Variable:`, `Alias:`, `WSMan:`), so a literal file such as
+  `notes:2026.txt` or the drive-relative `C:notes.txt` is listed in `file_changes` again when
+  written or deleted, and the literal path of a `[System.IO.File]` write is never read as a
+  provider target.
+
+- **The restore recipes in `docs/self-hosting.md` match what the backup script writes and the user
+  the server runs as (`docs/self-hosting.md`, `docs/analysis.md`):** the Docker database restore
+  reads `deploy/backups/<name>.db` (`/backup/backups/<name>.db` in the helper container), and both
+  it and the bare-metal recipe hand the restored file to the service user (`runledger:runledger`,
+  mode `0600`) with a writable `/data` (`0700`) before the server starts, because a backup is
+  owner-only and the helpers run as root. The volume archive is now described as the data volume
+  only: Caddy's certificates live in the separate `caddy-data` and `caddy-config` volumes, and the
+  clean restore removes that one volume instead of `docker compose down -v`, which would delete
+  volumes the archive does not hold. `docs/analysis.md` states which provider names are skipped,
+  that a colon elsewhere is part of a file name, and that a `[System.IO.File]` call counts anywhere
+  in a command.
+
 ### Security
 
 - **A cross-site `GET /?key=` link cannot sign the browser in to another team (`runledger.server`):**

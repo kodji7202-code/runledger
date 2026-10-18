@@ -50,10 +50,14 @@ _REDIR_OP_RE = re.compile(r"^(?:[1-6*]?>>|[1-6*]?>(?!&))$")
 _REDIR_MERGE_RE = re.compile(r"^[1-6*]?>>&?[0-9]?$|^[1-6*]?✨$")
 _STREAM_MERGE_PREFIX_RE = re.compile(r"^(?:[1-6*]?>>|[1-6*]?>)(?:&[1-6]?)?(.*)$")
 
-# A PowerShell provider qualifier (`HKLM:\Software`, `Cert:\LocalMachine`, `Env:\Path`) names
-# a registry key, a certificate store or a variable, never a file; a drive letter is one letter
-# followed by `:\` or `:/`, so it does not match.
-_PROVIDER_RE = re.compile(r"^(?![A-Za-z]:[\\/])[A-Za-z][A-Za-z0-9_.-]*:")
+# A PowerShell provider qualifier (`HKLM:\Software`, `HKCU:\...`, `Cert:\LocalMachine`,
+# `Env:\Path`, `Function:\prompt`, `Variable:\x`, `Alias:\ll`, `WSMan:\...`) names a registry
+# key, a certificate store, a variable or another non-filesystem store, never a file. Only these
+# provider names are skipped: a colon in any other name belongs to a file (`notes:2026.txt`, or a
+# drive-relative `C:notes.txt`).
+_PROVIDER_RE = re.compile(
+    r"^(?:HKLM|HKCU|HKCR|HKU|HKCC|Cert|Env|Function|Variable|Alias|WSMan):", re.IGNORECASE
+)
 
 _DEVICES = {
     "/dev/null",
@@ -190,7 +194,7 @@ def _strip_ps_herestrings(text: str) -> str:
     return text
 
 
-def _clean_ps_path(raw: Optional[str], cwd: Optional[str] = None) -> Optional[str]:
+def _clean_ps_path(raw: Optional[str], cwd: Optional[str] = None, dotnet: bool = False) -> Optional[str]:
     if not raw:
         return None
     s = raw.strip()
@@ -202,7 +206,7 @@ def _clean_ps_path(raw: Optional[str], cwd: Optional[str] = None) -> Optional[st
         return None
     if s.lower() in _DEVICES or re.match(r"^(?:com|lpt)[1-9]$", s, re.I):
         return None
-    if _PROVIDER_RE.match(s):
+    if not dotnet and _PROVIDER_RE.match(s):
         return None
     if s.endswith(("/", "\\")):
         return None
@@ -503,7 +507,8 @@ def _ps_writes_cached(command: str) -> Tuple[ShellWrite, ...]:
         for m in _DOTNET_WRITE_RE.finditer(stmt):
             quoted_path = m.group(2)
             if quoted_path is not None:
-                cleaned = _clean_ps_path(quoted_path, cwd)
+                # `System.IO.File` takes a filesystem path, so no provider filter applies here.
+                cleaned = _clean_ps_path(quoted_path, cwd, dotnet=True)
                 if cleaned:
                     out.append(ShellWrite(cleaned, added=1))
 

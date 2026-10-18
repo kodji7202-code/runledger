@@ -416,6 +416,28 @@ def test_backup_script_uses_portable_commands():
     assert "bash -n deploy/backup.sh" in ci
 
 
+def test_self_hosting_restore_recipes_match_the_backup_script():
+    """The documented restore reads the folder deploy/backup.sh writes, hands the restored files
+    to the unprivileged service user, and deletes only the volume the archive holds."""
+    text = (ROOT / "docs" / "self-hosting.md").read_text(encoding="utf-8")
+    script = (ROOT / "deploy" / "backup.sh").read_text(encoding="utf-8")
+    restore = text[text.index("**Restore.**"):]
+    assert 'dest="backups/$(basename "$latest")"' in script, "backup.sh writes into deploy/backups"
+    assert '-v "$PWD":/backup' in restore
+    assert "cp /backup/backups/runledger-runledger-" in restore, "the copy reads deploy/backups/"
+    assert "chown runledger:runledger /var/lib/runledger/runledger.db" in restore
+    assert "chown -R runledger:runledger /data" in restore
+    assert "chmod 600 /data/runledger.db" in restore
+    for line in restore.splitlines():
+        if "--entrypoint sh" in line:
+            assert "-v deploy_runledger-data:/data" in line, "the helper must mount the volume"
+    # The data-volume archive does not hold Caddy's certificates, and no recipe deletes them.
+    assert "including the certificates in the Caddy volume" not in text
+    assert "caddy-data" in text and "caddy-config" in text
+    assert "docker volume rm deploy_runledger-data" in restore
+    assert not re.search(r"^docker compose down -v", restore, re.M)
+
+
 def test_license_file_is_apache_2_0():
     text = (ROOT / "LICENSE").read_text(encoding="utf-8")
     assert "Apache License" in text

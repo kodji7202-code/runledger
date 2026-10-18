@@ -341,9 +341,12 @@ chmod +x deploy/backup.sh
 crontab -e   # add: 15 3 * * * cd /path/to/runledger/deploy && ./backup.sh >> backup.log 2>&1
 ```
 
-**Whole volume.** For a complete copy, including the certificates in the Caddy volume, stop
-the stack and archive the volumes. The volume names start with the project name, which is the
-folder name (`deploy`). Check them with `docker volume ls`.
+**Whole data volume.** For a complete copy of the server's data, stop the stack and archive the
+volume. It holds the database, its `-wal` and `-shm` files and the copies under `/data/backups`.
+Caddy's certificates are **not** in it: they live in the `caddy-data` volume (mounted at `/data` in
+the Caddy container) and the `caddy-config` volume (`/config`), which this recipe leaves alone. The
+volume names start with the project name, which is the folder name (`deploy`). Check them with
+`docker volume ls`.
 
 ```bash
 docker compose down
@@ -352,11 +355,17 @@ docker run --rm -v deploy_runledger-data:/data -v "$PWD":/backup alpine \
 docker compose up -d
 ```
 
+If you also want the certificates, archive those two volumes the same way. Caddy asks Let's
+Encrypt for them again on the next start, so you need that only to stay away from the request
+limits.
+
 Store backups off the host, encrypted. They contain the same data as the live database,
 including keys' hashes, prompts, file paths and webhook URLs. Test a restore before you need one.
 
 **Restore.** Stop the server first, so nothing writes to the database while you replace it, and
-delete the `runledger.db-wal` and `runledger.db-shm` files that belong to the old database.
+delete the `runledger.db-wal` and `runledger.db-shm` files that belong to the old database. A
+backup is owner-only (`0600`) and the server runs as an unprivileged user, so both recipes hand the
+restored database to that user before the server starts again.
 
 **Bare metal:**
 
@@ -364,40 +373,63 @@ delete the `runledger.db-wal` and `runledger.db-shm` files that belong to the ol
 sudo systemctl stop runledger
 sudo cp /var/backups/runledger/runledger-runledger-20261018-030000.db /var/lib/runledger/runledger.db
 sudo rm -f /var/lib/runledger/runledger.db-wal /var/lib/runledger/runledger.db-shm
+sudo chown runledger:runledger /var/lib/runledger/runledger.db
+sudo chmod 600 /var/lib/runledger/runledger.db
 sudo systemctl start runledger
 ```
 
+`runledger:runledger` is the service user from the systemd unit above. The `cp` runs as `root`, so
+without the `chown` the restored file belongs to `root` and the service cannot open it.
+
 **Docker.** The data lives in the `runledger-data` volume of the Compose project, so copy the
-backup into the volume with a throwaway container instead of the host filesystem. The volume is
-named `<compose project>_runledger-data`; the project name is the folder the compose file is run
-from (`deploy`), or the `-p` name you pass:
+backup into the volume with a throwaway container instead of the host filesystem. Host copies made
+by `deploy/backup.sh` are in `deploy/backups/`, which is `/backup/backups/` in the container. The
+volume is named `<compose project>_runledger-data` and the image `<compose project>-runledger`; the
+project name is the folder the compose file is run from (`deploy`), or the `-p` name you pass:
 
 ```bash
 cd deploy
 docker compose down
 docker run --rm -v deploy_runledger-data:/data -v "$PWD":/backup alpine \
-  sh -c "cp /backup/runledger-runledger-20261018-030000.db /data/runledger.db"
-docker run --rm -v deploy_runledger-data:/data alpine \
-  sh -c "rm -f /data/runledger.db-wal /data/runledger.db-shm"
+  sh -c "cp /backup/backups/runledger-runledger-20261018-030000.db /data/runledger.db \
+         && rm -f /data/runledger.db-wal /data/runledger.db-shm"
+docker run --rm --user root -v deploy_runledger-data:/data --entrypoint sh deploy-runledger \
+  -c "chown -R runledger:runledger /data && chmod 700 /data && chmod 600 /data/runledger.db"
 docker compose up -d
 ```
 
-With `docker compose -p myproject ...` the volume is `myproject_runledger-data`; use that name in
-the two `docker run` commands.
+The Alpine helper runs as `root`, so the database it copies belongs to `root`; the second command
+is the image's own shell, started as `root`, and gives the volume and the file back to the
+`runledger` user the server runs as (`USER runledger` in the `Dockerfile`), with `/data` writable by
+that user and the database owner-only. Without it the server cannot open its database, and a data
+volume that was created by an Alpine helper is not writable by that user either.
 
-**Whole volume (tar).** Restore the archive from the "Whole volume" backup into the volume, again
-with the stack stopped:
+With `docker compose -p myproject ...` the volume is `myproject_runledger-data` and the image is
+`myproject-runledger`; use those names in the helper commands. If you built the image yourself with
+`docker build -t <name> .`, use `<name>` in the second command.
+
+**Whole data volume (tar).** Restore the archive from the "Whole data volume" backup into the
+volume, again with the stack stopped. For a clean restore of an old archive, remove the data volume
+first, if you no longer need what it holds. Remove that one volume only; `docker compose down -v`
+would also delete the `caddy-data` and `caddy-config` volumes, which this archive does not hold:
 
 ```bash
+cd deploy
 docker compose down
+docker volume rm deploy_runledger-data
 docker run --rm -v deploy_runledger-data:/data -v "$PWD":/backup alpine \
   sh -c "cd /data && tar xzf /backup/runledger-data-20261018.tgz"
+docker run --rm --user root -v deploy_runledger-data:/data --entrypoint sh deploy-runledger \
+  -c "chown -R runledger:runledger /data && chmod 700 /data"
 docker compose up -d
 ```
 
-The archive holds the certificates as well as the database, and extracting it overwrites the files
-in the volume with the archived ones. For a clean restore of an old archive, remove the volume
-first (`docker compose down -v`) if you no longer need what it holds.
+The archive holds what the volume held when it was taken, with the files' own modes (the database
+is `0600`), and extracting it overwrites the files in the volume with the archived ones. It does not
+touch Caddy's volumes, so the certificates are still there. `tar` runs as `root` here, so the
+extracted files belong to `root` and the last helper hands them back to the `runledger` user that
+the server runs as. `docker volume rm` refuses while a container still uses the volume, which is why
+the stack is stopped first.
 
 ## Upgrades
 

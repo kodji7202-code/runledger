@@ -159,10 +159,11 @@ is analysed again. A `#` comment ends at the newline, so the line after it is a 
 (`echo ok # <<EOF` followed by `rm k.txt` still lists `k.txt` as deleted).
 
 **When a step is read as PowerShell.** A `PowerShell` tool step always is. A `Bash` step is read
-as PowerShell only when a cmdlet or a `[System.IO.File]` call is the command word of a statement,
-after statement separators (`;`, `|`, newline, parentheses), prefixes such as `sudo`, `env`,
-`time` and `xargs`, and `VAR=` assignments. Quoted strings, `$'...'` strings, `@'...'@`
-here-strings, `<# ... #>` block comments and `#` comments are blanked first, so
+as PowerShell when a cmdlet is the command word of a statement, after statement separators (`;`,
+`|`, newline, parentheses), prefixes such as `sudo`, `env`, `time` and `xargs`, and `VAR=`
+assignments, or when the code contains a `[System.IO.File]` call, which counts anywhere in it, not
+only in command position. Quoted strings, `$'...'` strings, `@'...'@` here-strings, `<# ... #>`
+block comments and `#` comments are blanked first, so
 `echo 'Set-Content is a cmdlet'; touch t.txt; rm r.txt` stays POSIX and keeps its writes and
 deletes.
 
@@ -178,8 +179,11 @@ delete of the old path plus a write of the new one.
 
 **What is skipped.** Targets that are not one literal file: `$variable` and `$(...)` targets,
 wildcards (`*.log`, `?`), backtick interpolation, paths that end in a separator (a directory),
-device names (`nul`, `con`, `com1`), non-FileSystem provider paths (`HKLM:\Software\...`,
-`Cert:\...`, `Env:\...`), which change registry keys, certificates or environment variables
-rather than files, and `-WhatIf`, which skips the whole statement. A `Copy-Item`, `Move-Item` or
-`Rename-Item` whose source has a variable or a wildcard is skipped entirely, because the
-destination cannot be known.
+device names (`nul`, `con`, `com1`), targets on another PowerShell provider (`HKLM:\Software\...`,
+`HKCU:\...`, `Cert:\...`, `Env:\...`, `Function:\...`, `Variable:\...`, `Alias:\...`, `WSMan:\...`),
+which change registry keys, certificates, environment variables or other non-file stores rather than
+files, and `-WhatIf`, which skips the whole statement. Only those provider names are skipped, so a
+colon inside a file name (`notes:2026.txt`) or a drive-relative `C:notes.txt` stays a file, and the
+literal path of a `[System.IO.File]` write is never read as a provider target. A `Copy-Item`,
+`Move-Item` or `Rename-Item` whose source has a variable or a wildcard is skipped entirely, because
+the destination cannot be known.
