@@ -57,7 +57,7 @@ def _run(root, *args):
         [sys.executable, str(SCRIPT), "--root", str(root)] + list(args),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        universal_newlines=True,
+        encoding="utf-8",  # the checker writes UTF-8 whatever the console code page is
     )
 
 
@@ -127,7 +127,7 @@ def test_notes_for_the_current_version_of_this_repository():
         [sys.executable, str(SCRIPT), "--tag", "v" + __version__, "--notes"],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        universal_newlines=True,
+        encoding="utf-8",
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.startswith("## [%s]" % __version__)
@@ -135,14 +135,14 @@ def test_notes_for_the_current_version_of_this_repository():
 
 def test_notes_survive_a_legacy_console_encoding(tmp_path):
     # Windows consoles default to a legacy code page, and a changelog holds characters such as
-    # U+2265 that it cannot encode; the notes must still be written, in full.
+    # U+2265 that it cannot encode; the notes must still be written, in full and in UTF-8.
     env = dict(os.environ)
     env["PYTHONIOENCODING"] = "cp1252"
     result = subprocess.run(
         [sys.executable, str(SCRIPT), "--root", str(_repo(tmp_path)), "--tag", "v0.6.0", "--notes"],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        universal_newlines=True,
+        encoding="utf-8",
         env=env,
     )
     assert result.returncode == 0, result.stderr
