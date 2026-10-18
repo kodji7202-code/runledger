@@ -103,8 +103,13 @@ def build_payload(
     # The JSON receipt carries "agent" (label, e.g. "Codex CLI") and "agent_id".
     payload = json.loads(render(run, score, level, risks, "json"))
     # Exact cost per model, including messages that issued no tool call
-    # (step costs alone would miss those).
-    payload["models"] = {m: {"tokens": u.total, "cost_usd": cost_of(u, m)} for m, u in run.models.items()}
+    # (step costs alone would miss those). A run whose agent recorded no usage has no cost at
+    # all: a priced-model zero bucket would reach the server as a free run.
+    missing_usage = run.usage_source == "missing"
+    payload["models"] = {
+        m: {"tokens": u.total, "cost_usd": None if missing_usage else cost_of(u, m)}
+        for m, u in run.models.items()
+    }
     payload["user"] = (user or default_user()).strip() or "unknown"
     payload["project"] = folder
     payload["html"] = render(run, score, level, risks, "html")

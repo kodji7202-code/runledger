@@ -333,6 +333,28 @@ def test_cost_cells_render_unknown_cost_as_not_available_and_partial_as_a_lower_
     assert "var hint = unpricedHint(t);" in js
 
 
+def test_budget_card_and_developer_rows_render_unknown_and_partial_spend_honestly():
+    js = _script(DASHBOARD_HTML)
+    # A group is a lower bound when one of its runs is partly priced, not only when one has
+    # no price at all.
+    assert "if (Number(row.partial_runs) > 0) { return true; }" in js
+    # Budget figures stay numeric for the threshold arithmetic, so the display turns an
+    # all-unknown month back into "n/a" and marks a partly priced one "≥".
+    assert "function spendText(row)" in js
+    assert 'if ((Number(row.runs) || 0) > 0 && !(Number(row.priced_runs) || 0)) { return "n/a"; }' in js
+    assert "return costText(row.spend_usd, groupLowerBound(row));" in js
+    assert ('$("budget-figure").textContent = hasLimit ? spendText(status) + " of " + money(limit)'
+            ' : spendText(status) + " spent";') in js
+    assert '"% of the team budget used" + coverageNote(status)' in js
+    assert "function coverageNote(row)" in js
+    assert 'return spendText(r) + (up === null ? "" : " · " + up + "%");' in js
+    # The numbers behind the bar and the percentages are unchanged: the bar still gets the
+    # numeric spend and the threshold arithmetic still runs on it.
+    assert "var spend = Number(status.spend_usd) || 0;" in js
+    assert "function (r) { return r.spend_usd; }," in js
+    assert "p = Math.round((100 * spend) / limit);" in js
+
+
 def test_run_detail_dialog_shows_who_pushed_the_run():
     page = _page(DASHBOARD_HTML)
     ids = {a["id"] for _, a in page.elements if a.get("id")}

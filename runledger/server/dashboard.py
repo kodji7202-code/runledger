@@ -675,8 +675,26 @@ tr.pickable:hover{background:var(--chip)}
   // A group is a lower bound when any of its runs has no price or only a partial one.
   function groupLowerBound(row) {
     if (row.cost_is_lower_bound === true) { return true; }
+    if (Number(row.partial_runs) > 0) { return true; }
     var priced = Number(row.priced_runs);
     return isFinite(priced) && priced < (Number(row.runs) || 0);
+  }
+
+  // A budget figure stays numeric for the threshold arithmetic, so the display turns a month
+  // with no priced run back into "n/a" instead of $0.00, and marks a partly priced one "≥".
+  function spendText(row) {
+    if ((Number(row.runs) || 0) > 0 && !(Number(row.priced_runs) || 0)) { return "n/a"; }
+    return costText(row.spend_usd, groupLowerBound(row));
+  }
+
+  // How much of the month a budget figure covers, for the note next to it.
+  function coverageNote(row) {
+    var unpriced = Number(row.unpriced_runs) || 0;
+    var partial = Number(row.partial_runs) || 0;
+    var count = unpriced || partial;
+    if (!count) { return ""; }
+    return " (" + count + " of " + (Number(row.runs) || 0) + " runs "
+      + (unpriced ? "unpriced" : "only partly priced") + ")";
   }
 
   // The unpriced hint names the cause: the agent recorded no usage, the model has no known
@@ -968,9 +986,9 @@ tr.pickable:hover{background:var(--chip)}
     }
 
     $("budget-month").textContent = status.month ? "Month " + status.month : "";
-    $("budget-figure").textContent = hasLimit ? money(spend) + " of " + money(limit) : money(spend) + " spent";
+    $("budget-figure").textContent = hasLimit ? spendText(status) + " of " + money(limit) : spendText(status) + " spent";
     $("budget-note").textContent = hasLimit
-      ? p + "% of the team budget used"
+      ? p + "% of the team budget used" + coverageNote(status)
       : "No team budget is set. Admins can set one below.";
     $("budget-over").hidden = !(hasLimit && p >= 100);
 
@@ -988,7 +1006,7 @@ tr.pickable:hover{background:var(--chip)}
       function (r) { return r.spend_usd; },
       function (r) {
         var up = pct(r.pct);
-        return money(r.spend_usd) + (up === null ? "" : " · " + up + "%");
+        return spendText(r) + (up === null ? "" : " · " + up + "%");
       },
       "No developer spend recorded this month.");
 

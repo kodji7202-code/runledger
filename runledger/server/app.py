@@ -1385,12 +1385,18 @@ def receipt_to_run(
     if level not in LEVELS:
         level = _level_for(score)
 
+    usage_source = _enum(totals.get("usage_source"), USAGE_SOURCES)
+    # An agent that recorded no usage has an unknown cost: whatever the client put in cost_usd
+    # (usually 0.0) would read as a free run. The same goes for each model's bucket, so a model
+    # group made of such runs stays unpriced instead of a priced zero.
+    missing_usage = usage_source == "missing"
+
     models: Dict[str, Dict[str, Any]] = {}
     for name, info in list(_dict(payload.get("models")).items())[:50]:
         label = str(name)[:200]
         info = _dict(info)
-        cost = _money(info.get("cost_usd"))
-        if cost is None:  # older receipts: fall back to the per-step costs
+        cost = None if missing_usage else _money(info.get("cost_usd"))
+        if cost is None and not missing_usage:  # older receipts: fall back to the per-step costs
             step_costs = [
                 c for c in (_money(s.get("cost_usd")) for s in steps if s.get("model") == name)
                 if c is not None
@@ -1422,11 +1428,7 @@ def receipt_to_run(
     receipt["project"] = project
     receipt.update({k: review[k] for k in ("quality", "recommendations", "ai_review")})
 
-    usage_source = _enum(totals.get("usage_source"), USAGE_SOURCES)
-    # An agent that recorded no usage has an unknown cost: whatever the client put in cost_usd
-    # (usually 0.0) would read as a free run.
-    cost = None if usage_source == "missing" else _money(totals.get("cost_usd"))
-
+    cost = None if missing_usage else _money(totals.get("cost_usd"))
     return {
         "id": session_id,
         "user": user,

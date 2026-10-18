@@ -171,9 +171,11 @@ runs or block the guard; they only alert.
   UTC. A run with no start time counts in the month it was pushed.
 - **Unknown costs.** A run whose cost is unknown (the agent recorded no usage, or no model had a
   price) adds nothing to the month's spend, and a run whose cost is only partly priced counts with the
-  part that is known. A month of unknown runs therefore reads `$0`, never a made-up figure. The status
-  and the alert carry the run counts behind the number, and say the figure is a lower bound when some
-  run is unpriced or only partly priced.
+  part that is known. A month of unknown runs therefore reads `$0` in the API, never a made-up figure,
+  and the dashboard shows `n/a` for it; a month with partly priced runs reads `≥ $X` there, and the
+  note next to the figure names the runs it leaves out. The status and the alert carry the run counts
+  behind the number, and say the figure is a lower bound when some run is unpriced or only partly
+  priced.
 - **Limits.** `monthly_usd` for the team and `per_user_monthly_usd` for each developer. `null` or `0`
   means no limit.
 - **Attribution.** The developer a run counts against is the run's `user`, which follows the team's
@@ -248,7 +250,8 @@ the audit log.
 A run whose cost is unknown leaves the `cost_usd` cell empty rather than writing `0`; `quality_score`
 and `est_savings_usd` are empty in the same way. The report states the window's cost as `n/a` when no
 run in it could be priced, and as a lower bound (`≥ $X`, with the number of runs it leaves out) when
-some runs are unpriced or only partly priced.
+some runs are unpriced or only partly priced; the month's developer rows follow the same rule, so a
+developer whose runs are only partly priced reads `≥ $X` too.
 
 Each endpoint also answers `HEAD`, with the same headers and no body. Exports are admin-only.
 

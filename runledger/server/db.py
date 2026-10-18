@@ -1225,7 +1225,8 @@ class Database:
             ).fetchone()
             agents = conn.execute(
                 "SELECT COALESCE(agent, 'unknown') AS name, COUNT(*) AS runs, AVG(quality_score) AS avg_quality, "
-                "AVG(risk_score) AS avg_risk, SUM(cost) AS cost_usd, COUNT(cost) AS priced_runs "
+                "AVG(risk_score) AS avg_risk, SUM(cost) AS cost_usd, COUNT(cost) AS priced_runs, "
+                "COALESCE(SUM(CASE WHEN cost_partial THEN 1 ELSE 0 END), 0) AS partial_runs "
                 f"FROM runs WHERE {window} GROUP BY name "
                 "ORDER BY cost_usd IS NULL, cost_usd DESC, runs DESC, name",
                 args,
