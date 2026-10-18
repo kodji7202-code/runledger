@@ -13,7 +13,7 @@
   runledger key revoke ID [--db runledger.db]
   runledger key rotate ID [--db runledger.db]
   runledger push [SESSION | --latest] [--project PATH] [--agent AGENT] [--server URL] [--key KEY] [--user NAME]
-                 [--review] [--review-model MODEL]
+                 [--review] [--review-model MODEL] [--safe | --no-safe]
   runledger guard                       Claude Code PreToolUse hook (reads the event on stdin)
   runledger guard install [--project PATH | --global]
   runledger guard uninstall [--project PATH | --global]
@@ -42,7 +42,7 @@ from urllib.parse import quote
 from . import __version__
 from . import adapters
 from .gitinfo import current_branch, file_diffs, repo_context, session_base, toplevel, working_changes
-from .guard import redact
+from .guard import load_user_config, redact
 from .guard_receipt import load_guard_decisions
 from .parser import _ts
 from .paths import is_abs
@@ -731,17 +731,30 @@ def _key_list(db, team_id: int) -> int:
     return 0
 
 
+def push_safe_mode(args) -> bool:
+    """Whether `push` masks what it sends. `--safe`/`--no-safe` wins, then
+    RUNLEDGER_PUSH_SAFE (1/true/yes/on, anything else off), then `push_safe` in the
+    user config, then off: the team server wants the project folder by default."""
+    if args.safe is not None:
+        return args.safe
+    value = os.environ.get("RUNLEDGER_PUSH_SAFE")
+    if value is not None:
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return load_user_config().get("push_safe") is True
+
+
 def cmd_push(args) -> int:
-    from .client import PushError, push
+    from .client import PushError, push, safe_hint
 
     server = args.server or os.environ.get("RUNLEDGER_SERVER")
     key = args.key or os.environ.get("RUNLEDGER_API_KEY")
     path = _session_path(args)
     if path is None:
         return 1
+    safe = push_safe_mode(args)
     notes: List[str] = []
     try:
-        result = push(server or "", key or "", path, user=args.user,
+        result = push(server or "", key or "", path, user=args.user, safe=safe,
                       review=args.review, review_model=args.review_model, notes=notes)
     except PushError as exc:
         _print_notes(notes)
@@ -754,6 +767,9 @@ def cmd_push(args) -> int:
     else:
         print(f"Pushed {result.get('id', '?')}  ·  risk {result.get('risk_score', '?')}/100 "
               f"({result.get('risk_level', '?')})  ·  {server.rstrip('/')}{result.get('url', '')}")
+    hint = safe_hint(server or "", safe)
+    if hint:
+        print(hint, file=sys.stderr)
     return 0
 
 
@@ -912,6 +928,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                          "sends redacted commands and edits, see docs/analysis.md)")
     pp.add_argument("--review-model", default=DEFAULT_REVIEW_MODEL,
                     help=f"model for --review (default {DEFAULT_REVIEW_MODEL})")
+    p_safe = pp.add_mutually_exclusive_group()
+    p_safe.add_argument("--safe", dest="safe", action="store_true", default=None,
+                        help="mask local paths and e-mail addresses in what is sent "
+                             "(or set RUNLEDGER_PUSH_SAFE=1)")
+    p_safe.add_argument("--no-safe", dest="safe", action="store_false",
+                        help="send full local paths and e-mail addresses (default)")
     pp.set_defaults(func=cmd_push)
 
     pc = sub.add_parser("checkpoint", help="snapshot the working tree without changing HEAD or index")

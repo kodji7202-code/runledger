@@ -536,6 +536,16 @@ change behavior, so read the entry before you upgrade.
   event. The new `RUNLEDGER_AUDIT_RETENTION_DAYS` variable deletes audit events on their own schedule
   (default 365 days while runs are pruned, `0` keeps them for ever), so audit history is no longer
   deleted on the runs' period.
+- **`runledger push --safe` masks what the team server stores (`runledger.client`, `runledger.cli`):**
+  `--safe` (or `RUNLEDGER_PUSH_SAFE=1`, or `"push_safe": true` in `~/.runledger/config.json`; the flag
+  wins over the environment, which wins over the config) applies the same safe mode as `runledger
+  receipt` to the receipt before it is sent, so the stored JSON receipt, the HTML and the dashboard
+  show relative paths and `[EMAIL]` instead of local folders and e-mail addresses. The default is
+  unchanged: without any of the three, the server gets the full paths and the project folder it
+  groups runs by. `--safe` wins over `RUNLEDGER_PUSH_SAFE=0`. A push to a remote HTTPS server that is
+  not masked prints one line on stderr: `tip: --safe (or RUNLEDGER_PUSH_SAFE=1) masks local paths and
+  e-mail addresses before they are sent`; a loopback server and plain HTTP stay silent. The developer
+  name from `--user` is kept as given: it is the name the dashboard attributes the run to.
 
 ## [0.6.0] - 2026-10-15
 

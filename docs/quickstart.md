@@ -71,7 +71,8 @@ follows the folder it is sent from: redacted inside a Git work tree, full paths 
 `--safe` and `--no-safe` override the default. After writing a file, `receipt` prints the mode
 it used to stderr. JSON receipts record it as `"safe": true` or `false`. Session id, branch,
 models, scores and file counts are the same in both modes. The GitHub pull-request comment is
-always safe. `push` is not changed, because the team server needs the project folder.
+always safe. `push` sends full paths by default, because the team server needs the project folder;
+`push --safe` masks the receipt the same way before it is stored (see below).
 
 Choose a session explicitly with a file path:
 
@@ -202,6 +203,16 @@ runledger push --user "ana@example.com"
 PowerShell uses `$env:RUNLEDGER_SERVER = "http://127.0.0.1:8787"` and the same for the key.
 `--user` is the developer name shown on the dashboard. Without it, RunLedger uses the git
 `user.email`, then the operating-system user.
+
+**Safe mode for a shared server.** The stored receipt keeps full local paths by default, so the
+dashboard can show which folder and which files a run touched. `runledger push --safe` masks the
+receipt before it is sent, exactly like `runledger receipt`: paths inside the project become
+relative, the home folder becomes `~`, e-mail addresses in prompts and commands become `[EMAIL]`,
+and the project folder name and the `--user` name are kept, because they are what the dashboard
+groups by. Set `RUNLEDGER_PUSH_SAFE=1` to mask every push, or `"push_safe": true` in
+`~/.runledger/config.json` (the flag wins over the environment, which wins over the config;
+`--no-safe` forces full detail). A push to a remote HTTPS server that is not masked prints one
+tip line on stderr; a local server stays silent.
 
 A local server is for trying things out. For a shared server, use HTTPS: see
 [self-hosting.md](self-hosting.md) for Docker Compose with automatic certificates, or a bare-metal
