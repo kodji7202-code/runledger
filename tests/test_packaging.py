@@ -235,7 +235,8 @@ def test_changelog_links_cover_headings():
     assert missing == [], f"CHANGELOG headings without a link definition: {missing}"
     assert [name for name in links if name not in headings] == [], "stale CHANGELOG link"
     base = "https://github.com/kodji7202-code/runledger"
-    assert links["Unreleased"] == f"{base}/compare/v0.6.0...HEAD"
+    assert headings[0] == "Unreleased", headings[0]
+    assert links["Unreleased"] == f"{base}/compare/v{headings[1]}...HEAD"
     assert links["0.2.0"] == f"{base}/releases/tag/v0.2.0"
     # 0.1.0 is the untagged prototype, so it points at its own commit instead of a comparison.
     assert links["0.1.0"].startswith(f"{base}/commit/")
