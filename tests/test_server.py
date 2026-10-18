@@ -1,4 +1,4 @@
-"""Tests for the RunLedger team server, the push client and the team CLI.
+﻿"""Tests for the RunLedger team server, the push client and the team CLI.
 
 Each test runs a real server on a free port in a background thread, with a
 temporary SQLite database.
@@ -444,6 +444,221 @@ def test_agent_id_round_trips_and_the_agent_filter_keeps_working(env):
     assert [r["id"] for r in _json(_http(base, "GET", "/api/runs?agent=droid", headers=_auth(key))[2])["runs"]] == ["run-droid"]
 
 
+def _receipts(base, key, run_id):
+    """The run row from the list, from the detail view and from the table."""
+    listed = {r["id"]: r for r in _json(_http(base, "GET", "/api/runs", headers=_auth(key))[2])["runs"]}
+    detail = _json(_http(base, "GET", f"/api/runs/{run_id}", headers=_auth(key))[2])["run"]
+    return listed.get(run_id), detail
+
+
+def test_missing_usage_is_stored_as_unknown_cost(env):
+    """A receipt whose agent recorded no usage is stored with a NULL cost, never 0.0."""
+    srv, base = env
+    _, key = srv.db.create_team("alpha")
+    payload = _stored(client.build_payload(FIX, user="dev@example.com"), "no-usage", cost=0.0)
+    payload["totals"] = dict(payload["totals"], tokens=0, cost_usd=0.0, usage_source="missing")
+    payload["models"] = {"claude-sonnet-4-5": {"tokens": 0, "cost_usd": 0.0}}
+    assert _push(base, key, payload)[0] == 201
+
+    listed, detail = _receipts(base, key, "no-usage")
+    for row in (listed, detail):
+        assert row["cost_usd"] is None
+        assert row["usage_source"] == "missing"
+        assert row["tokens"] == 0
+        assert row["cost_partial"] is False
+    assert _run_row(srv.db.path, "no-usage")["cost"] is None
+
+
+def test_legacy_and_reported_zero_receipts_keep_their_meaning(env):
+    """Only a run that says its usage is missing loses its cost. An older client's 0.0 and a
+    reported zero stay at $0.00; a receipt with no cost at all stays unknown."""
+    srv, base = env
+    _, key = srv.db.create_team("alpha")
+    payload = _stored(client.build_payload(FIX, user="dev@example.com"), "legacy-zero", cost=0.0)
+    payload["totals"].pop("usage_source", None)          # an old client: no usage_source at all
+    assert _push(base, key, payload)[0] == 201
+
+    reported = _stored(client.build_payload(FIX, user="dev@example.com"), "reported-zero", cost=0.0)
+    reported["totals"] = dict(reported["totals"], tokens=0, usage_source="messages")
+    assert _push(base, key, reported)[0] == 201
+
+    unknown = _stored(client.build_payload(FIX, user="dev@example.com"), "no-cost")
+    unknown["totals"].pop("cost_usd", None)
+    unknown["models"] = {}
+    assert _push(base, key, unknown)[0] == 201
+
+    rows = {r["id"]: r for r in _json(_http(base, "GET", "/api/runs", headers=_auth(key))[2])["runs"]}
+    assert rows["legacy-zero"]["cost_usd"] == 0.0 and rows["legacy-zero"]["usage_source"] is None
+    assert rows["reported-zero"]["cost_usd"] == 0.0 and rows["reported-zero"]["usage_source"] == "messages"
+    assert rows["no-cost"]["cost_usd"] is None
+    stats = _json(_http(base, "GET", "/api/stats?days=30", headers=_auth(key))[2])
+    assert stats["totals"]["cost_usd"] == 0.0
+    assert stats["totals"]["runs"] == 3
+    assert stats["totals"]["unpriced_runs"] == 1
+    assert stats["totals"]["partial_runs"] == 0
+    assert stats["totals"]["cost_is_lower_bound"] is True
+
+
+def test_stats_report_partial_and_missing_costs(env):
+    """A partly priced run is a lower bound; the totals count it and say so."""
+    srv, base = env
+    _, key = srv.db.create_team("alpha")
+    fixture = client.build_payload(FIX, user="dev@example.com")
+
+    partial = _stored(fixture, "partial", cost=0.2)
+    partial["totals"] = dict(partial["totals"], cost_usd=0.2, cost_partial=True, usage_source="messages")
+    complete = _stored(fixture, "complete", cost=0.3)
+    complete["totals"] = dict(complete["totals"], cost_usd=0.3, usage_source="messages")
+    missing = _stored(fixture, "missing", cost=0.0)
+    missing["totals"] = dict(missing["totals"], cost_usd=0.0, usage_source="missing")
+    for body in (partial, complete, missing):
+        assert _push(base, key, body)[0] == 201
+
+    totals = _json(_http(base, "GET", "/api/stats?days=30", headers=_auth(key))[2])["totals"]
+    assert totals["runs"] == 3
+    assert totals["cost_usd"] == pytest.approx(0.5)
+    assert totals["priced_runs"] == 2
+    assert totals["partial_runs"] == 1
+    assert totals["missing_usage_runs"] == 1
+    assert totals["unpriced_runs"] == 2
+    assert totals["cost_is_lower_bound"] is True
+
+
+def test_a_fully_priced_window_is_not_a_lower_bound(tmp_path):
+    with running_server(tmp_path / "priced.db") as (srv, base):
+        _, key = srv.db.create_team("alpha")
+        payload = _stored(client.build_payload(FIX, user="dev@example.com"), "only", cost=0.3)
+        payload["totals"] = dict(payload["totals"], cost_usd=0.3, usage_source="messages")
+        assert _push(base, key, payload)[0] == 201
+        totals = _json(_http(base, "GET", "/api/stats?days=30", headers=_auth(key))[2])["totals"]
+        assert totals["cost_usd"] == pytest.approx(0.3)
+        assert totals["partial_runs"] == 0
+        assert totals["unpriced_runs"] == 0
+        assert totals["cost_is_lower_bound"] is False
+
+
+def test_group_with_no_priced_runs_is_null_and_mixed_groups_sum_priced_only(env):
+    """An all-unknown group is n/a in the API; a mixed group adds up only its priced runs."""
+    srv, base = env
+    _, key = srv.db.create_team("alpha")
+    fixture = client.build_payload(FIX, user="dev@example.com")
+
+    def push(run_id, user, project, cost):
+        payload = _stored(fixture, run_id, cost=0.0 if cost is None else cost, user=user, project=project)
+        if cost is None:
+            payload["totals"] = dict(payload["totals"], cost_usd=0.0, usage_source="missing")
+            payload["models"] = {}
+        else:
+            payload["totals"] = dict(payload["totals"], cost_usd=cost, usage_source="messages")
+        assert _push(base, key, payload)[0] == 201
+
+    push("u-1", "u-unknown", "p-unknown", None)
+    push("u-2", "u-unknown", "p-unknown", None)
+    push("m-1", "u-mixed", "p-mixed", None)
+    push("m-2", "u-mixed", "p-mixed", 0.10)
+    push("k-1", "u-known", "p-known", 0.25)
+
+    stats = _json(_http(base, "GET", "/api/stats?days=30", headers=_auth(key))[2])
+    by_user = {row["user"]: row for row in stats["by_user"]}
+    assert by_user["u-unknown"]["cost_usd"] is None and by_user["u-unknown"]["priced_runs"] == 0
+    assert by_user["u-mixed"]["cost_usd"] == pytest.approx(0.1)
+    assert by_user["u-mixed"]["priced_runs"] == 1 and by_user["u-mixed"]["runs"] == 2
+    assert by_user["u-known"]["cost_usd"] == pytest.approx(0.25)
+    by_project = {row["project"]: row for row in stats["by_project"]}
+    assert by_project["p-unknown"]["cost_usd"] is None and by_project["p-unknown"]["priced_runs"] == 0
+    assert by_project["p-mixed"]["cost_usd"] == pytest.approx(0.1)
+    by_agent = {row["agent"]: row for row in stats["by_agent"]}
+    assert by_agent["Claude Code"]["cost_usd"] == pytest.approx(0.35)
+    assert by_agent["Claude Code"]["priced_runs"] == 2
+    model = next(m for m in stats["by_model"] if m["model"] == "Sonnet 4.5")
+    assert model["cost_usd"] == pytest.approx(0.35) and model["priced_runs"] == 2
+    assert stats["totals"]["cost_usd"] == pytest.approx(0.35)
+    assert stats["totals"]["cost_is_lower_bound"] is True
+
+
+def test_a_window_of_only_unknown_costs_has_null_totals(env):
+    srv, base = env
+    _, key = srv.db.create_team("alpha")
+    payload = _stored(client.build_payload(FIX, user="dev@example.com"), "unknown", cost=0.0)
+    payload["totals"] = dict(payload["totals"], cost_usd=0.0, usage_source="missing")
+    payload["models"] = {}
+    assert _push(base, key, payload)[0] == 201
+    stats = _json(_http(base, "GET", "/api/stats?days=30", headers=_auth(key))[2])
+    assert stats["totals"]["cost_usd"] is None
+    assert stats["totals"]["priced_runs"] == 0
+    assert stats["totals"]["cost_is_lower_bound"] is True
+    assert stats["by_user"][0]["cost_usd"] is None
+    assert stats["by_user"][0]["priced_runs"] == 0
+
+
+def test_attribution_defaults_to_the_client_user_and_the_admin_can_opt_into_keys(env):
+    srv, base = env
+    team_id, admin = srv.db.create_team("alpha")
+    member = srv.db.create_key(team_id, "alice-laptop", "member", "test")["key"]
+    viewer = srv.db.create_key(team_id, "viewer-key", "viewer", "test")["key"]
+
+    settings = _json(_http(base, "GET", "/api/team/settings", headers=_auth(admin))[2])
+    assert settings["attribution"] == "client"
+
+    status, _, raw = _http(base, "PUT", "/api/team/settings", body={"attribution": "key"},
+                           headers={**_auth(admin)})
+    assert status == 200 and _json(raw)["attribution"] == "key"
+    assert _json(_http(base, "GET", "/api/team/settings", headers=_auth(admin))[2])["attribution"] == "key"
+
+    status, _, raw = _http(base, "PUT", "/api/team/settings", body={"attribution": "nope"},
+                           headers={**_auth(admin)})
+    assert status == 400 and _json(raw)["error"]["code"] == "invalid_settings"
+    assert _json(_http(base, "GET", "/api/team/settings", headers=_auth(admin))[2])["attribution"] == "key"
+
+    for key in (member, viewer):
+        assert _http(base, "PUT", "/api/team/settings", body={"attribution": "client"},
+                     headers={**_auth(key)})[0] == 403
+
+    events = _json(_http(base, "GET", "/api/audit?action=team.settings", headers=_auth(admin))[2])["events"]
+    assert any(e["details"].get("attribution") == "key" for e in events)
+
+
+def test_key_attribution_stamps_the_key_label_and_keeps_the_client_user(env):
+    """In key mode a member cannot choose the displayed user; the admin may still push for
+    someone else, and the client's own user value stays in the stored receipt."""
+    srv, base = env
+    team_id, admin = srv.db.create_team("alpha")
+    member = srv.db.create_key(team_id, "alice-laptop", "member", "test")["key"]
+    assert _http(base, "PUT", "/api/team/settings", body={"attribution": "key"},
+                 headers={**_auth(admin)})[0] == 200
+    fixture = client.build_payload(FIX, user="bob@example.com")
+
+    body = _stored(fixture, "member-run", cost=0.4)
+    body["started"] = "2026-10-01T10:00:00Z"
+    assert _push(base, member, body)[0] == 201
+    admin_body = _stored(fixture, "admin-run", cost=0.4)
+    admin_body["started"] = "2026-10-01T10:00:00Z"
+    admin_body["user"] = "carol"
+    assert _push(base, admin, admin_body)[0] == 201
+
+    rows = {r["id"]: r for r in _json(_http(base, "GET", "/api/runs", headers=_auth(admin))[2])["runs"]}
+    assert rows["member-run"]["user"] == "alice-laptop"
+    assert rows["member-run"]["pushed_by"] == "alice-laptop"
+    assert rows["admin-run"]["user"] == "carol"
+    assert rows["admin-run"]["pushed_by"] == "initial"
+
+    run = _json(_http(base, "GET", "/api/runs/member-run", headers=_auth(admin))[2])["run"]
+    assert run["user"] == "alice-laptop" and run["pushed_by"] == "alice-laptop"
+    assert run["receipt"]["user"] == "bob@example.com"
+
+    stats = _json(_http(base, "GET", "/api/stats?days=3650", headers=_auth(admin))[2])
+    assert sorted(row["user"] for row in stats["by_user"]) == ["alice-laptop", "carol"]
+
+    # Back to the default: the client value is the displayed user again, pushed_by still shows.
+    assert _http(base, "PUT", "/api/team/settings", body={"attribution": "client"},
+                 headers={**_auth(admin)})[0] == 200
+    client_body = _stored(fixture, "client-run", cost=0.4)
+    client_body["started"] = "2026-10-01T10:00:00Z"
+    assert _push(base, member, client_body)[0] == 201
+    run = _json(_http(base, "GET", "/api/runs/client-run", headers=_auth(admin))[2])["run"]
+    assert run["user"] == "bob@example.com" and run["pushed_by"] == "alice-laptop"
+
+
 def test_sort_at_drives_the_list_order_and_the_window(env):
     srv, base = env
     _, key = srv.db.create_team("alpha")
@@ -660,3 +875,4 @@ def test_push_needs_server_and_key(monkeypatch, tmp_path):
     with pytest.raises(client.PushError):
         client.push("http://127.0.0.1:9", "rl_x", tmp_path / "missing.jsonl")
     assert client.default_user()
+

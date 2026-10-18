@@ -299,7 +299,8 @@ Keys do not expire. Rotate a key when a person leaves or when a key may have lea
 | `--trust-proxy` | `runledger serve` | Honours `X-Forwarded-Proto: https` for the `Secure` flag and HSTS. Only from the `--trusted-proxy` addresses when any are given; otherwise from any address. |
 | `--trusted-proxy CIDR` (repeatable), or `RUNLEDGER_TRUSTED_PROXIES` (comma-separated) | `runledger serve`, environment | The addresses or ranges of your reverse proxies, for example `127.0.0.1` or `172.20.0.0/16`. The client address is read from `X-Forwarded-For` only for these peers. It is used for the failed-sign-in limit and the audit log. |
 | `RUNLEDGER_PUBLIC_URL` | environment | Public base URL used in approval links. Set it whenever the server is behind a proxy. |
-| `RUNLEDGER_RETENTION_DAYS` | environment | Delete runs, approvals, audit events and budget alerts older than this many days. Checked at start and every hour. Unset keeps everything. |
+| `RUNLEDGER_RETENTION_DAYS` | environment | Delete runs, their history, approvals and budget alerts older than this many days. Checked at start and every hour. Unset keeps everything. The shortest useful period is 35 days: a value from 1 to 34 is raised to 35 with a warning, because a shorter one could delete the runs of the month a budget alert belongs to and fire the alert again. Budget alerts are kept by the calendar month they belong to, never by their fire time. |
+| `RUNLEDGER_AUDIT_RETENTION_DAYS` | environment | Delete audit events older than this many days, on their own schedule. Default 365 while `RUNLEDGER_RETENTION_DAYS` is set, and `0` keeps them forever. Unset with no run retention keeps everything. |
 
 The database is upgraded automatically when the server starts. Missing columns are added, so an old
 database keeps working. A database from before roles existed keeps its one key as an admin key labelled
@@ -405,8 +406,11 @@ roll back, install the older version and restore the backup from before the upgr
       and HTML exports. They contain developer and project names, run titles (the first request, up to 200
       characters), risk findings, approval decisions and audit details. Treat them as confidential. They are
       records, not a compliance certification.
-- [ ] **Choose a retention period.** Without `RUNLEDGER_RETENTION_DAYS`, runs stay until the database
-      is removed. With it, older runs, approvals and audit events are deleted every hour. To erase
+- [ ] **Choose a retention period.** Without `RUNLEDGER_RETENTION_DAYS`, nothing is deleted
+      automatically, whatever its age. With it (35 days or more; shorter values are raised to 35),
+      older runs, their history, approvals and budget alerts are deleted every hour. Audit events
+      follow their own period (`RUNLEDGER_AUDIT_RETENTION_DAYS`, default 365 days while runs are
+      pruned, `0` for ever), so a 35-day run period still keeps a year of audit history. To erase
       everything, stop the server, back up what you need, and delete the database file and its
       `-wal` and `-shm` files. This removes every team.
 - [ ] **Keep the host and the images updated.** Rebuild the Docker image with `--pull` when a new
@@ -416,8 +420,9 @@ roll back, install the older version and restore the backup from before the upgr
 ## Known limits in 0.4.0
 
 - No single sign-on, no per-person accounts, no multi-factor authentication, and no key expiry.
-- Retention is one period for the whole server (`RUNLEDGER_RETENTION_DAYS`), not per team. There is no
-  command to delete a single run.
+- Retention is one run period for the whole server (`RUNLEDGER_RETENTION_DAYS`), not per team, with
+  a separate period for audit events (`RUNLEDGER_AUDIT_RETENTION_DAYS`). There is no command to
+  delete a single run.
 - One server process and one SQLite file. This is not a multi-node cluster.
 - There is no sign-out endpoint. Sessions end when their key is revoked or rotated, or after 12 hours.
 - Receipts and the guard's log mask secrets by pattern. A secret in an unknown format, or a short

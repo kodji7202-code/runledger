@@ -459,7 +459,14 @@ def cmd_serve(args) -> int:
     if host not in _LOOPBACK and server.tls_context is None:
         print("Warning: listening on a network address. Put it behind HTTPS before sharing it.", file=sys.stderr)
     if server.retention_days:
-        print(f"Retention: runs, approvals and audit events older than {server.retention_days} days are deleted")
+        audit = server.audit_retention_days
+        audit_text = f"{audit} days" if audit else "for ever"
+        print(
+            f"Retention: runs, their versions and approvals older than {server.retention_days} days "
+            f"are deleted; audit events are kept {audit_text}"
+        )
+    elif server.audit_retention_days:
+        print(f"Retention: audit events older than {server.audit_retention_days} days are deleted")
     server.start_maintenance()
     print("Create a team with: runledger team create NAME   (Ctrl+C to stop)")
     try:

@@ -183,6 +183,7 @@ Each text filter is limited to 200 characters.
     "project": "payments-service",
     "agent": "Claude Code",
     "agent_id": "claude-code",
+    "pushed_by": "alice-laptop",
     "title": "The payment retry logic gives up after the first failure. Add exponential backoff (3 attempts) and make the tests pass.",
     "started_at": "2026-10-08T10:00:17Z",
     "ended_at": "2026-10-08T10:06:14Z",
@@ -211,6 +212,11 @@ first. `revision` is 1 until the same session is pushed again and replaces it. R
 `agent_id` existed report `null`, and a receipt from a client that did not report how it measured
 usage has `usage_source` `null`.
 
+`cost_usd` is `null` when nothing could be priced: the agent recorded no usage
+(`usage_source: "missing"`), or no model had a known price. It is never `0.0` for an unknown cost; a
+reported zero is stored and shown as `0.0`. `cost_partial` is `true` when some of the run's tokens had
+no price, so the figure is a lower bound. `pushed_by` is the label of the key that pushed the run.
+
 Errors: `400` `bad_request` (for example `limit=0`, or `min_risk=101`); `401`.
 
 ### `GET /api/runs/{id}`
@@ -221,6 +227,7 @@ Role: any. One run with its full receipt JSON and its risk reasons.
 {"run": {
   "id": "7f3c2a10-9b1e-4c55-a1d2-0e6f8b3c9d42",
   "user": "Ana", "project": "payments-service", "agent": "Claude Code", "agent_id": "claude-code",
+  "pushed_by": "alice-laptop",
   "title": "...", "started_at": "2026-10-08T10:00:17Z", "ended_at": "2026-10-08T10:06:14Z",
   "steps": 10, "tokens": 116416, "files_changed": 3, "cost_usd": 0.108408,
   "usage_source": "messages", "cost_partial": false,
@@ -230,6 +237,10 @@ Role: any. One run with its full receipt JSON and its risk reasons.
   "risks": [{"severity": "high", "code": "secret_file", "reason": "Read a secrets file (.env)", "step": 3}]
 }}
 ```
+
+With the team setting `attribution: "key"`, `user` is the pushing key's label and the `receipt` object
+still holds the client's own `user` value. With the default `attribution: "client"`, `user` is what the
+client sent and `pushed_by` is the key's label.
 
 Errors: `401`; `404` `not_found` ("Run not found.").
 
@@ -249,16 +260,29 @@ project, agent and model, and the most common risk codes.
 {
   "days": 30,
   "since": "2026-09-08T16:37:34Z",
-  "totals": {"runs": 1, "cost_usd": 0.108408, "unpriced_runs": 0, "avg_risk": 80.0,
-             "high_risk_runs": 1, "steps": 10, "tokens": 116416, "files_changed": 3},
-  "by_user": [{"user": "Ana", "runs": 1, "cost_usd": 0.108408}],
-  "by_project": [{"project": "payments-service", "runs": 1, "cost_usd": 0.108408}],
-  "by_agent": [{"agent": "Claude Code", "runs": 1, "cost_usd": 0.108408}],
-  "by_model": [{"model": "Sonnet 4.5", "runs": 1, "tokens": 79661, "cost_usd": 0.103563}],
+  "totals": {"runs": 1, "cost_usd": 0.108408, "priced_runs": 1, "unpriced_runs": 0,
+             "partial_runs": 0, "missing_usage_runs": 0, "cost_is_lower_bound": false,
+             "avg_risk": 80.0, "high_risk_runs": 1, "steps": 10, "tokens": 116416,
+             "files_changed": 3},
+  "by_user": [{"user": "Ana", "runs": 1, "cost_usd": 0.108408, "priced_runs": 1,
+               "unpriced_runs": 0, "cost_is_lower_bound": false}],
+  "by_project": [{"project": "payments-service", "runs": 1, "cost_usd": 0.108408, "priced_runs": 1,
+                  "unpriced_runs": 0, "cost_is_lower_bound": false}],
+  "by_agent": [{"agent": "Claude Code", "runs": 1, "cost_usd": 0.108408, "priced_runs": 1,
+                "unpriced_runs": 0, "cost_is_lower_bound": false}],
+  "by_model": [{"model": "Sonnet 4.5", "runs": 1, "tokens": 79661, "cost_usd": 0.103563,
+                "priced_runs": 1, "unpriced_runs": 0, "cost_is_lower_bound": false}],
   "top_risk_codes": [{"code": "secret_file", "occurrences": 2, "runs": 1}],
   "team": "demo"
 }
 ```
+
+A `cost_usd` is `null` when nothing in that group could be priced: the group had no priced run at all.
+It is never `0` for a group with unknown costs. `priced_runs` counts the runs whose cost is a number
+(including a reported zero), so `runs` minus `priced_runs` is how many are left out of the figure.
+`unpriced_runs` counts the runs whose cost is `null` or only partly priced (`cost_partial`), and
+`cost_is_lower_bound` is `true` when it is not 0: the figure then understates the month or window.
+`missing_usage_runs` counts the runs whose agent recorded no usage at all.
 
 Errors: `400` `bad_request` (`days` outside 1 to 3650); `401`.
 
@@ -368,11 +392,11 @@ response is a sign-in page with status `401`. An unknown id returns the JSON `40
 
 ### `GET /api/team/settings`
 
-Role: any. Webhook URLs and the approval timeout. For roles other than admin, the URLs show only the
-scheme, host and port, followed by `/[hidden]`.
+Role: any. Webhook URLs, the approval timeout, and which name a run is attributed to. For roles other
+than admin, the URLs show only the scheme, host and port, followed by `/[hidden]`.
 
 ```json
-{"team": "demo", "slack_webhook_url": null, "webhook_url": "http://127.0.0.1:8798/[hidden]", "approval_ttl_s": 600}
+{"team": "demo", "slack_webhook_url": null, "webhook_url": "http://127.0.0.1:8798/[hidden]", "approval_ttl_s": 600, "attribution": "client"}
 ```
 
 Errors: `401`.
@@ -386,6 +410,15 @@ Role: `admin`. Changes only the fields you send.
 | `slack_webhook_url` | string or `null` | Public `https://` URL. Private, loopback and link-local destinations are blocked. `null` or `""` clears it. |
 | `webhook_url` | string or `null` | As above. |
 | `approval_ttl_s` | integer | 1 to 604800 (seven days). The time a pending approval stays open. |
+| `attribution` | string | `client` (default) or `key`. See below. |
+
+`attribution` decides whose name a pushed run is stored under. With `client`, `user` is what the
+client sent (its default is the Git email), which a member can change on every push. With `key`, the
+pushing key's label is stored as `user`, so per-user budgets and the dashboard cannot be dodged by
+editing the receipt; the client's own value stays visible in the run's `receipt` object, and admin keys
+still push under the client's user (an admin pushing on someone's behalf keeps that person's name).
+Every change is recorded as a `team.settings` audit event. The setting applies to runs pushed after it
+is changed; stored runs keep the attribution they were given.
 
 Response `200`: the same shape as `GET`, with full URLs.
 
@@ -394,8 +427,8 @@ For local development only, `RUNLEDGER_ALLOW_LOOPBACK_WEBHOOKS=1` permits HTTP w
 Webhook delivery validates all DNS answers and connects to a checked address to prevent
 internal-network requests and DNS rebinding. Redirects and proxy routing are not followed.
 
-Errors: `400` `invalid_settings` (unknown field, an empty body, a bad URL, a TTL out of range); `401`;
-`403` (not admin); `411`; `413` (over 16 KB).
+Errors: `400` `invalid_settings` (unknown field, an empty body, a bad URL, a TTL out of range, an
+attribution other than `client` or `key`); `401`; `403` (not admin); `411`; `413` (over 16 KB).
 
 ## API keys
 
@@ -562,11 +595,24 @@ Role: any. This month's spend (UTC calendar month) against the budget.
   "spend_usd": 412.37,
   "monthly_usd": 500.0,
   "pct": 82.5,
-  "per_user": [{"user": "ana@example.com", "spend_usd": 58.1, "pct": 96.8}]
+  "runs": 30,
+  "priced_runs": 28,
+  "unpriced_runs": 2,
+  "partial_runs": 1,
+  "cost_is_lower_bound": true,
+  "per_user": [{"user": "ana@example.com", "spend_usd": 58.1, "pct": 96.8,
+                "runs": 5, "priced_runs": 5, "unpriced_runs": 0, "partial_runs": 0}]
 }
 ```
 
 `pct` is `null` when there is no limit. `per_user` is sorted by spend, largest first.
+
+Only runs with a known cost add to `spend_usd`, so a month of unknown costs reads `0`, never a made-up
+figure. The run counts say how much of the month the figure covers: `unpriced_runs` counts runs whose
+cost is `null` or only partly priced, and `cost_is_lower_bound` is `true` when the real spend is at
+least `spend_usd`. A developer whose runs all have unknown costs shows `spend_usd` 0 with their counts.
+The effective `user` follows the team's `attribution` setting (see
+[Team settings](#get-apiteamsettings)).
 
 Errors: `401`.
 
@@ -589,11 +635,13 @@ and no body, and nothing is built or audited.
 **`runs.csv`** has this header row, and one row per run:
 
 ```
-id,started_at,user,project,agent,models,steps,tokens,files_changed,cost_usd,risk_score,risk_level,title
-7f3c2a10-9b1e-4c55-a1d2-0e6f8b3c9d42,2026-10-08T10:00:17Z,Ana,payments-service,Claude Code,claude-haiku-4-5-20251001; claude-sonnet-4-5-20250929,10,116416,3,0.108408,80,high,The payment retry logic gives up after the first failure. Add exponential backoff (3 attempts) and make the tests pass.
+id,started_at,user,project,agent,models,steps,tokens,files_changed,cost_usd,risk_score,risk_level,title,quality_score,quality_grade,ai_verdict,est_savings_usd
+7f3c2a10-9b1e-4c55-a1d2-0e6f8b3c9d42,2026-10-08T10:00:17Z,Ana,payments-service,Claude Code,claude-haiku-4-5-20251001; claude-sonnet-4-5-20250929,10,116416,3,0.108408,80,high,The payment retry logic gives up after the first failure. Add exponential backoff (3 attempts) and make the tests pass.,62,C,needs_review,0.031
 ```
 
 `models` lists the model names joined with `; `. The receipt JSON and the HTML receipt are never included.
+A run whose cost is unknown has an empty `cost_usd` cell, never `0`; `quality_score` and
+`est_savings_usd` are empty in the same way when they are unknown.
 
 **`audit.csv`** has the header `id,at,actor,action,target,details_json`. `details_json` is the event's
 details as JSON text.

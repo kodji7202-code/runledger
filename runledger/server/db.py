@@ -47,12 +47,14 @@ TEAM_SETTING_COLUMNS = (
     ("monthly_budget_usd", "REAL"),
     ("per_user_budget_usd", "REAL"),
     ("alert_thresholds", "TEXT NOT NULL DEFAULT '[50, 80, 100]'"),
+    ("attribution", "TEXT NOT NULL DEFAULT 'client'"),
 )
 
 # Run columns added after the first release.
 RUN_COLUMNS = (
     ("agent", "TEXT"),
     ("pushed_by_key_id", "TEXT"),
+    ("pushed_by", "TEXT"),
 )
 
 # Run columns and the version history added with superseding runs and the extracted insight
@@ -100,7 +102,8 @@ CREATE TABLE IF NOT EXISTS teams (
     approval_ttl_s  INTEGER NOT NULL DEFAULT 600,
     monthly_budget_usd  REAL,
     per_user_budget_usd REAL,
-    alert_thresholds    TEXT NOT NULL DEFAULT '[50, 80, 100]'
+    alert_thresholds    TEXT NOT NULL DEFAULT '[50, 80, 100]',
+    attribution         TEXT NOT NULL DEFAULT 'client'
 );
 CREATE TABLE IF NOT EXISTS approvals (
     id           TEXT PRIMARY KEY,
@@ -150,6 +153,7 @@ CREATE TABLE IF NOT EXISTS runs (
     receipt_json   TEXT NOT NULL,
     receipt_html   TEXT,
     pushed_by_key_id TEXT,
+    pushed_by      TEXT,
     created_at     TEXT NOT NULL,
     updated_at     TEXT NOT NULL,
     PRIMARY KEY (team_id, id)
@@ -226,9 +230,10 @@ CREATE TABLE IF NOT EXISTS budget_alerts (
 """
 
 _SUMMARY_COLUMNS = (
-    "id, user, project, agent, agent_id, title, started_at, ended_at, steps, tokens, files_changed, "
-    "cost, usage_source, cost_partial, risk_score, risk_level, quality_score, quality_grade, ai_verdict, "
-    "est_savings_usd, revision, created_at, updated_at, (receipt_html IS NOT NULL) AS has_html"
+    "id, user, project, agent, agent_id, pushed_by, title, started_at, ended_at, steps, tokens, "
+    "files_changed, cost, usage_source, cost_partial, risk_score, risk_level, quality_score, "
+    "quality_grade, ai_verdict, est_savings_usd, revision, created_at, updated_at, "
+    "(receipt_html IS NOT NULL) AS has_html"
 )
 
 _KEY_COLUMNS = "id, label, role, prefix, created_at, last_used_at, revoked_at"
@@ -327,6 +332,7 @@ def _summary(row: sqlite3.Row) -> Dict[str, Any]:
         "project": row["project"],
         "agent": row["agent"],
         "agent_id": row["agent_id"],
+        "pushed_by": row["pushed_by"],
         "title": row["title"],
         "started_at": row["started_at"],
         "ended_at": row["ended_at"],
@@ -346,6 +352,18 @@ def _summary(row: sqlite3.Row) -> Dict[str, Any]:
         "has_html": bool(row["has_html"]),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
+    }
+
+
+def _group_row(row: sqlite3.Row, name_key: str) -> Dict[str, Any]:
+    """One breakdown row. A group with no priced run has a null cost, never a fake zero."""
+    return {
+        name_key: row["name"],
+        "runs": row["runs"],
+        "cost_usd": None if row["cost_usd"] is None else round(row["cost_usd"], 6),
+        "priced_runs": row["priced_runs"],
+        "unpriced_runs": row["unpriced_runs"],
+        "cost_is_lower_bound": bool(row["unpriced_runs"]),
     }
 
 
@@ -840,7 +858,7 @@ class Database:
                     "files_changed = ?, cost = ?, usage_source = ?, cost_partial = ?, risk_score = ?, "
                     "risk_level = ?, quality_score = ?, quality_grade = ?, ai_verdict = ?, "
                     "est_savings_usd = ?, recommendations = ?, ai_assessment = ?, receipt_json = ?, "
-                    "receipt_html = ?, pushed_by_key_id = ?, revision = ?, updated_at = ? "
+                    "receipt_html = ?, pushed_by_key_id = ?, pushed_by = ?, revision = ?, updated_at = ? "
                     "WHERE team_id = ? AND id = ?",
                     (
                         run["user"], run["project"], run["agent"], run["agent_id"], run["title"],
@@ -849,7 +867,7 @@ class Database:
                         run["usage_source"], run["cost_partial"], run["risk_score"], run["risk_level"],
                         run["quality_score"], run["quality_grade"], run["ai_verdict"],
                         run["est_savings_usd"], run["recommendations"], run["ai_assessment"],
-                        receipt_json, run["receipt_html"], key_id, revision, now,
+                        receipt_json, run["receipt_html"], key_id, run.get("pushed_by"), revision, now,
                         team_id, run["id"],
                     ),
                 )
@@ -879,8 +897,8 @@ class Database:
                                   risk_score, risk_level,
                                   quality_score, quality_grade, ai_verdict, est_savings_usd, recommendations,
                                   ai_assessment, revision, receipt_json, receipt_html, pushed_by_key_id,
-                                  created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
+                                  pushed_by, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run["id"], team_id, run["user"], run["project"], run["agent"], run["agent_id"],
@@ -889,7 +907,7 @@ class Database:
                     run["cost_partial"], run["risk_score"], run["risk_level"],
                     run["quality_score"], run["quality_grade"], run["ai_verdict"], run["est_savings_usd"],
                     run["recommendations"], run["ai_assessment"],
-                    receipt_json, run["receipt_html"], key_id,
+                    receipt_json, run["receipt_html"], key_id, run.get("pushed_by"),
                     now, now,
                 ),
             )
@@ -993,8 +1011,11 @@ class Database:
         args = (team_id, since)
         with self._lock:
             totals = self._conn.execute(
-                "SELECT COUNT(*) AS runs, COALESCE(SUM(cost), 0) AS cost_usd, "
-                "COALESCE(SUM(CASE WHEN cost IS NULL THEN 1 ELSE 0 END), 0) AS unpriced_runs, "
+                "SELECT COUNT(*) AS runs, SUM(cost) AS cost_usd, "
+                "COALESCE(SUM(CASE WHEN cost IS NOT NULL THEN 1 ELSE 0 END), 0) AS priced_runs, "
+                "COALESCE(SUM(CASE WHEN cost IS NULL OR cost_partial THEN 1 ELSE 0 END), 0) AS unpriced_runs, "
+                "COALESCE(SUM(CASE WHEN cost_partial THEN 1 ELSE 0 END), 0) AS partial_runs, "
+                "COALESCE(SUM(CASE WHEN usage_source = 'missing' THEN 1 ELSE 0 END), 0) AS missing_usage_runs, "
                 "AVG(risk_score) AS avg_risk, "
                 "COALESCE(SUM(CASE WHEN risk_level = 'high' THEN 1 ELSE 0 END), 0) AS high_risk_runs, "
                 "COALESCE(SUM(steps), 0) AS steps, COALESCE(SUM(tokens), 0) AS tokens, "
@@ -1020,31 +1041,44 @@ class Database:
         for row in model_rows:
             for name, info in json.loads(row["models"] or "{}").items():
                 label = friendly_model(name)
-                slot = models.setdefault(label, {"model": label, "runs": 0, "tokens": 0, "cost_usd": 0.0})
+                slot = models.setdefault(
+                    label, {"model": label, "runs": 0, "tokens": 0, "cost_usd": None, "priced_runs": 0},
+                )
                 slot["runs"] += 1
                 slot["tokens"] += int(info.get("tokens") or 0)
                 if info.get("cost_usd") is not None:
-                    slot["cost_usd"] += float(info["cost_usd"])
-        by_model = sorted(models.values(), key=lambda m: (-m["cost_usd"], -m["tokens"], m["model"]))
+                    slot["priced_runs"] += 1
+                    slot["cost_usd"] = round((slot["cost_usd"] or 0.0) + float(info["cost_usd"]), 6)
+        by_model = sorted(
+            models.values(),
+            key=lambda m: (m["cost_usd"] is None, -(m["cost_usd"] or 0.0), -m["tokens"], m["model"]),
+        )
 
         return {
             "days": days,
             "since": since,
             "totals": {
                 "runs": totals["runs"],
-                "cost_usd": round(totals["cost_usd"] or 0.0, 6),
+                "cost_usd": None if totals["cost_usd"] is None else round(totals["cost_usd"], 6),
+                "priced_runs": totals["priced_runs"],
                 "unpriced_runs": totals["unpriced_runs"],
+                "partial_runs": totals["partial_runs"],
+                "missing_usage_runs": totals["missing_usage_runs"],
+                "cost_is_lower_bound": bool(totals["unpriced_runs"]),
                 "avg_risk": None if totals["avg_risk"] is None else round(totals["avg_risk"], 1),
                 "high_risk_runs": totals["high_risk_runs"],
                 "steps": totals["steps"],
                 "tokens": totals["tokens"],
                 "files_changed": totals["files_changed"],
             },
-            "by_user": [{"user": r["name"], "runs": r["runs"], "cost_usd": round(r["cost_usd"], 6)} for r in by_user],
-            "by_project": [{"project": r["name"], "runs": r["runs"], "cost_usd": round(r["cost_usd"], 6)} for r in by_project],
-            "by_agent": [{"agent": r["name"], "runs": r["runs"], "cost_usd": round(r["cost_usd"], 6)} for r in by_agent],
+            "by_user": [_group_row(r, "user") for r in by_user],
+            "by_project": [_group_row(r, "project") for r in by_project],
+            "by_agent": [_group_row(r, "agent") for r in by_agent],
             "by_model": [
-                {"model": m["model"], "runs": m["runs"], "tokens": m["tokens"], "cost_usd": round(m["cost_usd"], 6)}
+                {
+                    "model": m["model"], "runs": m["runs"], "tokens": m["tokens"],
+                    "cost_usd": m["cost_usd"], "priced_runs": m["priced_runs"],
+                }
                 for m in by_model[:20]
             ],
             "top_risk_codes": [
@@ -1100,8 +1134,9 @@ class Database:
             ).fetchone()
             agents = self._conn.execute(
                 "SELECT COALESCE(agent, 'unknown') AS name, COUNT(*) AS runs, AVG(quality_score) AS avg_quality, "
-                "AVG(risk_score) AS avg_risk, COALESCE(SUM(cost), 0) AS cost_usd "
-                f"FROM runs WHERE {window} GROUP BY name ORDER BY cost_usd DESC, runs DESC, name",
+                "AVG(risk_score) AS avg_risk, SUM(cost) AS cost_usd, COUNT(cost) AS priced_runs "
+                f"FROM runs WHERE {window} GROUP BY name "
+                "ORDER BY cost_usd IS NULL, cost_usd DESC, runs DESC, name",
                 args,
             ).fetchall()
             model_rows = self._conn.execute(
@@ -1196,18 +1231,43 @@ class Database:
             })
         return self.budget_settings(team_id)
 
-    def month_spend(self, team_id: int, start: str, end: str) -> Tuple[float, List[Tuple[str, float]]]:
-        """Total run cost for runs whose start (or push time, when there is no start) is in [start, end),
-        and the same per developer. Runs without a cost count as zero."""
+    def month_spend(self, team_id: int, start: str, end: str) -> Dict[str, Any]:
+        """What the runs whose start (or push time, when there is no start) falls in [start, end)
+        cost, for the team and per developer. `spend_usd` adds up the priced runs only and is null
+        when the window has none; `runs - priced_runs` counts the runs with no cost at all, and
+        `partial_runs` the runs whose cost is a lower bound."""
         window = "team_id = ? AND sort_at >= ? AND sort_at < ?"
         args = (team_id, start, end)
         with self._lock:
-            total = self._conn.execute(f"SELECT COALESCE(SUM(cost), 0) FROM runs WHERE {window}", args).fetchone()[0]
+            total = self._conn.execute(
+                f"SELECT COUNT(*) AS runs, SUM(cost) AS spend_usd, COUNT(cost) AS priced_runs, "
+                "COALESCE(SUM(CASE WHEN cost_partial THEN 1 ELSE 0 END), 0) AS partial_runs "
+                f"FROM runs WHERE {window}",
+                args,
+            ).fetchone()
             rows = self._conn.execute(
-                f"SELECT user AS name, COALESCE(SUM(cost), 0) AS spend FROM runs WHERE {window} GROUP BY user",
+                "SELECT user AS name, COUNT(*) AS runs, SUM(cost) AS spend_usd, COUNT(cost) AS priced_runs, "
+                "COALESCE(SUM(CASE WHEN cost_partial THEN 1 ELSE 0 END), 0) AS partial_runs "
+                f"FROM runs WHERE {window} GROUP BY user "
+                "ORDER BY spend_usd IS NULL, spend_usd DESC, runs DESC, name",
                 args,
             ).fetchall()
-        return float(total or 0.0), [(r["name"], float(r["spend"])) for r in rows]
+        return {
+            "runs": total["runs"],
+            "spend_usd": None if total["spend_usd"] is None else float(total["spend_usd"]),
+            "priced_runs": total["priced_runs"],
+            "partial_runs": total["partial_runs"],
+            "users": [
+                {
+                    "user": r["name"],
+                    "runs": r["runs"],
+                    "spend_usd": None if r["spend_usd"] is None else float(r["spend_usd"]),
+                    "priced_runs": r["priced_runs"],
+                    "partial_runs": r["partial_runs"],
+                }
+                for r in rows
+            ],
+        }
 
     def record_budget_alerts(self, team_id: int, month: str, candidates: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Record the candidate alerts that have not fired this month. Each insert is conditional
@@ -1226,6 +1286,9 @@ class Database:
                     self._audit(team_id, "system", "budget.alert", item["scope"], {
                         "month": month, "threshold": item["threshold"], "spend_usd": item["spend_usd"],
                         "limit_usd": item["limit_usd"], "pct": item["pct"],
+                        "runs": item.get("runs", 0), "unpriced_runs": item.get("unpriced_runs", 0),
+                        "partial_runs": item.get("partial_runs", 0),
+                        "cost_is_lower_bound": bool(item.get("lower_bound")),
                     })
                     fired.append(item)
         return fired
@@ -1233,9 +1296,11 @@ class Database:
     def _group(self, column: str, window: str, args: Tuple[Any, ...]) -> List[sqlite3.Row]:
         # column is always a fixed expression from this module ("user", "project", ...)
         return self._conn.execute(
-            f"SELECT {column} AS name, COUNT(*) AS runs, COALESCE(SUM(cost), 0) AS cost_usd "
+            f"SELECT {column} AS name, COUNT(*) AS runs, SUM(cost) AS cost_usd, "
+            "COALESCE(SUM(CASE WHEN cost IS NOT NULL THEN 1 ELSE 0 END), 0) AS priced_runs, "
+            "COALESCE(SUM(CASE WHEN cost IS NULL OR cost_partial THEN 1 ELSE 0 END), 0) AS unpriced_runs "
             f"FROM runs WHERE {window} GROUP BY {column} "
-            "ORDER BY cost_usd DESC, runs DESC, name LIMIT 20",
+            "ORDER BY cost_usd IS NULL, cost_usd DESC, runs DESC, name LIMIT 20",
             args,
         ).fetchall()
 
@@ -1244,13 +1309,21 @@ class Database:
     def approval_settings(self, team_id: int) -> Dict[str, Any]:
         with self._lock:
             row = self._conn.execute(
-                "SELECT slack_webhook_url, webhook_url, approval_ttl_s FROM teams WHERE id = ?", (team_id,)
+                "SELECT slack_webhook_url, webhook_url, approval_ttl_s, attribution FROM teams WHERE id = ?",
+                (team_id,),
             ).fetchone()
         return {
             "slack_webhook_url": row["slack_webhook_url"],
             "webhook_url": row["webhook_url"],
             "approval_ttl_s": int(row["approval_ttl_s"]),
+            "attribution": row["attribution"] or "client",
         }
+
+    def team_attribution(self, team_id: int) -> str:
+        """How a pushed run's displayed user is decided: "client" (the default) or "key"."""
+        with self._lock:
+            row = self._conn.execute("SELECT attribution FROM teams WHERE id = ?", (team_id,)).fetchone()
+        return (row["attribution"] if row else None) or "client"
 
     def approval_ttl_s(self, team_id: int) -> int:
         return self.approval_settings(team_id)["approval_ttl_s"]
@@ -1258,9 +1331,10 @@ class Database:
     def update_approval_settings(
         self, team_id: int, changes: Dict[str, Any], actor: Optional[str] = None
     ) -> Dict[str, Any]:
-        """Apply validated settings. Only the three known column names can reach the SQL text.
-        The audit entry names the fields that changed, never their values (the URLs are secrets)."""
-        columns = [c for c in ("slack_webhook_url", "webhook_url", "approval_ttl_s") if c in changes]
+        """Apply validated settings. Only the known column names can reach the SQL text.
+        The audit entry names the fields that changed; the webhook URLs are never written to it."""
+        columns = [c for c in ("slack_webhook_url", "webhook_url", "approval_ttl_s", "attribution")
+                   if c in changes]
         if columns:
             sql = "UPDATE teams SET " + ", ".join(f"{c} = ?" for c in columns) + " WHERE id = ?"
             with self._lock, self._conn:
@@ -1269,6 +1343,8 @@ class Database:
                     details: Dict[str, Any] = {"fields": sorted(columns)}
                     if "approval_ttl_s" in changes:
                         details["approval_ttl_s"] = changes["approval_ttl_s"]
+                    if "attribution" in changes:
+                        details["attribution"] = changes["attribution"]
                     self._audit(team_id, actor, "team.settings", "settings", details)
         return self.approval_settings(team_id)
 
@@ -1396,29 +1472,36 @@ class Database:
 
     # Retention
 
-    def purge_before(self, cutoff: str) -> Dict[str, int]:
-        """Delete, for every team, runs that started (or were pushed) before `cutoff`, the versions
-        kept of those runs, and approvals, audit events and budget alerts older than it. Returns
-        the number of rows removed per table."""
+    def purge_before(
+        self, cutoff: Optional[str], audit_cutoff: Optional[str] = None
+    ) -> Dict[str, int]:
+        """Delete the run history older than `cutoff` (None keeps it): the runs that started (or
+        were pushed) before it, the versions kept of those runs, and the approvals of that age.
+        Budget alerts go by calendar month, never by fire time, so an alert of the current month
+        can never be forgotten and fire again. Audit events live on their own clock: they are
+        deleted against `audit_cutoff` only, which None keeps forever. Returns the number of rows
+        removed per table."""
         counts: Dict[str, int] = {}
         with self._lock, self._conn:
-            old_runs = "SELECT team_id, id FROM runs WHERE sort_at < ?"
-            self._conn.execute(
-                f"DELETE FROM risks WHERE (team_id, run_id) IN ({old_runs})", (cutoff,)
-            )
-            counts["run_revisions"] = self._conn.execute(
-                f"DELETE FROM run_revisions WHERE (team_id, run_id) IN ({old_runs})", (cutoff,)
-            ).rowcount
-            counts["runs"] = self._conn.execute(
-                "DELETE FROM runs WHERE sort_at < ?", (cutoff,)
-            ).rowcount
-            counts["approvals"] = self._conn.execute(
-                "DELETE FROM approvals WHERE created_at < ?", (cutoff,)
-            ).rowcount
-            counts["audit_log"] = self._conn.execute(
-                "DELETE FROM audit_log WHERE at < ?", (cutoff,)
-            ).rowcount
-            counts["budget_alerts"] = self._conn.execute(
-                "DELETE FROM budget_alerts WHERE fired_at < ?", (cutoff,)
-            ).rowcount
+            if cutoff:
+                old_runs = "SELECT team_id, id FROM runs WHERE sort_at < ?"
+                self._conn.execute(
+                    f"DELETE FROM risks WHERE (team_id, run_id) IN ({old_runs})", (cutoff,)
+                )
+                counts["run_revisions"] = self._conn.execute(
+                    f"DELETE FROM run_revisions WHERE (team_id, run_id) IN ({old_runs})", (cutoff,)
+                ).rowcount
+                counts["runs"] = self._conn.execute(
+                    "DELETE FROM runs WHERE sort_at < ?", (cutoff,)
+                ).rowcount
+                counts["approvals"] = self._conn.execute(
+                    "DELETE FROM approvals WHERE created_at < ?", (cutoff,)
+                ).rowcount
+                counts["budget_alerts"] = self._conn.execute(
+                    "DELETE FROM budget_alerts WHERE month < ?", (cutoff[:7],)
+                ).rowcount
+            if audit_cutoff:
+                counts["audit_log"] = self._conn.execute(
+                    "DELETE FROM audit_log WHERE at < ?", (audit_cutoff,)
+                ).rowcount
         return counts

@@ -341,6 +341,27 @@ def test_receipts_with_known_prices_do_not_need_pricing_help(fmt):
     assert pricing.PRICING_HELP not in render(run, 0, "Low", [], fmt)
 
 
+def test_missing_usage_is_priced_as_unknown_not_as_zero():
+    """When the agent recorded no usage, a priced model with a zero total must not make the run
+    look free: the cost stays unknown (n/a) and is not marked partial."""
+    run = _run({"claude-opus-5-5": Usage()})
+    run.usage_source = "missing"
+    pricing.apply_costs(run)
+    assert run.cost is None
+    assert not run.cost_partial
+    assert "**Cost:** n/a" in render(run, 0, "Low", [], "md")
+    assert json.loads(render(run, 0, "Low", [], "json"))["totals"]["cost_usd"] is None
+
+
+def test_reported_zero_usage_keeps_its_zero_cost():
+    """A run whose usage was reported (all counters zero is a real measurement) keeps $0.00."""
+    run = _run({"claude-opus-5-5": Usage()})
+    run.usage_source = "messages"
+    pricing.apply_costs(run)
+    assert run.cost == 0.0
+    assert not run.cost_partial
+
+
 # --- partial costs and unattributed tokens -------------------------------------
 
 @pytest.mark.parametrize("fmt", ["md", "html", "json"])

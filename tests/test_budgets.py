@@ -143,6 +143,25 @@ def push(base, key, run_id, **kwargs):
     return _json(raw)
 
 
+def push_unpriced(base, key, run_id, **kwargs):
+    """A run whose agent recorded no usage: its cost is unknown, never 0."""
+    payload = make_payload(run_id, cost=0.0, **kwargs)
+    payload["totals"] = dict(payload["totals"], cost_usd=0.0, usage_source="missing")
+    payload["models"] = {}
+    status, _, raw = _http(base, "POST", "/api/runs", body=payload, headers=_auth(key))
+    assert status in (200, 201), raw
+    return _json(raw)
+
+
+def push_partial(base, key, run_id, cost, **kwargs):
+    """A run with some of its tokens unpriced: its cost is a lower bound."""
+    payload = make_payload(run_id, cost=cost, **kwargs)
+    payload["totals"] = dict(payload["totals"], cost_usd=cost, cost_partial=True, usage_source="messages")
+    status, _, raw = _http(base, "POST", "/api/runs", body=payload, headers=_auth(key))
+    assert status in (200, 201), raw
+    return _json(raw)
+
+
 def set_budget(base, key, **body):
     status, _, raw = _http(base, "PUT", "/api/budgets", body=body, headers={**_auth(key), **CSRF})
     return status, _json(raw)
@@ -314,8 +333,10 @@ def test_status_adds_up_the_team_and_each_developer(env):
     assert status["month"] == "2026-10"
     assert status["spend_usd"] == 0.5 and status["monthly_usd"] == 1.0 and status["pct"] == 50.0
     assert status["per_user"] == [
-        {"user": "ann@example.com", "spend_usd": 0.3, "pct": 120.0},
-        {"user": "bob@example.com", "spend_usd": 0.2, "pct": 80.0},
+        {"user": "ann@example.com", "spend_usd": 0.3, "pct": 120.0,
+         "runs": 1, "priced_runs": 1, "unpriced_runs": 0, "partial_runs": 0},
+        {"user": "bob@example.com", "spend_usd": 0.2, "pct": 80.0,
+         "runs": 1, "priced_runs": 1, "unpriced_runs": 0, "partial_runs": 0},
     ]
 
 
@@ -325,7 +346,10 @@ def test_status_without_a_budget_has_no_percentages(env):
     push(base, admin, "run-1", cost=0.4)
     status = _json(_http(base, "GET", "/api/budgets/status", headers=_auth(admin))[2])
     assert status["spend_usd"] == 0.4 and status["monthly_usd"] is None and status["pct"] is None
-    assert status["per_user"] == [{"user": "dev@example.com", "spend_usd": 0.4, "pct": None}]
+    assert status["per_user"] == [
+        {"user": "dev@example.com", "spend_usd": 0.4, "pct": None,
+         "runs": 1, "priced_runs": 1, "unpriced_runs": 0, "partial_runs": 0},
+    ]
 
 
 def test_status_is_the_same_for_every_role(env):
@@ -387,6 +411,102 @@ def test_a_run_without_a_start_time_counts_from_its_push_time(env, clock):
 
 
 # Threshold alerts
+
+def test_a_month_of_unknown_costs_has_no_spend_and_fires_nothing(env):
+    """Runs whose cost is unknown contribute nothing: no fake spend, no alert, and the status
+    says the figure is a lower bound of the month's real cost."""
+    srv, base = env
+    _, admin, _, _ = team_with_keys(srv, base)
+    set_budget(base, admin, monthly_usd=1.0, alert_thresholds=[50])
+    with _Hook() as hook:
+        _http(base, "PUT", "/api/team/settings", body={"webhook_url": hook.url},
+              headers={**_auth(admin), **CSRF})
+        push_unpriced(base, admin, "no-usage-1")
+        push_unpriced(base, admin, "no-usage-2")
+        assert hook.received.empty()
+
+    status = _json(_http(base, "GET", "/api/budgets/status", headers=_auth(admin))[2])
+    assert status["spend_usd"] == 0
+    assert status["pct"] == 0.0
+    assert status["runs"] == 2 and status["priced_runs"] == 0 and status["unpriced_runs"] == 2
+    assert status["cost_is_lower_bound"] is True
+    assert _db_rows(srv.db.path, "SELECT COUNT(*) FROM budget_alerts")[0][0] == 0
+    assert _json(_http(base, "GET", "/api/audit?action=budget.alert", headers=_auth(admin))[2])["events"] == []
+
+
+def test_a_budget_alert_names_the_runs_the_figure_leaves_out(env):
+    """A crossing on a month with a run of unknown cost is announced as a lower bound, with the
+    counts behind it, in the webhook body and in the audit event."""
+    srv, base = env
+    _, admin, _, _ = team_with_keys(srv, base)
+    set_budget(base, admin, monthly_usd=1.0, alert_thresholds=[50])
+    with _Hook() as hook:
+        _http(base, "PUT", "/api/team/settings", body={"webhook_url": hook.url},
+              headers={**_auth(admin), **CSRF})
+        push_unpriced(base, admin, "no-usage")
+        push_partial(base, admin, "partial", 0.60)
+        alert = hook.next_json()
+
+    assert alert["threshold"] == 50 and alert["spend_usd"] == pytest.approx(0.6)
+    assert alert["cost_is_lower_bound"] is True
+    assert alert["runs"] == 2 and alert["unpriced_runs"] == 1 and alert["partial_runs"] == 1
+    assert "lower bound" in alert["note"] and "1 of 2 runs unpriced" in alert["note"]
+
+    events = _json(_http(base, "GET", "/api/audit?action=budget.alert", headers=_auth(admin))[2])["events"]
+    details = events[0]["details"]
+    assert details["cost_is_lower_bound"] is True
+    assert details["runs"] == 2 and details["unpriced_runs"] == 1 and details["partial_runs"] == 1
+    assert details["spend_usd"] == pytest.approx(0.6)
+
+
+def test_a_partly_priced_run_alone_is_announced_as_a_lower_bound(env):
+    """A partial run can cross a threshold by itself; the alert then names the part it misses."""
+    srv, base = env
+    _, admin, _, _ = team_with_keys(srv, base)
+    set_budget(base, admin, monthly_usd=1.0, alert_thresholds=[50])
+    with _Hook() as hook:
+        _http(base, "PUT", "/api/team/settings", body={"webhook_url": hook.url},
+              headers={**_auth(admin), **CSRF})
+        push_partial(base, admin, "partial", 0.60)
+        alert = hook.next_json()
+    assert alert["cost_is_lower_bound"] is True
+    assert alert["runs"] == 1 and alert["partial_runs"] == 1 and alert["unpriced_runs"] == 0
+    assert "lower bound" in alert["note"] and "1 of 1 runs only partly priced" in alert["note"]
+
+
+def test_a_user_budget_cannot_be_dodged_by_changing_the_user_in_key_mode(env):
+    """With attribution "key" the month's per-user spend follows the key label, so three runs
+    pushed under three different user names still cross one developer's budget."""
+    srv, base = env
+    team_id, admin = srv.db.create_team("alpha")
+    member = srv.db.create_key(team_id, "alice-laptop", "member", "test")["key"]
+    set_budget(base, admin, per_user_monthly_usd=1.0, alert_thresholds=[50, 100])
+    assert _http(base, "PUT", "/api/team/settings", body={"attribution": "key"},
+                 headers={**_auth(admin), **CSRF})[0] == 200
+    names = ("bob@example.com", "carol@example.com", "dave@example.com")
+    for index, user in enumerate(names):
+        push(base, member, f"key-{index}", user=user, cost=0.4)
+
+    status = _json(_http(base, "GET", "/api/budgets/status", headers=_auth(admin))[2])
+    assert [(row["user"], row["spend_usd"], row["pct"]) for row in status["per_user"]] == [
+        ("alice-laptop", 1.2, 120.0),
+    ]
+    events = _json(_http(base, "GET", "/api/audit?action=budget.alert", headers=_auth(admin))[2])["events"]
+    assert {e["target"] for e in events} == {"user:alice-laptop"}
+    fired = len(events)
+
+    # The default mode splits the same three pushes across three names, each under the limit.
+    assert _http(base, "PUT", "/api/team/settings", body={"attribution": "client"},
+                 headers={**_auth(admin), **CSRF})[0] == 200
+    for index, user in enumerate(names):
+        push(base, member, f"client-{index}", user=user, cost=0.4)
+    status = _json(_http(base, "GET", "/api/budgets/status", headers=_auth(admin))[2])
+    assert {row["user"]: row["spend_usd"] for row in status["per_user"]} == {
+        "alice-laptop": 1.2, names[0]: 0.4, names[1]: 0.4, names[2]: 0.4,
+    }
+    events = _json(_http(base, "GET", "/api/audit?action=budget.alert", headers=_auth(admin))[2])["events"]
+    assert len(events) == fired
+
 
 def test_a_team_threshold_fires_once_per_month_with_a_stub_webhook(env):
     srv, base = env

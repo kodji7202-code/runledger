@@ -14,7 +14,7 @@ NOW = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
 
 
 @pytest.mark.parametrize("raw, expected", [
-    ("", None), ("  ", None), ("90", 90), (" 1 ", 1),
+    ("", None), ("  ", None), ("90", 90), ("35", 35), ("3650", 3650),
 ])
 def test_retention_from_env(raw, expected):
     assert maintenance.retention_from_env({maintenance.RETENTION_ENV: raw}) == expected
@@ -24,10 +24,32 @@ def test_retention_is_unset_by_default():
     assert maintenance.retention_from_env({}) is None
 
 
+@pytest.mark.parametrize("raw", ["1", "10", "34"])
+def test_a_short_retention_is_raised_to_the_floor_with_a_warning(raw, capsys):
+    """A period shorter than a month could delete the runs behind a budget alert, which would let
+    the same alert fire again. The floor is applied instead of refusing to start."""
+    assert maintenance.retention_from_env({maintenance.RETENTION_ENV: raw}) == 35
+    err = capsys.readouterr().err
+    assert maintenance.RETENTION_ENV in err and raw in err and "35" in err
+
+
 @pytest.mark.parametrize("raw", ["0", "ninety", "-5", "1.5"])
 def test_retention_from_env_rejects_bad_values(raw):
     with pytest.raises(ValueError, match=maintenance.RETENTION_ENV):
         maintenance.retention_from_env({maintenance.RETENTION_ENV: raw})
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ("", None), ("  ", None), ("365", 365), ("0", 0), ("1", 1),
+])
+def test_audit_retention_from_env(raw, expected):
+    assert maintenance.audit_retention_from_env({maintenance.AUDIT_RETENTION_ENV: raw}) == expected
+
+
+@pytest.mark.parametrize("raw", ["-1", "forever", "1.5"])
+def test_audit_retention_from_env_rejects_bad_values(raw):
+    with pytest.raises(ValueError, match=maintenance.AUDIT_RETENTION_ENV):
+        maintenance.audit_retention_from_env({maintenance.AUDIT_RETENTION_ENV: raw})
 
 
 def test_serve_rejects_invalid_retention_before_opening_database(tmp_path, monkeypatch, capsys):
@@ -60,10 +82,10 @@ def test_retention_removes_only_old_history(tmp_path):
             conn.execute("UPDATE approvals SET created_at = ? WHERE id = 'new-approval'", (recent,))
             conn.execute("UPDATE audit_log SET at = ?", (old,))
             conn.execute(
-                "INSERT INTO budget_alerts VALUES (?, '2026-07', 'team', 50, 5, 10, ?)", (team_id, old),
+                "INSERT INTO budget_alerts VALUES (?, '2026-06', 'team', 50, 5, 10, ?)", (team_id, old),
             )
         token = db.issue_session(team_id, key_id, "admin")
-        removed = maintenance.run_maintenance(db, 90, moment=NOW)
+        removed = maintenance.run_maintenance(db, 90, moment=NOW, audit_days=90)
         assert removed["runs"] == 1
         assert removed["approvals"] == 1
         assert removed["audit_log"] > 0
@@ -83,6 +105,127 @@ def test_retention_removes_only_old_history(tmp_path):
 def test_retention_is_optional():
     # No database operations are needed when retention is disabled.
     assert maintenance.run_maintenance(None, None, moment=NOW) == {}
+
+
+def _aged_db(tmp_path, name="aged.db"):
+    """A database with a run, an approval, budget alerts and audit rows of known ages."""
+    db = Database(str(tmp_path / name))
+    team_id, key = db.create_team("aged")
+    key_id = db.key_for_token(key)["id"]
+    db.upsert_run(team_id, receipt_to_run({
+        "session_id": "old-run", "started": (NOW - timedelta(days=400)).strftime(TIME_FORMAT),
+    }), actor="test", key_id=key_id)
+    db.upsert_run(team_id, receipt_to_run({
+        "session_id": "new-run", "started": (NOW - timedelta(days=2)).strftime(TIME_FORMAT),
+    }), actor="test", key_id=key_id)
+    db.create_approval(team_id, "old-approval", {
+        "session_id": "old-run", "tool": "Bash", "summary": "example", "risks": [], "cwd": None,
+    }, 600)
+    with sqlite3.connect(db.path) as conn:
+        conn.execute("UPDATE approvals SET created_at = ?",
+                     ((NOW - timedelta(days=400)).strftime(TIME_FORMAT),))
+        # The alert of the month three months ago, and the alert of the month we are in whose
+        # fire time is older than the retention period (a purge by fired_at would drop it and the
+        # threshold would fire a second time this month).
+        conn.execute("INSERT INTO budget_alerts VALUES (?, '2026-07', 'team', 50, 5, 10, ?)",
+                     (team_id, (NOW - timedelta(days=100)).strftime(TIME_FORMAT)))
+        conn.execute("INSERT INTO budget_alerts VALUES (?, '2026-10', 'team', 50, 5, 10, ?)",
+                     (team_id, (NOW - timedelta(days=40)).strftime(TIME_FORMAT)))
+        for age in (100, 300, 400):
+            conn.execute(
+                "INSERT INTO audit_log (team_id, at, actor, action, target, details) "
+                "VALUES (?, ?, 'seed', 'key.create', NULL, '{}')",
+                (team_id, (NOW - timedelta(days=age)).strftime(TIME_FORMAT)),
+            )
+    return db, team_id
+
+
+def _counts(db, table, where="1=1"):
+    with sqlite3.connect(db.path) as conn:
+        return conn.execute(f"SELECT COUNT(*) FROM {table} WHERE {where}").fetchone()[0]
+
+
+def _seeded_audit_days(db):
+    """The ages in days of the audit rows the helper seeded, oldest first."""
+    with sqlite3.connect(db.path) as conn:
+        return [row[0] for row in conn.execute(
+            "SELECT julianday(?) - julianday(at) FROM audit_log WHERE actor = 'seed' ORDER BY at",
+            (NOW.strftime(TIME_FORMAT),),
+        )]
+
+
+def test_nothing_is_deleted_when_retention_is_unset(tmp_path):
+    db, _ = _aged_db(tmp_path, "keep.db")
+    try:
+        assert maintenance.run_maintenance(db, None, moment=NOW) == {}
+        assert _counts(db, "runs") == 2
+        assert _counts(db, "approvals") == 1
+        assert _counts(db, "budget_alerts") == 2
+        assert _seeded_audit_days(db) == [400.0, 300.0, 100.0]
+    finally:
+        db.close()
+
+
+def test_the_audit_log_keeps_its_own_default_of_a_year(tmp_path):
+    """Pruning runs never prunes audit events on the runs' schedule: with no audit variable the
+    audit log keeps a year, so a 100- and a 300-day-old event stay while a 400-day-old one goes."""
+    db, _ = _aged_db(tmp_path, "audit-default.db")
+    try:
+        removed = maintenance.run_maintenance(db, 35, moment=NOW)
+        assert removed["runs"] == 1 and removed["approvals"] == 1
+        assert removed["audit_log"] == 1
+        assert _seeded_audit_days(db) == [300.0, 100.0]
+    finally:
+        db.close()
+
+
+def test_audit_retention_can_be_shortened_on_its_own(tmp_path):
+    db, _ = _aged_db(tmp_path, "audit-120.db")
+    try:
+        removed = maintenance.run_maintenance(db, 35, moment=NOW, audit_days=120)
+        assert removed["audit_log"] == 2
+        assert _seeded_audit_days(db) == [100.0]
+        assert _counts(db, "runs") == 1       # the young run is untouched
+    finally:
+        db.close()
+
+
+def test_audit_retention_zero_keeps_every_event(tmp_path):
+    db, _ = _aged_db(tmp_path, "audit-forever.db")
+    try:
+        removed = maintenance.run_maintenance(db, 35, moment=NOW, audit_days=0)
+        assert removed["runs"] == 1
+        assert "audit_log" not in removed or removed["audit_log"] == 0
+        assert _seeded_audit_days(db) == [400.0, 300.0, 100.0]
+    finally:
+        db.close()
+
+
+def test_audit_retention_works_when_runs_are_kept(tmp_path):
+    db, _ = _aged_db(tmp_path, "audit-only.db")
+    try:
+        removed = maintenance.run_maintenance(db, None, moment=NOW, audit_days=120)
+        assert removed["audit_log"] == 2
+        assert _counts(db, "runs") == 2 and _counts(db, "budget_alerts") == 2
+    finally:
+        db.close()
+
+
+def test_retention_keeps_the_alert_of_the_current_month(tmp_path):
+    """Alerts are purged by the month they belong to, never by when they fired: an alert of the
+    current month survives even when its fire time is older than the retention period, so the
+    threshold cannot fire a second time."""
+    db, team_id = _aged_db(tmp_path, "alerts.db")
+    try:
+        removed = maintenance.run_maintenance(db, 35, moment=NOW)
+        assert removed["budget_alerts"] == 1
+        with sqlite3.connect(db.path) as conn:
+            months = [row[0] for row in conn.execute(
+                "SELECT month FROM budget_alerts WHERE team_id = ? ORDER BY month", (team_id,),
+            )]
+        assert months == ["2026-10"]
+    finally:
+        db.close()
 
 
 def test_maintenance_only_starts_when_needed(tmp_path, monkeypatch):

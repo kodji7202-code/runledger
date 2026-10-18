@@ -495,8 +495,27 @@ def test_a_model_without_prices_has_no_cost_per_run_and_no_share(env):
     payload = receipt("unpriced", models={SONNET: {"tokens": 10, "cost_usd": None}}, cost=None, steps=[])
     push(base, admin, payload)
     (model,) = insights_of(base, admin)["models"]
-    assert model["runs"] == 1 and model["cost_usd"] == 0
+    assert model["runs"] == 1 and model["cost_usd"] is None and model["priced_runs"] == 0
     assert model["cost_per_run"] is None and model["share_of_cost"] is None and model["avg_quality"] is None
+
+
+def test_an_agent_with_no_priced_run_has_a_null_cost(env):
+    """Droid runs whose usage was never recorded have no cost: n/a, never 0."""
+    srv, base = env
+    _, admin, _, _ = team_with_keys(srv)
+    unpriced = receipt("droid-1", cost=0.0, agent="Factory Droid")
+    unpriced["totals"] = dict(unpriced["totals"], cost_usd=0.0, usage_source="missing")
+    unpriced["models"] = {}
+    push(base, admin, unpriced)
+    priced = receipt("claude-1", cost=1.0, agent="Claude Code",
+                     models={SONNET: {"tokens": 10, "cost_usd": 1.0}})
+    push(base, admin, priced)
+
+    agents = {a["agent"]: a for a in insights_of(base, admin)["agents"]}
+    assert agents["Factory Droid"]["cost_usd"] is None
+    assert agents["Factory Droid"]["priced_runs"] == 0 and agents["Factory Droid"]["runs"] == 1
+    assert agents["Claude Code"]["cost_usd"] == pytest.approx(1.0)
+    assert agents["Claude Code"]["priced_runs"] == 1
 
 
 def test_agents_are_compared_with_unknown_for_runs_without_one(env):
