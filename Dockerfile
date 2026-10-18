@@ -2,15 +2,27 @@
 #
 # Build from the repository root:  docker build -t runledger .
 # Or use deploy/docker-compose.yml, which adds Caddy for HTTPS.
+# The image carries OCI labels; pass the version and the commit you built for real values:
+#   docker build -t runledger --build-arg RUNLEDGER_VERSION=0.6.1 \
+#     --build-arg RUNLEDGER_REVISION="$(git rev-parse HEAD)" .
 
 # The official Python image can also be fetched from a registry mirror when
 # Docker Hub rate-limits anonymous CI runners. Default remains Docker Hub.
 ARG PYTHON_BASE_IMAGE=python:3.12-slim
 FROM ${PYTHON_BASE_IMAGE}
 
+# Build arguments for the OCI labels below. The CI docker job passes the real version from
+# pyproject.toml and the commit it built; a plain `docker build` gets the placeholders.
+ARG RUNLEDGER_VERSION=dev
+ARG RUNLEDGER_REVISION=
+
 LABEL org.opencontainers.image.title="RunLedger" \
       org.opencontainers.image.description="RunLedger team server: collects agent run receipts and serves a dashboard" \
-      org.opencontainers.image.licenses="Apache-2.0"
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.version="${RUNLEDGER_VERSION}" \
+      org.opencontainers.image.revision="${RUNLEDGER_REVISION}" \
+      org.opencontainers.image.source="https://github.com/kodji7202-code/runledger" \
+      org.opencontainers.image.url="https://runledger.site"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

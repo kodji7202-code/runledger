@@ -84,6 +84,19 @@ change behavior, so read the entry before you upgrade.
   (`docs/api.md`, `docs/enterprise.md`, `docs/self-hosting.md`, `docs/quickstart.md`) describe the
   form, the Strict cookie, the confirmation step and the session cap; the `?key=` link is documented
   as deprecated.
+- **The Docker image identifies itself, and the Compose stack is hardened (`Dockerfile`, `deploy/`):**
+  the image carries the full OCI label set, with `org.opencontainers.image.version` and
+  `org.opencontainers.image.revision` fed by the `RUNLEDGER_VERSION` and `RUNLEDGER_REVISION` build
+  arguments (the CI docker job passes the version from `pyproject.toml` and the commit it built, then
+  checks the labels on the built image); the base image stays on a tag, so Dependabot can bump it.
+  `deploy/docker-compose.yml` runs the server with a read-only root filesystem (only the data volume
+  and `/tmp` are writable), drops every Linux capability, forbids gaining new ones, pins its network
+  to `172.28.0.0/16` and uses that subnet as the default `RUNLEDGER_TRUSTED_PROXIES`, so every user
+  keeps their own failed-sign-in counter and audit address without any configuration; Caddy is pinned
+  to `caddy:2.8` and waits for the server's healthcheck before it starts. `deploy/backup.sh` uses
+  POSIX commands only, copies exactly the file the backup command wrote, and gives the host copy a
+  free name, so two runs within the same second neither overwrite nor miss each other. `deploy/.env.example`
+  documents the new trusted-proxies default.
 
 ### Fixed
 

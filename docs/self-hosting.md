@@ -104,46 +104,38 @@ docker compose down                # stop; keeps the volumes and the data
 
 Do not run `docker compose down -v` unless you want to delete the data volumes.
 
-### Trusted proxy on the Compose network (recommended)
+### Trusted proxy on the Compose network
 
 Caddy reaches the server over the Compose network, so the server sees Caddy's address as the client.
-Until the server is told that Caddy is a trusted proxy:
+The compose file pins that network to `172.28.0.0/16` and passes the subnet as
+`RUNLEDGER_TRUSTED_PROXIES`, so the server already knows Caddy is a proxy and reads each client's
+address from `X-Forwarded-For`. Without a trusted proxy named:
 
 - every user shares one failed-sign-in counter with Caddy's address, so a few bad keys from anyone can
   lock out everyone for up to five minutes (`429`);
 - the audit log records Caddy's address instead of the user's.
 
-Name the Compose network as a trusted proxy:
+Change `RUNLEDGER_TRUSTED_PROXIES` in `deploy/.env` when the stack does not use that subnet, for
+example after you change the network in `deploy/docker-compose.yml`. The subnet of the network is:
 
-1. After the stack is running, find the subnet of the network. Compose names it `<project>_default`,
-   which is `deploy_default` in this folder:
+```bash
+docker network inspect deploy_runledger-net --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}'
+```
 
-   ```bash
-   docker network inspect deploy_default --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}'
-   ```
+```yaml
+environment:
+  RUNLEDGER_PUBLIC_URL: ${RUNLEDGER_PUBLIC_URL:?set RUNLEDGER_PUBLIC_URL in deploy/.env}
+  RUNLEDGER_TRUSTED_PROXIES: "172.20.0.0/16"   # the subnet of your network
+```
 
-2. Tell the server the subnet. The simplest way is the environment of the `runledger` service in
-   `deploy/docker-compose.yml`, which needs no change to the command:
+The equivalent flag is `--trusted-proxy 172.20.0.0/16` in the server command (the `CMD` in the
+`Dockerfile`, or a `command:` in the compose file). Apply the change with `docker compose up -d`; the
+server prints `Trusting X-Forwarded-For from: 172.20.0.0/16` when it starts.
 
-   ```yaml
-   environment:
-     RUNLEDGER_PUBLIC_URL: ${RUNLEDGER_PUBLIC_URL:?set RUNLEDGER_PUBLIC_URL in deploy/.env}
-     RUNLEDGER_TRUSTED_PROXIES: "172.20.0.0/16"   # the subnet from step 1
-   ```
-
-   The equivalent flag is `--trusted-proxy 172.20.0.0/16` in the server command (the `CMD` in the
-   `Dockerfile`, or a `command:` in the compose file).
-
-3. Apply the change with `docker compose up -d`. The server prints
-   `Trusting X-Forwarded-For from: 172.20.0.0/16` when it starts.
-
-Docker assigns subnets, and a network that is recreated can get a different one. Check the subnet again
-after you change the network, and pin it in the compose file if it must stay the same. Only the Caddy
-container should be on this network, which is the case by default.
-
-With a trusted proxy named, the server takes the client address from `X-Forwarded-For`, and it honours
-`X-Forwarded-Proto` (set by Caddy) only from that proxy. The `Dockerfile` command also passes
-`--trust-proxy`, so the HTTPS cookie flags work through Caddy.
+Only the Caddy container and the server are on this network. With a trusted proxy named, the server
+takes the client address from `X-Forwarded-For`, and it honours `X-Forwarded-Proto` (set by Caddy)
+only from that proxy. The `Dockerfile` command also passes `--trust-proxy`, so the HTTPS cookie flags
+work through Caddy.
 
 ## Bare metal: pip, systemd and nginx
 
@@ -422,7 +414,9 @@ roll back, install the older version and restore the backup from before the upgr
       everything, stop the server, back up what you need, and delete the database file and its
       `-wal` and `-shm` files. This removes every team.
 - [ ] **Keep the host and the images updated.** Rebuild the Docker image with `--pull` when a new
-      base image is released. The container runs as the unprivileged `runledger` user.
+      base image is released. The container runs as the unprivileged `runledger` user, its filesystem
+      is read-only (only the data volume and `/tmp` are writable), and it drops every Linux capability
+      and cannot gain new privileges (`deploy/docker-compose.yml`).
 - [ ] **Back up regularly, and test the restore.**
 
 ## Known limits in 0.4.0
