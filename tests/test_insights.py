@@ -518,6 +518,30 @@ def test_an_agent_with_no_priced_run_has_a_null_cost(env):
     assert agents["Claude Code"]["priced_runs"] == 1
 
 
+def test_an_agent_with_only_partial_runs_is_a_lower_bound(env):
+    """An agent whose runs are all only partly priced shows a lower bound, not a complete amount."""
+    srv, base = env
+    _, admin, _, _ = team_with_keys(srv)
+    payload = receipt("partial-1", cost=0.2, agent="Factory Droid")
+    payload["totals"] = dict(payload["totals"], cost_usd=0.2, cost_partial=True, usage_source="messages")
+    push(base, admin, payload)
+
+    (agent,) = insights_of(base, admin)["agents"]
+    assert agent["agent"] == "Factory Droid"
+    assert agent["runs"] == 1 and agent["priced_runs"] == 1
+    assert agent["cost_usd"] == pytest.approx(0.2)
+    assert agent["partial_runs"] == 1
+    assert agent["cost_is_lower_bound"] is True
+
+
+def test_an_agent_with_a_complete_price_is_not_a_lower_bound(env):
+    srv, base = env
+    _, admin, _, _ = team_with_keys(srv)
+    push(base, admin, receipt("complete-1", cost=0.2, agent="Factory Droid"))
+    (agent,) = insights_of(base, admin)["agents"]
+    assert agent["partial_runs"] == 0 and agent["cost_is_lower_bound"] is False
+
+
 def test_agents_are_compared_with_unknown_for_runs_without_one(env):
     srv, base = env
     _, admin, _, _ = team_with_keys(srv)

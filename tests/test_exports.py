@@ -560,6 +560,19 @@ def test_report_budget_section_shows_a_lower_bound_and_its_counts(env):
     assert '<td class="num">≥ $0.6000</td>' in body  # the developer row says so too
 
 
+def test_report_marks_a_partial_only_developer_as_a_lower_bound(env):
+    """One partly priced run and nothing else: the developer row must not read as complete."""
+    srv, base = env
+    _, admin, _, _ = team_with_keys(srv)
+    push_partial(base, admin, "partial", 0.6)
+    body = export(base, admin, "report")[2].decode("utf-8")
+    assert (
+        "Month 2026-10: spend ≥ $0.6000 (lower bound: 1 of 1 runs only partly priced), "
+        "no team budget set."
+    ) in body
+    assert '<td>dev@example.com</td><td class="num">≥ $0.6000</td>' in body  # the developer row
+
+
 def test_report_says_when_a_long_table_is_cut_short(env):
     srv, base = env
     team_id, admin, _, _ = team_with_keys(srv)

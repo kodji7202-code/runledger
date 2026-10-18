@@ -139,9 +139,12 @@ def _spend_text(row: Dict[str, Any]) -> str:
     if runs and not priced:
         return "n/a"
     text = _usd(row["spend_usd"])
-    if row.get("cost_is_lower_bound") or (priced is not None and runs > priced):
-        return "≥ " + text
-    return text
+    lower_bound = (
+        row.get("cost_is_lower_bound")
+        or int(row.get("partial_runs") or 0)
+        or (priced is not None and runs > priced)
+    )
+    return "≥ " + text if lower_bound else text
 
 
 def _unknown_note(row: Dict[str, Any]) -> str:

@@ -302,16 +302,22 @@ def _agents_block(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     for row in rows:
         avg_quality = row["avg_quality"]
         avg_risk = row["avg_risk"]
-        priced = int(row["priced_runs"] or 0) if "priced_runs" in row.keys() else 0
+        keys = row.keys()
+        runs = int(row["runs"])
+        priced = int(row["priced_runs"] or 0) if "priced_runs" in keys else 0
+        partial = int(row["partial_runs"] or 0) if "partial_runs" in keys else 0
         cost = row["cost_usd"]
         out.append({
             "agent": row["name"],
-            "runs": int(row["runs"]),
+            "runs": runs,
             "avg_quality": None if avg_quality is None else round(float(avg_quality), 1),
             "avg_risk": None if avg_risk is None else round(float(avg_risk), 1),
-            # An agent whose runs were never priced has an unknown cost, not a zero one.
+            # An agent whose runs were never priced has an unknown cost, not a zero one, and a
+            # run whose price is only partly known leaves the agent's figure a lower bound.
             "cost_usd": None if cost is None else round(float(cost), 6),
             "priced_runs": priced,
+            "partial_runs": partial,
+            "cost_is_lower_bound": bool(priced < runs or partial),
         })
     out.sort(key=lambda a: (a["cost_usd"] is None, -(a["cost_usd"] or 0.0), -a["runs"], a["agent"]))
     return out[:TABLE_LIMIT]

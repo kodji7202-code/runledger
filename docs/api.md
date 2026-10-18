@@ -164,7 +164,9 @@ Response `200` when the push replaced the stored version. The URL of a run never
 Stored fields: `user` defaults to `unknown`; `project` defaults to the last folder name of `cwd`;
 `risk_level` is derived from the score when absent (below 25 low, below 60 medium, otherwise high).
 `usage_source` is stored as sent (`messages`, `settings` or `missing`; anything else is `null`), and
-`cost_partial` is `true` only when the receipt says the cost is a lower bound.
+`cost_partial` is `true` only when the receipt says the cost is a lower bound. A receipt whose
+`usage_source` is `missing` is stored with no cost at all: `cost_usd` and every `models[].cost_usd`
+are `null`, never the `0.0` an unrecorded usage would otherwise produce.
 Errors: `400` `empty_body`, `invalid_json`, `invalid_receipt`; `401`;
 `403` (viewer); `409` `run_conflict` (a different key pushed this session, or the new receipt is
 older); `411`; `413` (over 10 MB, "Receipts are limited to 10 MB.").
@@ -544,7 +546,8 @@ Role: any. Quality, model, agent and AI-review aggregates over the last `days`
   "models": [{"model": "claude-sonnet-5-5", "runs": 9, "cost_usd": 1.42,
               "avg_quality": 73.1, "cost_per_run": 0.158, "share_of_cost": 0.81}],
   "agents": [{"agent": "Claude Code", "runs": 10, "avg_quality": 72.0,
-              "avg_risk": 31.5, "cost_usd": 1.61}],
+              "avg_risk": 31.5, "cost_usd": 1.61, "priced_runs": 9, "partial_runs": 1,
+              "cost_is_lower_bound": true}],
   "top_recommendations": [{"kind": "model_downgrade", "title": "Run read-only steps on Haiku",
                            "count": 6, "est_savings_usd": 0.42}],
   "est_savings_usd": 0.57,
@@ -555,6 +558,9 @@ Role: any. Quality, model, agent and AI-review aggregates over the last `days`
 
 `share_of_cost` and `false_positive_rate` are ratios from 0 to 1. `cost_per_run`
 divides by priced runs only. A run's quality counts toward every model it used.
+An agent whose runs were never priced has a `cost_usd` of `null` with `priced_runs` 0, and
+`cost_is_lower_bound` is `true` when the agent's figure leaves a run out: it has an unpriced run
+(`priced_runs` below `runs`) or a partly priced one (`partial_runs`).
 `top_recommendations` is ranked by total estimated savings, then count, at most 10.
 
 Errors: `400` `bad_request` (bad `days`); `401`.
@@ -618,10 +624,12 @@ Role: any. This month's spend (UTC calendar month) against the budget.
 `pct` is `null` when there is no limit. `per_user` is sorted by spend, largest first.
 
 Only runs with a known cost add to `spend_usd`, so a month of unknown costs reads `0`, never a made-up
-figure. The run counts say how much of the month the figure covers: `unpriced_runs` counts runs whose
-cost is `null` or only partly priced, and `cost_is_lower_bound` is `true` when the real spend is at
-least `spend_usd`. A developer whose runs all have unknown costs shows `spend_usd` 0 with their counts.
-The effective `user` follows the team's `attribution` setting (see
+figure. That numeric zero is what the alert thresholds are compared against; the dashboard shows
+`n/a` for it instead. The run counts say how much of the month the figure covers: here
+`unpriced_runs` counts the runs with no cost at all and `partial_runs` the runs whose cost is only
+partly known (the `stats` endpoint counts both together), and `cost_is_lower_bound` is `true` when
+the real spend is at least `spend_usd`. A developer whose runs all have unknown costs shows
+`spend_usd` 0 with their counts. The effective `user` follows the team's `attribution` setting (see
 [Team settings](#get-apiteamsettings)).
 
 Errors: `401`.

@@ -14,6 +14,7 @@ from runledger import client
 from runledger.cli import main
 
 FIX = Path(__file__).parent / "fixtures" / "sample_session.jsonl"
+DROID_FIX = Path(__file__).parent / "fixtures" / "droid_session.jsonl"
 
 SAFE_CWD = "C:\\Users\\claud\\proj"
 SAFE_FILE = SAFE_CWD + "\\secret\\x.py"
@@ -312,3 +313,38 @@ def test_push_cli_reports_an_other_key_conflict_as_an_error(push_session, capsys
     assert "different key already pushed this session" in err
     assert "error" in err
     assert "Traceback" not in err and "Traceback" not in out
+
+
+# ------------------------------------------------------------- cost honesty
+
+
+def test_a_missing_usage_run_sends_no_model_cost(tmp_path):
+    """A Droid session whose settings report no tokens has no cost at all. The priced-model
+    bucket must not turn the unknown into a $0.00 cost the server would aggregate as priced."""
+    session = tmp_path / "session.jsonl"
+    session.write_bytes(DROID_FIX.read_bytes())
+    session.with_suffix(".settings.json").write_text(
+        json.dumps({"model": "claude-sonnet-4-5",
+                    "tokenUsage": {"inputTokens": 0, "outputTokens": 0}}),
+        encoding="utf-8",
+    )
+    payload = client.build_payload(session, user="dev@example.com")
+    assert payload["totals"]["usage_source"] == "missing"
+    assert payload["totals"]["cost_usd"] is None
+    assert payload["models"] == {"claude-sonnet-4-5": {"tokens": 0, "cost_usd": None}}
+
+
+def test_a_run_with_recorded_usage_still_sends_its_model_cost(tmp_path):
+    """The missing-usage rule never touches a session that reports usage."""
+    session = tmp_path / "session.jsonl"
+    session.write_bytes(DROID_FIX.read_bytes())
+    session.with_suffix(".settings.json").write_text(
+        json.dumps({"model": "claude-sonnet-4-5",
+                    "tokenUsage": {"inputTokens": 1000, "outputTokens": 200}}),
+        encoding="utf-8",
+    )
+    payload = client.build_payload(session, user="dev@example.com")
+    assert payload["totals"]["usage_source"] == "settings"
+    assert payload["totals"]["cost_usd"] > 0
+    (model,) = payload["models"].values()
+    assert model["cost_usd"] > 0

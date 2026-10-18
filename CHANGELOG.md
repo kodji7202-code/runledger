@@ -9,6 +9,23 @@ change behavior, so read the entry before you upgrade.
 
 ### Changed
 
+- **A Droid run with no recorded usage no longer prices its models (`runledger.client`,
+  `runledger.server`):** the push body and the stored run keep `cost_usd` `null` on every model of
+  such a run instead of the `0.0` the priced-model bucket used to carry, so a model group made only
+  of missing-usage runs shows `cost_usd` `null` with `priced_runs` 0 in `GET /api/stats` and
+  `GET /api/insights` (n/a in the dashboard), not a free `$0.00`.
+- **Insights agent aggregates carry their lower-bound flag (`runledger.server`):** `agents[]` in
+  `GET /api/insights` now returns `priced_runs`, `partial_runs` and `cost_is_lower_bound`, so an agent
+  whose runs are all only partly priced reads `≥ $X` in the dashboard instead of a complete figure.
+- **The compliance report marks a partly priced developer as a lower bound (`runledger.server`):** a
+  developer row in `GET /api/export/report.html` reads `≥ $X` when any of that developer's runs is
+  only partly priced, matching the team figure above it (previously only a run with no cost at all
+  produced a mark).
+- **The dashboard budget card shows `n/a` for an unpriced month and `≥ $X` for a partly priced one
+  (`runledger.server`):** a month whose runs all have unknown costs no longer reads `$0.00 spent`, and
+  a month with partly priced runs is marked `≥`, in both the team figure and the developer rows. The
+  note next to the figure names how many runs it leaves out. The numeric spend behind the alert
+  thresholds and the progress bar is unchanged.
 - **Quality score: an install word inside a test argument no longer hides the run
   (`runledger.quality`):** an install verb (`install`, `uninstall`, `add`, `i`, `remove`)
   disqualifies a segment only when it is a package manager's subcommand in the command word or

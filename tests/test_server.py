@@ -23,6 +23,7 @@ from runledger.server.dashboard import DASHBOARD_HTML
 from runledger.server.db import Database
 
 FIX = Path(__file__).parent / "fixtures" / "sample_session.jsonl"
+DROID_FIX = Path(__file__).parent / "fixtures" / "droid_session.jsonl"
 NATIVE = Path(__file__).parent / "fixtures" / "native_session.json"
 SESSION_ID = "7f3c2a10-9b1e-4c55-a1d2-0e6f8b3c9d42"
 XSS = "<script>alert(1)</script>"
@@ -516,6 +517,84 @@ def test_missing_usage_is_stored_as_unknown_cost(env):
         assert row["tokens"] == 0
         assert row["cost_partial"] is False
     assert _run_row(srv.db.path, "no-usage")["cost"] is None
+
+
+def test_a_droid_session_without_recorded_usage_leaves_its_model_unpriced(env, tmp_path):
+    """A real Droid transcript with a zero-token settings file, pushed through the client: the
+    model and agent groups read n/a, never a priced $0.00 that makes the model look free."""
+    srv, base = env
+    _, key = srv.db.create_team("alpha")
+    session = tmp_path / "droid-missing.jsonl"
+    session.write_bytes(DROID_FIX.read_bytes())
+    session.with_suffix(".settings.json").write_text(
+        json.dumps({"model": "claude-sonnet-4-5",
+                    "tokenUsage": {"inputTokens": 0, "outputTokens": 0}}),
+        encoding="utf-8",
+    )
+    payload = client.build_payload(session, user="dev@example.com")
+    payload["started"], payload["ended"] = "2026-10-15T10:00:00Z", "2026-10-15T10:05:00Z"
+    assert payload["totals"]["usage_source"] == "missing"
+    assert payload["models"] == {"claude-sonnet-4-5": {"tokens": 0, "cost_usd": None}}
+    assert _push(base, key, payload)[0] == 201
+
+    stats = _json(_http(base, "GET", "/api/stats?days=30", headers=_auth(key))[2])
+    assert stats["totals"]["cost_usd"] is None
+    (model,) = stats["by_model"]
+    assert "sonnet" in model["model"].lower() and model["runs"] == 1
+    assert model["cost_usd"] is None and model["priced_runs"] == 0
+    (agent,) = stats["by_agent"]
+    assert agent["agent"] == "Factory Droid"
+    assert agent["cost_usd"] is None and agent["priced_runs"] == 0
+
+    body = _json(_http(base, "GET", "/api/insights?days=30", headers=_auth(key))[2])
+    (model,) = body["models"]
+    assert "sonnet" in model["model"].lower() and model["runs"] == 1
+    assert model["cost_usd"] is None and model["priced_runs"] == 0 and model["cost_per_run"] is None
+    (agent,) = body["agents"]
+    assert agent["agent"] == "Factory Droid"
+    assert agent["cost_usd"] is None and agent["priced_runs"] == 0
+
+
+def test_missing_usage_model_buckets_are_not_priced(env):
+    """An older client still sends the priced-model zero the fix removes: the server normalizes
+    it, so the stored model group stays unpriced instead of a free $0.00."""
+    srv, base = env
+    _, key = srv.db.create_team("alpha")
+    payload = _stored(client.build_payload(FIX, user="dev@example.com"), "droid-unknown", cost=0.0)
+    payload["agent"] = "Factory Droid"
+    payload["totals"] = dict(payload["totals"], tokens=0, cost_usd=0.0, usage_source="missing")
+    payload["models"] = {"claude-sonnet-4-5": {"tokens": 0, "cost_usd": 0.0}}
+    assert _push(base, key, payload)[0] == 201
+
+    stats = _json(_http(base, "GET", "/api/stats?days=30", headers=_auth(key))[2])
+    assert stats["totals"]["cost_usd"] is None
+    (model,) = stats["by_model"]
+    assert "sonnet" in model["model"].lower() and model["runs"] == 1
+    assert model["cost_usd"] is None and model["priced_runs"] == 0
+    (agent,) = stats["by_agent"]
+    assert agent["agent"] == "Factory Droid"
+    assert agent["cost_usd"] is None and agent["priced_runs"] == 0
+
+    body = _json(_http(base, "GET", "/api/insights?days=30", headers=_auth(key))[2])
+    (model,) = body["models"]
+    assert "sonnet" in model["model"].lower() and model["runs"] == 1
+    assert model["cost_usd"] is None and model["priced_runs"] == 0 and model["cost_per_run"] is None
+    (agent,) = body["agents"]
+    assert agent["agent"] == "Factory Droid"
+    assert agent["cost_usd"] is None and agent["priced_runs"] == 0
+
+
+def test_a_reported_zero_keeps_its_model_cost(env):
+    """A run that reports its usage may honestly cost $0.00: the model bucket stays a priced zero."""
+    srv, base = env
+    _, key = srv.db.create_team("alpha")
+    payload = _stored(client.build_payload(FIX, user="dev@example.com"), "reported-zero-model", cost=0.0)
+    payload["totals"] = dict(payload["totals"], tokens=0, cost_usd=0.0, usage_source="messages")
+    payload["models"] = {"claude-sonnet-4-5": {"tokens": 0, "cost_usd": 0.0}}
+    assert _push(base, key, payload)[0] == 201
+    stats = _json(_http(base, "GET", "/api/stats?days=30", headers=_auth(key))[2])
+    (model,) = stats["by_model"]
+    assert model["cost_usd"] == 0.0 and model["priced_runs"] == 1
 
 
 def test_legacy_and_reported_zero_receipts_keep_their_meaning(env):
