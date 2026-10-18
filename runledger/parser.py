@@ -152,6 +152,9 @@ class Run:
     safe: bool = False  # safe.make_safe rewrote paths and masked e-mails for sharing
     # safe.make_safe: the changed files computed before paths were rewritten (summarize.FileChange values)
     frozen_changes: Optional[Dict[str, Any]] = None
+    # receipt.redact_run: the whole-path labels of the raw commands, by step index. Masking a
+    # command takes a spaced drive path apart, so the labels a receipt shows are read before it.
+    show_labels: Optional[Dict[int, Dict[str, str]]] = None
 
     @property
     def duration_seconds(self) -> Optional[float]:

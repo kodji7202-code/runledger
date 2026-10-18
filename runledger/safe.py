@@ -249,6 +249,9 @@ def make_safe(run: Run, risks: Sequence[Risk], root: Optional[str] = None) -> No
     every = {id(r): r for r in list(risks) + [r for s in run.steps for r in s.risks]}
     for r in every.values():
         r.reason = safe_text(labels.show_reason(r.reason, by_step.get(r.step)), ctx)
+    # Those reasons carry their labels now, so a later render has nothing left to label: masking
+    # rewrites the text inside a label, and a second pass would append the path a second time.
+    run.show_labels = {}
     run.quality = _value(run.quality, ctx)
     run.recommendations = _value(run.recommendations, ctx)
     run.ai_review = _value(run.ai_review, ctx)
