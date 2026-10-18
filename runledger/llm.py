@@ -51,12 +51,15 @@ _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 # A home folder in free text. The user name may contain spaces (it runs to a separator, a
 # quote or the end of a word), so no part of it can leave the machine; shell operators and
 # quotes end it, so a command keeps its shape. `~` and `…` paths are left alone, and a URL
-# (`https://host/Users/x`) is not a path start.
+# (`https://host/Users/x`) is not a path start. A separator may be doubled where the text
+# was serialized to JSON, so a nested step input cannot smuggle a home path past this.
 _HOME_WORD = r"[^\s\\/:*?\"<>|,;()\[\]{}&`]+"
+_HOME_SEP = r"[\\/]{1,2}"
 _HOME_PATH_RE = re.compile(
-    r"(?<![\w.~/\\-])(?:[A-Za-z]:[\\/][Uu]sers[\\/]|/(?:[Hh]ome|[Uu]sers)/)"
-    + _HOME_WORD + r"(?:[ \t]+" + _HOME_WORD + r")*?"
-    + r"(?P<rest>[\\/][^\s'\"`<>|;&]*)?",
+    r"(?<![\w.~/\\-])(?:[A-Za-z]:" + _HOME_SEP + r"[Uu]sers" + _HOME_SEP
+    + r"|/(?:[Hh]ome|[Uu]sers)/)"
+    + _HOME_WORD + r"(?:[ \t]+" + _HOME_WORD + r")*"
+    + r"(?P<rest>" + _HOME_SEP + r"[^\s'\"`<>|;&]*)?",
     re.I)
 
 

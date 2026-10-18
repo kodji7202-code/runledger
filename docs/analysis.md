@@ -121,10 +121,14 @@ and the developer and project names used by `push`.
 - **E-mail addresses** become `[EMAIL]`.
 - **Home folders** become `~`: the user name of `C:\Users\<name>`, `/Users/<name>` and `/home/<name>`
   never leaves the machine, and the rest of the path is kept (`C:\Users\ana\app\x.py` is sent as
-  `~\app\x.py`).
+  `~\app\x.py`). A name containing spaces is taken whole, quoted or not
+  (`"C:\Users\Jane Smith\app\x.py"` is sent as `"~\app\x.py"`, not `"~ Smith\app\x.py"`).
 
 `--ai` summaries are masked the same way: the prompts, each step's inputs, each tool result and the
-agent's final message all pass through it. Masking is pattern-based and will miss an unusual secret
+agent's final message all pass through it. A step input is masked at every level before it is written
+as JSON, so a `MultiEdit`'s `edits` list (or any other nested value) is masked too, and the doubling
+of the Windows separators that JSON does cannot hide a path from the check that runs at the API
+boundary. Masking is pattern-based and will miss an unusual secret
 or a path outside a home folder. The data block of a review is also escaped, so a command containing
 `</run_data>` cannot close it: the text arrives as `\u003c/run_data>` and is still readable.
 

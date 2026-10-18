@@ -432,6 +432,10 @@ HOME_WIN = "C:" + "\\" + "Users" + "\\" + "claud" + "\\" + "project" + "\\" + "s
 HOME_MAC = "/" + "Users/bob/app/x"
 HOME_LINUX = "/" + "home/carol/app/y"
 NAMES = ("claud", "bob", "carol")
+SPACED_WIN = "C:" + "\\" + "Users" + "\\" + "Jane Smith" + "\\" + "app" + "\\" + "x.py"
+SPACED_WIN_HOME = "C:" + "\\" + "Users" + "\\" + "Jane Smith"
+SPACED_MAC = "/Users/Jane Smith/app/x"
+SPACED_NAMES = ("Jane", "Smith")
 
 
 def _home_leaks(text):
@@ -463,6 +467,32 @@ def test_scrub_masks_a_windows_home_without_a_trailing_file():
     assert llm.scrub_paths("cd C:/Users/claud && ls") == "cd ~ && ls"
 
 
+def test_scrub_masks_a_home_name_with_spaces():
+    """SGD-011: the whole user name goes, quoted or not, and the rest of the path stays."""
+    assert llm.scrub_paths(f'type "{SPACED_WIN}"') == 'type "~' + "\\app\\x.py\""
+    assert llm.scrub_paths(f"cat '{SPACED_MAC}'") == "cat '~/app/x'"
+    assert llm.scrub_paths(f"cp {SPACED_WIN} D:\\dest && echo done") == "cp ~\\app\\x.py D:\\dest && echo done"
+    assert llm.scrub_paths(f"cd {SPACED_WIN_HOME}") == "cd ~"
+    assert llm.scrub_paths("cd /Users/Jane Smith") == "cd ~"
+    both = llm.scrub(f"echo {SPACED_WIN} {SPACED_MAC}")
+    assert both == "echo ~\\app\\x.py ~/app/x", both
+    assert not any(name in both for name in SPACED_NAMES)
+
+
+def test_scrub_keeps_command_boundaries_after_a_spaced_home():
+    assert llm.scrub_paths(f"cat {SPACED_MAC} && echo done; cd /tmp") == "cat ~/app/x && echo done; cd /tmp"
+    assert llm.scrub_paths(f"cat {SPACED_WIN} | wc -l") == "cat ~\\app\\x.py | wc -l"
+
+
+def test_scrub_masks_a_home_path_inside_json_text():
+    """Serialized JSON doubles the separators; the API-boundary scrub still masks the name."""
+    doubled = json.dumps({"new_string": SPACED_WIN})[len('{"new_string": "'):-2]
+    out = llm.scrub(doubled)
+    assert out == "~\\\\app\\\\x.py", out
+    assert not any(name in out for name in SPACED_NAMES)
+    assert llm.scrub(json.dumps({"command": SPACED_WIN})) == '{"command": "~\\\\app\\\\x.py"}'
+
+
 def test_outgoing_text_masks_emails_and_home_paths(stub):
     text = f"cat {HOME_WIN}; git config user.email ana@example.com; cat {HOME_LINUX}"
     stub.queue()
@@ -485,6 +515,23 @@ def test_summary_prompt_masks_emails_and_home_paths(stub, tmp_path):
     assert _home_leaks(raw) == []
     assert "git config user.email" in raw
     assert run.overall_summary == "Done."
+
+
+def test_summary_prompt_masks_nested_step_inputs(stub, tmp_path):
+    """SGD-012: nested input strings are scrubbed before the step JSON is written."""
+    step = {"tool": "MultiEdit",
+            "input": {"file_path": "src/a.py",
+                      "edits": [{"old_string": "old = 1", "new_string": SPACED_WIN},
+                                {"old_string": "a", "new_string": SPACED_MAC}],
+                      "notes": [SPACED_WIN_HOME, "keep me"]},
+            "model": "claude-haiku-5-5", "result_text": "ok", "is_error": False}
+    run = _native_run(tmp_path, [step])
+    stub.queue(body=message_reply(json.dumps({"overview": "Edited.", "steps": [{"n": 1, "summary": "Edited it."}]})))
+    summarize.ai_summaries(run, api_key=ANTHROPIC_KEY, model="claude-haiku-5-5")
+    raw = stub.requests[0]["raw"]
+    assert not any(name in raw for name in SPACED_NAMES)
+    assert "Users" not in raw
+    assert "old = 1" in raw and "keep me" in raw      # the readable shape stays
 
 
 # ---------------------------------------------------------------- summary JSON (LLM5)

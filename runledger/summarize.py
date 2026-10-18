@@ -211,10 +211,21 @@ def _clip(text: Optional[str], limit: int) -> str:
     return s if len(s) <= limit else s[:limit] + f"…[+{len(s) - limit} chars]"
 
 
+def _scrub_input(value: Any, limit: int) -> Any:
+    """Mask every string in a step input, however deeply it is nested (a MultiEdit's edits,
+    a list of notes), before the JSON is written: serialization doubles the Windows
+    separators, so an unmasked path could no longer be recognized at the API boundary."""
+    if isinstance(value, str):
+        return _clip(value, limit)
+    if isinstance(value, dict):
+        return {llm.scrub(str(key)): _scrub_input(item, limit) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_scrub_input(item, limit) for item in value]
+    return value
+
+
 def _compact_step(s: Step) -> Dict:
-    inp = {}
-    for k, v in s.input.items():
-        inp[k] = _clip(v, 600) if isinstance(v, str) else v
+    inp = {key: _scrub_input(value, 600) for key, value in s.input.items()}
     return {"n": s.index, "tool": s.tool, "input": inp,
             "result": _clip(s.result_text, 400), "error": s.is_error}
 

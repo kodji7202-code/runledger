@@ -46,6 +46,15 @@ change behavior, so read the entry before you upgrade.
   their shape. A review's data block also escapes `<` as `\u003c`, so a command containing
   `</run_data>` cannot close it. `docs/analysis.md`, `docs/quickstart.md` and the README state what
   is masked.
+- **A home folder whose user name contains spaces is masked whole, and nested step inputs are
+  masked before `--ai` writes them as JSON (`runledger.llm`, `runledger.summarize`):** a quoted path
+  such as `"C:\Users\Jane Smith\app\x.py"` or `/Users/Jane Smith/app/x` was masked only up to the
+  first word, leaving ` Smith` in the text sent to Anthropic; the user name is now consumed to the
+  separator or quote, so both read `"~\app\x.py"` and `~/app/x`. A step input is masked at every
+  level before serialization, so a `MultiEdit`'s `edits` (and the doubled Windows separators that
+  JSON produces) can no longer carry a complete home path into an `--ai` request. The check at the
+  API boundary also recognizes a path whose separators were doubled, and command boundaries are
+  kept: `cat ~/app/x && ls` still sends `&& ls`.
 - **The dashboard reads a second, read-only connection, and a backup no longer stops writes
   (`runledger.server`):** reports, stats, insights, the run list and the exports read from their own
   read-only connection (`file:...?mode=ro`), so a long report or a `runledger backup` running beside
