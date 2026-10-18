@@ -438,6 +438,30 @@ def test_self_hosting_restore_recipes_match_the_backup_script():
     assert not re.search(r"^docker compose down -v", restore, re.M)
 
 
+def test_self_hosting_tar_restore_reads_the_archive_the_backup_writes():
+    """SGD-022: the whole-volume restore names the archive the backup command writes
+    (runledger-data-YYYY-MM-DD.tgz), checks it before the volume is removed, and stops before
+    the restart when the extraction fails."""
+    text = (ROOT / "docs" / "self-hosting.md").read_text(encoding="utf-8")
+    backup = text[text.index("**Whole data volume.**"):text.index("**Restore.**")]
+    restore = text[text.index("**Whole data volume (tar).**"):text.index("## Upgrades")]
+    assert "runledger-data-$(date +%F).tgz" in backup, "the backup writes a YYYY-MM-DD name"
+    # The same YYYY-MM-DD name in the restore, never the compact YYYYMMDD one.
+    assert re.search(r"runledger-data-\d{4}-\d{2}-\d{2}\.tgz", restore)
+    assert not re.search(r"runledger-data-\d{8}\.tgz", restore)
+    # The archive is listed before the volume is removed, so a missing one stops the recipe.
+    listing = restore.index("tar tzf")
+    removal = restore.index("docker volume rm deploy_runledger-data")
+    assert listing < removal, "check the archive before deleting the volume"
+    # One shell with `set -e`: a failed extraction ends the script before the stack starts again.
+    start = restore.index("sh -c '") + len("sh -c '")
+    script = restore[start:restore.index("'", start)]
+    assert "set -e" in script
+    assert script.index("docker volume rm") < script.index("tar xzf")
+    assert script.index("tar xzf") < script.index("docker compose up -d")
+    assert "chown -R runledger:runledger /data" in script
+
+
 def test_license_file_is_apache_2_0():
     text = (ROOT / "LICENSE").read_text(encoding="utf-8")
     assert "Apache License" in text

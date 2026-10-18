@@ -48,19 +48,28 @@ MAX_RETRY_AFTER_S = 60.0     # a longer retry-after is cut to this
 ERROR_TEXT_CHARS = 300
 _LOOPBACK = {"127.0.0.1", "localhost", "::1"}
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
-# A home folder in free text. The user name may contain spaces (it runs to a separator, a
-# quote or the end of a word), so no part of it can leave the machine; shell operators and
-# quotes end it, so a command keeps its shape. `~` and `…` paths are left alone, and a URL
-# (`https://host/Users/x`) is not a path start. A separator may be doubled where the text
-# was serialized to JSON, so a nested step input cannot smuggle a home path past this.
-_HOME_WORD = r"[^\s\\/:*?\"<>|,;()\[\]{}&`]+"
+# A home folder in free text. The user name may contain spaces or a parenthesized word
+# ('Jane (Smith)'), and it runs to a separator, a quote or the end of a word, so no part of
+# it can leave the machine; shell operators and quotes end it, so a command keeps its shape.
+# `~` and `…` paths are left alone, and a URL (`https://host/Users/x`) is not a path start. A
+# separator may be doubled where the text was serialized to JSON, so a nested step input
+# cannot smuggle a home path past this.
+_HOME_WORD = r"[^\s\\/:*?\"<>|,;\[\]{}&`]+"
 _HOME_SEP = r"[\\/]{1,2}"
+_HOME_PREFIX = (r"(?:[A-Za-z]:" + _HOME_SEP + r"[Uu]sers" + _HOME_SEP
+                + r"|/(?:[Hh]ome|[Uu]sers)/)")
+_HOME_REST = r"(?P<rest>" + _HOME_SEP + r"[^\s'\"`<>|;&]*)?"
 _HOME_PATH_RE = re.compile(
-    r"(?<![\w.~/\\-])(?:[A-Za-z]:" + _HOME_SEP + r"[Uu]sers" + _HOME_SEP
-    + r"|/(?:[Hh]ome|[Uu]sers)/)"
-    + _HOME_WORD + r"(?:[ \t]+" + _HOME_WORD + r")*"
-    + r"(?P<rest>" + _HOME_SEP + r"[^\s'\"`<>|;&]*)?",
+    r"(?<![\w.~/\\-])" + _HOME_PREFIX
+    + _HOME_WORD + r"(?:[ \t]+" + _HOME_WORD + r")*" + _HOME_REST,
     re.I)
+# The same path inside quotes, where no shell delimiter ends the name: it runs to the next
+# path separator or the closing quote, so punctuation in a real folder name ('Jane (Smith)')
+# goes whole. The other quote character stays a legal name character.
+_QUOTED_HOME_PATH_RES = (
+    re.compile(r'(?<=")' + _HOME_PREFIX + r'[^\\/"\r\n]+' + _HOME_REST, re.I),
+    re.compile(r"(?<=')" + _HOME_PREFIX + r"[^\\/'\r\n]+" + _HOME_REST, re.I),
+)
 
 
 class LLMError(RuntimeError):
@@ -84,8 +93,17 @@ def redact(text: Any, emails: bool = False) -> str:
 
 def scrub_paths(text: Any) -> str:
     """Mask home folders in free text: the user name of `C:\\Users\\<name>`, `/Users/<name>`
-    or `/home/<name>` becomes `~`, keeping the rest of the path."""
-    return _HOME_PATH_RE.sub(lambda m: "~" + (m.group("rest") or ""), "" if text is None else str(text))
+    or `/home/<name>` becomes `~`, keeping the rest of the path. A quoted path is masked
+    first, where the name runs to the next separator instead of to a shell delimiter."""
+    s = "" if text is None else str(text)
+    for pattern in _QUOTED_HOME_PATH_RES:
+        s = pattern.sub(_mask_home, s)
+    return _HOME_PATH_RE.sub(_mask_home, s)
+
+
+def _mask_home(match: "re.Match[str]") -> str:
+    """`~` plus the part of the path the pattern kept separately."""
+    return "~" + (match.group("rest") or "")
 
 
 def scrub(text: Any) -> str:

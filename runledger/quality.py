@@ -101,10 +101,13 @@ _TIMESTAMP_PREFIX = (
 # or spaces then stays linear instead of backtracking quadratically).
 _LOG_PREFIX = (r"(?:(?:" + _SERVICE_PREFIX + r")?" + _TIMESTAMP_PREFIX
                + r"|" + _SERVICE_PREFIX + r")")
+# pytest appends its own elapsed time, `(H:MM:SS)`, to the summary of a session that ran for
+# at least a minute. Only that bounded shape is accepted after the seconds.
+_ELAPSED_SUFFIX = r"(?:[ \t]*\(\d{1,4}:\d{2}:\d{2}\))?"
 _PYTEST_SUMMARY = re.compile(
     r"^[\s=]*(?:(?:" + _LOG_PREFIX + r")[\s=]*)?(?:" + _COUNT_PHRASE + r")"
     r"(?:[\s,|]+" + _COUNT_PHRASE + r")*"
-    r"\s+in\s+\d+(?:\.\d+)?s[\s=]*$")
+    r"\s+in\s+\d+(?:\.\d+)?s" + _ELAPSED_SUFFIX + r"[\s=]*$")
 _MOCHA_SUMMARY = re.compile(r"^\s*\d+\s+(?:passing|failing|pending)\b")
 # A count read out of a line fragment. The `(?<!\d)` keeps a long digit run from being
 # rescanned from every digit: without it a 20 KB line of digits backtracks for seconds.
@@ -222,6 +225,30 @@ def _head_word(word: str) -> str:
     return w[:-4] if w.endswith(".exe") else w
 
 
+def _split_words(segment: str) -> List[str]:
+    """The words of one shell segment, split on unquoted whitespace only: a quoted executable
+    keeps its spaces (`& "C:\\Program Files\\Python312\\python.exe" -m pytest` is one word).
+    Quotes stay in the word; _head_word strips them."""
+    words: List[str] = []
+    word: List[str] = []
+    quote = ""
+    for ch in segment:
+        if quote:
+            if ch == quote:
+                quote = ""
+        elif ch in "'\"":
+            quote = ch
+        elif ch.isspace():
+            if word:
+                words.append("".join(word))
+                word = []
+            continue
+        word.append(ch)
+    if word:
+        words.append("".join(word))
+    return words
+
+
 def _test_script(rest: List[str]) -> bool:
     """`test`, `run test` or `run test:unit`: a package manager's test script, not a mention."""
     if not rest:
@@ -301,7 +328,7 @@ def _test_runner(command: str) -> Optional[str]:
     """The test runner a shell command runs, or None when it only installs, inspects or
     mentions one. Each `&&`/`;`/`|`/newline segment is judged on its own command word."""
     for segment in re.split(r"&&|\|\||;|\||\n", command):
-        words = segment.split()
+        words = _split_words(segment)
         if not words or _inspecting(words):
             continue
         runner = _runner_of(words)

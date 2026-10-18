@@ -46,15 +46,17 @@ change behavior, so read the entry before you upgrade.
   their shape. A review's data block also escapes `<` as `\u003c`, so a command containing
   `</run_data>` cannot close it. `docs/analysis.md`, `docs/quickstart.md` and the README state what
   is masked.
-- **A home folder whose user name contains spaces is masked whole, and nested step inputs are
-  masked before `--ai` writes them as JSON (`runledger.llm`, `runledger.summarize`):** a quoted path
-  such as `"C:\Users\Jane Smith\app\x.py"` or `/Users/Jane Smith/app/x` was masked only up to the
-  first word, leaving ` Smith` in the text sent to Anthropic; the user name is now consumed to the
-  separator or quote, so both read `"~\app\x.py"` and `~/app/x`. A step input is masked at every
-  level before serialization, so a `MultiEdit`'s `edits` (and the doubled Windows separators that
-  JSON produces) can no longer carry a complete home path into an `--ai` request. The check at the
-  API boundary also recognizes a path whose separators were doubled, and command boundaries are
-  kept: `cat ~/app/x && ls` still sends `&& ls`.
+- **A home folder whose user name contains spaces or punctuation is masked whole, and nested step
+  inputs are masked before `--ai` writes them as JSON (`runledger.llm`, `runledger.summarize`):** a
+  quoted path such as `"C:\Users\Jane Smith\app\x.py"` or `/Users/Jane Smith/app/x` was masked only
+  up to the first word, leaving ` Smith` in the text sent to Anthropic; the user name is now consumed
+  to the separator or quote, so both read `"~\app\x.py"` and `~/app/x`. Inside quotes the name runs
+  to the next path separator, so a folder named `Jane (Smith)` goes whole
+  (`"C:\Users\Jane (Smith)\app\x.py"` sends `"~\app\x.py"`), and the same name is masked when it
+  appears unquoted. A step input is masked at every level before serialization, so a `MultiEdit`'s
+  `edits` (and the doubled Windows separators that JSON produces) can no longer carry a complete
+  home path into an `--ai` request. The check at the API boundary also recognizes a path whose
+  separators were doubled, and command boundaries are kept: `cat ~/app/x && ls` still sends `&& ls`.
 - **The dashboard reads a second, read-only connection, and a backup no longer stops writes
   (`runledger.server`):** reports, stats, insights, the run list and the exports read from their own
   read-only connection (`file:...?mode=ro`), so a long report or a `runledger backup` running beside
@@ -165,12 +167,15 @@ change behavior, so read the entry before you upgrade.
 
 - **Test runs are read from PowerShell call-operator commands and from real summary lines only
   (`runledger.quality`):** `& pytest -q` and `& "C:\Python312\python.exe" -m pytest -q` are runs
-  again, with their outcome at score level, while a literal mention (`echo pytest`, `& echo pytest`)
-  still earns nothing. A line counts as a runner summary only when it has a summary shape (counts
-  and a timing and nothing else), so `retried after 3 errors in 0.10s` no longer turns a following
-  `3 passed in 0.20s` into a failure, and free-text error counts stay ignored. The v0.6.0 fallback
-  for an explicit failed count is back: `2 failed, 3 passed` without a timing marks the run failed
-  even when the step reports no error, while unreadable output (`Done.`) stays unknown.
+  again, with their outcome at score level, and a quoted executable keeps its spaces, so
+  `& "C:\Program Files\Python312\python.exe" -m pytest -q` counts too, while a literal mention
+  (`echo pytest`, `& echo pytest`, `echo "C:\Program Files\Python312\python.exe" -m pytest`) still
+  earns nothing. A line counts as a runner summary only when it has a summary shape (counts and a
+  timing and nothing else), so `retried after 3 errors in 0.10s` no longer turns a following
+  `3 passed in 0.20s` into a failure, and free-text error counts stay ignored. Pytest's own elapsed
+  suffix is part of that shape: `==== 3 passed in 75.12s (0:01:15) ====` parses again. The v0.6.0
+  fallback for an explicit failed count is back: `2 failed, 3 passed` without a timing marks the run
+  failed even when the step reports no error, while unreadable output (`Done.`) stays unknown.
 
 - **A failed Opus escalation keeps the first review (`runledger.review`):** when
   `RUNLEDGER_ESCALATE_OPUS=1` re-runs a `dangerous` verdict on Opus and that call fails, the receipt
@@ -560,7 +565,12 @@ change behavior, so read the entry before you upgrade.
   owner-only and the helpers run as root. The volume archive is now described as the data volume
   only: Caddy's certificates live in the separate `caddy-data` and `caddy-config` volumes, and the
   clean restore removes that one volume instead of `docker compose down -v`, which would delete
-  volumes the archive does not hold. `docs/analysis.md` states which provider names are skipped,
+  volumes the archive does not hold. The whole-volume tar restore reads the archive the backup
+  command writes (`runledger-data-YYYY-MM-DD.tgz`, not a compact date), lists it with `tar tzf`
+  before the volume is removed, and runs the removal, extraction, ownership and restart in one
+  `sh -c` with `set -e`, so a missing or unreadable archive stops the recipe before anything is
+  deleted and a failed extraction stops it before the server starts on an empty volume.
+  `docs/analysis.md` states which provider names are skipped,
   that a colon elsewhere is part of a file name, and that a `[System.IO.File]` call counts anywhere
   in a command.
 

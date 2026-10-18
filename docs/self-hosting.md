@@ -355,6 +355,10 @@ docker run --rm -v deploy_runledger-data:/data -v "$PWD":/backup alpine \
 docker compose up -d
 ```
 
+The archive is named `runledger-data-<date>.tgz`, with the date in `YYYY-MM-DD` form
+(`date +%F`), for example `runledger-data-2026-10-18.tgz`. The restore recipe below reads that same
+name.
+
 If you also want the certificates, archive those two volumes the same way. Caddy asks Let's
 Encrypt for them again on the next start, so you need that only to stay away from the request
 limits.
@@ -409,19 +413,31 @@ With `docker compose -p myproject ...` the volume is `myproject_runledger-data` 
 `docker build -t <name> .`, use `<name>` in the second command.
 
 **Whole data volume (tar).** Restore the archive from the "Whole data volume" backup into the
-volume, again with the stack stopped. For a clean restore of an old archive, remove the data volume
-first, if you no longer need what it holds. Remove that one volume only; `docker compose down -v`
-would also delete the `caddy-data` and `caddy-config` volumes, which this archive does not hold:
+volume, again with the stack stopped. The backup command names the archive with `date +%F`, so the
+file is `runledger-data-YYYY-MM-DD.tgz`; name the file you actually took the same way
+(`runledger-data-2026-10-18.tgz` below is one example). Check that it is there and readable before
+anything is deleted, then let one `sh -c` with `set -e` do the destructive work: it removes the old
+data volume, extracts the archive, hands the files back to the service user and only then starts the
+stack again, so a failed extraction stops the recipe instead of starting the server on an empty
+volume. Remove that one volume only; `docker compose down -v` would also delete the `caddy-data` and
+`caddy-config` volumes, which this archive does not hold:
 
 ```bash
 cd deploy
 docker compose down
+archive=runledger-data-2026-10-18.tgz     # the YYYY-MM-DD name the backup command wrote
+test -r "$archive"                        # stop here if the archive is missing or unreadable
+docker run --rm -v "$PWD":/backup alpine tar tzf "/backup/$archive" > /dev/null
+sh -c '
+set -e
+archive=$1
 docker volume rm deploy_runledger-data
 docker run --rm -v deploy_runledger-data:/data -v "$PWD":/backup alpine \
-  sh -c "cd /data && tar xzf /backup/runledger-data-20261018.tgz"
+  tar xzf "/backup/$archive"
 docker run --rm --user root -v deploy_runledger-data:/data --entrypoint sh deploy-runledger \
   -c "chown -R runledger:runledger /data && chmod 700 /data"
 docker compose up -d
+' sh "$archive"
 ```
 
 The archive holds what the volume held when it was taken, with the files' own modes (the database
@@ -429,7 +445,10 @@ is `0600`), and extracting it overwrites the files in the volume with the archiv
 touch Caddy's volumes, so the certificates are still there. `tar` runs as `root` here, so the
 extracted files belong to `root` and the last helper hands them back to the `runledger` user that
 the server runs as. `docker volume rm` refuses while a container still uses the volume, which is why
-the stack is stopped first.
+the stack is stopped first; if a first attempt already removed the volume, that command fails and
+`set -e` stops there, so create it back with `docker volume create deploy_runledger-data` and run the
+recipe again. If the extraction fails, `set -e` stops the shell before `docker compose up -d`, so the
+server never starts on a half-restored volume: fix the archive and run the recipe again.
 
 ## Upgrades
 
