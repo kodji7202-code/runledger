@@ -682,6 +682,15 @@ Max-Age=43200` (plus `Secure` over HTTPS). On failure it returns the sign-in pag
 and the failure counts toward the rate limit. A successful sign-in is recorded in the audit log as
 `auth.sign_in`, with the role and the client address.
 
+A browser request that comes from another origin is refused with `403 cross_site`, before the body is
+read, with no cookie and no session: `Sec-Fetch-Site: cross-site` or `same-site` (another port, scheme
+or subdomain is a different origin), or, when that header is absent, an `Origin` header that is not
+this server's own origin (`null` included). `Sec-Fetch-Site: same-origin` is accepted on its own,
+because this server sends `Referrer-Policy: no-referrer` and Chromium then serializes the `Origin` of
+the dashboard's own form POST as `null`. A request with neither header (curl, `runledger`, any
+non-browser client) signs in as before, and the server writes a warning line that never contains the
+key.
+
 ### `GET /?key=<key>`
 
 Legacy sign-in, kept for links printed by `runledger serve` and `team create`. It is deprecated (the
@@ -717,6 +726,7 @@ There is no sign-out endpoint. Revoke or rotate the key to end a session.
 | 403 | `forbidden` | The role is too low for the action. The message names the role needed. |
 | 403 | `self_approval` | The same authenticated key requested and attempted to decide an approval. |
 | 403 | `csrf_required` | A cookie-authenticated change lacks `X-Requested-With: runledger`. |
+| 403 | `cross_site` | `POST /session` came from another origin (`Origin` or `Sec-Fetch-Site`). |
 | 404 | `not_found` | No such endpoint, run, approval or key. |
 | 405 | `method_not_allowed` | The path does not accept this method. The `Allow` header lists the allowed ones. |
 | 409 | `already_decided` | The approval was already approved or denied. |

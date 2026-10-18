@@ -29,8 +29,8 @@ XSS = "<script>alert(1)</script>"
 
 
 @contextmanager
-def running_server(db_path):
-    srv = make_server(str(db_path), host="127.0.0.1", port=0)
+def running_server(db_path, **kwargs):
+    srv = make_server(str(db_path), host="127.0.0.1", port=0, **kwargs)
     thread = threading.Thread(target=srv.serve_forever, daemon=True)
     thread.start()
     try:
@@ -791,6 +791,119 @@ def test_post_login_sets_cookie_and_redirects(env):
     )
     assert status == 401 and "set-cookie" not in headers
     assert b"not recognized" in page
+
+
+def _sessions(db_path):
+    """How many dashboard sessions the database holds (the tokens themselves are hashed)."""
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        return conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+
+
+def _sign_in_form(key):
+    """The body and headers of the sign-in form the dashboard page posts."""
+    return urlencode({"key": key}).encode(), {"Content-Type": "application/x-www-form-urlencoded"}
+
+
+def test_cross_site_sign_in_post_is_refused(env, tmp_path, capsys):
+    srv, base = env
+    db_path = tmp_path / "rl.db"
+    port = srv.server_address[1]
+    _, admin_a = srv.db.create_team("alpha")
+    _, admin_b = srv.db.create_team("beta")
+    body, form = _sign_in_form(admin_b)
+    capsys.readouterr()
+
+    cross_site = [
+        {"Origin": "http://evil.example"},
+        {"Origin": "null"},  # a sandboxed page or a local file
+        {"Origin": "null", "Sec-Fetch-Site": "none"},
+        {"Sec-Fetch-Site": "cross-site"},
+        {"Sec-Fetch-Site": "same-site"},  # a different port or a subdomain is another origin
+        {"Origin": f"http://127.0.0.1:{port + 1}", "Sec-Fetch-Site": "same-site"},
+        {"Origin": f"https://127.0.0.1:{port}"},  # right host, wrong scheme
+    ]
+    for extra in cross_site:
+        status, headers, raw = _http(base, "POST", "/session", body=body, headers={**form, **extra})
+        assert status == 403, extra
+        assert "set-cookie" not in headers, extra
+        assert _json(raw)["error"]["code"] == "cross_site"
+        assert headers["connection"] == "close"
+
+    assert _sessions(db_path) == 0  # no session row for a refused sign-in
+    assert _http(base, "GET", "/api/me", headers=_auth(admin_b))[0] == 200  # the key itself still works
+    err = capsys.readouterr().err
+    assert "cross-site sign-in" in err and admin_b not in err
+
+    # A session cookie that arrives anyway (a hand-made request; a browser sends none cross-site)
+    # is not replaced either.
+    _, headers, _ = _http(base, "POST", "/session", body=urlencode({"key": admin_a}).encode(), headers=form)
+    cookie_a = headers["set-cookie"].split(";")[0]
+    status, headers, _ = _http(
+        base, "POST", "/session", body=body,
+        headers={**form, "Cookie": cookie_a, "Origin": "http://evil.example"},
+    )
+    assert status == 403 and "set-cookie" not in headers
+    assert _sessions(db_path) == 1
+    me = _json(_http(base, "GET", "/api/me", headers={"Cookie": cookie_a})[2])
+    assert me["team"]["name"] == "alpha"
+
+
+def test_same_origin_and_headerless_sign_in_post_still_works(env, tmp_path):
+    srv, base = env
+    db_path = tmp_path / "rl.db"
+    port = srv.server_address[1]
+    _, admin = srv.db.create_team("alpha")
+    body, form = _sign_in_form(admin)
+
+    allowed = [
+        {"Origin": f"http://127.0.0.1:{port}", "Sec-Fetch-Site": "same-origin"},
+        # What Chromium really sends for the dashboard form: this server's Referrer-Policy
+        # no-referrer serializes the Origin of a same-origin form POST as "null" (Chrome 155).
+        {"Origin": "null", "Sec-Fetch-Site": "same-origin"},
+        {"Sec-Fetch-Site": "same-origin"},
+        {"Sec-Fetch-Site": "none"},  # a typed address or a bookmark
+        {"Host": "127.0.0.1", "Origin": "http://127.0.0.1"},  # the scheme's default port
+        {},  # curl, an agent, any non-browser client
+    ]
+    for extra in allowed:
+        status, headers, _ = _http(base, "POST", "/session", body=body, headers={**form, **extra})
+        assert status == 302 and headers["location"] == "/", extra
+        cookie = headers["set-cookie"]
+        assert "HttpOnly" in cookie and "SameSite=Strict" in cookie, extra
+    assert _sessions(db_path) == len(allowed)
+
+
+def test_sign_in_origin_check_follows_the_trusted_proxy_setting(tmp_path):
+    with running_server(tmp_path / "proxy.db", trust_proxy=True, trusted_proxies=["127.0.0.1"]) as (srv, base):
+        _, admin = srv.db.create_team("alpha")
+        body, form = _sign_in_form(admin)
+        proxy = {"Host": "runledger.example.com", "X-Forwarded-Proto": "https"}
+
+        status, headers, _ = _http(base, "POST", "/session", body=body, headers={
+            **form, **proxy, "Origin": "https://runledger.example.com", "Sec-Fetch-Site": "same-origin",
+        })
+        assert status == 302 and "set-cookie" in headers
+        assert "Secure" in headers["set-cookie"]  # the trusted proxy reports https, as before
+
+        for origin in (
+            "http://runledger.example.com",  # the scheme the proxy reports is the one to match
+            "https://evil.example",
+            "https://runledger.example.com.evil.example",
+            "https://runledger.example.com:8443",
+        ):
+            status, headers, _ = _http(base, "POST", "/session", body=body, headers={**form, **proxy, "Origin": origin})
+            assert status == 403, origin
+            assert "set-cookie" not in headers, origin
+
+    # Without --trust-proxy the forwarded protocol is not believed, so the scheme stays http.
+    with running_server(tmp_path / "plain.db") as (srv, base):
+        _, admin = srv.db.create_team("alpha")
+        body, form = _sign_in_form(admin)
+        status, headers, _ = _http(base, "POST", "/session", body=body, headers={
+            **form, "Host": "runledger.example.com", "X-Forwarded-Proto": "https",
+            "Origin": "https://runledger.example.com",
+        })
+        assert status == 403 and "set-cookie" not in headers
 
 
 def test_query_key_redirect_strips_key(env):

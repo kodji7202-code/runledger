@@ -26,7 +26,8 @@
   GET  /api/export/audit.csv[?days=30]        audit log as CSV (admin)
   GET  /api/export/report.html[?days=30]      printable compliance report (admin)
   GET  /                                      dashboard; sign in with the form, which posts the key
-  POST /session                               sign in: form field "key" -> session cookie (302)
+  POST /session                               sign in: form field "key" -> session cookie (302);
+                                              from another origin (Origin/Sec-Fetch-Site) -> 403
   GET  /?key=API_KEY                          legacy sign-in: redirects to strip the key; never
                                               replaces a session of another team without confirmation
   GET  /health                                liveness, no auth
@@ -88,6 +89,9 @@ SEVERITIES = ("low", "medium", "high")
 USAGE_SOURCES = ("messages", "settings", "missing")
 CSRF_HEADER = "X-Requested-With"
 CSRF_VALUE = "runledger"
+# Sec-Fetch-Site values that mean the request comes from another origin. "same-site" is another
+# origin by definition (another port or scheme, or a subdomain), so a sign-in POST is refused too.
+CROSS_ORIGIN_FETCH_SITES = ("cross-site", "same-site")
 PUBLIC_URL_ENV = "RUNLEDGER_PUBLIC_URL"
 SECURE_COOKIES_ENV = "RUNLEDGER_SECURE_COOKIES"
 TRUSTED_PROXIES_ENV = "RUNLEDGER_TRUSTED_PROXIES"
@@ -817,8 +821,49 @@ class _Handler(BaseHTTPRequestHandler):
         nonce = secrets.token_urlsafe(16)
         self._send_html(200, DASHBOARD_HTML.replace("__CSP_NONCE__", nonce), {"Content-Security-Policy": _page_csp(nonce)})
 
+    def _refuse_cross_origin_sign_in(self) -> None:
+        """Refuse a sign-in POST that a browser marks as coming from another origin.
+
+        The session cookie is SameSite=Strict, so a cross-site form arrives without the cookie
+        the visitor already holds: the server cannot show the confirmation page (see
+        _switch_team_page) and the Set-Cookie that would follow replaces the visitor's session
+        for another team. A browser describes a POST with Origin and Sec-Fetch-Site, so a
+        mismatch is refused here, before the body is read.
+
+        Sec-Fetch-Site is the browser's own statement and page script cannot set it, so
+        "same-origin" is trusted on its own: every response carries `Referrer-Policy:
+        no-referrer`, which makes Chromium serialize the Origin of a same-origin form POST as
+        "null" (measured with Chrome 155). Without the header, the Origin is compared with the
+        Host header at the scheme the server believes the client used, so a request behind a
+        reverse proxy still matches when the server already trusts X-Forwarded-Proto (see
+        RunLedgerServer.secure_for). A client that sends neither header is not a browser (curl,
+        an agent) and keeps working."""
+        site = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
+        if site in CROSS_ORIGIN_FETCH_SITES:
+            self._refuse_sign_in(f"Sec-Fetch-Site: {site}")
+        if site == "same-origin":
+            return
+        origin = self.headers.get("Origin")
+        if origin is None:
+            return
+        host = (self.headers.get("Host") or "").strip()
+        scheme = "https" if self._secure() else "http"
+        if not host or not _same_origin(origin, scheme, host):
+            self._refuse_sign_in(f"Origin: {_log_text(origin)}")
+
+    def _refuse_sign_in(self, reason: str) -> None:
+        """403 without a cookie and without a session row. The line names the header that
+        refused the request, never the key."""
+        sys.stderr.write(f"warning: refused a cross-site sign-in POST ({reason})\n")
+        raise _HttpError(
+            403, "cross_site",
+            "Sign-in must come from this site. Open the dashboard in a new tab and use the form there.",
+            {"Connection": "close"},
+        )
+
     def _session_post(self) -> None:
         """The sign-in form: the key travels in the body, never in the URL."""
+        self._refuse_cross_origin_sign_in()
         length = self._content_length(SIGN_IN_BODY_LIMIT, "Sign-in forms")
         raw = self.rfile.read(length) if length else b""
         fields = parse_qs(raw.decode("utf-8", "replace"), keep_blank_values=True)
@@ -1083,6 +1128,34 @@ def _attested_identity(ident: Identity) -> str:
     source = "dashboard" if ident.via == "session" else "api"
     key_ref = ident.prefix or ident.key_id
     return f"{source}: {ident.label} ({key_ref})"
+
+
+def _same_origin(origin: str, scheme: str, host: str) -> bool:
+    """Whether an Origin header names exactly the scheme and host of this request. "null", an
+    opaque origin, and a value without a scheme are never this request's origin."""
+    parts = urlsplit(origin.strip())
+    if parts.scheme.lower() != scheme or not parts.netloc:
+        return False
+    return _authority(parts.netloc, scheme) == _authority(host, scheme)
+
+
+def _authority(value: str, scheme: str) -> Tuple[str, str]:
+    """A Host header or an origin's authority as (host, port), lower-cased, with the scheme's
+    default port filled in, so `example.com` and `example.com:443` compare equal."""
+    text = value.strip().lower()
+    if text.startswith("["):  # an IPv6 literal, with or without a port
+        host, _, rest = text[1:].partition("]")
+        port = rest[1:] if rest.startswith(":") else ""
+    elif text.count(":") == 1:
+        host, _, port = text.partition(":")
+    else:
+        host, port = text, ""
+    return host, port or ("443" if scheme == "https" else "80")
+
+
+def _log_text(value: str, limit: int = 120) -> str:
+    """Header text for a log line: printable ASCII only, one line, bounded."""
+    return re.sub(r"[^\x20-\x7e]", "?", value.strip())[:limit]
 
 
 def _page_csp(nonce: str) -> str:

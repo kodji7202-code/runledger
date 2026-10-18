@@ -329,6 +329,20 @@ change behavior, so read the entry before you upgrade.
 
 ### Security
 
+- **A cross-site form cannot sign the browser in to another team (`runledger.server`):** `POST /session`
+  now refuses a request that a browser marks as coming from another origin, before the body is read,
+  with `403 cross_site`, no cookie and no session row, and a warning line on the server's stderr that
+  never contains the key. `Sec-Fetch-Site: cross-site` and `same-site` are refused (another port,
+  scheme or subdomain is a different origin, which is what a page on a second loopback port sends),
+  and so is an `Origin` header that is not this server's own origin, `null` included, when compared at
+  the scheme the server believes the client used (so a reverse proxy it already trusts for
+  `X-Forwarded-Proto` matches). A `Sec-Fetch-Site: same-origin` request is accepted without comparing
+  the Origin, because every response carries `Referrer-Policy: no-referrer` and Chromium then
+  serializes the Origin of the dashboard's own form POST as `null` (measured with Chrome 155). Because
+  the session cookie is `SameSite=Strict`, a cross-site form arrives without the cookie the visitor
+  holds, so the confirmation page could not be shown and the cookie it set replaced the visitor's
+  session; that request is now refused instead. Same-origin sign-ins (the dashboard form) and clients
+  that send neither header (curl, `runledger` and other non-browser callers) are unchanged.
 - **Writes are authenticated before their body is read, and the failed-key limiter has a real memory
   cap (`runledger.server`):** every endpoint that needs a role (`POST /api/runs`, `POST /api/approvals`,
   `POST /api/approvals/<id>/decision`, `PUT /api/team/settings`, `POST /api/keys`, `PUT /api/budgets`)
