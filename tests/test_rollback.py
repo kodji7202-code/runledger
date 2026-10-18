@@ -1079,10 +1079,12 @@ def test_checkpoint_hook_rejects_attached_shell_operators(command):
     '"/usr/$(printf bin)/python3.13t" -m runledger checkpoint --hook',
     '"/usr/`printf bin`/python3.13t" -m runledger checkpoint --hook',
     '"$PYTHON3" -m runledger checkpoint --hook',
+    r'"/usr/\$python/python3.13t" -m runledger checkpoint --hook',
 ])
 def test_checkpoint_hook_rejects_executable_substitutions(command):
     """CORE-SCR-R4-004: an executable word with a `$` or a backtick computes its own path even
-    inside double quotes, so it is a foreign entry and stays untouched."""
+    inside double quotes, so it is a foreign entry and stays untouched. A backslash-escaped `$`
+    counts as an operator too, the conservative reading of the same rule."""
     assert rollback.is_checkpoint_hook({"type": "command", "command": command}) is False
 
 
