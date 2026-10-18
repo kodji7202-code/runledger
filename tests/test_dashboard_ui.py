@@ -293,6 +293,28 @@ def test_filters_are_written_to_the_url_hash_and_restored_from_it():
     assert "filterValues()" in js                          # a hash the user edits is applied too
 
 
+def test_switching_views_never_clears_the_run_filters():
+    """SGD-007: another view's hash carries no query, so restoring from it wiped the filter bar."""
+    js = _script(DASHBOARD_HTML)
+    assert 'function onRunsRoute() { return currentRoute() === "runs"; }' in js
+
+    # The filter bar is restored in exactly one place, and that place is the runs view only.
+    restore = js[js.index("function restoreRunFilters() {"):]
+    restore = restore[:restore.index("\n  }")]
+    assert "if (!onRunsRoute()) { return; }" in restore, restore
+    assert "applyFilterHash();" in restore, restore
+    assert js.count("applyFilterHash();") == 1, js.count("applyFilterHash();")
+    assert "restoreRunFilters();" in js[js.index('window.addEventListener("hashchange"'):]
+    assert "restoreRunFilters();" in js[js.index("  // Start"):]   # on load, before the first query
+
+    # A filter edit landing after the user switched view must not rewrite that view's hash;
+    # doing so would flip the page back to runs and drop the view the user asked for.
+    write = js[js.index("function writeFilterHash() {"):]
+    write = write[:write.index("\n  }")]
+    assert "if (!onRunsRoute()) { return; }" in write, write
+    assert 'if (location.hash !== hash) { location.hash = hash; }' in write
+
+
 def test_polling_pauses_while_hidden_and_backs_off_after_a_failure():
     js = _script(DASHBOARD_HTML)
     assert "var APPROVAL_POLL_MS = 3000;" in js

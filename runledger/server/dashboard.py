@@ -7,7 +7,9 @@ API with cookie credentials; every POST or PUT sends X-Requested-With, which a
 cross-site form cannot set.
 
 Views are switched by location hash (#runs, #insights, #approvals, and for admins #keys,
-#audit, #settings), and the runs filters live in that hash too, so a reload keeps them. Members
+#audit, #settings), and the runs filters live in that hash too, so a reload keeps them. Only the
+runs route reads or writes that query: switching to another view leaves the filter bar untouched,
+and returning to runs writes the filters back into the hash. Members
 and viewers never see the admin-only panels: the page hides their tabs, and the panels the API
 refuses with 403 (the budget card, the export links) hide themselves. The Insights view reads
 /api/insights; its trend chart is an inline SVG built with createElementNS.
@@ -845,8 +847,10 @@ tr.pickable:hover{background:var(--chip)}
     });
   }
 
-  // Filters. The bar writes them into the URL hash, so a reload (or a shared link) shows the
-  // same runs. Only keys with a value are kept; "runs" stays the view.
+  // Filters. The bar writes them into the URL hash for the runs view only, so a reload (or a
+  // shared link) shows the same runs. Every other view's hash carries no query, so switching
+  // views must leave the controls alone and return them to the runs hash on the way back.
+  // Only keys with a value are kept; "runs" stays the view.
 
   var FILTER_IDS = {
     "f-user": "user",
@@ -877,6 +881,7 @@ tr.pickable:hover{background:var(--chip)}
   }
 
   function writeFilterHash() {
+    if (!onRunsRoute()) { return; }   // another view's hash holds no run query
     var hash = filterHash();
     if (location.hash !== hash) { location.hash = hash; }
   }
@@ -889,6 +894,13 @@ tr.pickable:hover{background:var(--chip)}
       var value = params.get(FILTER_IDS[id]);
       $(id).value = value === null ? "" : value;
     });
+  }
+
+  // The one place that puts a hash into the filter bar. Restoring on another view would wipe
+  // every control (its hash has no query) and lose the filters while the user is away.
+  function restoreRunFilters() {
+    if (!onRunsRoute()) { return; }
+    applyFilterHash();
   }
 
   function boundedNumber(raw) {
@@ -1735,6 +1747,8 @@ tr.pickable:hover{background:var(--chip)}
     return VIEWS.indexOf(name) >= 0 ? name : "runs";
   }
 
+  function onRunsRoute() { return currentRoute() === "runs"; }
+
   function enterView(name) {
     if (name === "insights") { loadInsights(); }
     if (name === "keys") { loadKeys(); }
@@ -1847,7 +1861,7 @@ tr.pickable:hover{background:var(--chip)}
   });
   window.addEventListener("hashchange", function () {
     var before = JSON.stringify(filterValues());
-    applyFilterHash();
+    restoreRunFilters();
     showView(currentRoute());
     if (JSON.stringify(filterValues()) !== before) { report(loadRuns()); }
   });
@@ -1979,7 +1993,7 @@ tr.pickable:hover{background:var(--chip)}
 
   // Start
 
-  applyFilterHash();
+  restoreRunFilters();
   loadMe();
   refresh();
   loadBudget();

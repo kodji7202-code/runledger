@@ -64,7 +64,10 @@ change behavior, so read the entry before you upgrade.
   bar next to Min quality has a Max quality number input and an AI verdict select
   (`looks_safe`, `needs_review`, `dangerous`, or any), and the whole filter set (developer, project,
   agent, min risk, min quality, max quality, verdict) is written to the URL hash and restored from it,
-  so a reload or a shared link shows the same runs.
+  so a reload or a shared link shows the same runs. The filter bar belongs to the Runs view: switching
+  to Insights, Approvals, Keys, Audit or Settings leaves it untouched, and returning to Runs writes
+  the filters back into the hash, so a tab switch no longer loses what the developer typed (and a
+  filter edit landing after the switch cannot pull the page back to Runs).
 - **Dashboard polling pauses while the tab is hidden and backs off after a failure
   (`runledger.server`):** the pending-approvals poll on the dashboard and the poll on the individual
   approval page now stop while the page is hidden, refresh at once when it becomes visible again, and
