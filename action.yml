@@ -1,19 +1,33 @@
 name: RunLedger receipt
-description: Post a RunLedger risk receipt for Claude Code sessions as a sticky pull request comment, and fail the job above a risk threshold.
+description: Post a RunLedger risk receipt for AI coding agent sessions (.jsonl, .runledger.json) as a sticky pull request comment, and fail the job above a risk threshold.
 branding:
   icon: shield
   color: green
 inputs:
   sessions-dir:
-    description: Folder of Claude Code session .jsonl files to score (commit them there or copy them in before this step).
+    description: >-
+      Folder of AI coding agent session files to score: Claude Code, Codex and Factory Droid
+      .jsonl transcripts, and .runledger.json written by any agent (commit them there or copy
+      them in before this step). A Droid session needs its sibling .settings.json next to it
+      for token usage and cost.
     required: false
     default: .runledger/sessions
   fail-on:
     description: Fail the job when the highest risk score is at or above this value (0-100). Leave empty to never fail.
     required: false
     default: "60"
+  allow-empty:
+    description: >-
+      Set to "true" to accept a session folder with no session files: the action prints a notice,
+      posts nothing and stays green. The default fails the job, which catches a misconfigured path.
+    required: false
+    default: "false"
+  python-version:
+    description: Python version the action installs.
+    required: false
+    default: "3.11"
   github-token:
-    description: "Token that can write pull request comments (needs pull-requests: write)."
+    description: "Token that can write pull request comments (needs pull-requests: write). Pull requests from forks get a read-only token: the receipt then goes to the job summary."
     required: false
     default: ${{ github.token }}
 outputs:
@@ -29,7 +43,7 @@ runs:
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
-        python-version: "3.11"
+        python-version: ${{ inputs.python-version }}
     - name: Install RunLedger
       shell: bash
       env:
@@ -42,9 +56,13 @@ runs:
         GITHUB_TOKEN: ${{ inputs.github-token }}
         RUNLEDGER_SESSIONS_DIR: ${{ inputs.sessions-dir }}
         RUNLEDGER_FAIL_ON: ${{ inputs.fail-on }}
+        RUNLEDGER_ALLOW_EMPTY: ${{ inputs.allow-empty }}
       run: |
         args=(--sessions-dir "$RUNLEDGER_SESSIONS_DIR")
         if [ -n "$RUNLEDGER_FAIL_ON" ]; then
           args+=(--fail-on "$RUNLEDGER_FAIL_ON")
+        fi
+        if [ "$RUNLEDGER_ALLOW_EMPTY" = "true" ]; then
+          args+=(--allow-empty)
         fi
         python -m runledger.github comment "${args[@]}"

@@ -147,7 +147,7 @@ def test_ci_matrix_has_every_os_and_python():
     assert "python -m compileall -q runledger" in ci
     assert "/health" in ci
     action = (ROOT / "action.yml").read_text(encoding="utf-8")
-    assert 'python-version: "3.11"' in action
+    assert "python-version: ${{ inputs.python-version }}" in action
 
 
 def test_release_workflow_uses_trusted_publishing_on_version_tags():
