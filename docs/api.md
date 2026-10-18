@@ -103,7 +103,9 @@ Role: `member`. Pushes one receipt. This is what `runledger push` sends: the JSO
 `runledger receipt --format json`, plus `user`, `project`, `html` and per-model costs.
 
 Only `session_id` is required (1 to 200 characters). Other fields are optional and fall back to safe
-defaults.
+defaults. The receipt arrives exactly as the client built it: `runledger push --safe` (or
+`RUNLEDGER_PUSH_SAFE=1`) sends a masked one, with `"safe": true`, relative paths and `[EMAIL]`
+instead of e-mail addresses, while `user` and `project` are kept as the client sent them.
 
 A session may be pushed more than once. A session that grew replaces the run already stored when the
 same key pushes it (or an admin key does), and the replaced version is kept in the run history (the

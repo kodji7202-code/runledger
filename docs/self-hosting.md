@@ -88,6 +88,12 @@ Run these commands on the host, from the repository's `deploy` folder.
    runledger push --user "Ana"
    ```
 
+   The stored receipt keeps full local paths and e-mail addresses unless safe mode is on, and a
+   push to this server without it prints a one-line tip on stderr. Add `--safe` (or set
+   `RUNLEDGER_PUSH_SAFE=1`, or `"push_safe": true` in `~/.runledger/config.json`) so the receipts
+   on a shared server carry relative paths and `[EMAIL]` only; `--no-safe` forces full detail and
+   wins over the environment and the config.
+
 Day-to-day commands, from `deploy`:
 
 ```bash
