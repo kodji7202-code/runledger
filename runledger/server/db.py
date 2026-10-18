@@ -24,6 +24,7 @@ from ..pricing import friendly_model
 from .insights import AI_REVIEW_LIKE, QUALITY_LIKE, RECOMMENDATIONS_LIKE, review_fields
 from .auth import (
     INITIAL_KEY_LABEL,
+    SESSION_CAP_PER_KEY,
     SESSION_TTL_SECONDS,
     generate_key,
     hash_key,
@@ -37,6 +38,17 @@ from .auth import (
 TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 LAST_USED_WRITE_INTERVAL_S = 60
 DEFAULT_ALERT_THRESHOLDS = "[50, 80, 100]"
+PRIVATE_FILE_MODE = 0o600
+
+
+def _restrict_file(path: str) -> None:
+    """Make a database or backup file readable only by its owner where the OS has modes.
+    On Windows, and on filesystems that refuse chmod, this does nothing."""
+    try:
+        os.chmod(path, PRIVATE_FILE_MODE)
+    except OSError:
+        pass
+
 
 # Team settings added after the first release. Databases created earlier get them
 # through _add_missing_columns().
@@ -375,6 +387,7 @@ class Database:
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(self.path, check_same_thread=False, timeout=10)
         self._conn.row_factory = sqlite3.Row
+        _restrict_file(self.path)
         try:
             with self._lock:
                 self._conn.execute("PRAGMA foreign_keys = ON")
@@ -427,6 +440,7 @@ class Database:
             except OSError:
                 pass
             raise
+        _restrict_file(str(dest))
 
     def _add_missing_columns(self, table: str, columns: Tuple[Tuple[str, str], ...]) -> None:
         """Upgrade a database created before these columns existed."""
@@ -641,13 +655,20 @@ class Database:
 
     def issue_session(self, team_id: int, key_id: str, role: str, ttl_s: int = SESSION_TTL_SECONDS) -> str:
         """Start a dashboard session for a key. Returns the plaintext token (for the cookie);
-        only its hash is stored. Expired sessions are purged here, so the table stays small."""
+        only its hash is stored. Expired sessions are purged here, and a key keeps only its
+        SESSION_CAP_PER_KEY newest sessions, so the table stays small."""
         token = new_session_token()
         now = datetime.now(timezone.utc)
         now_text = now.strftime(TIME_FORMAT)
         expires = (now + timedelta(seconds=ttl_s)).strftime(TIME_FORMAT)
         with self._lock, self._conn:
             self._conn.execute("DELETE FROM sessions WHERE expires_at <= ?", (now_text,))
+            self._conn.execute(
+                "DELETE FROM sessions WHERE token_hash IN ("
+                "SELECT token_hash FROM sessions WHERE key_id = ? "
+                "ORDER BY created_at DESC, rowid DESC LIMIT -1 OFFSET ?)",
+                (key_id, SESSION_CAP_PER_KEY - 1),
+            )
             self._conn.execute(
                 "INSERT INTO sessions (token_hash, team_id, key_id, role, created_at, expires_at) "
                 "VALUES (?, ?, ?, ?, ?, ?)",

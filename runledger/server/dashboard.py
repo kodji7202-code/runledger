@@ -555,7 +555,7 @@ dialog::backdrop{background:rgba(5,6,8,.6)}
 
   function explain(err) {
     if (err.status === 401) {
-      return "Not signed in, or the session expired. Open this dashboard once with ?key=YOUR_API_KEY.";
+      return "Not signed in, or the session expired. Reload this page and sign in with your API key.";
     }
     return "Could not load data: " + err.message;
   }
@@ -1888,7 +1888,7 @@ a{color:var(--accent)}
 
   function explain(err) {
     if (err.status === 401) {
-      return "Not signed in, or the session expired. Open the dashboard once with ?key=YOUR_API_KEY, then open this page again.";
+      return "Not signed in, or the session expired. Reload this page and sign in with your API key, then open this page again.";
     }
     if (err.status === 404) { return "This approval was not found for your team."; }
     return "Could not load the approval: " + err.message;

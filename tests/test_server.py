@@ -6,18 +6,19 @@ temporary SQLite database.
 import copy
 import http.client
 import json
+import re
 import sqlite3
 import threading
 from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 
 import pytest
 
 from runledger import client
 from runledger.cli import main
-from runledger.server.app import MAX_BODY_BYTES, make_server
+from runledger.server.app import MAX_BODY_BYTES, RECEIPT_CSP, make_server
 from runledger.server.dashboard import DASHBOARD_HTML
 from runledger.server.db import Database
 
@@ -738,7 +739,7 @@ def test_dashboard_sign_in_sets_http_only_cookie(env):
     status, headers, _ = _http(base, "GET", f"/?key={key}")
     assert status == 302 and headers["location"] == "/"
     cookie = headers["set-cookie"]
-    assert "HttpOnly" in cookie and "SameSite=Lax" in cookie
+    assert "HttpOnly" in cookie and "SameSite=Strict" in cookie
     token_pair = cookie.split(";")[0]
     assert key not in cookie  # the API key itself is not stored in the cookie
 
@@ -757,6 +758,142 @@ def test_dashboard_sign_in_sets_http_only_cookie(env):
     assert _http(base, "POST", "/api/runs", body=body,
                  headers={"Cookie": token_pair, "X-Requested-With": "runledger"})[0] == 201
     assert _http(base, "GET", "/?key=rl_wrong")[0] == 401
+
+
+def test_sign_in_page_posts_the_key(env):
+    srv, base = env
+    srv.db.create_team("alpha")
+    status, _, page = _http(base, "GET", "/")
+    assert status == 401
+    text = page.decode("utf-8")
+    assert 'method="post"' in text
+    assert 'action="/session"' in text
+    assert 'name="key"' in text
+    assert "?key=" not in text  # the sign-in page never teaches the key-in-URL form
+
+
+def test_post_login_sets_cookie_and_redirects(env):
+    srv, base = env
+    _, admin = srv.db.create_team("alpha")
+    status, headers, _ = _http(
+        base, "POST", "/session", body=urlencode({"key": admin}).encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    assert status == 302 and headers["location"] == "/"
+    cookie = headers["set-cookie"]
+    assert "HttpOnly" in cookie and "SameSite=Strict" in cookie
+    token = cookie.split(";")[0]
+    assert _json(_http(base, "GET", "/api/me", headers={"Cookie": token})[2])["role"] == "admin"
+
+    status, headers, page = _http(
+        base, "POST", "/session", body=b"key=rl_wrong",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    assert status == 401 and "set-cookie" not in headers
+    assert b"not recognized" in page
+
+
+def test_query_key_redirect_strips_key(env):
+    srv, base = env
+    _, admin = srv.db.create_team("alpha")
+    status, headers, _ = _http(base, "GET", f"/?key={admin}")
+    assert status == 302
+    assert headers["location"] == "/" and "key" not in headers["location"]
+    cookie = headers["set-cookie"]
+    assert "HttpOnly" in cookie and "SameSite=Strict" in cookie
+    token = cookie.split(";")[0]
+    assert _http(base, "GET", "/api/me", headers={"Cookie": token})[0] == 200
+    events = _json(_http(base, "GET", "/api/audit?action=auth.sign_in", headers=_auth(admin))[2])["events"]
+    assert [event["action"] for event in events] == ["auth.sign_in"]
+
+
+def _form_fields(page):
+    """The first form's action and named inputs, as a browser would submit them."""
+    text = page.decode("utf-8")
+    action = re.search(r'<form[^>]*action="([^"]*)"', text).group(1)
+    fields = dict(re.findall(r'<input[^>]*name="([^"]+)"[^>]*value="([^"]*)"', text))
+    return action, fields
+
+
+def test_query_key_does_not_override_existing_session(env):
+    srv, base = env
+    _, admin_a = srv.db.create_team("alpha")
+    team_b_id, admin_b = srv.db.create_team("beta")
+    member_b = srv.db.create_key(team_b_id, "member-b", "member", "test")["key"]
+
+    _, headers, _ = _http(base, "GET", f"/?key={admin_a}")
+    cookie_a = headers["set-cookie"].split(";")[0]
+
+    status, headers, page = _http(base, "GET", f"/?key={admin_b}", headers={"Cookie": cookie_a})
+    assert status == 200 and "set-cookie" not in headers
+    assert b"alpha" in page and b"beta" in page
+    action, fields = _form_fields(page)
+    assert action == "/session" and fields["key"] == admin_b
+    assert _json(_http(base, "GET", "/api/me", headers={"Cookie": cookie_a})[2])["team"]["name"] == "alpha"
+
+    status, headers, _ = _http(
+        base, "POST", action, body=urlencode(fields).encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded", "Cookie": cookie_a},
+    )
+    assert status == 302 and headers["location"] == "/"
+    cookie_b = headers["set-cookie"].split(";")[0]
+    assert _json(_http(base, "GET", "/api/me", headers={"Cookie": cookie_b})[2])["team"]["name"] == "beta"
+
+    # a key of the team already signed in needs no confirmation
+    status, headers, _ = _http(base, "GET", f"/?key={member_b}", headers={"Cookie": cookie_b})
+    assert status == 302 and "set-cookie" in headers
+
+
+def test_query_key_deprecation_logged_once(env, capsys):
+    srv, base = env
+    _, admin = srv.db.create_team("alpha")
+    capsys.readouterr()
+    for _ in range(3):
+        assert _http(base, "GET", f"/?key={admin}")[0] == 302
+    err = capsys.readouterr().err
+    lines = [line for line in err.splitlines() if "deprecated" in line and "?key=" in line]
+    assert len(lines) == 1
+    assert admin not in err
+
+
+def test_receipt_csp_has_sandbox(env):
+    srv, base = env
+    _, key = srv.db.create_team("alpha")
+    client.push(base, key, FIX, user="dev@example.com")
+    status, headers, _ = _http(base, "GET", f"/runs/{SESSION_ID}", headers=_auth(key))
+    assert status == 200
+    csp = headers["content-security-policy"]
+    assert csp == RECEIPT_CSP
+    assert "sandbox" in csp
+    assert "default-src 'none'" in csp and "script-src" not in csp
+    assert headers["x-content-type-options"] == "nosniff"
+
+
+def test_unauthenticated_post_rejected_without_reading_body(env):
+    srv, base = env
+    team_id, admin = srv.db.create_team("alpha")
+    member = srv.db.create_key(team_id, "member", "member", "test")
+    viewer = srv.db.create_key(team_id, "viewer", "viewer", "test")
+    oversized = {"Content-Length": str(MAX_BODY_BYTES * 10)}
+
+    writes = [
+        ("POST", "/api/runs"),
+        ("POST", "/api/approvals"),
+        ("POST", "/api/approvals/abc/decision"),
+        ("PUT", "/api/team/settings"),
+        ("POST", "/api/keys"),
+        ("PUT", "/api/budgets"),
+    ]
+    for method, path in writes:
+        status, _, _ = _http(base, method, path, body=b"x", headers={**_auth("rl_wrong"), **oversized})
+        assert status == 401, (method, path, status)
+        status, _, _ = _http(base, method, path, body=b"x", headers={**_auth(viewer["key"]), **oversized})
+        assert status == 403, (method, path, status)
+
+    status, _, raw = _http(base, "POST", "/api/runs", body=b"x", headers={**_auth(member["key"]), **oversized})
+    assert status == 413 and _json(raw)["error"]["code"] == "payload_too_large"
+    assert _http(base, "GET", "/health")[0] == 200
+    assert srv.db.list_runs(team_id) == []
 
 
 def test_bad_bodies_are_rejected_with_json_errors(env):

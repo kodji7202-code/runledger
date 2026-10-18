@@ -627,7 +627,7 @@ def _backup_size(target: Path) -> Optional[int]:
 
 def cmd_backup(args) -> int:
     """Copy the team database to DIR/runledger-<stem>-YYYYmmdd-HHMMSS[-N].db and keep the newest --keep copies."""
-    from .server.db import Database
+    from .server.db import Database, _restrict_file
 
     folder = Path(args.dir)
     if args.keep < 1:
@@ -648,6 +648,7 @@ def cmd_backup(args) -> int:
             db.backup_to(str(target))
         finally:
             db.close()
+        _restrict_file(str(target))
         size = _backup_size(target)
     except (OSError, sqlite3.Error) as exc:
         _discard_reserved_backup(reservation)

@@ -378,7 +378,7 @@ def test_head_returns_headers_only_and_builds_nothing(env, kind, monkeypatch):
     assert "content-length" not in headers  # the length of a body that was never built is not claimed
     assert headers["cache-control"] == "no-store"
     if kind == "report":
-        assert headers["content-security-policy"] == RECEIPT_CSP
+        assert headers["content-security-policy"] == exports.REPORT_CSP
 
 
 def test_head_is_refused_for_members_and_still_checks_the_days(env):
@@ -433,7 +433,10 @@ def test_report_is_self_contained_and_served_with_the_receipt_csp(env):
     status, headers, raw = export(base, admin, "report")
     assert status == 200
     assert headers["content-type"] == "text/html; charset=utf-8"
-    assert headers["content-security-policy"] == RECEIPT_CSP == exports.REPORT_CSP
+    # The report keeps its own CSP: it links to receipts, which the receipt's sandbox would block.
+    assert headers["content-security-policy"] == exports.REPORT_CSP
+    assert headers["content-security-policy"] != RECEIPT_CSP
+    assert "sandbox" in RECEIPT_CSP and "sandbox" not in exports.REPORT_CSP
     assert "frame-ancestors 'none'" in headers["content-security-policy"]
     assert headers["content-disposition"] == 'inline; filename="runledger-report-20261015.html"'
     body = raw.decode("utf-8")
