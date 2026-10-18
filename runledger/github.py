@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from . import __version__
+from . import labels
 from .adapters import label as agent_label
 from .cli import build
 from .parser import Run
@@ -135,7 +136,7 @@ def _run_details(item: Scored) -> List[str]:
         "**Risk reasons**",
     ]
     if item.risks:
-        for r in item.risks[:MAX_LIST_ITEMS]:
+        for r in labels.show_risks(item.risks[:MAX_LIST_ITEMS], labels.step_label_map(item.run)):
             lines.append(f"- **{r.severity.upper()}** · step {r.step}: {_text(r.reason)}")
         if len(item.risks) > MAX_LIST_ITEMS:
             lines.append(f"- … and {len(item.risks) - MAX_LIST_ITEMS} more")

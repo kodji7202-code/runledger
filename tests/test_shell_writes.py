@@ -83,19 +83,17 @@ def test_ignores_reads_and_unresolvable_targets(command):
 ])
 def test_an_unquoted_spaced_drive_path_is_the_shells_own_words(command, expected):
     """CORE-SCR-R4-001: a shell splits an unquoted path at its spaces, so the write targets are
-    its own words; only a quoted path is one word. Showing the folder name whole is a display
-    label applied afterwards (`risk._label_spaced_paths`, `summarize.file_changes`), never the
-    reading file changes are computed from."""
+    its own words; only a quoted path is one word. Showing the folder name whole is a label
+    output renders (`runledger.labels`), never the reading file changes are computed from."""
     assert _paths(command) == expected
 
 
-def test_a_spaced_drive_write_inside_the_project_is_labelled_whole():
-    """The shell writes `My` and `Folder/x.txt` inside the project; the file entry whose path is
-    the leading fragment of the spaced drive path is shown as the whole path, so a receipt names
-    the file the command's folder name belongs to. The drive path is spelled out so the check
-    reads the same on every host."""
+def test_a_spaced_drive_write_inside_the_project_lists_the_shells_own_files():
+    """R5-003: `touch C:/repo/My Folder/x.txt` writes the two files a shell writes, so a receipt
+    counts exactly those; the whole path is a label a finding shows, never a file key. The drive
+    path is spelled out so the check reads the same on every host."""
     run = _run("C:/repo", ["touch C:/repo/My Folder/x.txt"])
-    assert sorted(file_changes(run)) == ["Folder/x.txt", "My Folder/x.txt"]
+    assert sorted(file_changes(run)) == ["Folder/x.txt", "My"]
 
 
 @pytest.mark.parametrize("command, deleted, written", [

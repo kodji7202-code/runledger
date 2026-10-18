@@ -21,6 +21,7 @@ import re
 import tempfile
 from typing import Any, List, Optional, Sequence
 
+from . import labels
 from .guard import redact
 from .parser import Run
 from .paths import (PATH_CHUNK, PATH_NAME, PATH_REST, SPACED_SUFFIX, _norm, is_abs,
@@ -228,6 +229,7 @@ def make_safe(run: Run, risks: Sequence[Risk], root: Optional[str] = None) -> No
     from .summarize import file_changes
     ctx = context(run.cwd, root)
     changes = file_changes(run)
+    by_step = labels.step_label_map(run)
     run.frozen_changes = {}
     for path, change in changes.items():
         shown = safe_text(path, ctx) if not is_abs(path) else safe_path(path, ctx)
@@ -246,7 +248,7 @@ def make_safe(run: Run, risks: Sequence[Risk], root: Optional[str] = None) -> No
                 s.input[key] = safe_text(val, ctx)
     every = {id(r): r for r in list(risks) + [r for s in run.steps for r in s.risks]}
     for r in every.values():
-        r.reason = safe_text(r.reason, ctx)
+        r.reason = safe_text(labels.show_reason(r.reason, by_step.get(r.step)), ctx)
     run.quality = _value(run.quality, ctx)
     run.recommendations = _value(run.recommendations, ctx)
     run.ai_review = _value(run.ai_review, ctx)

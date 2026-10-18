@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from runledger.labels import command_labels, show_reason
 from runledger.parser import Run, Step, Usage
 from runledger.risk import _outside, assess, assess_step, load_policy
 
@@ -28,6 +29,12 @@ def _risks(tool, cwd=WIN_CWD, **inp):
 
 def _reasons(risks):
     return [r.reason for r in risks]
+
+
+def _shown(tool, command, risks):
+    """The reasons a receipt shows: the whole spaced drive path, applied after the rules ran."""
+    labels = command_labels(tool, command)
+    return [show_reason(r.reason, labels) for r in risks]
 
 
 def _run(steps, cwd):
@@ -173,14 +180,17 @@ def test_bash_shell_outside_windows_path_is_high_when_deleting():
 
 
 def test_unquoted_spaced_drive_path_is_read_as_one_path():
-    """CORE-SCR-013: a folder name with spaces is shown as one path in the finding, so safe mode
-    can mask the whole path instead of leaking the folders above the last two parts. Writing the
-    same path quoted gives the same reading (the shell's own word), and the unquoted form is
-    labelled to match it (`risk._label_spaced_paths`)."""
-    risks = _risks("Bash", command=r"type E:\Work\Client X\secret.txt")
-    assert _reasons(risks) == [r"Shell command referenced a path outside the working folder (E:\Work\Client X\secret.txt)"]
-    quoted = _risks("Bash", command=r'type "E:\Work\Client X\secret.txt"')
-    assert _reasons(quoted) == _reasons(risks)
+    """CORE-SCR-013/R5-001: a folder name with spaces is two words to a shell, so the finding
+    names the word the shell reads; a receipt shows the whole path (`E:\\Work\\Client` ->
+    `E:\\Work\\Client X\\secret.txt`) so safe mode can mask the folder name (VAL-CORE-034)."""
+    command = r"type E:\Work\Client X\secret.txt"
+    risks = _risks("Bash", command=command)
+    assert _reasons(risks) == [
+        r"Shell command referenced a path outside the working folder (E:\Work\Client)"]
+    assert _shown("Bash", command, risks) == [
+        r"Shell command referenced a path outside the working folder (E:\Work\Client X\secret.txt)"]
+    quoted = r'type "E:\Work\Client X\secret.txt"'
+    assert _shown("Bash", quoted, _risks("Bash", command=quoted)) == _shown("Bash", command, risks)
 
 
 def test_spaced_drive_path_does_not_merge_two_paths():
@@ -190,23 +200,32 @@ def test_spaced_drive_path_does_not_merge_two_paths():
 
 
 def test_unquoted_spaced_drive_redirect_target_is_one_write_finding():
-    """The redirect target is read whole, like the rest of the command, so the finding names the
-    path safe mode can mask and no fragment or second finding is left behind."""
-    risks = _risks("Bash", command=r"echo hi > E:\Work\Client y\z.txt")
+    """The redirect target is the shell's own word, and the receipt shows the whole path that
+    word's folder name belongs to: one finding either way, no fragment and no second finding."""
+    command = r"echo hi > E:\Work\Client y\z.txt"
+    risks = _risks("Bash", command=command)
     assert [(r.severity, r.code, r.reason) for r in risks] == [
-        ("low", "shell_outside", r"Shell command wrote outside the working folder (E:\Work\Client y\z.txt)")]
+        ("low", "shell_outside", r"Shell command wrote outside the working folder (E:\Work\Client)")]
+    assert _shown("Bash", command, risks) == [
+        r"Shell command wrote outside the working folder (E:\Work\Client y\z.txt)"]
 
 
 def test_spaced_drive_redirect_target_with_forward_slashes_is_one_write_finding():
-    outside = [r for r in _risks("Bash", command=r"echo hi > E:/Work/Client y/z.txt")
-               if r.code == "shell_outside"]
+    command = r"echo hi > E:/Work/Client y/z.txt"
+    risks = _risks("Bash", command=command)
+    outside = [r for r in risks if r.code == "shell_outside"]
     assert len(outside) == 1
     assert outside[0].reason.replace("\\", "/") == \
+        "Shell command wrote outside the working folder (E:/Work/Client)"
+    assert _shown("Bash", command, risks)[0].replace("\\", "/") == \
         "Shell command wrote outside the working folder (E:/Work/Client y/z.txt)"
 
 
 def test_unquoted_spaced_drive_read_redirect_names_the_whole_path():
-    assert _reasons(_risks("Bash", command=r"cat < E:\Work\Client y\z.txt")) == [
+    command = r"cat < E:\Work\Client y\z.txt"
+    assert _reasons(_risks("Bash", command=command)) == [
+        r"Shell command referenced a path outside the working folder (E:\Work\Client)"]
+    assert _shown("Bash", command, _risks("Bash", command=command)) == [
         r"Shell command referenced a path outside the working folder (E:\Work\Client y\z.txt)"]
 
 
@@ -253,29 +272,38 @@ def test_traversing_operand_is_named_when_the_joined_path_is_itself_outside(comm
 
 
 def test_spaced_drive_path_with_several_words_is_still_one_path():
-    """CORE-SCR-R2-005: a folder name may hold more than one extra word, and the label names
-    the whole path so safe mode can mask it."""
-    assert _reasons(_risks("Bash", command=r"type E:\Work\Client X Corp\secret.txt")) == [
+    """CORE-SCR-R2-005: a folder name may hold more than one extra word; the label names the
+    whole path so safe mode can mask it, while the finding keeps the shell's own word."""
+    command = r"type E:\Work\Client X Corp\secret.txt"
+    risks = _risks("Bash", command=command)
+    assert _reasons(risks) == [
+        r"Shell command referenced a path outside the working folder (E:\Work\Client)"]
+    assert _shown("Bash", command, risks) == [
         r"Shell command referenced a path outside the working folder (E:\Work\Client X Corp\secret.txt)"]
 
 
 def test_the_spaced_path_label_shows_what_the_shell_reads_as_two_words():
-    """The label step rewrites the path a finding shows (`E:\\Work\\Client` ->
-    `E:\\Work\\Client X\\secret.txt`); the finding itself is the shell's own reading, so the
-    unquoted command reports exactly what the same command with the path quoted reports."""
-    loose = _risks("Bash", command=r"echo hi > E:\Work\Client y\z.txt")
-    quoted = _risks("Bash", command=r"echo hi > 'E:\Work\Client y\z.txt'")
-    assert [(r.severity, r.code, r.reason) for r in loose] == \
-        [(r.severity, r.code, r.reason) for r in quoted]
+    """The label step rewrites the path a receipt shows (`E:\\Work\\Client` ->
+    `E:\\Work\\Client y\\z.txt`); the findings themselves are the shell's own reading, so the
+    codes and severities match the same command with the path quoted (R5-001)."""
+    loose_command = r"echo hi > E:\Work\Client y\z.txt"
+    quoted_command = r"echo hi > 'E:\Work\Client y\z.txt'"
+    loose = _risks("Bash", command=loose_command)
+    quoted = _risks("Bash", command=quoted_command)
+    assert [(r.severity, r.code) for r in loose] == [(r.severity, r.code) for r in quoted]
+    assert _shown("Bash", loose_command, loose) == _reasons(quoted)
 
 
 def test_the_spaced_path_label_never_adds_a_finding():
     """The label is a display step: the words the shell splits stay two operands, and the
     second one is checked as itself (here it resolves inside the working folder)."""
-    assert [(r.severity, r.code, r.reason) for r in
-            _risks("Bash", command=r"type E:\Work\Client y\z.txt")] == [
+    command = r"type E:\Work\Client y\z.txt"
+    risks = _risks("Bash", command=command)
+    assert [(r.severity, r.code, r.reason) for r in risks] == [
         ("low", "shell_outside",
-         r"Shell command referenced a path outside the working folder (E:\Work\Client y\z.txt)")]
+         r"Shell command referenced a path outside the working folder (E:\Work\Client)")]
+    assert _shown("Bash", command, risks) == [
+        r"Shell command referenced a path outside the working folder (E:\Work\Client y\z.txt)"]
 
 
 # ------------------------------------------------ round 4: the shell's own words decide

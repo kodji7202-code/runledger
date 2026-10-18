@@ -967,22 +967,6 @@ def _shell_risks(step: Step, cwd: Optional[str], extra: List["re.Pattern"], risk
     return flagged
 
 
-def _label_spaced_paths(step: Step, risks: List[Risk]) -> None:
-    """Show the whole spaced drive path in each finding that names its leading fragment
-    (`E:\\Work\\Client` -> `E:\\Work\\Client X\\secret.txt`), so a receipt shows the folder name
-    together and safe mode masks it whole (VAL-CORE-034).
-
-    A display step only: findings are computed from the words the shell's own reading gives,
-    and a label never adds, removes or merges a finding, never changes a code or a severity, and
-    never takes part in a guard decision."""
-    cmd = str(step.input.get("command") or "")
-    labels = paths.spaced_drive_labels(_strip_heredocs(cmd, shell_kind(step) == "powershell"))
-    if not labels:
-        return
-    for r in risks:
-        r.reason = paths.show_spaced_drive_paths(r.reason, labels)
-
-
 def _project_path(path: str, cwd: Optional[str]) -> str:
     """`path` relative to the working folder when it lies inside it, as receipts list files."""
     return paths.relative(path, cwd)
@@ -1284,7 +1268,6 @@ def assess_step(step: Step, cwd: Optional[str], policy: Optional[Dict[str, Any]]
     if tool in SHELL_TOOLS:
         flagged = _shell_risks(step, cwd, extra, risks, default_workdir=base)
         _shell_write_risks(step, cwd, extra, risks, default_workdir=base, flagged=flagged)
-        _label_spaced_paths(step, risks)
 
     if tool.startswith("mcp__"):
         risks.append(Risk("low", "mcp", f"Called an external MCP tool ({tool.split('__', 2)[-1]})", step.index))
