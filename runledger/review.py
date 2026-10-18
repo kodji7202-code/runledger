@@ -70,8 +70,8 @@ Rules for the answer:
 
 
 def _clip(text: Any, limit: int) -> str:
-    """Redact first, then cut, so a secret is never cut in half."""
-    s = llm.redact("" if text is None else str(text))
+    """Mask first, then cut, so a secret, an e-mail or a home folder is never cut in half."""
+    s = llm.scrub("" if text is None else str(text))
     return s if len(s) <= limit else s[:limit] + "…"
 
 
@@ -159,8 +159,10 @@ def _user_message(run: Run, risks: Sequence[Risk], changed: Sequence[Tuple[str, 
                         "reason": _clip(r.reason, REASON_CHARS)} for r in risks],
         "files_changed": _files_payload(changed),
     }
-    return ("Review this run and call record_review once.\n<run_data>\n"
-            + json.dumps(payload, ensure_ascii=False, indent=1) + "\n</run_data>")
+    # `<` is written as \u003c (valid JSON, the model reads it the same way), so no text in the
+    # run can close the data block or start a tag of its own.
+    data = json.dumps(payload, ensure_ascii=False, indent=1).replace("<", "\\u003c")
+    return "Review this run and call record_review once.\n<run_data>\n" + data + "\n</run_data>"
 
 
 REVIEW_SCHEMA: Dict[str, Any] = {
@@ -272,7 +274,12 @@ def _empty_result() -> Dict[str, Any]:
     return {"model": "none", "verdict": "looks_safe",
             "summary": "Nothing to review: no rule-based risks and no files changed.",
             "risk_assessments": [], "diff_explanations": [],
-            "cost_usd": 0.0, "tokens": {"input": 0, "output": 0}}
+            "cost_usd": 0.0, "tokens": {"input": 0, "output": 0},
+            "escalated": False, "notes": []}
+
+
+def _one_line(exc: BaseException, limit: int = 200) -> str:
+    return " ".join(str(exc).split())[:limit]
 
 
 def _ask(model: str, user_text: str, api_key: Optional[str]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
@@ -294,7 +301,8 @@ def ai_review(run: Run, risks: Sequence[Risk], model: str = DEFAULT_REVIEW_MODEL
     With no rule-based risks and no changed files there is nothing to review: the verdict
     is looks_safe and no API call is made. Otherwise one structured call is made. When the
     verdict is "dangerous" and RUNLEDGER_ESCALATE_OPUS=1, the same request is re-run on
-    Opus and that result is kept; both calls' costs and tokens are added together.
+    Opus and that result is kept (`escalated: true`); both calls' costs and tokens are added
+    together. An escalation that fails keeps the first review, with a note saying why.
 
     `tokens.input` counts all input tokens (uncached, cache writes and cache reads).
     `cost_usd` is None when a model has no price in prices.json. Raises llm.LLMError when
@@ -313,17 +321,26 @@ def ai_review(run: Run, risks: Sequence[Risk], model: str = DEFAULT_REVIEW_MODEL
     usage = llm.usage(reply)
     cost = cost_of(usage, model)
     result = _normalise(data, model, risks, file_names)
+    escalated = False
+    notes: List[str] = []
 
     if (result["verdict"] == "dangerous" and model != ESCALATION_MODEL
             and os.environ.get(ESCALATE_ENV, "").strip() == "1"):
-        data, reply = _ask(ESCALATION_MODEL, user_text, api_key)
-        second = llm.usage(reply)
-        usage.add(second)
-        cost = _sum_costs(cost, cost_of(second, ESCALATION_MODEL))
-        result = _normalise(data, ESCALATION_MODEL, risks, file_names)
+        try:
+            data, reply = _ask(ESCALATION_MODEL, user_text, api_key)
+        except llm.LLMError as exc:      # the first review is still a review
+            notes.append(f"escalation failed: {_one_line(exc)}")
+        else:
+            second = llm.usage(reply)
+            usage.add(second)
+            cost = _sum_costs(cost, cost_of(second, ESCALATION_MODEL))
+            result = _normalise(data, ESCALATION_MODEL, risks, file_names)
+            escalated = True
 
     result["cost_usd"] = cost
     result["tokens"] = {"input": usage.input_tokens + usage.cache_write_tokens + usage.cache_read_tokens,
                         "output": usage.output_tokens}
+    result["escalated"] = escalated
+    result["notes"] = notes
     run.ai_review = result
     return result

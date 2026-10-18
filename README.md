@@ -159,11 +159,13 @@ for the home folder) and e-mail addresses are masked. HTML receipts keep full pa
 
 - **`--ai`** sends the prompts, each step's inputs (up to 600 characters per field, which can include
   file contents being written), each tool result (up to 400 characters) and the agent's final message to
-  `api.anthropic.com`. Known secret formats are masked first, but masking is pattern-based. Do not use it
-  on sessions you may not share with that service.
-- **`--review`** sends redacted prompts, commands, relative file paths, edit snippets and the rule
-  findings to Claude Sonnet for an explanation of each risk. Tool output is not sent. See
+  `api.anthropic.com`. Do not use it on sessions you may not share with that service.
+- **`--review`** sends prompts, commands, relative file paths, edit snippets and the rule findings to
+  Claude Sonnet for an explanation of each risk. Tool output is not sent. See
   [docs/analysis.md](docs/analysis.md#ai-risk-review).
+- **Both mask before sending, with no opt-out:** e-mail addresses become `[EMAIL]`, home folders
+  (`C:\Users\<name>`, `/Users/<name>`, `/home/<name>`) become `~...`, and known secret formats become
+  `[REDACTED]`. Masking is pattern-based, so an unusual secret can still get through.
 - **The guard log** (`.runledger/guard.log`) records tool names, commands and paths, masked the same
   way. Add `.runledger/` to your `.gitignore`.
 - **Checkpoints** store real file contents locally in Git, without secret masking. Ignore sensitive

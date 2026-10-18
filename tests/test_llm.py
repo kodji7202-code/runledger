@@ -1,12 +1,16 @@
 """llm.py: the stdlib Anthropic client. Every request goes to the local stub (ANTHROPIC_BASE_URL),
 so no real network is used. Retry sleeps are recorded instead of waited for."""
+import io
 import json
 import os
+import re
 import socket
+import urllib.error
 
 import pytest
 
 from runledger import adapters, llm, summarize
+from runledger.cli import main
 from runledger.llm import LLMError
 from runledger.parser import Usage
 from runledger.pricing import cost_of
@@ -35,15 +39,25 @@ def _closed_port() -> int:
         return sock.getsockname()[1]
 
 
-def _native_run(tmp_path, steps, prompts=None):
+def _native_file(tmp_path, steps, prompts=None, name="session.json"):
     doc = {"runledger_format": 1, "agent": "demo-agent", "session_id": "llm-1", "cwd": "/work/app",
            "prompts": prompts or ["Summarise the change."], "final_message": "All done.",
            "models": {"claude-haiku-5-5": {"input_tokens": 100, "output_tokens": 20}}, "steps": steps}
-    path = tmp_path / "session.json"
+    path = tmp_path / name
     path.write_text(json.dumps(doc), encoding="utf-8")
+    return path
+
+
+def _native_run(tmp_path, steps, prompts=None):
+    path = _native_file(tmp_path, steps, prompts)
     run = adapters.detect(path).parse(path)
     apply_templates(run)
     return run
+
+
+def _read_step(index):
+    return {"tool": "Read", "input": {"file_path": f"/work/app/f{index}.py"}, "model": "claude-haiku-5-5",
+            "result_text": "", "is_error": False}
 
 
 # ---------------------------------------------------------------- call(): the request
@@ -410,3 +424,160 @@ def test_summary_clip_redacts_before_cutting():
     out = summarize._clip(text, 600)
     assert "sk-ant" not in out and "api03" not in out
     assert out.startswith("x" * 595)
+
+
+# ---------------------------------------------------------------- privacy (LLM1)
+
+HOME_WIN = "C:" + "\\" + "Users" + "\\" + "claud" + "\\" + "project" + "\\" + "src" + "\\" + "a.py"
+HOME_MAC = "/" + "Users/bob/app/x"
+HOME_LINUX = "/" + "home/carol/app/y"
+NAMES = ("claud", "bob", "carol")
+
+
+def _home_leaks(text):
+    """The user names that still appear as a folder after `Users`/`home`, JSON escaping included."""
+    found = re.findall(r"Users[\\/]{1,2}([A-Za-z0-9._-]+)", text) + re.findall(r"home/([A-Za-z0-9._-]+)", text)
+    return [name for name in found if name in NAMES]
+
+
+def test_scrub_masks_emails_and_home_paths():
+    text = f"git config user.email ana@example.com && cat {HOME_WIN} && cat {HOME_MAC} && cat {HOME_LINUX}"
+    out = llm.scrub(text)
+    assert "ana@example.com" not in out and "[EMAIL]" in out
+    for name in NAMES:
+        assert name not in out
+    assert out.count("~") == 3
+    assert "git config user.email" in out and "cat" in out      # the command shape stays
+
+
+def test_scrub_keeps_ordinary_text_and_is_idempotent():
+    assert llm.scrub("npm test -- --watch") == "npm test -- --watch"
+    assert llm.scrub(None) == ""
+    once = llm.scrub(f"cd {HOME_WIN} && ls")
+    assert once == llm.scrub(once)
+    assert llm.scrub_paths("cd ~/work") == "cd ~/work"
+
+
+def test_scrub_masks_a_windows_home_without_a_trailing_file():
+    assert llm.scrub_paths("C:" + "\\" + "Users" + "\\" + "claud") == "~"
+    assert llm.scrub_paths("cd C:/Users/claud && ls") == "cd ~ && ls"
+
+
+def test_outgoing_text_masks_emails_and_home_paths(stub):
+    text = f"cat {HOME_WIN}; git config user.email ana@example.com; cat {HOME_LINUX}"
+    stub.queue()
+    llm.call([{"role": "user", "content": text}], "claude-haiku-5-5",
+             system=f"a secret home {HOME_MAC}")
+    raw = stub.requests[0]["raw"]
+    assert "ana@example.com" not in raw
+    assert _home_leaks(raw) == []
+    assert "~" in raw
+
+
+def test_summary_prompt_masks_emails_and_home_paths(stub, tmp_path):
+    step = {"tool": "Bash", "input": {"command": f"cat {HOME_WIN} && git config user.email ana@example.com"},
+            "model": "claude-haiku-5-5", "result_text": f"wrote {HOME_MAC}", "is_error": False}
+    run = _native_run(tmp_path, [step], prompts=[f"fix {HOME_WIN} for ana@example.com"])
+    stub.queue(body=message_reply(json.dumps({"overview": "Done.", "steps": [{"n": 1, "summary": "Read it."}]})))
+    summarize.ai_summaries(run, api_key=ANTHROPIC_KEY, model="claude-haiku-5-5")
+    raw = stub.requests[0]["raw"]
+    assert "ana@example.com" not in raw
+    assert _home_leaks(raw) == []
+    assert "git config user.email" in raw
+    assert run.overall_summary == "Done."
+
+
+# ---------------------------------------------------------------- summary JSON (LLM5)
+
+def test_summary_json_tolerates_trailing_prose_with_braces(stub, tmp_path):
+    run = _native_run(tmp_path, [_read_step(1)])
+    reply = ('Here you go: {"overview":"Added a cache","steps":[{"n":1,"summary":"Read file"}]} '
+             "Note: use {braces} freely.")
+    stub.queue(body=message_reply(reply))
+    summarize.ai_summaries(run, api_key=ANTHROPIC_KEY, model="claude-haiku-5-5")
+    assert run.overall_summary == "Added a cache"
+    assert run.steps[0].summary == "Read file"
+
+
+def test_summary_json_ignores_invalid_steps_and_coerces_the_number(stub, tmp_path):
+    run = _native_run(tmp_path, [_read_step(1), _read_step(2)])
+    stub.queue(body=message_reply(
+        '{"overview":"X","steps":["bad", 7, {"n":"two","summary":"ok"}, {"n":1,"summary":"first"}]}'))
+    summarize.ai_summaries(run, api_key=ANTHROPIC_KEY, model="claude-haiku-5-5")
+    assert run.overall_summary == "X"
+    assert run.steps[0].summary == "first"
+    assert run.steps[1].summary == "ok"
+
+
+def test_summary_json_accepts_a_code_fence(stub, tmp_path):
+    run = _native_run(tmp_path, [_read_step(1)])
+    stub.queue(body=message_reply(
+        '```json\n{"overview":"Added a cache","steps":[{"n":1,"summary":"Read file"}]}\n```'))
+    summarize.ai_summaries(run, api_key=ANTHROPIC_KEY, model="claude-haiku-5-5")
+    assert run.overall_summary == "Added a cache"
+    assert run.steps[0].summary == "Read file"
+
+
+def test_summary_without_json_is_still_an_error(stub, tmp_path):
+    run = _native_run(tmp_path, [_read_step(1)])
+    stub.queue(body=message_reply("I cannot help with that."))
+    with pytest.raises(RuntimeError, match="JSON"):
+        summarize.ai_summaries(run, api_key=ANTHROPIC_KEY, model="claude-haiku-5-5")
+
+
+def test_cli_ai_keeps_the_receipt_when_the_reply_has_no_json(stub, tmp_path, capsys):
+    path = _native_file(tmp_path, [_read_step(1)])
+    stub.queue(body=message_reply("I cannot help with that."))
+    assert main(["receipt", str(path), "--ai", "--format", "md", "-o", "-"]) == 0
+    captured = capsys.readouterr()
+    assert captured.err.startswith("AI summaries skipped:")
+    assert captured.out.strip()
+
+
+def test_cli_ai_uses_summaries_with_trailing_prose(stub, tmp_path, capsys):
+    path = _native_file(tmp_path, [_read_step(1)])
+    stub.queue(body=message_reply(
+        'Here you go: {"overview":"Added a cache","steps":[{"n":1,"summary":"Read file"}]} '
+        "Note: use {braces} freely."))
+    assert main(["receipt", str(path), "--ai", "--format", "md", "-o", "-"]) == 0
+    captured = capsys.readouterr()
+    assert "Added a cache" in captured.out
+    assert "Read file" in captured.out
+    assert "Traceback" not in captured.err
+
+
+# ---------------------------------------------------------------- error bodies (LLM6)
+
+class _RecordingBody(io.BytesIO):
+    """An error body that remembers being closed, the way a real response must be."""
+
+    def __init__(self, data: bytes = b""):
+        super().__init__(data)
+        self.closed_by_us = False
+
+    def close(self):
+        self.closed_by_us = True
+        super().close()
+
+
+def test_http_error_body_closed():
+    body = _RecordingBody(json.dumps(error_body("model not found")).encode("utf-8"))
+    exc = urllib.error.HTTPError("http://127.0.0.1/v1/messages", 400, "Bad Request", {}, body)
+    assert llm._error_text(exc, ANTHROPIC_KEY) == "model not found"
+    assert body.closed_by_us
+
+
+def test_every_retried_error_body_is_closed(monkeypatch):
+    bodies = []
+
+    def open_raising(*_args, **_kwargs):
+        body = _RecordingBody(json.dumps(error_body("overloaded")).encode("utf-8"))
+        bodies.append(body)
+        raise urllib.error.HTTPError("http://127.0.0.1/v1/messages", 529, "Overloaded", {}, body)
+
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open", open_raising)
+    monkeypatch.setattr(llm.time, "sleep", lambda _seconds: None)
+    with pytest.raises(LLMError, match="529"):
+        llm.call([{"role": "user", "content": "x"}], "claude-haiku-5-5", api_key=ANTHROPIC_KEY)
+    assert len(bodies) == llm.MAX_RETRIES + 1      # the first attempt plus every retry
+    assert all(body.closed_by_us for body in bodies)

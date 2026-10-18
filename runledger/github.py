@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from . import __version__
+from . import _http
 from . import labels
 from .adapters import label as agent_label
 from .cli import build
@@ -45,6 +46,7 @@ PER_PAGE = 100
 MAX_PAGES = 100
 HTTP_TIMEOUT = 30
 MAX_LIST_ITEMS = 25  # risk reasons and files listed per run
+ERROR_BODY_BYTES = 4096  # of an error body, only this much is read before the 300-char detail
 
 EXIT_OK = 0
 EXIT_THRESHOLD = 1
@@ -242,7 +244,7 @@ class GitHubClient:
                 raw = resp.read()
                 link = resp.headers.get("Link", "") or ""
         except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", "replace")[:300]
+            detail = _http.read_error(exc, ERROR_BODY_BYTES)[:300]   # always closes the response
             raise GitHubError(f"GitHub returned HTTP {exc.code} for {method} {url}: "
                               f"{self._redact(detail)}") from None
         except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as exc:

@@ -20,7 +20,7 @@ Kinds: model_downgrade, cache_misses, retry_loop, large_reads, unknown_pricing.
 from __future__ import annotations
 
 import re
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .parser import Run, Step
 from .pricing import cost_of, friendly_model, model_key, price_for, unknown_models
@@ -129,7 +129,14 @@ def _is_expensive(model: Optional[str]) -> bool:
     return key is not None and key[0] in EXPENSIVE_FAMILIES
 
 
+def _haiku_price() -> Optional[Tuple[float, float, float]]:
+    """The list price a downgrade is estimated against, or None when the table has none."""
+    return price_for(HAIKU)
+
+
 def _model_downgrade(run: Run, run_cost: Optional[float]) -> Optional[Dict[str, Any]]:
+    if _haiku_price() is None:
+        return None  # without a price for the cheaper model there is nothing to compare against
     candidates = [s for s in run.steps if _is_expensive(s.model) and _is_read_only(s)]
     picked = [s for s in candidates if _usage_known(run, s)]
     if not picked:

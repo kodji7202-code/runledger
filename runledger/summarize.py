@@ -205,8 +205,9 @@ def apply_templates(run: Run) -> None:
 # ---------------- AI summaries (Claude API) ----------------
 
 def _clip(text: Optional[str], limit: int) -> str:
-    """Redact first, then cut. A secret is replaced whole, so the cut cannot leave half of it."""
-    s = llm.redact(text or "")
+    """Mask first, then cut. A secret, an e-mail or a home folder is replaced whole, so the
+    cut cannot leave half of one."""
+    s = llm.scrub(text or "")
     return s if len(s) <= limit else s[:limit] + f"…[+{len(s) - limit} chars]"
 
 
@@ -216,6 +217,38 @@ def _compact_step(s: Step) -> Dict:
         inp[k] = _clip(v, 600) if isinstance(v, str) else v
     return {"n": s.index, "tool": s.tool, "input": inp,
             "result": _clip(s.result_text, 400), "error": s.is_error}
+
+
+_STEP_WORDS = {"zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+               "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12}
+
+
+def _step_number(value: Any) -> Optional[int]:
+    """The step a model's answer belongs to: an int, a number written as a string ("2") or a
+    small number written as a word ("two"). Anything else names no step and is ignored."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return _STEP_WORDS.get(value.strip().lower())
+    return None
+
+
+def _summary_json(text: str) -> Optional[Dict]:
+    """The first JSON object in the model's reply, or None. Prose before or after the object,
+    braces in that prose and a ```json fence around it do not hide the summaries."""
+    start = text.find("{")
+    if start < 0:
+        return None
+    try:
+        data, _end = json.JSONDecoder().raw_decode(text, start)
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def ai_summaries(run: Run, api_key: Optional[str] = None, model: str = DEFAULT_AI_MODEL,
@@ -239,15 +272,23 @@ def ai_summaries(run: Run, api_key: Optional[str] = None, model: str = DEFAULT_A
     )
     data = llm.call([{"role": "user", "content": prompt}], model, max_tokens=4000,
                     api_key=api_key, timeout=timeout)
-    text = llm.text_of(data)
-    m = re.search(r"\{.*\}", text, re.S)
-    if not m:
+    parsed = _summary_json(llm.text_of(data))
+    if parsed is None:
         raise RuntimeError("Claude did not return JSON summaries.")
-    parsed = json.loads(m.group(0))
-    by_n = {int(x["n"]): x["summary"] for x in parsed.get("steps", []) if "n" in x}
+    steps = parsed.get("steps")
+    by_n: Dict[int, str] = {}
+    for item in steps if isinstance(steps, list) else []:
+        if not isinstance(item, dict):
+            continue
+        index = _step_number(item.get("n"))
+        summary = item.get("summary")
+        if index is None or not isinstance(summary, str) or not summary.strip():
+            continue
+        by_n.setdefault(index, summary.strip())
     for s in run.steps:
-        if s.index in by_n and by_n[s.index].strip():
-            s.summary = by_n[s.index].strip()
-    if parsed.get("overview"):
-        run.overall_summary = parsed["overview"].strip()
+        if s.index in by_n:
+            s.summary = by_n[s.index]
+    overview = parsed.get("overview")
+    if isinstance(overview, str) and overview.strip():
+        run.overall_summary = overview.strip()
     return llm.usage(data)

@@ -9,6 +9,16 @@ change behavior, so read the entry before you upgrade.
 
 ### Changed
 
+- **Text sent to Claude masks e-mail addresses and home folders, with no opt-out
+  (`runledger.llm`, `runledger.review`, `runledger.summarize`):** every request body, from `--ai`
+  summaries as well as from `--review`, replaces e-mail addresses with `[EMAIL]` and the user name of
+  `C:\Users\<name>`, `/Users/<name>` and `/home/<name>` with `~`, on top of the secret patterns that
+  were already applied. Masking happens before the text is cut to its limit, so a home folder is
+  never sent in half, and it applies to the whole message at the API boundary. A session mentioning
+  `ana@example.com` or `C:\Users\ana\app\x.py` now sends `[EMAIL]` and `~\app\x.py`; commands keep
+  their shape. A review's data block also escapes `<` as `\u003c`, so a command containing
+  `</run_data>` cannot close it. `docs/analysis.md`, `docs/quickstart.md` and the README state what
+  is masked.
 - **The dashboard reads a second, read-only connection, and a backup no longer stops writes
   (`runledger.server`):** reports, stats, insights, the run list and the exports read from their own
   read-only connection (`file:...?mode=ro`), so a long report or a `runledger backup` running beside
@@ -66,6 +76,29 @@ change behavior, so read the entry before you upgrade.
   as deprecated.
 
 ### Fixed
+
+- **A failed Opus escalation keeps the first review (`runledger.review`):** when
+  `RUNLEDGER_ESCALATE_OPUS=1` re-runs a `dangerous` verdict on Opus and that call fails, the receipt
+  keeps the Sonnet review instead of losing it and printing "AI risk review skipped".
+  `ai_review.notes` records one line starting with `escalation failed:` and `ai_review.escalated` is
+  `false` (`true` after an escalation that succeeded); both keys are new.
+
+- **`--ai` reads its summaries from a reply that is not pure JSON (`runledger.summarize`):** the
+  first JSON object in the reply is decoded on its own, so trailing prose (even with braces in it)
+  and a ```json fence no longer lose the summaries. Step entries that are not objects, that name no
+  usable step number (an int, `"2"` and `two` all work) or that carry no text are skipped instead of
+  raising, and a reply with no JSON at all still prints `AI summaries skipped: ...` and keeps the
+  rule-based receipt.
+
+- **No model-downgrade estimate without a Haiku price (`runledger.advisor`):** the
+  `model_downgrade` recommendation is built against the price of `claude-haiku-5-5`; a user price
+  table that has no Haiku row now yields no downgrade advice instead of relying on the estimate
+  silently collapsing to zero.
+
+- **HTTP error bodies are closed in every client (`runledger._http`, `runledger.llm`,
+  `runledger.client`, `runledger.github`):** a 4xx/5xx reply from the Claude API, the team server or
+  GitHub is read through one helper that closes the response, so `-W error::ResourceWarning` runs
+  clean and a long-lived process does not keep the socket. The error text the user sees is unchanged.
 
 - **Quality score: installing or inspecting a runner is no longer a test run, and an unreadable
   result is unknown instead of a pass (`runledger.quality`, `runledger.risk`, `runledger.parser`):**

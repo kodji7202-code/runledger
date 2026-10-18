@@ -259,6 +259,19 @@ def test_empty_run_has_no_recommendations():
     assert recommend(_run([])) == []
 
 
+def test_no_downgrade_advice_without_haiku_price(monkeypatch):
+    """A price table that cannot price Haiku must not produce a downgrade estimate."""
+    from runledger import pricing
+
+    monkeypatch.setattr(pricing, "PRICES", {k: v for k, v in pricing.PRICES.items()
+                                            if k != pricing.model_key(HAIKU)})
+    assert price_for(HAIKU) is None
+    run = _run([_read(1, model=SONNET, usage=_usage(inp=1_000_000)),
+                _edit(2, model=SONNET, usage=_usage(inp=1000))])
+    assert [r["kind"] for r in recommend(run)] == []
+    assert estimated_cost(run) is not None      # the run itself is still priced
+
+
 def test_price_table_has_the_current_model_ids():
     assert price_for(HAIKU) is not None
     # Haiku 5.5 bills whole requests above a 100k prompt at tier 2 ($0.50/MTok)

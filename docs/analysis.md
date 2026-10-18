@@ -62,7 +62,7 @@ estimates, so the savings are lower bounds.
 
 | Kind | When it appears | How the saving is estimated |
 | --- | --- | --- |
-| `model_downgrade` | Reads, searches, listings and simple read-only shell commands ran on Opus or Sonnet. | Their cost, minus the same tokens at Haiku 5.5 prices (`claude-haiku-5-5`). |
+| `model_downgrade` | Reads, searches, listings and simple read-only shell commands ran on Opus or Sonnet. | Their cost, minus the same tokens at Haiku 5.5 prices (`claude-haiku-5-5`). A price table without a Haiku price gives no downgrade advice at all. |
 | `cache_misses` | A session of 20 or more steps with at least 50,000 input tokens, of which under 30% came from the prompt cache. | Half of the uncached input is assumed to repeat between turns. That share is priced at the input rate minus the cache-read rate. |
 | `retry_loop` | A shell command failed two or more times. | The cost of every failing repeat after the first. |
 | `large_reads` | A file was read three or more times, or a Read result was 4,000 characters or more. | For repeats, the cost of the reads after the second. For large results, the context they add to later steps at cache-read rates. |
@@ -87,11 +87,13 @@ your machine. `--ai` summaries are a separate opt-in.
   request is made. Otherwise it is one request to `claude-sonnet-5-5` (`--review-model` changes it).
   Each finding gets exactly one assessment; findings the model omits are recorded as `uncertain`.
 - **Escalation.** If the verdict is `dangerous` and `RUNLEDGER_ESCALATE_OPUS=1`, the request is re-run
-  on `claude-opus-5-5` and that result is kept. Costs and tokens of both calls are added.
+  on `claude-opus-5-5` and that result is kept (`escalated: true`). Costs and tokens of both calls are
+  added. If the second call fails, the first review is kept, `escalated` stays `false` and `notes`
+  records one line starting with `escalation failed:`.
 - **Failures.** The receipt is still written without the review, and one line on stderr says why.
   `push` uploads the run without the review.
 
-**Sent to Anthropic, after redaction:**
+**Sent to Anthropic, after masking:**
 
 - the first 5 user requests, each cut to 500 characters;
 - up to 60 steps: step number, tool name, failure flag, relative file path, command or search/URL
@@ -104,9 +106,20 @@ your machine. `--ai` summaries are a separate opt-in.
 **Not sent:** tool outputs, the agent's final message, the absolute working folder, the session id,
 and the developer and project names used by `push`.
 
-**Redaction** uses the same patterns as the risk rules: Anthropic, OpenAI, AWS and GitHub keys, Slack
-tokens, private key blocks, bearer tokens, and quoted `key=`, `token=`, `secret=` or `password=`
-values. Matches become `[REDACTED]`. Redaction is pattern-based and will miss some secrets.
+**Masking** happens before anything is sent, with no opt-out:
+
+- **Secrets** use the same patterns as the risk rules: Anthropic, OpenAI, AWS and GitHub keys, Slack
+  tokens, private key blocks, bearer tokens, and quoted `key=`, `token=`, `secret=` or `password=`
+  values. Matches become `[REDACTED]`.
+- **E-mail addresses** become `[EMAIL]`.
+- **Home folders** become `~`: the user name of `C:\Users\<name>`, `/Users/<name>` and `/home/<name>`
+  never leaves the machine, and the rest of the path is kept (`C:\Users\ana\app\x.py` is sent as
+  `~\app\x.py`).
+
+`--ai` summaries are masked the same way: the prompts, each step's inputs, each tool result and the
+agent's final message all pass through it. Masking is pattern-based and will miss an unusual secret
+or a path outside a home folder. The data block of a review is also escaped, so a command containing
+`</run_data>` cannot close it: the text arrives as `\u003c/run_data>` and is still readable.
 
 **Destination:** `https://api.anthropic.com`, or `ANTHROPIC_BASE_URL` if set. No other service
 receives it.
@@ -115,4 +128,4 @@ receives it.
 `tokens.input` counts cache tokens too.
 
 **Stored result:** `ai_review` on the run, with keys `model`, `verdict`, `summary`,
-`risk_assessments`, `diff_explanations`, `cost_usd` and `tokens`.
+`risk_assessments`, `diff_explanations`, `cost_usd`, `tokens`, `escalated` and `notes`.
