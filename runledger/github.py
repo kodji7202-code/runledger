@@ -68,6 +68,9 @@ _ESCAPE_RE = re.compile(r"([\\`*_~\[\]()!|])")
 _BACKTICKS_RE = re.compile(r"`+")
 _ISSUE_REF_RE = re.compile(r"#(?=\d)")
 _LINE_START_RE = re.compile(r"^(?:#|>|-|\+|\d+\.)")
+# GitHub links a bare URL on its own: the scheme and the `www.` prefix are the triggers,
+# and escaping the surrounding punctuation does not stop them.
+_BARE_URL_RE = re.compile(r"(?i)https?://|www\.")
 
 
 @dataclass
@@ -103,6 +106,14 @@ def _fork_forbidden(exc: GitHubError) -> bool:
 
 # ---------------------------------------------------------------- Markdown
 
+def _no_autolink(match: "re.Match[str]") -> str:
+    """A zero-width space inside the trigger: GitHub no longer links the URL, and the
+    reader still sees the whole address."""
+    token = match.group(0)
+    cut = token.index(":") + 1 if ":" in token else len(token) - 1
+    return token[:cut] + _ZWSP + token[cut:]
+
+
 def _text(value: Any, limit: Optional[int] = None) -> str:
     """User-derived text made safe inside a comment: one line, no raw HTML, no live link,
     image or @mention, no Markdown block that swallows the rest of the comment and no
@@ -114,6 +125,7 @@ def _text(value: Any, limit: Optional[int] = None) -> str:
     s = _ESCAPE_RE.sub(r"\\\1", s)
     s = _ISSUE_REF_RE.sub(r"\\#", s)
     s = _LINE_START_RE.sub(lambda m: "\\" + m.group(0), s)
+    s = _BARE_URL_RE.sub(_no_autolink, s)
     return s.replace("@", "@" + _ZWSP)
 
 
@@ -190,18 +202,24 @@ def _guard_line(item: Scored) -> Optional[str]:
 
 
 def _tests_line(item: Scored) -> str:
-    """One line per run saying whether tests ran and how the last run ended."""
+    """One line per run saying whether tests ran and how the final run ended. The final
+    invocation decides the verdict: an unreadable one is unknown, and any readable earlier
+    run is named as earlier instead of being passed off as the last run."""
     runs = item.test_runs if item.test_runs is not None else _test_runs(item.run)
     if not runs:
         return "- **Tests:** no tests run (this session has no test command)."
-    measured = [t for t in runs if t.outcome is not None]
-    if not measured:
-        return (f"- **Tests:** {len(runs)} test command(s) ran · "
-                "verdict: unknown (no readable summary line).")
-    last = measured[-1]
+    count = f"{len(runs)} test command(s) ran"
+    last = runs[-1]
+    if last.outcome is None:
+        line = (f"- **Tests:** {count} · last run unreadable ({last.description}) · "
+                "verdict: unknown.")
+        earlier = [t for t in runs[:-1] if t.outcome is not None]
+        if earlier:
+            ended = "passed" if earlier[-1].outcome == "pass" else "failed"
+            line += f" An earlier readable run {ended} ({earlier[-1].description})."
+        return line
     verdict = "passed" if last.outcome == "pass" else "failed"
-    return (f"- **Tests:** {len(runs)} test command(s) ran · "
-            f"last run {last.description} · verdict: {verdict}.")
+    return f"- **Tests:** {count} · last run {last.description} · verdict: {verdict}."
 
 
 def _run_details(item: Scored) -> List[str]:
