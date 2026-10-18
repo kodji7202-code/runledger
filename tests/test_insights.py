@@ -557,6 +557,57 @@ def test_the_false_positive_rate_is_null_when_no_risk_was_assessed(env):
     assert review["reviewed_runs"] == 1 and review["false_positive_rate"] is None
 
 
+def test_a_superseded_run_replaces_its_insight_contributions(env):
+    srv, base = env
+    _, admin, _, _ = team_with_keys(srv)
+    push(base, admin, receipt("s-1", recommendations=[rec("model_downgrade", "Use Haiku for search", 0.4)],
+                              ai_review=ai("needs_review", ["confirmed"])))
+    before = insights_of(base, admin)
+    assert before["top_recommendations"] == [
+        {"kind": "model_downgrade", "title": "Use Haiku for search", "count": 1, "est_savings_usd": 0.4},
+    ]
+    assert before["ai_review"]["needs_review"] == 1 and before["est_savings_usd"] == pytest.approx(0.4)
+
+    push(base, admin, receipt("s-1", recommendations=[rec("repeated_reads", "Cache the file", 0.1)],
+                              ai_review=ai("looks_safe", [])), expect=200)
+
+    after = insights_of(base, admin)
+    assert after["top_recommendations"] == [
+        {"kind": "repeated_reads", "title": "Cache the file", "count": 1, "est_savings_usd": 0.1},
+    ]
+    assert after["ai_review"]["needs_review"] == 0 and after["ai_review"]["looks_safe"] == 1
+    assert after["ai_review"]["false_positive_rate"] is None      # the old assessments are gone
+    assert after["est_savings_usd"] == pytest.approx(0.1)         # no double counting
+
+
+def test_a_run_stored_before_the_extraction_columns_still_counts(tmp_path):
+    """A database written before the extracted columns keeps its aggregates: the migration fills
+    them in, and a receipt stored without them is read as a fallback."""
+    path = tmp_path / "old.db"
+    with closing(sqlite3.connect(str(path))) as conn:
+        conn.executescript(SCHEMA)
+        conn.execute("INSERT INTO teams (name, api_key_hash, created_at) VALUES ('old', 'h', '2026-10-01T00:00:00Z')")
+        stored = receipt("legacy", recommendations=[rec("k", "Cut retries", 0.25)],
+                         ai_review=ai("dangerous", ["false_positive", "confirmed"]))
+        conn.execute(
+            "INSERT INTO runs (id, team_id, user, project, agent, title, started_at, ended_at, models, steps, "
+            "tokens, files_changed, cost, risk_score, risk_level, ai_verdict, receipt_json, receipt_html, created_at, "
+            "updated_at) VALUES ('legacy', 1, 'dev', 'p', 'Claude Code', NULL, '2026-10-05T10:00:00Z', NULL, '{}', "
+            "0, 0, 0, NULL, 10, 'low', 'dangerous', ?, NULL, '2026-10-05T10:00:00Z', '2026-10-05T10:00:00Z')",
+            (json.dumps(stored),),
+        )
+        # A row with no extraction at all: the fallback must read its receipt.
+        conn.execute("UPDATE runs SET recommendations = NULL, ai_assessment = NULL")
+        conn.commit()
+
+    with closing(Database(str(path))) as db:
+        summary = insights.compute(db, 1, "2026-10-01T00:00:00Z", 30)
+    assert summary["top_recommendations"] == [
+        {"kind": "k", "title": "Cut retries", "count": 1, "est_savings_usd": 0.25},
+    ]
+    assert summary["ai_review"]["dangerous"] == 1 and summary["ai_review"]["false_positive_rate"] == 0.5
+
+
 def test_insights_are_scoped_to_the_callers_team(env):
     srv, base = env
     _, admin_a, _, _ = team_with_keys(srv, "alpha")

@@ -130,7 +130,8 @@ target and details. Details never include a key secret or a webhook URL.
 | `key.create` | A key is created, including the team's first key | Key id | label, role, prefix |
 | `key.rotate` | A key's secret is replaced | Key id | label, role, prefix (of the new secret) |
 | `key.revoke` | A key is revoked | Key id | label, role, prefix |
-| `run.push` | A new immutable receipt is stored (identical retries are not new writes) | Run id | agent, project |
+| `run.push` | A new receipt is stored (identical retries are not new writes) | Run id | agent, project |
+| `run.supersede` | A session is pushed again and replaces the stored run | Run id | revision, replaced_revision, agent, project |
 | `approval.decide` | An approval is approved or denied | Approval id | status |
 | `team.settings` | Team settings change | `settings` | the names of the fields changed, and `approval_ttl_s` if it changed. Never the URLs. |
 | `auth.sign_in` | A dashboard sign-in with a key succeeds | Key id | role, and the client address (`ip`) |
@@ -316,6 +317,9 @@ The team database (one SQLite file) holds:
 
 - **Runs.** Each pushed receipt: the receipt JSON (prompts, step summaries, file paths and line counts,
   command text, models, cost and risk reasons) and the HTML receipt.
+- **Run history.** When a session is pushed again and replaces the stored run, the replaced version
+  (its receipt JSON and HTML, risk score and cost) is kept, at most the newest 20 versions per run.
+  The purge deletes a run's history with the run.
 - **Approvals.** Their summary, findings, folder, session id, decision, reason and who decided.
 - **Keys.** Hashes and prefixes, labels, roles and timestamps. Never the secrets.
 - **Settings.** Team webhook URLs and the approval timeout.
