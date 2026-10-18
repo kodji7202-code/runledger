@@ -410,45 +410,59 @@ volume that was created by an Alpine helper is not writable by that user either.
 
 With `docker compose -p myproject ...` the volume is `myproject_runledger-data` and the image is
 `myproject-runledger`; use those names in the helper commands. If you built the image yourself with
-`docker build -t <name> .`, use `<name>` in the second command.
+`docker build -t <name> .`, use `<name>` in the helper commands.
 
 **Whole data volume (tar).** Restore the archive from the "Whole data volume" backup into the
-volume, again with the stack stopped. The backup command names the archive with `date +%F`, so the
-file is `runledger-data-YYYY-MM-DD.tgz`; name the file you actually took the same way
-(`runledger-data-2026-10-18.tgz` below is one example). Check that it is there and readable before
-anything is deleted, then let one `sh -c` with `set -e` do the destructive work: it removes the old
-data volume, extracts the archive, hands the files back to the service user and only then starts the
-stack again, so a failed extraction stops the recipe instead of starting the server on an empty
-volume. Remove that one volume only; `docker compose down -v` would also delete the `caddy-data` and
-`caddy-config` volumes, which this archive does not hold:
+volume, with the `runledger` service stopped. The backup command names the archive with `date +%F`,
+so the file is `runledger-data-YYYY-MM-DD.tgz`; name the file you actually took the same way
+(`runledger-data-2026-10-18.tgz` below is one example). The backup archives the data directory
+(`tar czf ... -C /data .`), so its members are relative to it and the restore has to put them back
+where they came from. Nothing may be deleted before the archive has been proven usable.
+
+The recipe stops the `runledger` service only, leaving Caddy and its volumes alone, then runs one
+helper container from the server's own image, with the data volume on `/data` and the `deploy`
+folder on `/backup`. It runs a single `sh -c` script with `set -e` that does everything in order:
+check the archive is readable, list it with `tar tzf`, extract it into the fresh `/restore`
+directory, check that the extracted tree holds the database, and only then empty `/data` and copy
+the extracted tree into it (`cp -a /restore/. /data/`), ending by handing the volume back to the
+service user. The `&&` starts the service only when that container exited 0, so a missing,
+unreadable, corrupt or unusable archive leaves the volume exactly as it was, with the server still
+stopped:
 
 ```bash
 cd deploy
-docker compose down
+docker compose stop runledger
 archive=runledger-data-2026-10-18.tgz     # the YYYY-MM-DD name the backup command wrote
-test -r "$archive"                        # stop here if the archive is missing or unreadable
-docker run --rm -v "$PWD":/backup alpine tar tzf "/backup/$archive" > /dev/null
-sh -c '
+docker run --rm --user root \
+  -v deploy_runledger-data:/data -v "$PWD":/backup --entrypoint sh deploy-runledger \
+  -c '
 set -e
-archive=$1
-docker volume rm deploy_runledger-data
-docker run --rm -v deploy_runledger-data:/data -v "$PWD":/backup alpine \
-  tar xzf "/backup/$archive"
-docker run --rm --user root -v deploy_runledger-data:/data --entrypoint sh deploy-runledger \
-  -c "chown -R runledger:runledger /data && chmod 700 /data"
-docker compose up -d
-' sh "$archive"
+archive="/backup/$1"
+test -r "$archive"                    # a missing or unreadable archive stops here
+tar tzf "$archive" > /dev/null        # a corrupt archive stops here
+rm -rf /restore
+mkdir -p /restore
+tar xzf "$archive" -C /restore        # the members are relative to the data directory
+test -f /restore/runledger.db         # no database means no restore
+find /data -mindepth 1 -delete        # the archive is usable: replace the old contents
+cp -a /restore/. /data/
+rm -rf /restore
+chown -R runledger:runledger /data
+chmod 700 /data
+chmod 600 /data/runledger.db
+' sh "$archive" \
+  && docker compose start runledger
 ```
 
 The archive holds what the volume held when it was taken, with the files' own modes (the database
-is `0600`), and extracting it overwrites the files in the volume with the archived ones. It does not
-touch Caddy's volumes, so the certificates are still there. `tar` runs as `root` here, so the
-extracted files belong to `root` and the last helper hands them back to the `runledger` user that
-the server runs as. `docker volume rm` refuses while a container still uses the volume, which is why
-the stack is stopped first; if a first attempt already removed the volume, that command fails and
-`set -e` stops there, so create it back with `docker volume create deploy_runledger-data` and run the
-recipe again. If the extraction fails, `set -e` stops the shell before `docker compose up -d`, so the
-server never starts on a half-restored volume: fix the archive and run the recipe again.
+is `0600`), and copying it in replaces the old contents, including the `-wal` and `-shm` files that
+belonged to the database you replaced. It does not touch Caddy's volumes, so the certificates are
+still there; the recipe removes no volume at all, while `docker compose down -v` would delete
+`caddy-data` and `caddy-config`, which this archive does not hold. `tar` and the copy run as `root`
+in the helper, so the last lines give the volume back to the `runledger` user that the server runs
+as. If the server runs with a different `--db` name, use that file name in the `test -f` and
+`chmod` lines. When the helper exits non-zero, nothing has been deleted and the server stays
+stopped: fix the archive, the name or the file name above and run the recipe again.
 
 ## Upgrades
 
