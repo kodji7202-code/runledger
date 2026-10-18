@@ -6,34 +6,60 @@ Path rules, applied to path fields and to every absolute path found in free text
   - a prefix listed in RUNLEDGER_SAFE_PREFIXES (os.pathsep-separated): `…` plus the rest
   - temp folders (/tmp, /var/tmp, the system temp dir): kept as they are
   - a path sharing leading folders with the repository root: that prefix becomes `…`
-  - with no known root (a relative cwd), other non-system paths keep their last two parts: `…/a/b`
-Free text then gets the usual secret masking, e-mail addresses become [EMAIL] and the
-`user:pass@` part of URLs becomes [REDACTED]@. Session id, branch and models are kept.
+  - other non-system paths with more than two segments keep their last two parts: `…/a/b`
+Free text then gets the usual secret masking, e-mail addresses become [EMAIL] (except
+scp-style `git@host:org/repo` remotes) and the `user:pass@` part of URLs becomes
+[REDACTED]@ (except `ssh://git@host/...`). Sentence punctuation that follows an address
+(`contact me@example.com.`) stays in the text. Session id, branch and models are kept.
 Every function is idempotent: applying it to its own output changes nothing.
 """
 from __future__ import annotations
 
 import dataclasses
+from functools import lru_cache
 import os
 import re
 import tempfile
 from typing import Any, List, Optional, Sequence
 
+from . import labels
 from .guard import redact
 from .parser import Run
-from .paths import _norm, is_abs, is_windows_style, within
+from .paths import (PATH_CHUNK, PATH_NAME, PATH_REST, SPACED_SUFFIX, _norm, is_abs,
+                    is_windows_style, within)
 from .risk import Risk
 
 ELLIPSIS = "…"
 EMAIL = "[EMAIL]"
-_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
-_URL_CREDS_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9+.-]*://)[^\s/@]+@")
+# An scp-style remote (`git@host:org/repo`) is kept, but only with a non-empty remote path,
+# so a real address followed by a prose colon (`git@host: reply`) is still masked.
+# The address ends at the last label: sentence punctuation and closing brackets or quotes that
+# follow it are left in the text, so `contact me@example.com.` masks the address and keeps the
+# full stop. Only a letter or digit would have been part of the address itself.
+_EMAIL_RE = re.compile(
+    r"(?<![A-Za-z0-9._%+-])(?<!://)"
+    r"(?!git@[A-Za-z0-9.-]+\.[A-Za-z]{2,}:(?!//)[\w./~-])"
+    r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
+    r"(?![A-Za-z0-9])"
+)
+_URL_CREDS_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9+.-]*://)(?!git@)[^\s/@]+@")
+# More of a path separated by spaces: a name followed by a separator, then the rest of the
+# folder or file name (`E:\Work\Client X\secret.txt`).
+_SPACED = SPACED_SUFFIX + "*"
+# The user name of a home folder may contain spaces, in any script; it runs to a separator,
+# a quote or the end of the line, so no part of the name can leak. This over-redacts prose
+# after an unknown user name, which is the safe direction.
+_USER = PATH_NAME + r"(?:[ \t]+" + PATH_NAME + r")*"
+_HOME_REST = r"(?:[\\/]" + PATH_REST + r")?"
 # An absolute path in free text: a POSIX path not glued to a word, `~` or `…`, or a Windows
-# drive path. It ends at whitespace, quotes, shell punctuation or `:` (PATH-style lists).
-# `//` is not a path start, so URLs (`https://host/x`) are left alone.
+# drive path. `//` is not a path start, so URLs (`https://host/x`) are left alone.
 _TEXT_PATH_RE = re.compile(
-    r"(?<![\w.~/\\…-])/(?!/)[^\s'\"`<>|;:,(){}\[\]]+"
-    r"|(?<![\w])[A-Za-z]:[\\/][^\s'\"`<>|;,(){}\[\]]*")
+    r"(?<![\w.~/\\…-])/(?:[Hh]ome|[Uu]sers)/" + _USER + _HOME_REST
+    + r"|(?<![\w])[A-Za-z]:[\\/][Uu]sers[\\/]" + _USER + _HOME_REST
+    + r"|(?<![\w])[A-Za-z]:[\\/]" + PATH_CHUNK + _SPACED
+    + r"|(?<![\w.~/\\…-])/(?!/)[^\s'\"`<>|;:,(){}\[\]]+" + _SPACED
+    + r"|(?<![\w])[A-Za-z]:[\\/][^\s'\"`<>|;,(){}\[\]]*"
+)
 _HOME_RE = re.compile(r"^(?:/home/[^/]+|/Users/[^/]+|/root|[A-Za-z]:/Users/[^/]+)(?=/|$)", re.I)
 _TEMP_PREFIXES = ("/tmp", "/var/tmp", "/private/tmp", "/private/var/folders", "/var/folders")
 
@@ -74,7 +100,10 @@ def _temp_dirs() -> List[str]:
     return dirs
 
 
-_SYSTEM_PREFIXES = ("/usr", "/bin", "/sbin", "/etc", "/dev", "/proc", "/sys", "/opt/homebrew", "/lib")
+_SYSTEM_PREFIXES = (
+    "/usr", "/bin", "/sbin", "/etc", "/dev", "/proc", "/sys", "/opt/homebrew", "/lib",
+    "C:/Windows", "C:/Program Files", "C:/Program Files (x86)",
+)
 
 
 def _is_system(p: str) -> bool:
@@ -106,12 +135,11 @@ def safe_path(path: str, ctx: SafeContext) -> str:
         shared = 0
         while shared < min(len(a), len(b)) and (a[shared].lower() == b[shared].lower() if win else a[shared] == b[shared]):
             shared += 1
-        if shared >= 2:  # at least one folder below the filesystem root or drive is shared
+        if shared >= 2 and len(a) - shared <= 2:  # at least one folder below the filesystem root or drive is shared
             return ELLIPSIS + "/" + "/".join(a[shared:]) if shared < len(a) else ELLIPSIS
-    elif not _is_system(p):
-        # No known root (the log records a relative cwd): the folder layout cannot be told
-        # apart from the project, so only the last two parts are kept.
-        parts = [x for x in p.split("/") if x]
+    if not _is_system(p):
+        # Foreign paths (or any path when no root is known) keep only their last two parts.
+        parts = [x for x in p.split("/") if x and not re.match(r"^[A-Za-z]:$", x)]
         if len(parts) > 2:
             return ELLIPSIS + "/" + "/".join(parts[-2:])
     return path
@@ -149,8 +177,25 @@ def _truncated_path(base: str, ctx: SafeContext) -> Optional[str]:
     return None if shown == base else shown + ELLIPSIS
 
 
+@lru_cache(maxsize=64)
+def _compile_spaced_re(spaced: tuple[str, ...]) -> "re.Pattern[str]":
+    alts = [re.escape(p).replace("/", r"[\\/]") + r"(?:[\\/][^\s'\"`<>|;,(){}\[\]]*)?"
+            for p in sorted(spaced, key=len, reverse=True)]
+    flags = re.I if any(is_windows_style(p) for p in spaced) else 0
+    return re.compile("|".join(alts), flags)
+
+
+def _spaced_ctx_re(ctx: SafeContext) -> Optional["re.Pattern[str]"]:
+    spaced = tuple(p for p in (ctx.root, ctx.home, *ctx.prefixes) if p and " " in p)
+    return _compile_spaced_re(spaced) if spaced else None
+
+
 def safe_text(text: Any, ctx: SafeContext) -> str:
     s = "" if text is None else str(text)
+    if " " in s:
+        spaced_re = _spaced_ctx_re(ctx)
+        if spaced_re is not None:
+            s = spaced_re.sub(lambda m: _path_in_text(m, ctx), s)
     s = _TEXT_PATH_RE.sub(lambda m: _path_in_text(m, ctx), s)
     s = redact(s)
     s = _URL_CREDS_RE.sub(r"\1[REDACTED]@", s)
@@ -188,6 +233,7 @@ def make_safe(run: Run, risks: Sequence[Risk], root: Optional[str] = None) -> No
     from .summarize import file_changes
     ctx = context(run.cwd, root)
     changes = file_changes(run)
+    by_step = labels.step_label_map(run)
     run.frozen_changes = {}
     for path, change in changes.items():
         shown = safe_text(path, ctx) if not is_abs(path) else safe_path(path, ctx)
@@ -206,7 +252,10 @@ def make_safe(run: Run, risks: Sequence[Risk], root: Optional[str] = None) -> No
                 s.input[key] = safe_text(val, ctx)
     every = {id(r): r for r in list(risks) + [r for s in run.steps for r in s.risks]}
     for r in every.values():
-        r.reason = safe_text(r.reason, ctx)
+        r.reason = safe_text(labels.show_reason(r.reason, by_step.get(r.step)), ctx)
+    # Those reasons carry their labels now, so a later render has nothing left to label: masking
+    # rewrites the text inside a label, and a second pass would append the path a second time.
+    run.show_labels = {}
     run.quality = _value(run.quality, ctx)
     run.recommendations = _value(run.recommendations, ctx)
     run.ai_review = _value(run.ai_review, ctx)

@@ -2,7 +2,9 @@
 
 The receipt is built the same way as `runledger receipt` (parser, pricing and
 risk rules from cli.build), then POSTed as JSON to /api/runs with the developer
-name and project folder. Standard library only (urllib).
+name and project folder. With safe mode (`--safe`, `RUNLEDGER_PUSH_SAFE=1` or
+`push_safe` in the user config) the receipt is masked first, so the server stores
+no local paths and no e-mail addresses. Standard library only (urllib).
 """
 from __future__ import annotations
 
@@ -17,16 +19,35 @@ from typing import Any, Dict, List, Optional, Union
 from urllib.parse import urlsplit
 
 from . import __version__
+from . import _http
 from .cli import build
 from .pricing import cost_of
 from .receipt import render
 from .review import DEFAULT_REVIEW_MODEL
+from .safe import make_safe
 
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+SAFE_HINT = ("tip: --safe (or RUNLEDGER_PUSH_SAFE=1) masks local paths and e-mail addresses "
+             "before they are sent")
 
 
 class PushError(RuntimeError):
     """The receipt could not be built or delivered. The message is safe to print."""
+
+
+def safe_hint(server_url: str, safe: bool = False) -> Optional[str]:
+    """The one-line safe-mode tip for a push that is not masked, or None. Only a remote
+    HTTPS server gets it: a loopback server belongs to the developer, and a shared team
+    server is the one the docs put behind HTTPS."""
+    if safe:
+        return None
+    parts = urlsplit(server_url or "")
+    if parts.scheme.lower() != "https":
+        return None
+    host = (parts.hostname or "").lower()
+    if not host or host in LOOPBACK_HOSTS:
+        return None
+    return SAFE_HINT
 
 
 def default_user() -> str:
@@ -58,10 +79,13 @@ def build_payload(
     review: bool = False,
     review_model: str = DEFAULT_REVIEW_MODEL,
     notes: Optional[List[str]] = None,
+    safe: bool = False,
 ) -> Dict[str, Any]:
     """The JSON body for POST /api/runs: the receipt plus user, project, html.
     With review=True the Claude risk review is included as "ai_review". A review that
-    fails is left out and its one-line note is appended to `notes`."""
+    fails is left out and its one-line note is appended to `notes`. With safe=True the
+    receipt is masked first, so the stored JSON and HTML carry no local paths and no
+    e-mail addresses; the developer name and the project folder are kept as they are."""
     path = Path(session_path)
     if not path.is_file():
         raise PushError(f"Session file not found: {path}")
@@ -71,13 +95,23 @@ def build_payload(
         raise PushError(str(exc)) from None
     if note and notes is not None:
         notes.append(note)
+    # The project folder is read before masking: safe_cwd keeps the repository name and the
+    # subfolder, and the folder name alone is what the dashboard groups runs by.
+    folder = project or _folder_name(run.cwd) or "unknown"
+    if safe:
+        make_safe(run, risks)
     # The JSON receipt carries "agent" (label, e.g. "Codex CLI") and "agent_id".
     payload = json.loads(render(run, score, level, risks, "json"))
     # Exact cost per model, including messages that issued no tool call
-    # (step costs alone would miss those).
-    payload["models"] = {m: {"tokens": u.total, "cost_usd": cost_of(u, m)} for m, u in run.models.items()}
+    # (step costs alone would miss those). A run whose agent recorded no usage has no cost at
+    # all: a priced-model zero bucket would reach the server as a free run.
+    missing_usage = run.usage_source == "missing"
+    payload["models"] = {
+        m: {"tokens": u.total, "cost_usd": None if missing_usage else cost_of(u, m)}
+        for m, u in run.models.items()
+    }
     payload["user"] = (user or default_user()).strip() or "unknown"
-    payload["project"] = project or _folder_name(run.cwd) or "unknown"
+    payload["project"] = folder
     payload["html"] = render(run, score, level, risks, "html")
     if run.ai_review is not None:
         payload["ai_review"] = run.ai_review
@@ -93,7 +127,7 @@ def _opener_for(url: str) -> urllib.request.OpenerDirector:
 
 def _server_message(exc: urllib.error.HTTPError) -> str:
     try:
-        return str(json.loads(exc.read().decode("utf-8"))["error"]["message"])[:300]
+        return str(json.loads(_http.read_error(exc))["error"]["message"])[:300]
     except Exception:
         return str(exc.reason) if exc.reason else "no details"
 
@@ -109,15 +143,18 @@ def push(
     review: bool = False,
     review_model: str = DEFAULT_REVIEW_MODEL,
     notes: Optional[List[str]] = None,
+    safe: bool = False,
 ) -> Dict[str, Any]:
     """Build the receipt for a session and upload it. Returns the server's reply
-    ({"id", "url", "risk_score", "risk_level"}). See build_payload for review and notes."""
+    ({"id", "url", "risk_score", "risk_level"}), or {"status": "updated", "id", "revision"}
+    when the same key pushed a new version of a session already on the server.
+    See build_payload for review, notes and safe mode."""
     if not server_url:
         raise PushError("No server URL. Pass --server or set RUNLEDGER_SERVER.")
     if not api_key:
         raise PushError("No API key. Pass --key or set RUNLEDGER_API_KEY.")
     payload = build_payload(session_path, user=user, project=project,
-                            review=review, review_model=review_model, notes=notes)
+                            review=review, review_model=review_model, notes=notes, safe=safe)
     endpoint = server_url.rstrip("/") + "/api/runs"
     request = urllib.request.Request(
         endpoint,

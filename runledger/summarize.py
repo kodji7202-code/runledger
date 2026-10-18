@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional
 from . import llm
 from .parser import Run, Step, Usage
 from .paths import is_abs, relative
+from .ps_writes import ps_deletes, ps_writes, shell_kind
 from .shell_writes import shell_deletes, shell_writes
 
 DEFAULT_AI_MODEL = os.environ.get("RUNLEDGER_SUMMARY_MODEL", "claude-haiku-5-5")
@@ -73,6 +74,7 @@ def file_changes(run: Run) -> Dict[str, FileChange]:
     if run.frozen_changes is not None:
         return {p: replace(fc) for p, fc in run.frozen_changes.items()}
     changes: Dict[str, FileChange] = {}
+    uncounted = set()
     for s in run.steps:
         p = _str(s.input.get("file_path")) or _str(s.input.get("notebook_path"))
         p = _short(p, run.cwd) if p else p
@@ -80,10 +82,19 @@ def file_changes(run: Run) -> Dict[str, FileChange]:
             fc = changes.setdefault(p, FileChange(p))
             if not fc.added and not fc.removed:
                 fc.created = "created" in _str(s.result_text).lower() or not s.result_text
-            fc.added += _lines(s.input.get("content"))
+            if "content" in s.input:
+                fc.added += _lines(s.input.get("content"))
+                uncounted.discard(p)
+            elif not fc.added and not fc.removed:
+                uncounted.add(p)
         elif s.tool in ("Edit", "MultiEdit") and p:
             fc = changes.setdefault(p, FileChange(p))
-            for e in _edits(s.input):
+            edits = _edits(s.input)
+            if not any("old_string" in e or "new_string" in e for e in edits) and not fc.added and not fc.removed:
+                uncounted.add(p)
+            else:
+                uncounted.discard(p)
+            for e in edits:
                 o, n = e.get("old_string"), e.get("new_string")
                 fc.removed += _lines(o)
                 fc.added += _lines(n)
@@ -91,15 +102,20 @@ def file_changes(run: Run) -> Dict[str, FileChange]:
             changes.setdefault(p, FileChange(p)).deleted = True
         elif s.tool == "NotebookEdit" and p:
             changes.setdefault(p, FileChange(p)).added += _lines(s.input.get("new_source"))
-        elif s.tool == "Bash":
+        elif s.tool in ("Bash", "PowerShell"):
             cmd = _str(s.input.get("command"))
-            for target in shell_deletes(cmd):
+            is_ps = shell_kind(s) == "powershell"
+            # The shell's own words decide which files changed: `touch C:/repo/My Folder/x.txt`
+            # writes `My` and `Folder/x.txt`, and a receipt counts exactly those.
+            deletes = ps_deletes(cmd) if is_ps else shell_deletes(cmd)
+            writes = ps_writes(cmd) if is_ps else shell_writes(cmd)
+            for target in deletes:
                 p = _short(target, run.cwd)
                 if run.cwd and is_abs(p):
                     continue  # outside the project, such as a scratch file in /tmp
                 fc = changes.setdefault(p, FileChange(p))
                 fc.deleted = fc.shell = True
-            for w in shell_writes(cmd):
+            for w in writes:
                 p = _short(w.path, run.cwd)
                 if run.cwd and is_abs(p):
                     continue  # outside the project, such as a backup in /tmp
@@ -108,7 +124,7 @@ def file_changes(run: Run) -> Dict[str, FileChange]:
                 fc.deleted = w.deleted
                 fc.added += w.added
     for p, fc in changes.items():
-        git = run.git_changes.get(p) if fc.shell else None
+        git = run.git_changes.get(p) if (fc.shell or p in uncounted) else None
         if git:
             fc.added, fc.removed = int(git.get("added") or 0), int(git.get("removed") or 0)
             fc.created = git.get("status") in ("untracked", "added")
@@ -134,7 +150,7 @@ def template_summary(step: Step, cwd: Optional[str]) -> str:
         a = sum(_lines(e.get("new_string")) for e in edits)
         r = sum(_lines(e.get("old_string")) for e in edits)
         return f"Edited {p} (+{a} −{r})"
-    if t == "Bash":
+    if t in ("Bash", "PowerShell"):
         desc = _str(i.get("description"))
         lines = _str(i.get("command")).strip().splitlines() or [""]
         # Redact before cutting, so the 120-character limit cannot keep half of a secret.
@@ -189,17 +205,61 @@ def apply_templates(run: Run) -> None:
 # ---------------- AI summaries (Claude API) ----------------
 
 def _clip(text: Optional[str], limit: int) -> str:
-    """Redact first, then cut. A secret is replaced whole, so the cut cannot leave half of it."""
-    s = llm.redact(text or "")
+    """Mask first, then cut. A secret, an e-mail or a home folder is replaced whole, so the
+    cut cannot leave half of one."""
+    s = llm.scrub(text or "")
     return s if len(s) <= limit else s[:limit] + f"…[+{len(s) - limit} chars]"
 
 
+def _scrub_input(value: Any, limit: int) -> Any:
+    """Mask every string in a step input, however deeply it is nested (a MultiEdit's edits,
+    a list of notes), before the JSON is written: serialization doubles the Windows
+    separators, so an unmasked path could no longer be recognized at the API boundary."""
+    if isinstance(value, str):
+        return _clip(value, limit)
+    if isinstance(value, dict):
+        return {llm.scrub(str(key)): _scrub_input(item, limit) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_scrub_input(item, limit) for item in value]
+    return value
+
+
 def _compact_step(s: Step) -> Dict:
-    inp = {}
-    for k, v in s.input.items():
-        inp[k] = _clip(v, 600) if isinstance(v, str) else v
+    inp = {key: _scrub_input(value, 600) for key, value in s.input.items()}
     return {"n": s.index, "tool": s.tool, "input": inp,
             "result": _clip(s.result_text, 400), "error": s.is_error}
+
+
+_STEP_WORDS = {"zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+               "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12}
+
+
+def _step_number(value: Any) -> Optional[int]:
+    """The step a model's answer belongs to: an int, a number written as a string ("2") or a
+    small number written as a word ("two"). Anything else names no step and is ignored."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return _STEP_WORDS.get(value.strip().lower())
+    return None
+
+
+def _summary_json(text: str) -> Optional[Dict]:
+    """The first JSON object in the model's reply, or None. Prose before or after the object,
+    braces in that prose and a ```json fence around it do not hide the summaries."""
+    start = text.find("{")
+    if start < 0:
+        return None
+    try:
+        data, _end = json.JSONDecoder().raw_decode(text, start)
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def ai_summaries(run: Run, api_key: Optional[str] = None, model: str = DEFAULT_AI_MODEL,
@@ -223,15 +283,23 @@ def ai_summaries(run: Run, api_key: Optional[str] = None, model: str = DEFAULT_A
     )
     data = llm.call([{"role": "user", "content": prompt}], model, max_tokens=4000,
                     api_key=api_key, timeout=timeout)
-    text = llm.text_of(data)
-    m = re.search(r"\{.*\}", text, re.S)
-    if not m:
+    parsed = _summary_json(llm.text_of(data))
+    if parsed is None:
         raise RuntimeError("Claude did not return JSON summaries.")
-    parsed = json.loads(m.group(0))
-    by_n = {int(x["n"]): x["summary"] for x in parsed.get("steps", []) if "n" in x}
+    steps = parsed.get("steps")
+    by_n: Dict[int, str] = {}
+    for item in steps if isinstance(steps, list) else []:
+        if not isinstance(item, dict):
+            continue
+        index = _step_number(item.get("n"))
+        summary = item.get("summary")
+        if index is None or not isinstance(summary, str) or not summary.strip():
+            continue
+        by_n.setdefault(index, summary.strip())
     for s in run.steps:
-        if s.index in by_n and by_n[s.index].strip():
-            s.summary = by_n[s.index].strip()
-    if parsed.get("overview"):
-        run.overall_summary = parsed["overview"].strip()
+        if s.index in by_n:
+            s.summary = by_n[s.index]
+    overview = parsed.get("overview")
+    if isinstance(overview, str) and overview.strip():
+        run.overall_summary = overview.strip()
     return llm.usage(data)

@@ -11,7 +11,7 @@ from runledger.adapters import droid
 from runledger.cli import build, reconcile_git
 from runledger.parser import Run, Step, Usage
 from runledger.receipt import to_dict
-from runledger.shell_writes import ShellWrite, shell_writes
+from runledger.shell_writes import ShellWrite, shell_deletes, shell_writes
 from runledger.summarize import file_changes
 
 FIX = Path(__file__).parent / "fixtures" / "droid_shell_edits.jsonl"
@@ -43,6 +43,16 @@ def _paths(command):
     ("python3 - <<'EOF'\np='a.py'\nopen(p).read()\nopen(p,'w').write('x')\np='b.md'\nopen(p, mode='a').write('y')\nEOF",
      [("a.py", 0, False), ("b.md", 0, False)]),
     ("python - <<EOF\nfrom pathlib import Path\nPath('c.txt').write_text('x')\nEOF", [("c.txt", 0, False)]),
+    ("echo '<<EOF'\necho x > a.txt", [("a.txt", 0, False)]),
+    ('echo "<<EOF"\necho x > b.txt', [("b.txt", 0, False)]),
+    ("cat <<<word\necho x > c.txt", [("c.txt", 0, False)]),
+    ("echo $((1<<2))\necho x > d.txt", [("d.txt", 0, False)]),
+    ("# <<EOF\necho x > e.txt", [("e.txt", 0, False)]),
+    ("echo $'it\\'s <<EOF'\necho x > f.txt", [("f.txt", 0, False)]),
+    ("python3 - <<'EOF'\nopen('a.py', 'w').write('1\\n')\nEOF\necho x > b.txt", [("a.py", 0, False), ("b.txt", 0, False)]),
+    ('cat <<"EOF" > c.txt\nhi\nEOF', [("c.txt", 1, False)]),
+    ("cat <<-EOF > d.txt\n\thi\n\tEOF", [("d.txt", 1, False)]),
+    ("cat <<EOF > u.txt\nline1\nline2", [("u.txt", 2, False)]),
 ])
 def test_detects_shell_writes(command, expected):
     assert _paths(command) == expected
@@ -62,6 +72,61 @@ def test_detects_shell_writes(command, expected):
 ])
 def test_ignores_reads_and_unresolvable_targets(command):
     assert shell_writes(command) == []
+
+
+@pytest.mark.parametrize("command, expected", [
+    (r"echo hi > E:\Work\Client y\z.txt", [("E:\\Work\\Client", 0, False)]),
+    (r"echo hi > E:/Work/Client y/z.txt", [("E:\\Work\\Client", 0, False)]),
+    (r"echo hi >> 'E:\Work\Client y\z.txt'", [("E:\\Work\\Client y\\z.txt", 0, False)]),
+    (r"echo hi > E:\Work\Client X\secret.txt", [("E:\\Work\\Client", 0, False)]),
+    (r"touch E:\Work\Client y\z.txt", [("E:\\Work\\Client", 0, False), ("yz.txt", 0, False)]),
+])
+def test_an_unquoted_spaced_drive_path_is_the_shells_own_words(command, expected):
+    """CORE-SCR-R4-001: a shell splits an unquoted path at its spaces, so the write targets are
+    its own words; only a quoted path is one word. Showing the folder name whole is a label
+    output renders (`runledger.labels`), never the reading file changes are computed from."""
+    assert _paths(command) == expected
+
+
+def test_a_spaced_drive_write_inside_the_project_lists_the_shells_own_files():
+    """R5-003: `touch C:/repo/My Folder/x.txt` writes the two files a shell writes, so a receipt
+    counts exactly those; the whole path is a label a finding shows, never a file key. The drive
+    path is spelled out so the check reads the same on every host."""
+    run = _run("C:/repo", ["touch C:/repo/My Folder/x.txt"])
+    assert sorted(file_changes(run)) == ["Folder/x.txt", "My"]
+
+
+@pytest.mark.parametrize("command, deleted, written", [
+    (r"rm C:/repo/a.txt ../outside.txt", [r"C:\repo\a.txt", "../outside.txt"], []),
+    (r"rm C:/repo/a.txt > C:/repo/log ../outside.txt",
+     [r"C:\repo\a.txt", "../outside.txt"], [r"C:\repo\log"]),
+    (r"rm < C:/repo/input ../outside.txt", ["../outside.txt"], []),
+])
+def test_spaced_drive_path_does_not_swallow_a_relative_operand(command, deleted, written):
+    """CORE-SCR-R2-004: `../outside.txt` is an argument of its own, so the delete stays visible
+    instead of being read as the tail of the drive path (or of a redirect target) before it."""
+    assert shell_deletes(command) == deleted
+    assert [w.path for w in shell_writes(command)] == written
+
+
+@pytest.mark.parametrize("command, expected", [
+    ("echo <<EOF $'first\nsecond'\npayload\nEOF\nrm k.txt", ["k.txt"]),
+])
+def test_a_queued_heredoc_starts_after_the_command_line(command, expected):
+    """CORE-SCR-R3-002: a nested newline inside a multiline `$'...'` string is not the end of
+    the command line, so the heredoc body starts at the real terminator and the delete after
+    its `EOF` line stays visible."""
+    assert shell_deletes(command) == expected
+
+
+@pytest.mark.parametrize("command, expected", [
+    ("echo ok # <<EOF\nrm k.txt", ["k.txt"]),
+    ("echo a#b; rm k.txt", ["k.txt"]),
+    ("printf x # note\nrm k.txt", ["k.txt"]),
+])
+def test_comment_ends_at_the_newline(command, expected):
+    # shlex would swallow the comment's newline and read the next line as arguments.
+    assert shell_deletes(command) == expected
 
 
 def test_droid_fixture_lists_shell_edited_files():

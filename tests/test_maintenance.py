@@ -14,7 +14,7 @@ NOW = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
 
 
 @pytest.mark.parametrize("raw, expected", [
-    ("", None), ("  ", None), ("90", 90), (" 1 ", 1),
+    ("", None), ("  ", None), ("90", 90), ("35", 35), ("3650", 3650),
 ])
 def test_retention_from_env(raw, expected):
     assert maintenance.retention_from_env({maintenance.RETENTION_ENV: raw}) == expected
@@ -24,10 +24,32 @@ def test_retention_is_unset_by_default():
     assert maintenance.retention_from_env({}) is None
 
 
+@pytest.mark.parametrize("raw", ["1", "10", "34"])
+def test_a_short_retention_is_raised_to_the_floor_with_a_warning(raw, capsys):
+    """A period shorter than a month could delete the runs behind a budget alert, which would let
+    the same alert fire again. The floor is applied instead of refusing to start."""
+    assert maintenance.retention_from_env({maintenance.RETENTION_ENV: raw}) == 35
+    err = capsys.readouterr().err
+    assert maintenance.RETENTION_ENV in err and raw in err and "35" in err
+
+
 @pytest.mark.parametrize("raw", ["0", "ninety", "-5", "1.5"])
 def test_retention_from_env_rejects_bad_values(raw):
     with pytest.raises(ValueError, match=maintenance.RETENTION_ENV):
         maintenance.retention_from_env({maintenance.RETENTION_ENV: raw})
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ("", None), ("  ", None), ("365", 365), ("0", 0), ("1", 1),
+])
+def test_audit_retention_from_env(raw, expected):
+    assert maintenance.audit_retention_from_env({maintenance.AUDIT_RETENTION_ENV: raw}) == expected
+
+
+@pytest.mark.parametrize("raw", ["-1", "forever", "1.5"])
+def test_audit_retention_from_env_rejects_bad_values(raw):
+    with pytest.raises(ValueError, match=maintenance.AUDIT_RETENTION_ENV):
+        maintenance.audit_retention_from_env({maintenance.AUDIT_RETENTION_ENV: raw})
 
 
 def test_serve_rejects_invalid_retention_before_opening_database(tmp_path, monkeypatch, capsys):
@@ -60,10 +82,10 @@ def test_retention_removes_only_old_history(tmp_path):
             conn.execute("UPDATE approvals SET created_at = ? WHERE id = 'new-approval'", (recent,))
             conn.execute("UPDATE audit_log SET at = ?", (old,))
             conn.execute(
-                "INSERT INTO budget_alerts VALUES (?, '2026-07', 'team', 50, 5, 10, ?)", (team_id, old),
+                "INSERT INTO budget_alerts VALUES (?, '2026-06', 'team', 50, 5, 10, ?)", (team_id, old),
             )
         token = db.issue_session(team_id, key_id, "admin")
-        removed = maintenance.run_maintenance(db, 90, moment=NOW)
+        removed = maintenance.run_maintenance(db, 90, moment=NOW, audit_days=90)
         assert removed["runs"] == 1
         assert removed["approvals"] == 1
         assert removed["audit_log"] > 0
@@ -83,6 +105,127 @@ def test_retention_removes_only_old_history(tmp_path):
 def test_retention_is_optional():
     # No database operations are needed when retention is disabled.
     assert maintenance.run_maintenance(None, None, moment=NOW) == {}
+
+
+def _aged_db(tmp_path, name="aged.db"):
+    """A database with a run, an approval, budget alerts and audit rows of known ages."""
+    db = Database(str(tmp_path / name))
+    team_id, key = db.create_team("aged")
+    key_id = db.key_for_token(key)["id"]
+    db.upsert_run(team_id, receipt_to_run({
+        "session_id": "old-run", "started": (NOW - timedelta(days=400)).strftime(TIME_FORMAT),
+    }), actor="test", key_id=key_id)
+    db.upsert_run(team_id, receipt_to_run({
+        "session_id": "new-run", "started": (NOW - timedelta(days=2)).strftime(TIME_FORMAT),
+    }), actor="test", key_id=key_id)
+    db.create_approval(team_id, "old-approval", {
+        "session_id": "old-run", "tool": "Bash", "summary": "example", "risks": [], "cwd": None,
+    }, 600)
+    with sqlite3.connect(db.path) as conn:
+        conn.execute("UPDATE approvals SET created_at = ?",
+                     ((NOW - timedelta(days=400)).strftime(TIME_FORMAT),))
+        # The alert of the month three months ago, and the alert of the month we are in whose
+        # fire time is older than the retention period (a purge by fired_at would drop it and the
+        # threshold would fire a second time this month).
+        conn.execute("INSERT INTO budget_alerts VALUES (?, '2026-07', 'team', 50, 5, 10, ?)",
+                     (team_id, (NOW - timedelta(days=100)).strftime(TIME_FORMAT)))
+        conn.execute("INSERT INTO budget_alerts VALUES (?, '2026-10', 'team', 50, 5, 10, ?)",
+                     (team_id, (NOW - timedelta(days=40)).strftime(TIME_FORMAT)))
+        for age in (100, 300, 400):
+            conn.execute(
+                "INSERT INTO audit_log (team_id, at, actor, action, target, details) "
+                "VALUES (?, ?, 'seed', 'key.create', NULL, '{}')",
+                (team_id, (NOW - timedelta(days=age)).strftime(TIME_FORMAT)),
+            )
+    return db, team_id
+
+
+def _counts(db, table, where="1=1"):
+    with sqlite3.connect(db.path) as conn:
+        return conn.execute(f"SELECT COUNT(*) FROM {table} WHERE {where}").fetchone()[0]
+
+
+def _seeded_audit_days(db):
+    """The ages in days of the audit rows the helper seeded, oldest first."""
+    with sqlite3.connect(db.path) as conn:
+        return [row[0] for row in conn.execute(
+            "SELECT julianday(?) - julianday(at) FROM audit_log WHERE actor = 'seed' ORDER BY at",
+            (NOW.strftime(TIME_FORMAT),),
+        )]
+
+
+def test_nothing_is_deleted_when_retention_is_unset(tmp_path):
+    db, _ = _aged_db(tmp_path, "keep.db")
+    try:
+        assert maintenance.run_maintenance(db, None, moment=NOW) == {}
+        assert _counts(db, "runs") == 2
+        assert _counts(db, "approvals") == 1
+        assert _counts(db, "budget_alerts") == 2
+        assert _seeded_audit_days(db) == [400.0, 300.0, 100.0]
+    finally:
+        db.close()
+
+
+def test_the_audit_log_keeps_its_own_default_of_a_year(tmp_path):
+    """Pruning runs never prunes audit events on the runs' schedule: with no audit variable the
+    audit log keeps a year, so a 100- and a 300-day-old event stay while a 400-day-old one goes."""
+    db, _ = _aged_db(tmp_path, "audit-default.db")
+    try:
+        removed = maintenance.run_maintenance(db, 35, moment=NOW)
+        assert removed["runs"] == 1 and removed["approvals"] == 1
+        assert removed["audit_log"] == 1
+        assert _seeded_audit_days(db) == [300.0, 100.0]
+    finally:
+        db.close()
+
+
+def test_audit_retention_can_be_shortened_on_its_own(tmp_path):
+    db, _ = _aged_db(tmp_path, "audit-120.db")
+    try:
+        removed = maintenance.run_maintenance(db, 35, moment=NOW, audit_days=120)
+        assert removed["audit_log"] == 2
+        assert _seeded_audit_days(db) == [100.0]
+        assert _counts(db, "runs") == 1       # the young run is untouched
+    finally:
+        db.close()
+
+
+def test_audit_retention_zero_keeps_every_event(tmp_path):
+    db, _ = _aged_db(tmp_path, "audit-forever.db")
+    try:
+        removed = maintenance.run_maintenance(db, 35, moment=NOW, audit_days=0)
+        assert removed["runs"] == 1
+        assert "audit_log" not in removed or removed["audit_log"] == 0
+        assert _seeded_audit_days(db) == [400.0, 300.0, 100.0]
+    finally:
+        db.close()
+
+
+def test_audit_retention_works_when_runs_are_kept(tmp_path):
+    db, _ = _aged_db(tmp_path, "audit-only.db")
+    try:
+        removed = maintenance.run_maintenance(db, None, moment=NOW, audit_days=120)
+        assert removed["audit_log"] == 2
+        assert _counts(db, "runs") == 2 and _counts(db, "budget_alerts") == 2
+    finally:
+        db.close()
+
+
+def test_retention_keeps_the_alert_of_the_current_month(tmp_path):
+    """Alerts are purged by the month they belong to, never by when they fired: an alert of the
+    current month survives even when its fire time is older than the retention period, so the
+    threshold cannot fire a second time."""
+    db, team_id = _aged_db(tmp_path, "alerts.db")
+    try:
+        removed = maintenance.run_maintenance(db, 35, moment=NOW)
+        assert removed["budget_alerts"] == 1
+        with sqlite3.connect(db.path) as conn:
+            months = [row[0] for row in conn.execute(
+                "SELECT month FROM budget_alerts WHERE team_id = ? ORDER BY month", (team_id,),
+            )]
+        assert months == ["2026-10"]
+    finally:
+        db.close()
 
 
 def test_maintenance_only_starts_when_needed(tmp_path, monkeypatch):
@@ -137,3 +280,477 @@ def test_backup_copies_the_database_and_keeps_the_newest(tmp_path, capsys):
 def test_backup_needs_an_existing_database(tmp_path, capsys):
     assert main(["backup", "--db", str(tmp_path / "missing.db"), "--dir", str(tmp_path / "b")]) == 1
     assert "no database" in capsys.readouterr().err
+
+
+def test_backup_same_second_no_collision(tmp_path, capsys):
+    from contextlib import closing
+    import re
+    db_path = tmp_path / "team_a.db"
+    db = Database(str(db_path))
+    db.create_team("Team A")
+    db.close()
+
+    folder = tmp_path / "bkp"
+    outs = []
+    for _ in range(2):
+        assert main(["backup", "--db", str(db_path), "--dir", str(folder)]) == 0
+        outs.append(capsys.readouterr().out)
+
+    files = sorted(folder.glob("runledger-team_a-*.db"))
+    assert len(files) == 2
+    combined_out = "\n".join(outs)
+    for f in files:
+        assert re.fullmatch(r"runledger-team_a-\d{8}-\d{6}(-\d+)?\.db", f.name)
+        assert str(f) in combined_out
+        with closing(sqlite3.connect(str(f))) as conn:
+            assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+    # Rapid backups with --keep 2 in the same second must never reuse a pruned sequence number.
+    keep2_folder = tmp_path / "bkp_keep2"
+    for _ in range(5):
+        assert main(["backup", "--db", str(db_path), "--dir", str(keep2_folder), "--keep", "2"]) == 0
+        capsys.readouterr()
+    assert len(list(keep2_folder.glob("runledger-team_a-*.db"))) == 2
+
+
+def test_backup_prune_only_own_stem(tmp_path, capsys):
+    a_db = tmp_path / "a.db"
+    b_db = tmp_path / "b.db"
+    for p, name in ((a_db, "TeamA"), (b_db, "TeamB")):
+        db = Database(str(p))
+        db.create_team(name)
+        db.close()
+
+    folder = tmp_path / "shared_bkp"
+    folder.mkdir()
+    legacy = folder / "runledger-20200101-000000.db"
+    legacy.write_bytes(b"legacy-backup")
+
+    for _ in range(4):
+        assert main(["backup", "--db", str(a_db), "--dir", str(folder), "--keep", "10"]) == 0
+        assert main(["backup", "--db", str(b_db), "--dir", str(folder), "--keep", "10"]) == 0
+    capsys.readouterr()
+
+    assert main(["backup", "--db", str(a_db), "--dir", str(folder), "--keep", "2"]) == 0
+    assert main(["backup", "--db", str(b_db), "--dir", str(folder), "--keep", "2"]) == 0
+    capsys.readouterr()
+
+    a_files = sorted(folder.glob("runledger-a-*.db"))
+    b_files = sorted(folder.glob("runledger-b-*.db"))
+    assert len(a_files) == 2
+    assert len(b_files) == 2
+    assert legacy.exists()  # legacy file preserved when multiple DB stems share the folder
+
+    single_folder = tmp_path / "single_bkp"
+    single_folder.mkdir()
+    single_legacy = single_folder / "runledger-20200101-000000.db"
+    single_legacy.write_bytes(b"legacy-backup")
+    assert main(["backup", "--db", str(a_db), "--dir", str(single_folder), "--keep", "1"]) == 0
+    assert not single_legacy.exists()
+    assert len(list(single_folder.glob("runledger-a-*.db"))) == 1
+
+
+def test_failed_backup_leaves_no_partial_file(tmp_path, monkeypatch, capsys):
+    folder = tmp_path / "bkp"
+    bad_db = tmp_path / "corrupt.db"
+    bad_db.write_bytes(b"not-a-sqlite-db")
+
+    assert main(["backup", "--db", str(bad_db), "--dir", str(folder)]) == 1
+    assert "error:" in capsys.readouterr().err
+    assert list(folder.glob("runledger-*.db")) == []
+    assert list(folder.glob("*.tmp")) == []
+    assert list(folder.glob("*.lock")) == []
+
+    good_db = tmp_path / "good.db"
+    db = Database(str(good_db))
+    db.create_team("Good")
+    db.close()
+
+    def broken_backup(self, path):
+        tmp = folder / "runledger-good-broken.db.tmp"
+        tmp.write_bytes(b"partial")
+        try:
+            raise sqlite3.OperationalError("simulated disk failure mid-backup")
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    # Also test Database.backup_to directly when the connection it copies from fails mid-copy.
+    live = Database(str(good_db))
+    try:
+        class FailingConn:
+            def __init__(self, real):
+                self._real = real
+
+            def backup(self, target, **kwargs):
+                target.execute("CREATE TABLE partial_data (x INT)")
+                raise sqlite3.OperationalError("simulated mid-copy failure")
+
+            def close(self):
+                self._real.close()
+
+        real_conn = live._conn
+        monkeypatch.setattr(live, "_backup_source", lambda: FailingConn(real_conn), raising=False)
+        dest = folder / "runledger-good-20261016-000000.db"
+        with pytest.raises(sqlite3.OperationalError, match="mid-copy"):
+            live.backup_to(str(dest))
+    finally:
+        live.close()
+
+    assert list(folder.glob("runledger-*.db")) == []
+    assert list(folder.glob("*.tmp")) == []
+    assert list(folder.glob("*.lock")) == []
+
+
+def _pushable(run_id, cost=0.1):
+    """A receipt as the push endpoint flattens it, without going through the HTTP layer."""
+    return receipt_to_run({
+        "session_id": run_id,
+        "started": "2026-10-15T10:00:00Z",
+        "ended": "2026-10-15T10:05:00Z",
+        "totals": {"steps": 4, "tokens": 1000, "cost_usd": cost, "usage_source": "messages"},
+        "models": {"claude-sonnet-4-5": {"tokens": 1000, "cost_usd": cost}},
+        "risk": {"score": 20, "reasons": []},
+        "html": "<h1>Receipt</h1>",
+    })
+
+
+def test_a_backup_does_not_hold_the_store_while_it_copies(tmp_path, monkeypatch):
+    """The copy runs on its own connection: a report and a push go through while it runs."""
+    db = Database(str(tmp_path / "held.db"))
+    try:
+        team_id, key = db.create_team("held")
+        key_id = db.key_for_token(key)["id"]
+        db.upsert_run(team_id, _pushable("before"), key_id=key_id)
+        seen = {}
+        real_backup = sqlite3.Connection.backup
+
+        class HoldingSource:
+            """A stand-in for the backup's own connection: while it copies, another thread reads
+            and writes."""
+
+            def backup(self, target, **kwargs):
+                def other():
+                    seen["stats"] = db.stats(team_id)
+                    db.upsert_run(team_id, _pushable("during"), key_id=key_id)
+                    seen["pushed"] = True
+
+                worker = threading.Thread(target=other, daemon=True)
+                worker.start()
+                worker.join(3)
+                seen["finished"] = not worker.is_alive()
+                try:
+                    return real_backup(self.source, target, **kwargs)
+                finally:
+                    worker.join(10)
+
+            def close(self):
+                pass
+
+        with sqlite3.connect(db.path) as source:
+            holder = HoldingSource()
+            holder.source = source
+            monkeypatch.setattr(db, "_backup_source", lambda: holder, raising=False)
+            dest = tmp_path / "copy.db"
+            db.backup_to(str(dest))
+        assert seen["finished"] is True and seen["pushed"] is True
+        assert seen["stats"]["totals"]["runs"] == 1  # the concurrent push is not in this report
+        assert db.stats(team_id)["totals"]["runs"] == 2
+        with sqlite3.connect(str(dest)) as copy:
+            assert copy.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+            assert copy.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 2
+    finally:
+        db.close()
+
+
+def test_a_backup_of_a_busy_store_runs_beside_the_pushes(tmp_path):
+    """2,000 runs, then 20 pushes while the copy runs: every push stays fast and the copy is a
+    complete, consistent database."""
+    import time
+
+    db = Database(str(tmp_path / "busy.db"))
+    try:
+        team_id, key = db.create_team("busy")
+        key_id = db.key_for_token(key)["id"]
+        for index in range(2000):
+            db.upsert_run(team_id, _pushable(f"seed-{index}"), key_id=key_id)
+        dest = tmp_path / "copy.db"
+        failures = []
+
+        def copy():
+            try:
+                db.backup_to(str(dest))
+            except BaseException as err:  # reported below, never swallowed
+                failures.append(err)
+
+        thread = threading.Thread(target=copy)
+        thread.start()
+        latencies = []
+        for index in range(20):
+            began = time.monotonic()
+            db.upsert_run(team_id, _pushable(f"live-{index}"), key_id=key_id)
+            latencies.append(time.monotonic() - began)
+        thread.join(60)
+        assert failures == [] and not thread.is_alive()
+        assert max(latencies) < 2.0
+        assert db.stats(team_id)["totals"]["runs"] == 2020
+        with sqlite3.connect(str(dest)) as copy_db:
+            assert copy_db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+            copied = copy_db.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
+        assert 2000 <= copied <= 2020
+    finally:
+        db.close()
+
+
+def test_backup_stems_keep_distinct_database_names():
+    """Databases that differ in characters the stem cannot carry stay in separate namespaces."""
+    from runledger.cli import _backup_stem
+
+    stems = {name: _backup_stem(name) for name in (
+        "team a.db", "team_a.db", "team%20a.db", "a.db", "A.db", "team (1).db", "team-1.db",
+        "José.db", "team+two.db",
+    )}
+    assert len(set(stems.values())) == len(stems)
+    assert stems["a.db"] == "a"
+    assert stems["team_a.db"] == "team_a"
+
+
+def test_backup_retention_keeps_similar_stems_apart(tmp_path, capsys):
+    spaced_db = tmp_path / "team a.db"
+    plain_db = tmp_path / "team_a.db"
+    for path, name in ((spaced_db, "Spaced"), (plain_db, "Plain")):
+        db = Database(str(path))
+        db.create_team(name)
+        db.close()
+
+    folder = tmp_path / "shared"
+    for _ in range(2):
+        assert main(["backup", "--db", str(spaced_db), "--dir", str(folder), "--keep", "1"]) == 0
+        assert main(["backup", "--db", str(plain_db), "--dir", str(folder), "--keep", "1"]) == 0
+    capsys.readouterr()
+
+    files = sorted(folder.glob("runledger-*.db"))
+    assert len(files) == 2
+    teams = []
+    for path in files:
+        copy = Database(str(path))
+        try:
+            teams.append(copy.team_name(1))
+        finally:
+            copy.close()
+    assert sorted(teams) == ["Plain", "Spaced"]
+
+
+def test_concurrent_backups_never_share_a_target(tmp_path, monkeypatch):
+    from contextlib import closing
+
+    db_path = tmp_path / "team.db"
+    db = Database(str(db_path))
+    db.create_team("Concurrent")
+    db.close()
+    folder = tmp_path / "bkp"
+
+    barrier = threading.Barrier(2, timeout=15)
+    real_backup_to = Database.backup_to
+
+    def slow_backup_to(self, path):
+        barrier.wait()
+        return real_backup_to(self, path)
+
+    monkeypatch.setattr(Database, "backup_to", slow_backup_to)
+    codes = []
+
+    def worker():
+        codes.append(main(["backup", "--db", str(db_path), "--dir", str(folder)]))
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+        assert not thread.is_alive()
+
+    assert codes == [0, 0]
+    files = sorted(folder.glob("runledger-*.db"))
+    assert len(files) == 2
+    assert list(folder.glob("*.tmp")) == []
+    for path in files:
+        with closing(sqlite3.connect(str(path))) as conn:
+            assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+            assert conn.execute("SELECT COUNT(*) FROM teams").fetchone()[0] == 1
+
+
+def _valid_backup(path):
+    from contextlib import closing
+
+    assert path.stat().st_size > 0
+    with closing(sqlite3.connect(str(path))) as conn:
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        return conn.execute("SELECT COUNT(*) FROM teams").fetchone()[0]
+
+
+def test_retention_ignores_a_backup_that_is_still_copying(tmp_path, monkeypatch, capsys):
+    """An unfinished backup (a reserved name, or a copy still under `.tmp`) must not count
+    against --keep, and must never make a finished copy the one this run prunes."""
+    db_path = tmp_path / "team.db"
+    db = Database(str(db_path))
+    db.create_team("Overlap")
+    db.close()
+    folder = tmp_path / "bkp"
+
+    quick_copying = threading.Event()
+    slow_reserved = threading.Event()
+    release_slow = threading.Event()
+    main_thread = threading.current_thread()
+    real_backup_to = Database.backup_to
+
+    def controlled_backup_to(self, path):
+        if threading.current_thread() is main_thread:
+            quick_copying.set()
+            assert slow_reserved.wait(timeout=15)  # finish only while the other run still copies
+            return real_backup_to(self, path)
+        slow_reserved.set()
+        assert release_slow.wait(timeout=15)
+        return real_backup_to(self, path)
+
+    monkeypatch.setattr(Database, "backup_to", controlled_backup_to)
+    codes = {}
+
+    def slow_run():
+        assert quick_copying.wait(timeout=15)  # reserve the newer name after the quick run has one
+        codes["slow"] = main(["backup", "--db", str(db_path), "--dir", str(folder), "--keep", "1"])
+
+    thread = threading.Thread(target=slow_run)
+    thread.start()
+
+    assert main(["backup", "--db", str(db_path), "--dir", str(folder), "--keep", "1"]) == 0
+    finished = sorted(folder.glob("runledger-*.db"))
+    assert len(finished) == 1
+    assert _valid_backup(finished[0]) == 1
+    assert str(finished[0]) in capsys.readouterr().out
+
+    release_slow.set()
+    thread.join(timeout=30)
+    assert not thread.is_alive()
+    assert codes == {"slow": 0}
+    capsys.readouterr()
+    files = sorted(folder.glob("runledger-*.db"))
+    assert len(files) == 1
+    assert _valid_backup(files[0]) == 1
+    assert list(folder.glob("*.tmp")) == []
+    assert list(folder.glob("*.lock")) == []
+
+
+def test_a_completed_backup_is_never_overwritten_by_a_delayed_allocator(tmp_path, monkeypatch, capsys):
+    """CORE-SCR-R3-005: the sequence is scanned before the marker is claimed, so a writer that
+    paused in between can carry a stale number past another writer's whole marker lifetime. The
+    claim must re-check the final target and move on instead of letting os.replace overwrite a
+    completed backup (VAL-CORE-078)."""
+    from runledger import cli
+
+    db_path = tmp_path / "team.db"
+    db = Database(str(db_path))
+    db.create_team("First")
+    db.close()
+    folder = tmp_path / "bkp"
+
+    real_next_seq = cli._next_backup_seq
+    neighbour = {}
+    paused = []
+
+    def scan_then_complete(folder_arg, stem, stamp):
+        seq = real_next_seq(folder_arg, stem, stamp)
+        if paused:
+            return seq
+        paused.append(True)
+        # B takes the sequence A just read, finishes its copy and removes its marker, all
+        # while A has not claimed anything yet.
+        target, reservation = cli._reserve_backup_target(folder_arg, stem, stamp)
+        assert reservation.name == target.name + ".lock"
+        writer = Database(str(db_path))
+        writer.backup_to(str(target))
+        writer.close()
+        reservation.unlink()
+        neighbour["target"] = target
+        later = Database(str(db_path))          # A's copy is taken later, so the two must differ
+        later.create_team("Second")
+        later.close()
+        return seq
+
+    monkeypatch.setattr(cli, "_next_backup_seq", scan_then_complete)
+    assert main(["backup", "--db", str(db_path), "--dir", str(folder)]) == 0
+    assert neighbour["target"].exists()
+
+    files = sorted(folder.glob("runledger-*.db"))
+    assert len(files) == 2
+    assert sorted(_valid_backup(path) for path in files) == [1, 2]
+    assert list(folder.glob("*.tmp")) == []
+    assert list(folder.glob("*.lock")) == []
+
+
+def test_retention_leaves_an_empty_placeholder_alone(tmp_path, capsys):
+    """A zero-byte `.db` is not a backup: it neither counts against --keep nor gets pruned, so a
+    reservation an interrupted older run left behind cannot displace a finished copy."""
+    db_path = tmp_path / "a.db"
+    db = Database(str(db_path))
+    db.create_team("Kept")
+    db.close()
+    folder = tmp_path / "bkp"
+    folder.mkdir()
+    placeholder = folder / "runledger-a-20200101-000000.db"
+    placeholder.write_bytes(b"")
+
+    assert main(["backup", "--db", str(db_path), "--dir", str(folder), "--keep", "1"]) == 0
+    capsys.readouterr()
+    files = sorted(folder.glob("runledger-*.db"))
+    copies = [p for p in files if p != placeholder]
+    assert len(copies) == 1
+    assert _valid_backup(copies[0]) == 1
+    assert placeholder.exists()
+
+
+def test_a_failed_backup_cleans_only_its_own_reservation(tmp_path, monkeypatch, capsys):
+    """A copy that fails must not take a finished backup with it, and must leave no reservation."""
+    db_path = tmp_path / "team.db"
+    db = Database(str(db_path))
+    db.create_team("Survivor")
+    db.close()
+    folder = tmp_path / "bkp"
+
+    quick_copying = threading.Event()
+    failing_reserved = threading.Event()
+    fail_now = threading.Event()
+    main_thread = threading.current_thread()
+    real_backup_to = Database.backup_to
+
+    def controlled_backup_to(self, path):
+        if threading.current_thread() is main_thread:
+            quick_copying.set()
+            assert failing_reserved.wait(timeout=15)
+            return real_backup_to(self, path)
+        failing_reserved.set()
+        assert fail_now.wait(timeout=15)
+        raise sqlite3.OperationalError("simulated copy failure")
+
+    monkeypatch.setattr(Database, "backup_to", controlled_backup_to)
+    codes = {}
+
+    def failing_run():
+        assert quick_copying.wait(timeout=15)
+        codes["failing"] = main(["backup", "--db", str(db_path), "--dir", str(folder), "--keep", "1"])
+
+    thread = threading.Thread(target=failing_run)
+    thread.start()
+
+    assert main(["backup", "--db", str(db_path), "--dir", str(folder), "--keep", "1"]) == 0
+    fail_now.set()
+    thread.join(timeout=30)
+    assert not thread.is_alive()
+    assert codes == {"failing": 1}
+    assert "error:" in capsys.readouterr().err
+
+    files = sorted(folder.glob("runledger-*.db"))
+    assert len(files) == 1
+    assert _valid_backup(files[0]) == 1
+    assert list(folder.glob("*.tmp")) == []
+    assert list(folder.glob("*.lock")) == []
+

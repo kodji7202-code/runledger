@@ -200,3 +200,183 @@ def test_redact_stays_fast_on_long_text_without_secrets():
     for blob in ("a" * 60000, "a." * 30000, "token" * 12000, "x_" * 30000):
         guard.redact(blob)
     assert time.monotonic() - started < 10
+
+
+# ---------------------------------------------------------------- shared secrets module & parity (VAL-CORE-012..015, VAL-CORE-081)
+
+@pytest.mark.parametrize("secret_str", [
+    "sk-" + "proj-" + "A" * 48,
+    "sk-ant-" + "api03-" + "B" * 40,
+    "sk-" + "live-" + "C" * 32,
+    "AKIA" + "IOSFODNN7EXAMPLE",
+    "ASIA" + "IOSFODNN7EXAMPLE",
+    "ghp_" + "a" * 36,
+    "ghp_" + "a" * 30,
+    "github_pat_" + "a" * 22 + "_" + "b" * 59,
+    "glpat-" + "a" * 20,
+    "xox" + "b-" + "1" * 11 + "-" + "2" * 11 + "-" + "A" * 24,
+    "AIza" + "Sy" + "A" * 33,
+    "npm_" + "a" * 36,
+    "pypi-" + "AgEIcHlwaS5vcmc" + "a" * 50,
+    "rl_" + "a" * 40,
+    "eyJ" + "hbGciOiJIUzI1NiJ9." + "eyJ" + "zdWIiOiIxMjM0NTY3ODkwIn0." + "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+    "-----BEGIN " + "OPENSSH PRIVATE KEY-----",
+    "postgres://admin:" + "s3cret" + "Pass" + "@db.example.com:5432/app",
+    'export SECRET_TOKEN="' + "my_super_" + 'secret_val_1234"',
+    "Authorization: Bearer " + "eyJ" + "hbGciOiJIUzI1NiJ9.aaa.bbb",
+    "AccountKey=" + "Ab1/" * 11,
+    "aws_secret_access_key = '" + "wJalrXUtnFEMI/K7MDENG/bPxRfiCY" + "EXAMPLEKEY" + "'",
+])
+def test_secrets_module_detection_and_redaction_parity(secret_str):
+    from runledger import llm, secrets
+    from runledger.parser import Step
+    from runledger.risk import assess_step
+
+    found = secrets.find_secrets(secret_str)
+    assert len(found) >= 1
+    redacted = secrets.redact_text(secret_str)
+    assert redacted != secret_str
+    assert "[REDACTED]" in redacted
+    assert guard.redact(secret_str) == redacted
+    assert llm.redact(secret_str) == redacted
+    step_risks = assess_step(
+        Step(index=1, tool_use_id="t1", tool="Write", input={"file_path": "a.txt", "content": secret_str},
+             model=None, timestamp=None),
+        None,
+    )
+    assert any(r.code in ("secret", "secret_in_content") and r.severity == "high" for r in step_risks)
+
+
+@pytest.mark.parametrize("n,expected", [(20, False), (30, True), (36, True), (40, True)])
+def test_github_token_length_parity(n, expected):
+    from runledger import secrets
+
+    s = "ghp_" + "a" * n
+    detected = bool(secrets.find_secrets(s))
+    was_redacted = secrets.redact_text(s) != s
+    assert detected == was_redacted == expected
+
+
+def test_secrets_is_leaf_module():
+    import subprocess
+    import sys
+
+    code = (
+        "import sys; import runledger.secrets; "
+        "others = [m for m in sys.modules if m.startswith('runledger.') and m != 'runledger.secrets']; "
+        "assert not others, others"
+    )
+    res = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=30)
+    assert res.returncode == 0, res.stderr
+
+
+@pytest.mark.parametrize("benign", [
+    'password = "short"',
+    'password = "${PASSWORD}"',
+    "token = None",
+    "secret = True",
+    'api_key = os.environ["API_KEY"]',
+    'key = "<YOUR_API_KEY>"',
+    'example = "sk-ant-..."',
+    'url = "postgres://localhost:5432/mydb"',
+])
+def test_benign_values_not_flagged_or_redacted(benign):
+    from runledger import secrets
+    from runledger.parser import Step
+    from runledger.risk import assess_step
+
+    assert secrets.find_secrets(benign) == []
+    assert secrets.redact_text(benign) == benign
+    assert guard.redact(benign) == benign
+    step_risks = assess_step(
+        Step(index=1, tool_use_id="t1", tool="Write", input={"file_path": "a.py", "content": benign},
+             model=None, timestamp=None),
+        None,
+    )
+    assert not any(r.code in ("secret", "secret_in_content") for r in step_risks)
+
+
+def test_guard_standalone_fallback_when_secrets_unavailable():
+    import subprocess
+    import sys
+
+    code = (
+        "import importlib, sys; "
+        "import runledger.guard as guard; "
+        "sys.modules['runledger.secrets'] = None; "
+        "importlib.reload(guard); "
+        "s = 'key=sk-proj-' + 'A' * 48 + ' aws=AKIAIOSFODNN7EXAMPLE'; "
+        "r = guard.redact(s); "
+        "assert 'sk-proj-' not in r and 'AKIAIOSFODNN7EXAMPLE' not in r and '[REDACTED]' in r, r"
+    )
+    res = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=30)
+    assert res.returncode == 0, res.stderr
+
+
+def test_conftest_isolation_fixture_clears_env_and_Redirects_home(tmp_path):
+    import os
+    from pathlib import Path
+    from conftest import ISOLATED_ENV_VARS
+
+    home = Path(os.environ["HOME"])
+    userprofile = Path(os.environ["USERPROFILE"])
+    assert home == userprofile
+    assert tmp_path in home.parents or home.parent == tmp_path
+    for var in ISOLATED_ENV_VARS:
+        assert var not in os.environ
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("TOKEN=abc123 npm publish", "TOKEN=[REDACTED] npm publish"),
+    ("export DB_PASSWORD=" + "hunter22", "export DB_PASSWORD=[REDACTED]"),
+    ('password="' + "hunter22" + '"', 'password="[REDACTED]"'),
+    ("secret=" + "abcd1234", "secret=[REDACTED]"),
+    ("api_key: '" + "mysecret" + "'", "api_key: '[REDACTED]'"),
+])
+def test_short_generic_assignment_redaction_restored(raw, expected):
+    from runledger import llm, secrets
+
+    assert secrets.redact_text(raw) == expected
+    assert guard.redact(raw) == expected
+    assert llm.redact(raw) == expected
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("TOKEN2=abc123 npm publish", "TOKEN2=[REDACTED] npm publish"),
+    ("MYTOKEN=abc123 npm publish", "MYTOKEN=[REDACTED] npm publish"),
+    ("export MY_ACCESS_TOKEN2=abc123", "export MY_ACCESS_TOKEN2=[REDACTED]"),
+    ("my-token=hunter2 ./deploy.sh", "my-token=[REDACTED] ./deploy.sh"),
+    ("PASSWORD2=hunter22", "PASSWORD2=[REDACTED]"),
+    ("CLIENT_SECRET_ID=abc123", "CLIENT_SECRET_ID=[REDACTED]"),
+    ('MYTOKEN="abc12345"', 'MYTOKEN="[REDACTED]"'),
+    ("MY_API_KEY: 'abc12345'", "MY_API_KEY: '[REDACTED]'"),
+])
+def test_assignment_name_containing_a_secret_keyword_is_redacted(raw, expected):
+    """CORE-SCR-R2-001: the containing-name coverage v0.6.0 had (`TOKEN2=`, `MYTOKEN=`)
+    must survive in the shared redactor, the guard and the LLM text."""
+    from runledger import llm, secrets
+
+    assert secrets.redact_text(raw) == expected
+    assert guard.redact(raw) == expected
+    assert llm.redact(raw) == expected
+
+
+def test_guard_standalone_fallback_keeps_the_containing_name_coverage():
+    import subprocess
+    import sys
+
+    code = (
+        "import importlib, sys; "
+        "import runledger.guard as guard; "
+        "sys.modules['runledger.secrets'] = None; "
+        "importlib.reload(guard); "
+        "samples = {'TOKEN2=abc123 npm publish': 'TOKEN2=[REDACTED] npm publish', "
+        "'MYTOKEN=abc123 npm publish': 'MYTOKEN=[REDACTED] npm publish', "
+        "'MYTOKEN=\"abc12345\"': 'MYTOKEN=\"[REDACTED]\"'}; "
+        "out = {s: guard.redact(s) for s in samples}; "
+        "assert out == samples, out"
+    )
+    res = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=30)
+    assert res.returncode == 0, res.stderr
+
+

@@ -4,7 +4,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import shlex
 import shutil
 import stat
 import subprocess
@@ -17,15 +16,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Tuple
 
+from .paths import owned_hook_command
+
 PREFIX = "refs/runledger/checkpoints/"
 ID_RE = re.compile(r"[0-9]{8}T[0-9]{12}Z-[0-9a-f]{8}\Z")
 HOOK_COMMAND = "runledger checkpoint --hook"
 HOOK_EVENTS = ("SessionStart", "UserPromptSubmit")
-_PYTHON_RE = re.compile(r"python(?:w|[0-9]+(?:\.[0-9]+)*)?(?:\.exe)?\Z", re.I)
 
 
 class CheckpointError(RuntimeError):
     """A safe-to-display checkpoint or rollback failure."""
+
+
+class NotAGitRepository(CheckpointError):
+    """Raised when the target directory is not inside a Git working tree."""
 
 
 def _unsupported_reparse_point(path: Path, info: os.stat_result) -> bool:
@@ -37,6 +41,54 @@ def _unsupported_reparse_point(path: Path, info: os.stat_result) -> bool:
         return True
     is_junction = getattr(os.path, "isjunction", None)  # Python 3.12+, absent on 3.9
     return bool(is_junction and is_junction(path))
+
+
+def _repo_discovery_error(result: subprocess.CompletedProcess) -> CheckpointError:
+    """Only a directory that is not in a repository is a silent, expected outcome."""
+    stderr = (result.stderr or b"").decode("utf-8", "replace")
+    if "not a git repository" in stderr.casefold():
+        return NotAGitRepository("Not a Git working tree. Use --cwd DIR inside a Git repository.")
+    detail = next((line.strip() for line in stderr.splitlines() if line.strip()), "")
+    if detail.casefold().startswith("fatal:"):
+        detail = detail[len("fatal:"):].strip()
+    return CheckpointError("Git could not read this repository: " + (detail or "no reason reported"))
+
+
+def _split_ref_records(data: bytes) -> Optional[List[Tuple[bytes, ...]]]:
+    """Split a for-each-ref stream that carries the declared size of every ref's contents.
+
+    Each record is refname, objectname, objecttype, symref, tree, contents size and the
+    contents, NUL-separated and terminated by the record separator. Reading the contents by
+    their declared size keeps a separator inside a commit message inside its own record.
+    Returns None when the stream is not framed as expected, so callers can read refs one by one.
+    """
+    records: List[Tuple[bytes, ...]] = []
+    pos, end = 0, len(data)
+    while pos < end:
+        while pos < end and data[pos:pos + 1] in (b"\r", b"\n"):
+            pos += 1
+        if pos >= end:
+            break
+        fields = []
+        for _ in range(6):
+            stop = data.find(b"\x00", pos)
+            if stop < 0:
+                return None
+            fields.append(data[pos:stop])
+            pos = stop + 1
+        body = b""
+        if fields[5]:
+            if not fields[5].isdigit():
+                return None
+            size = int(fields[5])
+            body = data[pos:pos + size]
+            if len(body) != size:
+                return None
+        if data[pos + len(body):pos + len(body) + 1] != b"\x1e":
+            return None
+        pos += len(body) + 1
+        records.append(tuple(fields[:5]) + (body,))
+    return records
 
 
 @dataclass
@@ -66,6 +118,7 @@ class Plan:
 class Repository:
     def __init__(self, cwd: Optional[str] = None):
         self.root = Path(cwd or os.getcwd()).expanduser().resolve()
+        self._trees: Dict[str, Dict[str, Tuple[str, str]]] = {}
         self.env = dict(os.environ)
         # An inherited alternate index/worktree must not redirect an explicit --cwd.
         for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR",
@@ -74,14 +127,22 @@ class Repository:
                      "GIT_ICASE_PATHSPECS"):
             self.env.pop(name, None)
         self.env["GIT_OPTIONAL_LOCKS"] = "0"
-        result = self._git("rev-parse", "--show-toplevel", check=False)
+        result = self._git("rev-parse", "--show-toplevel", "--absolute-git-dir", "--git-common-dir",
+                           check=False, extra_env={"LC_ALL": "C", "LANG": "C"})
         if result.returncode:
-            raise CheckpointError("Not a Git working tree. Use --cwd DIR inside a Git repository.")
-        self.root = Path(os.fsdecode(result.stdout).rstrip("\r\n")).resolve()
-        self.git_dirs = []
-        for flag in ("--absolute-git-dir", "--git-common-dir"):
-            folder = Path(os.fsdecode(self._git("rev-parse", flag).stdout).rstrip("\r\n"))
-            self.git_dirs.append((self.root / folder).resolve())
+            raise _repo_discovery_error(result)
+        lines = [ln.rstrip("\r") for ln in os.fsdecode(result.stdout).rstrip("\r\n").split("\n")]
+        if len(lines) == 3 and all(lines):
+            top, abs_git_dir, common_git_dir = lines
+            self.root = Path(top).resolve()
+            self.git_dirs = [(self.root / Path(abs_git_dir)).resolve(),
+                             (self.root / Path(common_git_dir)).resolve()]
+        else:
+            self.root = Path(os.fsdecode(self._git("rev-parse", "--show-toplevel").stdout).rstrip("\r\n")).resolve()
+            self.git_dirs = []
+            for flag in ("--absolute-git-dir", "--git-common-dir"):
+                folder = Path(os.fsdecode(self._git("rev-parse", flag).stdout).rstrip("\r\n"))
+                self.git_dirs.append((self.root / folder).resolve())
         if self._git("config", "--bool", "--get", "core.sparseCheckout", check=False).stdout.strip() == b"true":
             raise CheckpointError("Sparse checkouts are not supported; use a full working tree.")
 
@@ -205,6 +266,10 @@ class Repository:
         return path
 
     def entries(self, tree: str) -> Dict[str, Tuple[str, str]]:
+        """Read a tree once per repository; tree objects never change."""
+        cached = self._trees.get(tree)
+        if cached is not None:
+            return cached
         entries = {}
         for record in self._git("ls-tree", "-r", "-z", "--full-tree", tree).stdout.split(b"\0"):
             if not record:
@@ -218,6 +283,7 @@ class Repository:
             entries[name] = (mode, oid)
         if os.name == "nt" and len({p.casefold() for p in entries}) != len(entries):
             raise CheckpointError("Checkpoint contains case-colliding Windows paths.")
+        self._trees[tree] = entries
         return entries
 
     def create(self, label: str = "", run_id: Optional[str] = None, *,
@@ -240,34 +306,72 @@ class Repository:
         self._git("update-ref", "--no-deref", checkpoint.ref, oid, "")
         return checkpoint
 
+    @staticmethod
+    def _parse_checkpoint_body(checkpoint_id: str, oid: str, tree: str, body: bytes) -> Optional[Checkpoint]:
+        if b"\x1e" in body:
+            # The record separator frames the bulk listing, so a body may never contain it.
+            return None
+        try:
+            text = body.decode("utf-8").replace("\r\n", "\n")
+            title, metadata = text.split("\n\n", 1)
+            meta = json.loads(metadata)
+            if (title != "RunLedger checkpoint" or meta["version"] != 1
+                    or meta["id"] != checkpoint_id
+                    or not isinstance(meta["label"], str)
+                    or not isinstance(meta["created_at"], str)
+                    or not (meta["run_id"] is None or isinstance(meta["run_id"], str))
+                    or meta["kind"] not in ("checkpoint", "safety")):
+                return None
+            return Checkpoint(checkpoint_id, oid, tree, meta["created_at"],
+                              meta["label"], meta["run_id"], meta["kind"])
+        except (ValueError, KeyError, TypeError, UnicodeError):
+            return None
+
+    @staticmethod
+    def _checkpoint_from_ref(ref: str, oid: str, tree: str, body: bytes) -> Optional[Checkpoint]:
+        if not ref.startswith(PREFIX) or not oid or not tree:
+            return None
+        checkpoint_id = ref[len(PREFIX):]
+        if not ID_RE.fullmatch(checkpoint_id):
+            return None
+        return Repository._parse_checkpoint_body(checkpoint_id, oid, tree, body)
+
     def checkpoints(self) -> List[Checkpoint]:
         result = []
-        refs = self._git("for-each-ref", "--format=%(refname) %(objectname) %(objecttype) %(symref)", PREFIX).stdout
+        fmt = ("%(refname)%00%(objectname)%00%(objecttype)%00%(symref)%00%(tree)"
+               "%00%(contents:size)%00%(contents)%1e")
+        probe = self._git("for-each-ref", f"--format={fmt}", PREFIX, check=False)
+        records = _split_ref_records(probe.stdout) if probe.returncode == 0 else None
+        if records is not None:
+            for ref_b, oid_b, obj_type_b, symref_b, tree_b, contents_b in records:
+                if obj_type_b != b"commit" or symref_b:
+                    continue  # symbolic refs must never redirect a rollback/prune to a branch
+                try:
+                    ref = os.fsdecode(ref_b)
+                    oid = oid_b.decode("ascii").strip()
+                    tree = tree_b.decode("ascii").strip()
+                except UnicodeError:
+                    continue
+                cp = self._checkpoint_from_ref(ref, oid, tree, contents_b)
+                if cp is not None:
+                    result.append(cp)
+            return sorted(result, key=lambda cp: cp.id, reverse=True)
+        refs = self._git("for-each-ref",
+                         "--format=%(refname) %(objectname) %(objecttype) %(symref)", PREFIX).stdout
         for line in os.fsdecode(refs).splitlines():
             fields = line.split()
             if len(fields) != 3 or fields[2] != "commit":
                 continue  # symbolic refs must never redirect a rollback/prune to a branch
             ref, oid, _ = fields
-            checkpoint_id = ref[len(PREFIX):]
-            if not ID_RE.fullmatch(checkpoint_id):
-                continue
             raw = self._git("cat-file", "commit", oid).stdout
             try:
                 header, body = raw.split(b"\n\n", 1)
-                title, metadata = body.decode("utf-8").split("\n\n", 1)
-                meta = json.loads(metadata)
-                if (title != "RunLedger checkpoint" or meta["version"] != 1
-                        or meta["id"] != checkpoint_id
-                        or not isinstance(meta["label"], str)
-                        or not isinstance(meta["created_at"], str)
-                        or not (meta["run_id"] is None or isinstance(meta["run_id"], str))
-                        or meta["kind"] not in ("checkpoint", "safety")):
-                    continue
                 tree = header.splitlines()[0].decode("ascii").removeprefix("tree ")
-                result.append(Checkpoint(checkpoint_id, oid, tree, meta["created_at"],
-                                         meta["label"], meta["run_id"], meta["kind"]))
-            except (ValueError, KeyError, TypeError, UnicodeError):
+            except (ValueError, IndexError, UnicodeError):
                 continue
+            cp = self._checkpoint_from_ref(ref, oid, tree, body)
+            if cp is not None:
+                result.append(cp)
         return sorted(result, key=lambda cp: cp.id, reverse=True)
 
     def select(self, checkpoint_id: Optional[str] = None, *,
@@ -391,10 +495,29 @@ class Repository:
         return removed
 
 
+_DEFAULT_SELECT = Repository.select
+
+
 def checkpoint_for_run(cwd: Optional[str], run_id: str) -> Optional[str]:
     """Read-only lookup; missing Git or pruned checkpoints must not break receipts."""
     if not cwd or not run_id or not os.path.isabs(cwd):
         return None
+    if Repository.select is _DEFAULT_SELECT:
+        from .gitinfo import toplevel
+        top = toplevel(cwd)
+        if not top:
+            return None
+        dot_git = Path(top) / ".git"
+        if (dot_git.is_dir()
+                and not (dot_git / "refs" / "runledger" / "checkpoints").exists()
+                and not (dot_git / "reftable").exists()):
+            packed = dot_git / "packed-refs"
+            try:
+                has_packed = packed.is_file() and b"refs/runledger/checkpoints/" in packed.read_bytes()
+            except OSError:
+                has_packed = True
+            if not has_packed:
+                return None
     try:
         return Repository(cwd).select(run_id=run_id).id
     except (CheckpointError, OSError, ValueError):
@@ -402,23 +525,13 @@ def checkpoint_for_run(cwd: Optional[str], run_id: str) -> Optional[str]:
 
 
 def is_checkpoint_hook(hook) -> bool:
-    if (not isinstance(hook, dict) or hook.get("type") != "command"
-            or not isinstance(hook.get("command"), str)):
+    """True for the complete RunLedger checkpoint hook command, written with either the
+    `runledger` command or the interpreter the installer stores. A compound entry (an attached
+    shell operator, a pipeline, a redirection, a second command) or an unrelated hook stays
+    foreign, so install appends beside it and uninstall leaves it alone."""
+    if not isinstance(hook, dict) or hook.get("type") != "command":
         return False
-    try:
-        # Keep Windows backslashes, and accept quoted executable paths on either platform.
-        parts = shlex.split(hook["command"], posix=False)
-    except ValueError:
-        return False
-    parts = [p[1:-1] if len(p) >= 2 and p[0] in ("'", '"') and p[-1] == p[0] else p
-             for p in parts]
-    if not parts or parts[-2:] != ["checkpoint", "--hook"]:
-        return False
-    executable = parts[0].replace("\\", "/").rsplit("/", 1)[-1]
-    # Match only our complete command, never an echo, pipeline, or compound user hook.
-    return ((len(parts) == 3 and executable.casefold() in ("runledger", "runledger.exe"))
-            or (len(parts) == 5 and _PYTHON_RE.fullmatch(executable) is not None
-                and parts[1:3] == ["-m", "runledger"]))
+    return owned_hook_command(hook.get("command"), ("checkpoint", "--hook")) is not None
 
 
 def hook_main() -> int:
@@ -431,6 +544,8 @@ def hook_main() -> int:
         if not isinstance(cwd, str) or not cwd or not isinstance(run_id, str) or not run_id:
             return 0
         Repository(cwd).create(label=event["hook_event_name"], run_id=run_id)
+    except NotAGitRepository:
+        return 0
     except (CheckpointError, OSError, ValueError):
         print("RunLedger checkpoint unavailable. Run 'runledger checkpoint' manually for details.",
               file=sys.stderr)

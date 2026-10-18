@@ -26,13 +26,13 @@ UNPRICED = {"runledger_format": 1, "agent": "lab-bot", "session_id": "lab-run-1"
 @pytest.fixture(autouse=True)
 def isolated_agent_dirs(tmp_path, monkeypatch):
     """No real agent sessions may leak into these tests."""
-    claude_dir = tmp_path / "claude-config"
-    codex_dir = tmp_path / "codex-home"
+    claude_dir = tmp_path / "c"
+    codex_dir = tmp_path / "x"
     claude_dir.mkdir()
     codex_dir.mkdir()
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_dir))
     monkeypatch.setenv("CODEX_HOME", str(codex_dir))
-    monkeypatch.setenv("FACTORY_HOME", str(tmp_path / "factory-home"))
+    monkeypatch.setenv("FACTORY_HOME", str(tmp_path / "f"))
     for name in ("GITHUB_REPOSITORY", "GITHUB_EVENT_PATH", "GITHUB_API_URL", "GITHUB_TOKEN",
                  "GITHUB_STEP_SUMMARY", "GITHUB_OUTPUT", "RUNLEDGER_SERVER", "RUNLEDGER_API_KEY"):
         monkeypatch.delenv(name, raising=False)
@@ -40,7 +40,7 @@ def isolated_agent_dirs(tmp_path, monkeypatch):
 
 def _project(tmp_path: Path, name: str, source: Path = None, text: str = None) -> Path:
     """A project folder with one session file in .runledger/runs/."""
-    project = tmp_path / "project"
+    project = tmp_path / "p"
     runs = project / ".runledger" / "runs"
     runs.mkdir(parents=True, exist_ok=True)
     content = text if text is not None else source.read_text(encoding="utf-8")
@@ -118,6 +118,29 @@ def test_default_file_name_is_safe_for_any_session_id(tmp_path, monkeypatch):
     assert "/" not in written[0].name and "\\" not in written[0].name
 
 
+def test_default_output_does_not_overwrite(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    expected = [
+        "runledger-demo-000.html",
+        "runledger-demo-000-2.html",
+        "runledger-demo-000-3.html",
+    ]
+    for name in expected:
+        assert main(["receipt", str(FIX_NATIVE)]) == 0
+        out = capsys.readouterr().out
+        assert f"Receipt: {name}" in out
+        assert (tmp_path / name).is_file() and (tmp_path / name).stat().st_size > 0
+
+    fixed = tmp_path / "fixed.html"
+    for _ in range(2):
+        assert main(["receipt", str(FIX_NATIVE), "-o", "fixed.html"]) == 0
+        out = capsys.readouterr().out
+        assert "Receipt: fixed.html" in out
+    assert fixed.is_file() and fixed.stat().st_size > 0
+    assert not (tmp_path / "fixed-2.html").exists()
+
+
+
 def test_invalid_native_file_is_reported_not_raised(tmp_path, capsys):
     bad = tmp_path / "bad.runledger.jsonl"
     bad.write_text(json.dumps({"runledger_format": 1}) + "\n" + json.dumps({"tool": ""}) + "\n", encoding="utf-8")
@@ -137,7 +160,7 @@ def test_list_shows_an_agent_column_and_filters(tmp_path, capsys):
     project = _project(tmp_path, "demo.runledger.json", source=FIX_NATIVE)
     claude_dir = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "projects" / encode_project_path(str(project))
     claude_dir.mkdir(parents=True)
-    shutil.copy(FIX_CLAUDE, claude_dir / "7f3c2a10-9b1e-4c55-a1d2-0e6f8b3c9d42.jsonl")
+    shutil.copy(FIX_CLAUDE, claude_dir / "s1.jsonl")
 
     assert main(["list", "--project", str(project)]) == 0
     out = capsys.readouterr().out
@@ -228,3 +251,105 @@ def test_github_sessions_dir_scores_native_files(tmp_path, capsys):
     shutil.copy(FIX_NATIVE, sessions / "demo.runledger.json")
     assert github_main(["comment", "--sessions-dir", str(sessions), "--dry-run"]) == 0
     assert "demo-agent" in capsys.readouterr().out
+
+
+def test_adapters_reports_import_error_and_reraises_on_debug(monkeypatch, capsys):
+    import importlib
+    from runledger import adapters
+    real_import = importlib.import_module
+
+    def flaky_import(name, package=None):
+        if name.endswith(".codex"):
+            raise ImportError("boom")
+        return real_import(name, package)
+
+    monkeypatch.setattr(importlib, "import_module", flaky_import)
+    monkeypatch.delenv("RUNLEDGER_DEBUG", raising=False)
+    adapters.clear_cache()
+    try:
+        loaded = adapters.adapters()
+        err = capsys.readouterr().err
+        assert "codex" in err and "boom" in err
+        assert [m.NAME for m in loaded] == ["claude-code", "droid", "aider", "native"]
+
+        monkeypatch.setenv("RUNLEDGER_DEBUG", "1")
+        with pytest.raises(ImportError, match="boom"):
+            adapters.adapters()
+    finally:
+        adapters.clear_cache()
+
+
+def test_broken_adapter_is_reported_once_per_process(monkeypatch, capsys):
+    """A failing adapter import warns exactly once per process, however many
+    discovery helpers run (VAL-CORE-065)."""
+    import importlib
+    from runledger import adapters
+    real_import = importlib.import_module
+
+    def flaky_import(name, package=None):
+        if name.endswith(".aider"):
+            raise ImportError("No module named 'definitely_missing_stdlib_mod_xyz'")
+        return real_import(name, package)
+
+    monkeypatch.setattr(importlib, "import_module", flaky_import)
+    monkeypatch.delenv("RUNLEDGER_DEBUG", raising=False)
+    adapters.clear_cache()
+    try:
+        for _ in range(3):
+            assert adapters.get("claude-code").NAME == "claude-code"
+            assert adapters.detect(FIX_CLAUDE).NAME == "claude-code"
+            assert adapters.label("droid") == "Factory Droid"
+        assert [m.NAME for m in adapters.adapters()] == ["claude-code", "codex", "droid", "native"]
+        err = capsys.readouterr().err
+
+        assert err.count("runledger: adapter 'aider' failed to load") == 1, err
+        assert "definitely_missing_stdlib_mod_xyz" in err
+    finally:
+        adapters.clear_cache()
+
+
+def test_cli_list_reports_a_broken_adapter_once(tmp_path):
+    """The real CLI prints one stderr line for a broken adapter and still lists the
+    session; RUNLEDGER_DEBUG=1 raises instead (VAL-CORE-065)."""
+    import subprocess
+    import sys
+
+    import runledger
+
+    pkg_src = Path(runledger.__file__).resolve().parent
+    shadow_root = tmp_path / "shadow"
+    shutil.copytree(pkg_src, shadow_root / "runledger", ignore=shutil.ignore_patterns("__pycache__"))
+    aider = shadow_root / "runledger" / "adapters" / "aider.py"
+    text = aider.read_text(encoding="utf-8")
+    marker = "from __future__ import annotations\n"
+    assert marker in text  # the broken import must stay below the future import
+    aider.write_text(text.replace(marker, marker + "import definitely_missing_stdlib_mod_xyz\n", 1),
+                     encoding="utf-8")
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    sessions = tmp_path / "claude" / "projects" / encode_project_path(str(project))
+    sessions.mkdir(parents=True)
+    shutil.copy(FIX_CLAUDE, sessions / "s1.jsonl")
+
+    env = dict(os.environ)
+    env.pop("RUNLEDGER_DEBUG", None)
+    env["PYTHONPATH"] = str(shadow_root)
+    env["CLAUDE_CONFIG_DIR"] = str(tmp_path / "claude")
+    env["CODEX_HOME"] = str(tmp_path / "codex")
+    env["FACTORY_HOME"] = str(tmp_path / "factory")
+    env["HOME"] = env["USERPROFILE"] = str(tmp_path / "home")
+    argv = [sys.executable, "-m", "runledger", "list", "--agent", "claude-code", "--project", str(project)]
+
+    res = subprocess.run(argv, capture_output=True, text=True, env=env, cwd=str(tmp_path), timeout=120)
+    assert res.returncode == 0, res.stderr
+    failures = [line for line in res.stderr.splitlines() if "failed to load" in line]
+    assert len(failures) == 1, res.stderr
+    assert failures[0].startswith("runledger: adapter 'aider' failed to load:")
+    assert "claude-code" in res.stdout
+
+    env["RUNLEDGER_DEBUG"] = "1"
+    debug = subprocess.run(argv, capture_output=True, text=True, env=env, cwd=str(tmp_path), timeout=120)
+    assert debug.returncode != 0
+    assert "definitely_missing_stdlib_mod_xyz" in debug.stderr
+

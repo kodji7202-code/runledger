@@ -25,12 +25,19 @@
   GET  /api/export/runs.csv[?days=30]         runs as CSV (admin); HEAD returns headers only
   GET  /api/export/audit.csv[?days=30]        audit log as CSV (admin)
   GET  /api/export/report.html[?days=30]      printable compliance report (admin)
-  GET  /                                      dashboard; sign in once with /?key=API_KEY
+  GET  /                                      dashboard; sign in with the form, which posts the key
+  POST /session                               sign in: form field "key" -> session cookie (302);
+                                              from another origin (Origin/Sec-Fetch-Site) -> 403
+  GET  /?key=API_KEY                          legacy sign-in: redirects to strip the key; never
+                                              replaces a session of another team without confirmation
   GET  /health                                liveness, no auth
 
 Credentials are "Authorization: Bearer KEY", or the dashboard session cookie. A cookie
 session has the role of the key it was signed in with, and survives a restart. A POST or
 PUT that uses a cookie must also send the header "X-Requested-With: runledger".
+
+A request that needs a role is authenticated before its body is read, so an oversized
+unauthenticated body gets 401, not 413, and the connection is closed without reading it.
 
 Behind a reverse proxy, pass --trusted-proxy CIDR (or RUNLEDGER_TRUSTED_PROXIES). A peer in
 a trusted range may report the client in X-Forwarded-For: the server then uses the right-most
@@ -55,7 +62,8 @@ import sys
 import threading
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from html import escape as _escape
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from .. import __version__
@@ -70,14 +78,20 @@ from .auth import (
     identity_from_row,
 )
 from .dashboard import APPROVAL_HTML, DASHBOARD_HTML
-from .db import TIME_FORMAT, Database
+from .db import TIME_FORMAT, Database, normalize_missing_costs
 
 MAX_BODY_BYTES = 10 * 1024 * 1024
+SIGN_IN_BODY_LIMIT = 4096
 COOKIE_NAME = "rl_session"
 LEVELS = ("low", "medium", "high")
 SEVERITIES = ("low", "medium", "high")
+# How the agent reported token usage (see the Droid adapter); anything else reads as unknown.
+USAGE_SOURCES = ("messages", "settings", "missing")
 CSRF_HEADER = "X-Requested-With"
 CSRF_VALUE = "runledger"
+# Sec-Fetch-Site values that mean the request comes from another origin. "same-site" is another
+# origin by definition (another port or scheme, or a subdomain), so a sign-in POST is refused too.
+CROSS_ORIGIN_FETCH_SITES = ("cross-site", "same-site")
 PUBLIC_URL_ENV = "RUNLEDGER_PUBLIC_URL"
 SECURE_COOKIES_ENV = "RUNLEDGER_SECURE_COOKIES"
 TRUSTED_PROXIES_ENV = "RUNLEDGER_TRUSTED_PROXIES"
@@ -94,19 +108,45 @@ _KEY_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 RECEIPT_CSP = (
     "default-src 'none'; style-src 'unsafe-inline'; img-src data:; "
-    "base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+    "base-uri 'none'; form-action 'none'; frame-ancestors 'none'; sandbox"
 )
+SIGN_IN_CSP = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'"
 SIGN_IN_HTML = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>RunLedger sign in</title>
 <style>body{font:15px/1.5 system-ui,sans-serif;margin:0;padding:48px 16px;background:#0a0b0d;color:#eef0f2}
 @media (prefers-color-scheme: light){body{background:#f7f8f9;color:#121417}}
-main{max-width:560px;margin:0 auto}code{font-family:ui-monospace,monospace;background:rgba(127,127,127,.18);padding:2px 6px;border-radius:6px}</style>
+main{max-width:560px;margin:0 auto}code{font-family:ui-monospace,monospace;background:rgba(127,127,127,.18);padding:2px 6px;border-radius:6px}
+form{display:flex;gap:8px;margin:18px 0}input{flex:1;padding:9px 11px;border:1px solid rgba(127,127,127,.4);border-radius:8px;background:transparent;color:inherit;font:inherit}
+button{padding:9px 16px;border:0;border-radius:8px;background:#3b82f6;color:#fff;font:inherit;font-weight:600;cursor:pointer}
+.error{color:#e5484d;font-weight:600}</style>
 </head><body><main>
 <h1 style="font-size:20px">RunLedger team dashboard</h1>
-<p>Open the dashboard once with your team API key. The server then sets a session cookie and the key leaves the address bar.</p>
-<p><code>/?key=YOUR_API_KEY</code></p>
+__ERROR__
+<p>Sign in with a team API key. The server then sets a session cookie, and the key is never put in the address bar.</p>
+<form method="post" action="/session">
+<label for="key" style="position:absolute;left:-9999px">API key</label>
+<input id="key" name="key" type="password" autocomplete="off" required>
+<button type="submit">Sign in</button>
+</form>
 <p>Create a team and its key with <code>runledger team create NAME</code>. Make more keys with <code>runledger key create</code>.</p>
+</main></body></html>
+"""
+SWITCH_TEAM_HTML = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Switch team · RunLedger</title>
+<style>body{font:15px/1.5 system-ui,sans-serif;margin:0;padding:48px 16px;background:#0a0b0d;color:#eef0f2}
+@media (prefers-color-scheme: light){body{background:#f7f8f9;color:#121417}}
+main{max-width:560px;margin:0 auto}a{color:#3b82f6}
+button{padding:9px 16px;border:0;border-radius:8px;background:#3b82f6;color:#fff;font:inherit;font-weight:600;cursor:pointer;margin:18px 0}</style>
+</head><body><main>
+<h1 style="font-size:20px">Switch to team __TO__?</h1>
+<p>This browser is already signed in to team <b>__FROM__</b>. The link you opened carries a key for team <b>__TO__</b>.</p>
+<form method="post" action="/session">
+<input type="hidden" name="key" value="__KEY__">
+<button type="submit">Switch to __TO__</button>
+</form>
+<p><a href="/">Stay signed in to __FROM__</a></p>
 </main></body></html>
 """
 
@@ -166,6 +206,7 @@ class RunLedgerServer(ThreadingHTTPServer):
         trust_proxy: bool = False,
         trusted_proxies: Sequence[_IPNetwork] = (),
         retention_days: Optional[int] = None,
+        audit_retention_days: Optional[int] = None,
     ) -> None:
         self.db = db
         self.log_requests = log_requests
@@ -175,6 +216,9 @@ class RunLedgerServer(ThreadingHTTPServer):
         self.trusted_proxies: Tuple[_IPNetwork, ...] = tuple(trusted_proxies)
         self.limiter = FailureLimiter()
         self.retention_days = retention_days
+        self.audit_retention_days = audit_retention_days
+        self._query_key_warned = False
+        self._query_key_lock = threading.Lock()
         self._maintenance_stop = threading.Event()
         super().__init__(address, _Handler)
         # The base URL people see in approval links. The default is the bound address,
@@ -197,14 +241,18 @@ class RunLedgerServer(ThreadingHTTPServer):
 
     def start_maintenance(self, interval_s: float = MAINTENANCE_INTERVAL_S) -> bool:
         """Apply retention now and then every interval_s, on a daemon thread, until
-        server_close(). Does nothing (returns False) when retention is not configured."""
-        if not self.retention_days:
+        server_close(). Does nothing (returns False) when neither retention period is set."""
+        if not self.retention_days and not self.audit_retention_days:
             return False
 
         def loop() -> None:
             while True:
                 try:
-                    removed = {k: v for k, v in maintenance.run_maintenance(self.db, self.retention_days).items() if v}
+                    removed = {
+                        k: v for k, v in maintenance.run_maintenance(
+                            self.db, self.retention_days, audit_days=self.audit_retention_days,
+                        ).items() if v
+                    }
                     if removed:
                         sys.stderr.write(f"RunLedger: maintenance removed {removed}\n")
                 except Exception:
@@ -273,6 +321,17 @@ class RunLedgerServer(ThreadingHTTPServer):
         row = self.db.session_key(token)
         return identity_from_row(row, "session") if row else None
 
+    def warn_query_key_once(self) -> None:
+        """Write the ?key= deprecation warning once per server process. Never the key."""
+        with self._query_key_lock:
+            if self._query_key_warned:
+                return
+            self._query_key_warned = True
+        sys.stderr.write(
+            "warning: signing in with '?key=' in the URL is deprecated; "
+            "use the sign-in form (POST /session) instead.\n"
+        )
+
 
 class _IPv6Server(RunLedgerServer):
     address_family = socket.AF_INET6
@@ -306,6 +365,7 @@ def make_server(
     trust_proxy: bool = False,
     trusted_proxies: Optional[Sequence[str]] = None,
     retention_days: Optional[int] = None,
+    audit_retention_days: Optional[int] = None,
 ) -> RunLedgerServer:
     """Open the database and bind the server. Port 0 picks a free port (see server_address).
     The caller owns the server: call shutdown(), server_close() and db.close() when done.
@@ -315,7 +375,10 @@ def make_server(
     the Secure flag on the session cookie. trust_proxy honours X-Forwarded-Proto from a
     reverse proxy the same way. trusted_proxies (and $RUNLEDGER_TRUSTED_PROXIES, comma
     separated) are the proxy addresses or CIDR ranges whose X-Forwarded-For is believed.
-    retention_days defaults to RUNLEDGER_RETENTION_DAYS (unset keeps all history).
+    retention_days defaults to RUNLEDGER_RETENTION_DAYS (unset keeps all history, and a value
+    below the 35-day floor is raised to it with a warning). audit_retention_days defaults to
+    RUNLEDGER_AUDIT_RETENTION_DAYS: unset keeps audit events for 365 days while runs are being
+    pruned, and 0 keeps them forever.
     Raises ValueError for an invalid address, range or retention setting before the
     database is opened."""
     if bool(tls_cert) != bool(tls_key):
@@ -323,6 +386,8 @@ def make_server(
     networks = parse_trusted_proxies(list(trusted_proxies or []) + _env_list(TRUSTED_PROXIES_ENV))
     if retention_days is None:
         retention_days = maintenance.retention_from_env()
+    if audit_retention_days is None:
+        audit_retention_days = maintenance.audit_retention_from_env()
     tls_context = make_tls_context(tls_cert, tls_key) if tls_cert else None
     secure = bool(secure_cookies) or _env_flag(SECURE_COOKIES_ENV)
     db = Database(db_path)
@@ -332,6 +397,7 @@ def make_server(
             (host, port), db, log_requests=log_requests, public_url=public_url,
             tls_context=tls_context, secure_cookies=secure, trust_proxy=bool(trust_proxy),
             trusted_proxies=networks, retention_days=retention_days,
+            audit_retention_days=audit_retention_days,
         )
     except Exception:
         db.close()
@@ -408,6 +474,9 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/":
             self._only(method, ("GET",))
             self._dashboard(query)
+        elif path == "/session":
+            self._only(method, ("POST",))
+            self._session_post()
         elif path == "/api/me":
             self._only(method, ("GET",))
             self._me()
@@ -521,8 +590,9 @@ class _Handler(BaseHTTPRequestHandler):
     def _send_html(self, status: int, html: str, headers: Optional[Dict[str, str]] = None) -> None:
         self._send(status, html.encode("utf-8"), "text/html; charset=utf-8", headers)
 
-    def _sign_in_page(self) -> None:
-        self._send_html(401, SIGN_IN_HTML, {"Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'"})
+    def _sign_in_page(self, error: Optional[str] = None) -> None:
+        message = f'<p class="error" role="alert">{_escape(error)}</p>' if error else ""
+        self._send_html(401, SIGN_IN_HTML.replace("__ERROR__", message), {"Content-Security-Policy": SIGN_IN_CSP})
 
     # Auth
 
@@ -599,6 +669,17 @@ class _Handler(BaseHTTPRequestHandler):
                 f"Dashboard changes must send the header '{CSRF_HEADER}: {CSRF_VALUE}'.",
             )
 
+    def _authed(self, minimum: str, what: str, write: bool = False) -> Identity:
+        """Identify and authorize before the request body is read, so a huge unauthenticated
+        body is answered 401/403 at once, and the connection closes without draining it."""
+        try:
+            ident = self._identify()
+            self._require(ident, minimum, what, write=write)
+        except _HttpError as exc:
+            exc.headers.setdefault("Connection", "close")
+            raise
+        return ident
+
     # Endpoints
 
     def _content_length(self, limit: int = MAX_BODY_BYTES, what: str = "Receipts") -> int:
@@ -625,10 +706,9 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_json(200, me)
 
     def _create_run(self) -> None:
+        ident = self._authed("member", "push runs", write=True)
         length = self._content_length()
         raw = self.rfile.read(length) if length else b""
-        ident = self._identify()
-        self._require(ident, "member", "push runs", write=True)
         if not raw:
             raise _HttpError(400, "empty_body", "Send the receipt as a JSON object in the request body.")
         try:
@@ -637,27 +717,45 @@ class _Handler(BaseHTTPRequestHandler):
             raise _HttpError(400, "invalid_json", "The body must be UTF-8 JSON.") from None
         if not isinstance(payload, dict):
             raise _HttpError(400, "invalid_json", "The body must be a JSON object.")
-        run = receipt_to_run(payload)
+        run = receipt_to_run(
+            payload,
+            attribution=self.server.db.team_attribution(ident.team_id),
+            pushed_by=ident.label,
+            role=ident.role,
+        )
         result = self.server.db.upsert_run(
             ident.team_id,
             run,
             actor=ident.actor(),
             key_id=ident.key_id,
+            role=ident.role,
         )
         outcome = result["outcome"]
         if outcome == "conflict":
             raise _HttpError(
                 409,
                 "run_conflict",
-                "A different receipt already exists for this session_id. Run receipts are immutable; use a new session_id.",
+                "A different key already pushed this session, or the new receipt is older. "
+                "Push the newest version of a session with the key that pushed it first.",
             )
         self._check_budget_alerts(ident)
-        self._send_json(201, {
+        if outcome == "updated":
+            self._send_json(200, {
+                "status": "updated",
+                "id": run["id"],
+                "revision": result["revision"],
+            })
+            return
+        body: Dict[str, Any] = {
             "id": run["id"],
             "url": "/runs/" + quote(run["id"], safe=""),
             "risk_score": result["risk_score"],
             "risk_level": result["risk_level"],
-        })
+            "revision": result["revision"],
+        }
+        if outcome == "duplicate":
+            body["status"] = "duplicate"
+        self._send_json(201 if outcome == "inserted" else 200, body)
 
     def _list_runs(self, query: Dict[str, List[str]]) -> None:
         ident = self._identify()
@@ -704,21 +802,24 @@ class _Handler(BaseHTTPRequestHandler):
         self._send(200, html.encode("utf-8"), "text/html; charset=utf-8", {"Content-Security-Policy": RECEIPT_CSP})
 
     def _dashboard(self, query: Dict[str, List[str]]) -> None:
-        if "key" in query:
-            # Sign-in: trade the key for an opaque cookie and redirect so the key leaves the URL.
-            row = self.server.db.key_for_token((query["key"][0] or "").strip())
+        key = (query.get("key") or [""])[0].strip()
+        if key:
+            # Legacy sign-in: trade the key for an opaque cookie and redirect so the key leaves
+            # the URL. A session of another team is never replaced without a confirming click,
+            # and a browser navigation that comes from another origin is refused outright: the
+            # Set-Cookie that would follow replaces the visitor's session for another team.
+            self._refuse_cross_origin_sign_in()
+            self.server.warn_query_key_once()
+            row = self.server.db.key_for_token(key)
             if row is None:
                 self.server.limiter.record_failure(self._client_ip())
-                self._sign_in_page()
+                self._sign_in_page("That key was not recognized. Check the key and try again.")
                 return
-            token = self.server.db.issue_session(row["team_id"], row["id"], row["role"])
-            session = identity_from_row(row, "session")
-            self.server.db.record_audit(row["team_id"], session.actor(), "auth.sign_in", row["id"],
-                                        {"role": row["role"], "ip": self._client_ip()})
-            cookie = f"{COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_TTL_SECONDS}"
-            if self._secure():
-                cookie += "; Secure"
-            self._send(302, b"", "text/plain; charset=utf-8", {"Location": "/", "Set-Cookie": cookie})
+            current = self._try_identify()
+            if current is not None and current.team_id != row["team_id"]:
+                self._switch_team_page(row, current, key)
+                return
+            self._sign_in(row)
             return
         if self._try_identify() is None:
             self._sign_in_page()
@@ -726,13 +827,91 @@ class _Handler(BaseHTTPRequestHandler):
         nonce = secrets.token_urlsafe(16)
         self._send_html(200, DASHBOARD_HTML.replace("__CSP_NONCE__", nonce), {"Content-Security-Policy": _page_csp(nonce)})
 
+    def _refuse_cross_origin_sign_in(self) -> None:
+        """Refuse a sign-in request that a browser marks as coming from another origin.
+
+        This covers the sign-in form (POST /session) and the legacy key-in-URL link
+        (GET /?key=). The session cookie is SameSite=Strict, so a cross-site request arrives
+        without the cookie the visitor already holds: the server cannot show the confirmation
+        page (see _switch_team_page) and the Set-Cookie that would follow replaces the visitor's
+        session for another team. A browser describes such a request with Origin and
+        Sec-Fetch-Site, so a mismatch is refused here, before the body is read.
+
+        Sec-Fetch-Site is the browser's own statement and page script cannot set it, so
+        "same-origin" is accepted without the Origin header: every response carries
+        `Referrer-Policy: no-referrer`, which makes Chromium serialize the Origin of a
+        same-origin form POST as "null" (measured with Chrome 155). That opaque "null" is the
+        only Origin `same-origin` excuses; a concrete Origin is still compared, so a request
+        that contradicts its own fetch metadata is refused. Without the fetch metadata, the
+        Origin is compared with the Host header at the scheme the server believes the client
+        used, so a request behind a reverse proxy still matches when the server already trusts
+        X-Forwarded-Proto (see RunLedgerServer.secure_for). A request with neither header is not
+        a browser (curl, a pasted link, an agent) and keeps working; a browser navigation from
+        another origin sends Sec-Fetch-Site: same-site or cross-site, never "none"."""
+        site = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
+        if site in CROSS_ORIGIN_FETCH_SITES:
+            self._refuse_sign_in(f"Sec-Fetch-Site: {site}")
+        origin = self.headers.get("Origin")
+        if origin is None:
+            return
+        if site == "same-origin" and origin.strip().lower() == "null":
+            return
+        host = (self.headers.get("Host") or "").strip()
+        scheme = "https" if self._secure() else "http"
+        if not host or not _same_origin(origin, scheme, host):
+            self._refuse_sign_in(f"Origin: {_log_text(origin)}")
+
+    def _refuse_sign_in(self, reason: str) -> None:
+        """403 without a cookie and without a session row. The line names the header that
+        refused the request, never the key."""
+        sys.stderr.write(f"warning: refused a cross-site sign-in request ({reason})\n")
+        raise _HttpError(
+            403, "cross_site",
+            "Sign-in must come from this site. Open the dashboard in a new tab and use the form there.",
+            {"Connection": "close"},
+        )
+
+    def _session_post(self) -> None:
+        """The sign-in form: the key travels in the body, never in the URL."""
+        self._refuse_cross_origin_sign_in()
+        length = self._content_length(SIGN_IN_BODY_LIMIT, "Sign-in forms")
+        raw = self.rfile.read(length) if length else b""
+        fields = parse_qs(raw.decode("utf-8", "replace"), keep_blank_values=True)
+        key = (fields.get("key") or [""])[0].strip()
+        row = self.server.db.key_for_token(key) if key else None
+        if row is None:
+            if key:
+                self.server.limiter.record_failure(self._client_ip())
+            self._sign_in_page("That key was not recognized. Check the key and try again.")
+            return
+        self._sign_in(row)
+
+    def _sign_in(self, row: Mapping[str, Any]) -> None:
+        token = self.server.db.issue_session(row["team_id"], row["id"], row["role"])
+        session = identity_from_row(row, "session")
+        self.server.db.record_audit(row["team_id"], session.actor(), "auth.sign_in", row["id"],
+                                    {"role": row["role"], "ip": self._client_ip()})
+        cookie = f"{COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_TTL_SECONDS}"
+        if self._secure():
+            cookie += "; Secure"
+        self._send(302, b"", "text/plain; charset=utf-8", {"Location": "/", "Set-Cookie": cookie})
+
+    def _switch_team_page(self, row: Mapping[str, Any], current: Identity, key: str) -> None:
+        """A ?key= link for another team is a switch, not a sign-in: ask for one click first."""
+        page = (
+            SWITCH_TEAM_HTML
+            .replace("__FROM__", _escape(current.team_name))
+            .replace("__TO__", _escape(row["team_name"]))
+            .replace("__KEY__", _escape(key))
+        )
+        self._send_html(200, page, {"Content-Security-Policy": SIGN_IN_CSP})
+
     # Approvals
 
     def _create_approval(self) -> None:
+        ident = self._authed("member", "request approvals", write=True)
         length = self._content_length(approvals.CREATE_BODY_LIMIT, "Approval requests")
         raw = self.rfile.read(length) if length else b""
-        ident = self._identify()
-        self._require(ident, "member", "request approvals", write=True)
         try:
             fields = approvals.validate_new_approval(_json_object(raw))
         except approvals.InvalidInput as exc:
@@ -773,10 +952,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _decide_approval(self, raw_id: str) -> None:
         approval_id = _approval_id(raw_id)
+        ident = self._authed("admin", "decide approvals", write=True)
         length = self._content_length(approvals.SMALL_BODY_LIMIT, "Decisions")
         raw = self.rfile.read(length) if length else b""
-        ident = self._identify()
-        self._require(ident, "admin", "decide approvals", write=True)
         try:
             decision, reason, _name = approvals.validate_decision(_json_object(raw))
         except approvals.InvalidInput as exc:
@@ -812,10 +990,9 @@ class _Handler(BaseHTTPRequestHandler):
     def _team_settings(self, method: str) -> None:
         db = self.server.db
         if method == "PUT":
+            ident = self._authed("admin", "change team settings", write=True)
             length = self._content_length(approvals.SMALL_BODY_LIMIT, "Settings")
             raw = self.rfile.read(length) if length else b""
-            ident = self._identify()
-            self._require(ident, "admin", "change team settings", write=True)
             try:
                 changes = approvals.validate_settings(_json_object(raw))
             except approvals.InvalidInput as exc:
@@ -853,10 +1030,9 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_json(200, {"keys": self.server.db.list_keys(ident.team_id)})
 
     def _create_key(self) -> None:
+        ident = self._authed("admin", "create keys", write=True)
         length = self._content_length(approvals.SMALL_BODY_LIMIT, "Key requests")
         raw = self.rfile.read(length) if length else b""
-        ident = self._identify()
-        self._require(ident, "admin", "create keys", write=True)
         body = _json_object(raw)
         try:
             view = self.server.db.create_key(ident.team_id, body.get("label"), body.get("role"), ident.actor())
@@ -918,10 +1094,9 @@ class _Handler(BaseHTTPRequestHandler):
     def _budgets(self, method: str) -> None:
         db = self.server.db
         if method == "PUT":
+            ident = self._authed("admin", "change the team budget", write=True)
             length = self._content_length(approvals.SMALL_BODY_LIMIT, "Budgets")
             raw = self.rfile.read(length) if length else b""
-            ident = self._identify()
-            self._require(ident, "admin", "change the team budget", write=True)
             try:
                 values = budgets.validate_budget(_json_object(raw))
             except _HttpError as exc:  # no body, or not a JSON object
@@ -963,6 +1138,38 @@ def _attested_identity(ident: Identity) -> str:
     source = "dashboard" if ident.via == "session" else "api"
     key_ref = ident.prefix or ident.key_id
     return f"{source}: {ident.label} ({key_ref})"
+
+
+def _same_origin(origin: str, scheme: str, host: str) -> bool:
+    """Whether an Origin header names exactly the scheme and host of this request. "null", an
+    opaque origin, a value without a scheme and a value the parser rejects (such as a malformed
+    bracketed IPv6 authority) are never this request's origin."""
+    try:
+        parts = urlsplit(origin.strip())
+    except ValueError:
+        return False
+    if parts.scheme.lower() != scheme or not parts.netloc:
+        return False
+    return _authority(parts.netloc, scheme) == _authority(host, scheme)
+
+
+def _authority(value: str, scheme: str) -> Tuple[str, str]:
+    """A Host header or an origin's authority as (host, port), lower-cased, with the scheme's
+    default port filled in, so `example.com` and `example.com:443` compare equal."""
+    text = value.strip().lower()
+    if text.startswith("["):  # an IPv6 literal, with or without a port
+        host, _, rest = text[1:].partition("]")
+        port = rest[1:] if rest.startswith(":") else ""
+    elif text.count(":") == 1:
+        host, _, port = text.partition(":")
+    else:
+        host, port = text, ""
+    return host, port or ("443" if scheme == "https" else "80")
+
+
+def _log_text(value: str, limit: int = 120) -> str:
+    """Header text for a log line: printable ASCII only, one line, bounded."""
+    return re.sub(r"[^\x20-\x7e]", "?", value.strip())[:limit]
 
 
 def _page_csp(nonce: str) -> str:
@@ -1119,6 +1326,12 @@ def _money(value: Any) -> Optional[float]:
     return round(max(0.0, float(value)), 6)
 
 
+def _enum(value: Any, allowed: Tuple[str, ...]) -> Optional[str]:
+    """A value from `allowed` (matched without case or padding), or None."""
+    text = value.strip().lower() if isinstance(value, str) else ""
+    return text if text in allowed else None
+
+
 def _iso(value: Any) -> Optional[str]:
     when = _parse_ts(value)
     return when.strftime(TIME_FORMAT) if when else None
@@ -1135,12 +1348,23 @@ def _title(payload: Dict[str, Any]) -> str:
     return _text(payload.get("overview"), 200) or ""
 
 
-def receipt_to_run(payload: Dict[str, Any]) -> Dict[str, Any]:
+def receipt_to_run(
+    payload: Dict[str, Any],
+    *,
+    attribution: str = "client",
+    pushed_by: Optional[str] = None,
+    role: Optional[str] = None,
+) -> Dict[str, Any]:
     """Validate a pushed receipt and flatten it into the columns the store keeps.
 
     Accepts the output of `runledger receipt --format json`, plus the fields the
     client adds: user, project, html, and models with cost_usd. Missing or odd
-    values fall back to safe defaults. Only a missing session_id is rejected."""
+    values fall back to safe defaults. Only a missing session_id is rejected.
+
+    With `attribution` "key" a run pushed by a member is displayed under the label of the
+    key that pushed it (`pushed_by`), leaving the client's own user value in the receipt;
+    admin keys always keep the client user. A receipt whose usage is missing keeps an
+    unknown cost even when it carries a cost of 0.0."""
     session_id = payload.get("session_id")
     if not isinstance(session_id, str) or not _valid_id(session_id):
         raise _HttpError(400, "invalid_receipt", "The receipt needs a session_id of 1-200 characters.")
@@ -1149,7 +1373,10 @@ def receipt_to_run(payload: Dict[str, Any]) -> Dict[str, Any]:
     risk = _dict(payload.get("risk"))
     steps = [s for s in _list(payload.get("steps")) if isinstance(s, dict)]
     cwd = _text(payload.get("cwd"), 500)
-    user = _text(payload.get("user"), 200) or "unknown"
+    client_user = _text(payload.get("user"), 200) or "unknown"
+    user = client_user
+    if attribution == "key" and pushed_by and role != "admin":
+        user = pushed_by
     project = _text(payload.get("project"), 200) or _folder_name(cwd) or "unknown"
     agent = _text(payload.get("agent"), 100)  # the agent's label, e.g. "Claude Code"
 
@@ -1158,12 +1385,18 @@ def receipt_to_run(payload: Dict[str, Any]) -> Dict[str, Any]:
     if level not in LEVELS:
         level = _level_for(score)
 
+    usage_source = _enum(totals.get("usage_source"), USAGE_SOURCES)
+    # An agent that recorded no usage has an unknown cost: whatever the client put in cost_usd
+    # (usually 0.0) would read as a free run. The same goes for each model's bucket, so a model
+    # group made of such runs stays unpriced instead of a priced zero.
+    missing_usage = usage_source == "missing"
+
     models: Dict[str, Dict[str, Any]] = {}
     for name, info in list(_dict(payload.get("models")).items())[:50]:
         label = str(name)[:200]
         info = _dict(info)
-        cost = _money(info.get("cost_usd"))
-        if cost is None:  # older receipts: fall back to the per-step costs
+        cost = None if missing_usage else _money(info.get("cost_usd"))
+        if cost is None and not missing_usage:  # older receipts: fall back to the per-step costs
             step_costs = [
                 c for c in (_money(s.get("cost_usd")) for s in steps if s.get("model") == name)
                 if c is not None
@@ -1191,15 +1424,19 @@ def receipt_to_run(payload: Dict[str, Any]) -> Dict[str, Any]:
     # stored as null (or dropped item by item) and never rejects the push.
     review = insights.review_fields(payload)
     receipt = {k: v for k, v in payload.items() if k != "html"}
-    receipt["user"] = user
+    receipt["user"] = client_user
     receipt["project"] = project
     receipt.update({k: review[k] for k in ("quality", "recommendations", "ai_review")})
+    normalize_missing_costs(receipt, usage_source)
 
+    cost = None if missing_usage else _money(totals.get("cost_usd"))
     return {
         "id": session_id,
         "user": user,
         "project": project,
         "agent": agent,
+        "agent_id": _text(payload.get("agent_id"), 100),
+        "pushed_by": pushed_by,
         "title": _title(payload),
         "started_at": _iso(payload.get("started")),
         "ended_at": _iso(payload.get("ended")),
@@ -1207,7 +1444,9 @@ def receipt_to_run(payload: Dict[str, Any]) -> Dict[str, Any]:
         "steps": _int(totals.get("steps"), len(steps)) or 0,
         "tokens": _int(totals.get("tokens"), 0) or 0,
         "files_changed": _int(totals.get("files_changed"), 0) or 0,
-        "cost": _money(totals.get("cost_usd")),
+        "cost": cost,
+        "usage_source": usage_source,
+        "cost_partial": totals.get("cost_partial") is True and cost is not None,
         "risk_score": score,
         "risk_level": level,
         "risks": risks,
@@ -1215,6 +1454,8 @@ def receipt_to_run(payload: Dict[str, Any]) -> Dict[str, Any]:
         "quality_grade": review["quality_grade"],
         "ai_verdict": review["ai_verdict"],
         "est_savings_usd": review["est_savings_usd"],
+        "recommendations": json.dumps(review["recommendation_counts"], ensure_ascii=False),
+        "ai_assessment": json.dumps(review["assessment_counts"]),
         "receipt": receipt,
         "receipt_html": html,
     }

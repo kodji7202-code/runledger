@@ -131,6 +131,35 @@ def _pct_text(pct: Any) -> str:
     return "no limit" if pct is None else f"{pct:.1f}%"
 
 
+def _spend_text(row: Dict[str, Any]) -> str:
+    """A spend figure: "n/a" when nothing behind it is priced, marked "≥" when only some of the
+    runs have a known cost, and the plain amount otherwise."""
+    runs = int(row.get("runs") or 0)
+    priced = row.get("priced_runs")
+    if runs and not priced:
+        return "n/a"
+    text = _usd(row["spend_usd"])
+    lower_bound = (
+        row.get("cost_is_lower_bound")
+        or int(row.get("partial_runs") or 0)
+        or (priced is not None and runs > priced)
+    )
+    return "≥ " + text if lower_bound else text
+
+
+def _unknown_note(row: Dict[str, Any]) -> str:
+    """The "(lower bound: N of M runs unpriced)" tail of a month's spend, or "". A month with no
+    priced run at all is unknown rather than a lower bound of zero."""
+    unpriced = int(row.get("unpriced_runs") or 0)
+    runs = int(row.get("runs") or 0)
+    partial = int(row.get("partial_runs") or 0)
+    count, kind = (unpriced, "unpriced") if unpriced else (partial, "only partly priced")
+    if not count:
+        return ""
+    prefix = "lower bound: " if row.get("priced_runs") else ""
+    return f" ({prefix}{count} of {runs} runs {kind})"
+
+
 def _table(headers: Sequence[str], rows: Iterable[Sequence[str]], numeric: Sequence[int] = ()) -> str:
     """A table. The cells must already be escaped (or be markup this module wrote)."""
     head = "".join(f"<th>{_e(h)}</th>" for h in headers)
@@ -240,12 +269,22 @@ def _report(db: Database, team_id: int, team_name: str, days: int, now: datetime
     generated = moment.strftime(TIME_FORMAT)
 
     avg = "n/a" if totals["avg_risk"] is None else f"{totals['avg_risk']:.1f}"
+    # An unknown cost is n/a, never $0.00; a window with unpriced or partly priced runs is a
+    # lower bound and says so.
+    if totals["cost_usd"] is None:
+        cost_text, cost_label = "n/a", "Estimated cost at list prices"
+    else:
+        cost_text = _usd(totals["cost_usd"])
+        cost_label = "Estimated cost at list prices"
+        if totals["cost_is_lower_bound"]:
+            cost_text = "≥ " + cost_text
+            cost_label = "Estimated cost at list prices (lower bound)"
     summary = _table(
         ["Measure", "Value"],
         [
             ["Runs", _e(totals["runs"])],
-            ["Estimated cost at list prices", _e(_usd(totals["cost_usd"]))],
-            ["Runs without a price", _e(totals["unpriced_runs"])],
+            [cost_label, _e(cost_text)],
+            ["Runs without a complete price", _e(totals["unpriced_runs"])],
             ["Tokens", _e(f"{totals['tokens']:,}")],
             ["Steps", _e(f"{totals['steps']:,}")],
             ["Files changed", _e(f"{totals['files_changed']:,}")],
@@ -302,7 +341,7 @@ def _report(db: Database, team_id: int, team_name: str, days: int, now: datetime
         event_table = '<p class="note">No key lifecycle events in this period.</p>'
 
     user_rows = [
-        [_e(u["user"]), _e(_usd(u["spend_usd"])), _e(_pct_text(u["pct"]))] for u in budget["per_user"][:10]
+        [_e(u["user"]), _e(_spend_text(u)), _e(_pct_text(u["pct"]))] for u in budget["per_user"][:10]
     ]
     if budget["monthly_usd"] is None:
         limit_text = "no team budget set"
@@ -313,7 +352,8 @@ def _report(db: Database, team_id: int, team_name: str, days: int, now: datetime
     else:
         user_table = '<p class="note">No developer spend recorded this month.</p>'
     budget_block = (
-        f"<p>Month {_e(budget['month'])}: spend {_e(_usd(budget['spend_usd']))}, {_e(limit_text)}.</p>"
+        f"<p>Month {_e(budget['month'])}: spend {_e(_spend_text(budget))}{_e(_unknown_note(budget))}, "
+        f"{_e(limit_text)}.</p>"
         + user_table
     )
 

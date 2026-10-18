@@ -149,3 +149,164 @@ def test_truncated_path_inside_root_is_hidden():
     assert safe_text("Ran `cd /private/var/folders/ab/T/pytest-0/case/r…`", ctx) == "Ran `cd …`"
     assert safe_text("cat /private/var/folders/ab/T/pytest-0/case/repo/src/app.…", ctx) == "cat src/app.…"
     assert safe_text("cat /home/alice/notes/to…", SafeContext(root="/work/repo")) == "cat ~/notes/to…"
+
+
+# ---------------------------------------------------------------- Spaced homes, git@ remotes, foreign paths (VAL-CORE-032..034)
+
+def test_home_folders_with_spaces_are_fully_masked():
+    ctx = SafeContext(root="D:/work/repo")
+    win_out = safe_text(r"edited C:\Users\John Smith\proj\a.py today", ctx)
+    assert win_out == "edited ~/proj/a.py today"
+    assert "John" not in win_out and "Smith" not in win_out
+
+    posix_out = safe_text("cat /home/john smith/notes.txt", ctx)
+    assert posix_out == "cat ~/notes.txt"
+    assert "john" not in posix_out and "smith" not in posix_out
+
+    mac_out = safe_text("open /Users/Mary Jane Doe/notes.txt", ctx)
+    assert mac_out == "open ~/notes.txt"
+    for name in ("Mary", "Jane", "Doe"):
+        assert name not in mac_out
+
+
+def test_scp_and_ssh_git_remotes_are_not_redacted_as_emails():
+    ctx = SafeContext(root=ROOT)
+    cmd = (
+        "git clone git@github.com:org/repo.git && "
+        "git remote set-url origin git@gitlab.internal.corp:team/service.git && "
+        "git fetch ssh://git@github.com/org/repo.git && "
+        "git fetch ssh://alice@host.example.com/repo.git && "
+        "git config user.email bob@example.com && "
+        "echo 'Co-authored-by: alice@corp.io' && "
+        "git clone https://user:pass@github.com/org/repo.git"
+    )
+    out = safe_text(cmd, ctx)
+    assert "git@github.com:org/repo.git" in out
+    assert "git@gitlab.internal.corp:team/service.git" in out
+    assert "ssh://git@github.com/org/repo.git" in out
+    assert "ssh://[REDACTED]@host.example.com/repo.git" in out
+    assert "alice@host.example.com" not in out
+    assert "git config user.email [EMAIL]" in out
+    assert "Co-authored-by: [EMAIL]" in out
+    assert "bob@example.com" not in out and "alice@corp.io" not in out
+    assert "https://[REDACTED]@github.com/org/repo.git" in out
+    assert "user:pass" not in out
+
+
+def test_foreign_absolute_paths_are_trimmed_when_root_is_known():
+    for root in ("C:/Users/dev/proj", "/home/dev/proj"):
+        ctx = SafeContext(root=root)
+        win_foreign = safe_path(r"D:\secret-corp\client-acme\payroll\q1.xlsx", ctx)
+        assert win_foreign == "…/payroll/q1.xlsx"
+        assert "secret-corp" not in win_foreign and "client-acme" not in win_foreign
+
+        posix_foreign = safe_path("/opt/proprietary-vendor/sdk-v3/include/header.h", ctx)
+        assert posix_foreign == "…/include/header.h"
+        assert "proprietary-vendor" not in posix_foreign and "sdk-v3" not in posix_foreign
+
+        text_out = safe_text(
+            r"copied D:\secret-corp\client-acme\payroll\q1.xlsx and /opt/proprietary-vendor/sdk-v3/include/header.h",
+            ctx,
+        )
+        assert text_out == "copied …/payroll/q1.xlsx and …/include/header.h"
+
+        for sys_path in ("/usr/bin/python3", "/etc/hosts", "/bin/sh"):
+            assert safe_path(sys_path, ctx) == sys_path
+        assert safe_path("/tmp/build.log", ctx) == "/tmp/build.log"
+
+
+def test_spaced_foreign_windows_paths_are_fully_masked():
+    """CORE-SCR-013: a foreign drive path containing spaces is masked as a whole, quoted
+    or bare, so neither the drive nor the folders above the last two parts survive."""
+    ctx = SafeContext(root="D:/repo", home="C:/Users/local")
+    assert safe_text(r'type "E:\Work\Client X\secret.txt"', ctx) == 'type "…/Client X/secret.txt"'
+    assert safe_text(r"type E:\Work\Client X\secret.txt", ctx) == "type …/Client X/secret.txt"
+    assert safe_text(r"type E:\Work\Client X\secret.txt now", ctx) == "type …/Client X/secret.txt now"
+    assert safe_text(r"copy D:\other\proj\file.py E:\Work\Client X\secret.txt", ctx) == (
+        "copy …/proj/file.py …/Client X/secret.txt")
+    for leaked in ("E:", "E:\\", "Work", "D:\\other"):
+        assert leaked not in safe_text(
+            r'type "E:\Work\Client X\secret.txt" and E:\Work\Client X\secret.txt and D:\other\proj\file.py', ctx)
+
+
+def test_spaced_and_non_ascii_home_usernames_are_fully_masked():
+    """CORE-SCR-014: an unknown home user name is consumed up to a separator, quote or end
+    of line with no ASCII or capitalisation restriction, so a surname never leaks."""
+    ctx = SafeContext(root="D:/repo", home="C:/Users/local")
+    posix = safe_text("cat /home/john smith/notes.txt today", ctx)
+    assert posix == "cat ~/notes.txt today"
+    assert safe_text("cd /home/john smith/work && ls", ctx) == "cd ~/work && ls"
+    mac = safe_text("ls /Users/mary jane doe", ctx)
+    assert mac == "ls ~"
+    win = safe_text(r"cat C:\Users\José Smith\Documents\x.txt", ctx)
+    assert win == "cat ~/Documents/x.txt"
+    for leaked in ("john", "smith", "mary", "jane", "doe", "José", "Smith"):
+        assert leaked not in posix + mac + win
+
+
+def test_three_word_spaced_foreign_paths_are_fully_masked():
+    """CORE-SCR-R2-005: a folder name may hold several words, and the whole path is still one
+    path, so nothing above the last two components survives in safe text."""
+    ctx = SafeContext(root="D:/repo", home="C:/Users/local")
+    assert safe_text(r'type "E:\Work\Client X Corp\secret.txt"', ctx) == 'type "…/Client X Corp/secret.txt"'
+    assert safe_text(r"type E:\Work\Client X Corp\secret.txt", ctx) == "type …/Client X Corp/secret.txt"
+    assert safe_text(r"type E:\Work\Client X Corp\secret.txt now", ctx) == "type …/Client X Corp/secret.txt now"
+    assert safe_text("type E:/Work/Client X Corp/secret.txt", ctx) == "type …/Client X Corp/secret.txt"
+    assert safe_text("ls /opt/My Client Docs/x.txt now", ctx) == "ls …/My Client Docs/x.txt now"
+    for leaked in ("E:", "Work"):
+        assert leaked not in safe_text(
+            r'type "E:\Work\Client X Corp\secret.txt" and E:\Work\Client X Corp\secret.txt', ctx)
+
+
+def test_home_user_names_with_repeated_spaces_are_fully_masked():
+    """CORE-SCR-R2-006: a whitespace run inside an unknown user name is consumed too, so no
+    surname fragment reaches a receipt on Windows or POSIX."""
+    ctx = SafeContext(root="D:/repo", home="C:/Users/local")
+    win = safe_text(r'cat "C:\Users\John  Smith\Documents\x.txt"', ctx)
+    assert win == 'cat "~/Documents/x.txt"'
+    posix = safe_text('cat "/home/john  smith/notes.txt"', ctx)
+    assert posix == 'cat "~/notes.txt"'
+    mac = safe_text("ls /Users/mary   jane  doe", ctx)
+    assert mac == "ls ~"
+    assert safe_text("cat /home/john\tsmith/x.txt", ctx) == "cat ~/x.txt"
+    for leaked in ("John", "Smith", "john", "smith", "mary", "jane", "doe"):
+        assert leaked not in win + posix + mac
+
+
+def test_sentence_final_emails_are_masked_without_eating_the_punctuation():
+    """VAL-PUSH-001 / VAL-CROSS-009: an address that ends a sentence is still an address.
+    A full stop, comma, semicolon, colon, question or exclamation mark, or a closing
+    bracket or quote, ends the address but stays in the text."""
+    ctx = SafeContext(root="D:/repo")
+    assert safe_text("contact me@example.com.", ctx) == "contact [EMAIL]."
+    assert safe_text("mail me@example.com, bob@example.org.", ctx) == "mail [EMAIL], [EMAIL]."
+    assert safe_text("ask me@example.com?", ctx) == "ask [EMAIL]?"
+    assert safe_text("ask me@example.com!", ctx) == "ask [EMAIL]!"
+    assert safe_text("ask me@example.com;", ctx) == "ask [EMAIL];"
+    assert safe_text("ask me@example.com:", ctx) == "ask [EMAIL]:"
+    assert safe_text("see (me@example.com), [me@example.com] and 'me@example.com'", ctx) == (
+        "see ([EMAIL]), [[EMAIL]] and '[EMAIL]'")
+    assert safe_text('asked "me@example.com".', ctx) == 'asked "[EMAIL]".'
+    assert safe_text("ends with me@example.com...", ctx) == "ends with [EMAIL]..."
+    assert safe_text("ends with me@example.com.", ctx) == "ends with [EMAIL]."
+    for text in ("me@example.com.", "Contact me@example.com.", "me@example.com, please",
+                 "List: me@example.com, bob@example.org."):
+        masked = safe_text(text, ctx)
+        assert "example.com" not in masked and "example.org" not in masked
+
+
+def test_git_scp_exemption_needs_a_remote_path():
+    """CORE-SCR-015: only `git@host:path` with a non-empty path is an scp remote; a real
+    address followed by a prose colon, a bare colon or a slash is still masked."""
+    ctx = SafeContext(root="D:/repo")
+    out = safe_text("Contact git@example.com: please respond", ctx)
+    assert out == "Contact [EMAIL]: please respond"
+    assert "git@example.com" not in out
+    assert safe_text("git@example.com:", ctx) == "[EMAIL]:"
+    assert safe_text("git@example.com/ x", ctx) == "[EMAIL]/ x"
+    assert safe_text("git clone git@github.com:org/repo.git", ctx) == (
+        "git clone git@github.com:org/repo.git")
+    assert safe_text("git remote add o git@gitlab.internal.corp:team/service.git", ctx) == (
+        "git remote add o git@gitlab.internal.corp:team/service.git")
+    assert safe_text("git fetch ssh://git@github.com/org/repo", ctx) == (
+        "git fetch ssh://git@github.com/org/repo")

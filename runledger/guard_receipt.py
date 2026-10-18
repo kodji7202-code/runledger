@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
-from .guard import LOG_DIR, LOG_FILE, _summary, redact
+from . import gitinfo
+from .guard import LOG_DIR, LOG_FILE, _summary, project_root, redact
 from .parser import Run, Step
+from .paths import is_unc
 
 
 # Guard writes short records. Bound memory even for a corrupt, enormous single line.
@@ -68,54 +71,119 @@ def _outcome(record: Dict[str, Any], step: Optional[Step]) -> Optional[str]:
     return None  # plain allows, warnings and errors aren't decisions to display
 
 
+def _log_paths(cwd: str) -> List[Path]:
+    """Candidate guard.log files for a run: project root, git top-level, and run.cwd."""
+    candidates = [project_root(cwd), gitinfo.toplevel(cwd), cwd]
+    paths: List[Path] = []
+    seen = set()
+    for d in candidates:
+        if not d or is_unc(d):
+            continue
+        p = Path(d) / LOG_DIR / LOG_FILE
+        try:
+            key = os.path.normcase(os.path.abspath(str(p)))
+        except OSError:
+            key = str(p)
+        if key not in seen:
+            seen.add(key)
+            paths.append(p)
+    return paths
+
+
 def load_guard_decisions(run: Run) -> List[Dict[str, Any]]:
     """Match by tool id, or by the Guard's own tool + summary for legacy records.
 
     Only legacy records use the fallback. A present but unknown id remains unmatched.
     Repeated legacy calls consume steps in transcript order, including blocked calls.
+    Reads from project root, git top-level, and `run.cwd` (legacy subfolder location),
+    de-duplicating identical entries across files.
     """
-    if not run.cwd:
+    if not run.cwd or is_unc(run.cwd):
         return []
     by_id = {s.tool_use_id: s for s in run.steps if s.tool_use_id}
     by_summary = defaultdict(deque)
     for step in run.steps:
         by_summary[(step.tool, _summary(step.tool, step.input))].append(step)
     used = set()
+    seen_keys = set()
     decisions: List[Dict[str, Any]] = []
-    for record in _records(Path(run.cwd) / LOG_DIR / LOG_FILE):
-        if record.get("session_id") != run.session_id:
-            continue
-        if record.get("decision") not in ("deny", "ask", "allow"):
-            continue
-        tool, summary = record.get("tool"), record.get("summary", "")
-        if not isinstance(tool, str) or not isinstance(summary, str):
-            continue
-        # Filter non-interventions before consuming a potential legacy match.
-        if _outcome(record, None) is None:
-            continue
-        tool_id = record.get("tool_use_id")
-        step = None
-        if isinstance(tool_id, str) and tool_id:
-            step = by_id.get(tool_id)
-        elif not tool_id:
-            candidates = by_summary[(tool, redact(summary))]
-            while candidates and candidates[0].index in used:
-                candidates.popleft()
-            if candidates:
-                step = candidates.popleft()
-        if step is not None:
-            used.add(step.index)
-        codes = record.get("codes")
-        decisions.append({
-            "step": step.index if step is not None else None,
-            "tool": redact(tool), "summary": redact(summary),
-            "decision": record["decision"], "outcome": _outcome(record, step),
-            "reason": redact(record.get("reason") or ""),
-            "codes": [redact(c) for c in codes if isinstance(c, str)]
-            if isinstance(codes, list) else [],
-            "ts": redact(record["ts"]) if isinstance(record.get("ts"), str) else None,
-        })
+    for log_idx, log_path in enumerate(_log_paths(run.cwd)):
+        seen_in_file = set()
+        for record in _records(log_path):
+            if record.get("session_id") != run.session_id:
+                continue
+            if record.get("decision") not in ("deny", "ask", "allow"):
+                continue
+            tool, summary = record.get("tool"), record.get("summary", "")
+            if not isinstance(tool, str) or not isinstance(summary, str):
+                continue
+            dedup_key = (record.get("ts"), tool, record.get("decision"), summary)
+            if record.get("ts") is not None:
+                if dedup_key in seen_keys:
+                    continue
+                seen_keys.add(dedup_key)
+            else:
+                if log_idx > 0 and dedup_key in seen_keys:
+                    continue
+                seen_in_file.add(dedup_key)
+            # Filter non-interventions before consuming a potential legacy match.
+            if _outcome(record, None) is None:
+                continue
+            tool_id = record.get("tool_use_id")
+            step = None
+            if isinstance(tool_id, str) and tool_id:
+                step = by_id.get(tool_id)
+            elif not tool_id:
+                candidates = by_summary[(tool, redact(summary))]
+                while candidates and candidates[0].index in used:
+                    candidates.popleft()
+                if candidates:
+                    step = candidates.popleft()
+            if step is not None:
+                used.add(step.index)
+            codes = record.get("codes")
+            decisions.append({
+                "step": step.index if step is not None else None,
+                "tool": redact(tool), "summary": redact(summary),
+                "decision": record["decision"], "outcome": _outcome(record, step),
+                "reason": redact(record.get("reason") or ""),
+                "codes": [redact(c) for c in codes if isinstance(c, str)]
+                if isinstance(codes, list) else [],
+                "ts": redact(record["ts"]) if isinstance(record.get("ts"), str) else None,
+            })
+        seen_keys.update(seen_in_file)
     return decisions
+
+
+def guard_warning_count(run: Run) -> int:
+    """Rows the Guard logged as a plain warning for this run (an ignored loosening setting).
+    Monitor-mode rows are decisions, which `guard_counts` already reports, so they are not
+    counted here. Missing, unreadable and unknown-CWD logs count zero."""
+    if not run.cwd or is_unc(run.cwd):
+        return 0
+    total = 0
+    seen_files = set()
+    seen = set()
+    for path in _log_paths(run.cwd):
+        try:
+            key = os.path.normcase(os.path.abspath(str(path)))
+        except OSError:
+            key = str(path)
+        if key in seen_files:
+            continue
+        seen_files.add(key)
+        for record in _records(path):
+            if record.get("session_id") != run.session_id:
+                continue
+            if record.get("decision") != "warning" or record.get("mode") == "monitor":
+                continue  # monitor-mode rows are decisions, and guard_counts() counts them
+            dup = (record.get("ts"), record.get("reason"))
+            if record.get("ts") is not None:
+                if dup in seen:
+                    continue
+                seen.add(dup)
+            total += 1
+    return total
 
 
 def guard_counts(decisions: List[Dict[str, Any]]) -> Dict[str, int]:

@@ -3,30 +3,36 @@
 Each test runs a real server on a free port in a background thread, with a
 temporary SQLite database.
 """
+import copy
 import http.client
 import json
+import re
 import sqlite3
 import threading
 from contextlib import closing, contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 
 import pytest
 
 from runledger import client
 from runledger.cli import main
-from runledger.server.app import MAX_BODY_BYTES, make_server
+from runledger.server.app import MAX_BODY_BYTES, RECEIPT_CSP, make_server
 from runledger.server.dashboard import DASHBOARD_HTML
 from runledger.server.db import Database
 
 FIX = Path(__file__).parent / "fixtures" / "sample_session.jsonl"
+DROID_FIX = Path(__file__).parent / "fixtures" / "droid_session.jsonl"
+NATIVE = Path(__file__).parent / "fixtures" / "native_session.json"
+ROOT = Path(__file__).resolve().parent.parent
 SESSION_ID = "7f3c2a10-9b1e-4c55-a1d2-0e6f8b3c9d42"
 XSS = "<script>alert(1)</script>"
 
 
 @contextmanager
-def running_server(db_path):
-    srv = make_server(str(db_path), host="127.0.0.1", port=0)
+def running_server(db_path, **kwargs):
+    srv = make_server(str(db_path), host="127.0.0.1", port=0, **kwargs)
     thread = threading.Thread(target=srv.serve_forever, daemon=True)
     thread.start()
     try:
@@ -67,6 +73,41 @@ def _auth(key):
 
 def _json(raw):
     return json.loads(raw.decode("utf-8"))
+
+
+def _stored(payload, run_id, *, steps=4, ended="2026-10-15T10:05:00Z", cost=0.1, risk=20, **extra):
+    """A receipt for `run_id` with a chosen step count, end time, cost and risk."""
+    body = copy.deepcopy(payload)
+    body["session_id"] = run_id
+    body["started"] = extra.pop("started", "2026-10-15T10:00:00Z")
+    body["ended"] = ended
+    body["totals"] = dict(body["totals"], steps=steps, cost_usd=cost)
+    body["models"] = {"claude-sonnet-4-5-20250929": {"tokens": 1000, "cost_usd": cost}}
+    level = "high" if risk >= 60 else "medium" if risk >= 25 else "low"
+    body["risk"] = {"score": risk, "level": level, "reasons": []}
+    body["html"] = f"<html><body>{run_id} version {steps}</body></html>"
+    body.update(extra)
+    return body
+
+
+def _push(base, key, payload):
+    status, _, raw = _http(base, "POST", "/api/runs", body=payload, headers=_auth(key))
+    return status, _json(raw)
+
+
+def _run_row(db_path, run_id):
+    """The stored row of a run, for the fields the API does not expose."""
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+        return dict(row) if row is not None else None
+
+
+def _revisions(db_path, run_id):
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        return [row[0] for row in conn.execute(
+            "SELECT revision FROM run_revisions WHERE run_id = ? ORDER BY revision", (run_id,)
+        )]
 
 
 def test_push_then_list_get_and_stats(env):
@@ -170,41 +211,39 @@ def test_same_session_id_in_two_teams_does_not_overwrite(env):
     assert [r["user"] for r in runs_b] == ["bob@example.com"]
 
 
-def test_repushing_is_idempotent_but_cannot_replace_an_existing_receipt(env):
+def test_repushing_is_idempotent_and_another_key_cannot_replace_the_receipt(env):
     srv, base = env
     team_id, key = srv.db.create_team("alpha")
     other = srv.db.create_key(team_id, "other-member", "member", "test")["key"]
     payload = client.build_payload(FIX, user="first@example.com")
 
     assert _http(base, "POST", "/api/runs", body=payload, headers=_auth(key))[0] == 201
-    assert _http(base, "POST", "/api/runs", body=payload, headers=_auth(key))[0] == 201
+    assert _http(base, "POST", "/api/runs", body=payload, headers=_auth(key))[0] == 200
+    # An identical retry is accepted from any key of the team: nothing changes.
+    assert _http(base, "POST", "/api/runs", body=payload, headers=_auth(other))[0] == 200
 
     changed = dict(payload)
     changed["user"] = "second@example.com"
     status, _, raw = _http(base, "POST", "/api/runs", body=changed, headers=_auth(other))
     assert status == 409 and _json(raw)["error"]["code"] == "run_conflict"
+    assert "immutable" not in _json(raw)["error"]["message"]
 
     runs = _json(_http(base, "GET", "/api/runs", headers=_auth(key))[2])["runs"]
-    assert len(runs) == 1 and runs[0]["user"] == "first@example.com"
+    assert len(runs) == 1 and runs[0]["user"] == "first@example.com" and runs[0]["revision"] == 1
     with closing(sqlite3.connect(str(srv.db.path))) as conn:
         pushes = conn.execute(
             "SELECT COUNT(*) FROM audit_log WHERE team_id = ? AND action = 'run.push' AND target = ?",
             (team_id, SESSION_ID),
         ).fetchone()[0]
-    assert pushes == 1
+        history = conn.execute("SELECT COUNT(*) FROM run_revisions").fetchone()[0]
+    assert pushes == 1 and history == 0
 
 
-def test_immutable_receipt_equality_is_type_sensitive_and_duplicate_reply_uses_stored_risk(env):
+def test_receipt_equality_is_type_sensitive_and_a_duplicate_reply_uses_the_stored_risk(env):
     srv, base = env
     _, key = srv.db.create_team("alpha")
     payload = client.build_payload(FIX, user="first@example.com")
-    payload["risk"]["score"] = True
     assert _http(base, "POST", "/api/runs", body=payload, headers=_auth(key))[0] == 201
-
-    typed_differently = json.loads(json.dumps(payload))
-    typed_differently["risk"]["score"] = 1
-    status, _, raw = _http(base, "POST", "/api/runs", body=typed_differently, headers=_auth(key))
-    assert status == 409 and _json(raw)["error"]["code"] == "run_conflict"
 
     # An exact retry reports persisted fields, which matters across parser-version
     # changes where flattened metadata can differ from today's derivation.
@@ -215,9 +254,688 @@ def test_immutable_receipt_equality_is_type_sensitive_and_duplicate_reply_uses_s
         )
         conn.commit()
     status, _, raw = _http(base, "POST", "/api/runs", body=payload, headers=_auth(key))
-    assert status == 201
+    assert status == 200
     reply = _json(raw)
-    assert reply["risk_score"] == 77 and reply["risk_level"] == "high"
+    assert reply["status"] == "duplicate"
+    assert reply["risk_score"] == 77 and reply["risk_level"] == "high" and reply["revision"] == 1
+    assert reply["id"] == SESSION_ID and reply["url"] == "/runs/" + SESSION_ID
+    assert _revisions(srv.db.path, SESSION_ID) == []
+
+    # Receipt equality is type-sensitive: True is not 1, so this is a new version, not a retry.
+    typed_differently = json.loads(json.dumps(payload))
+    typed_differently["risk"]["score"] = True
+    status, _, raw = _http(base, "POST", "/api/runs", body=typed_differently, headers=_auth(key))
+    assert status == 200
+    assert _json(raw) == {"status": "updated", "id": SESSION_ID, "revision": 2}
+
+
+def test_repush_grown_session_supersedes(env):
+    srv, base = env
+    team_id, key = srv.db.create_team("alpha")
+    key_id = srv.db.key_for_token(key)["id"]
+    payload = client.build_payload(FIX, user="dev@example.com")
+
+    grown_first = _stored(payload, "sess-grow", steps=4, ended="2026-10-15T10:05:00Z", cost=0.1, risk=20)
+    assert _push(base, key, grown_first)[0] == 201
+    created_at = _run_row(srv.db.path, "sess-grow")["created_at"]
+
+    grown = _stored(payload, "sess-grow", steps=9, ended="2026-10-15T10:20:00Z", cost=0.3, risk=60)
+    status, body = _push(base, key, grown)
+    assert status == 200
+    assert body == {"status": "updated", "id": "sess-grow", "revision": 2}
+
+    status, _, raw = _http(base, "GET", "/api/runs/sess-grow", headers=_auth(key))
+    run = _json(raw)["run"]
+    assert status == 200
+    assert run["steps"] == 9 and run["cost_usd"] == 0.3 and run["risk_score"] == 60
+    assert run["revision"] == 2 and run["receipt"]["totals"]["steps"] == 9
+    row = _run_row(srv.db.path, "sess-grow")
+    assert row["created_at"] == created_at and row["updated_at"] >= created_at
+    assert _http(base, "GET", "/runs/sess-grow", headers=_auth(key))[2].count(b"version 9") == 1
+    assert [r["id"] for r in _json(_http(base, "GET", "/api/runs", headers=_auth(key))[2])["runs"]] == ["sess-grow"]
+
+    with closing(sqlite3.connect(str(srv.db.path))) as conn:
+        history = conn.execute(
+            "SELECT revision, receipt_json, risk_score, cost, pushed_by_key_id FROM run_revisions "
+            "WHERE team_id = ? AND run_id = ?", (team_id, "sess-grow"),
+        ).fetchall()
+    assert len(history) == 1
+    revision, receipt_json, risk_score, cost, pushed_by = history[0]
+    assert (revision, risk_score, cost, pushed_by) == (1, 20, 0.1, key_id)
+    assert json.loads(receipt_json)["totals"]["steps"] == 4
+
+    events = _json(_http(base, "GET", "/api/audit?action=run.supersede", headers=_auth(key))[2])["events"]
+    assert [(e["action"], e["target"]) for e in events] == [("run.supersede", "sess-grow")]
+
+
+def test_repush_older_ended_at_or_fewer_steps_conflicts(env):
+    srv, base = env
+    _, key = srv.db.create_team("alpha")
+    payload = client.build_payload(FIX, user="dev@example.com")
+    assert _push(base, key, _stored(payload, "sess-r", steps=9, ended="2026-10-15T10:20:00Z"))[0] == 201
+
+    status, body = _push(base, key, _stored(payload, "sess-r", steps=9, ended="2026-10-15T10:05:00Z"))
+    assert status == 409 and body["error"]["code"] == "run_conflict"
+    status, body = _push(base, key, _stored(payload, "sess-r", steps=5, ended="2026-10-15T10:30:00Z"))
+    assert status == 409 and body["error"]["code"] == "run_conflict"
+
+    row = _run_row(srv.db.path, "sess-r")
+    assert (row["steps"], row["ended_at"], row["revision"]) == (9, "2026-10-15T10:20:00Z", 1)
+    assert _revisions(srv.db.path, "sess-r") == []
+
+    # The same ended time with more steps, and a receipt without an ended time, both supersede.
+    same_end = _push(base, key, _stored(payload, "sess-r", steps=11, ended="2026-10-15T10:20:00Z"))
+    assert same_end == (200, {"status": "updated", "id": "sess-r", "revision": 2})
+    no_end = _push(base, key, _stored(payload, "sess-r", steps=12, ended=None))
+    assert no_end == (200, {"status": "updated", "id": "sess-r", "revision": 3})
+
+
+def test_an_admin_key_may_supersede_a_members_run(env):
+    srv, base = env
+    team_id, admin = srv.db.create_team("alpha")
+    member = srv.db.create_key(team_id, "alice-laptop", "member", "test")["key"]
+    admin_label = srv.db.key_for_token(admin)["label"]
+    payload = client.build_payload(FIX, user="dev@example.com")
+    assert _push(base, member, _stored(payload, "sess-x", steps=4, ended="2026-10-15T10:05:00Z"))[0] == 201
+
+    status, body = _push(base, admin, _stored(payload, "sess-x", steps=6, ended="2026-10-15T10:30:00Z"))
+    assert (status, body["status"], body["revision"]) == (200, "updated", 2)
+    assert _run_row(srv.db.path, "sess-x")["steps"] == 6
+
+    events = _json(_http(base, "GET", "/api/audit?action=run.supersede", headers=_auth(admin))[2])["events"]
+    assert len(events) == 1 and events[0]["actor"].startswith(admin_label)
+    assert admin not in json.dumps(events)  # the key itself is never written to the audit log
+
+
+def test_a_run_without_stored_provenance_needs_an_admin_to_be_superseded(env):
+    """A run stored before key attribution has no pushing key: the migration leaves
+    `pushed_by_key_id` NULL, so no member key can be the one that pushed it. An identical retry
+    stays an accepted duplicate, a member key that sends a different receipt is refused without
+    touching the stored run, and an admin key may replace it and becomes its pushing key."""
+    srv, base = env
+    team_id, admin = srv.db.create_team("alpha")
+    admin_id = srv.db.key_for_token(admin)["id"]
+    member = srv.db.create_key(team_id, "alice-laptop", "member", "test")["key"]
+    other = srv.db.create_key(team_id, "bob-laptop", "member", "test")["key"]
+    payload = client.build_payload(FIX, user="dev@example.com")
+
+    legacy = _stored(payload, "sess-legacy", steps=4, ended="2026-10-15T10:05:00Z", cost=0.1, risk=20)
+    assert _push(base, member, legacy)[0] == 201
+    with closing(sqlite3.connect(str(srv.db.path))) as conn:
+        conn.execute("UPDATE runs SET pushed_by_key_id = NULL WHERE team_id = ? AND id = 'sess-legacy'",
+                     (team_id,))
+        conn.commit()
+    stored = _run_row(srv.db.path, "sess-legacy")
+    assert stored["pushed_by_key_id"] is None
+
+    # An identical retry is still a duplicate for whoever sends it.
+    for key in (member, other):
+        status, body = _push(base, key, legacy)
+        assert (status, body["status"], body["revision"]) == (200, "duplicate", 1)
+    assert _run_row(srv.db.path, "sess-legacy") == stored
+
+    # A member key cannot claim it: 409, the run and its provenance untouched, no history row.
+    grown = _stored(payload, "sess-legacy", steps=9, ended="2026-10-15T10:20:00Z", cost=0.3, risk=60)
+    status, body = _push(base, other, grown)
+    assert status == 409 and body["error"]["code"] == "run_conflict"
+    assert _run_row(srv.db.path, "sess-legacy") == stored
+    assert _revisions(srv.db.path, "sess-legacy") == []
+    events = _json(_http(base, "GET", "/api/audit?action=run.supersede", headers=_auth(admin))[2])["events"]
+    assert events == []
+
+    # An admin key replaces it and becomes its pushing key.
+    status, body = _push(base, admin, grown)
+    assert (status, body) == (200, {"status": "updated", "id": "sess-legacy", "revision": 2})
+    row = _run_row(srv.db.path, "sess-legacy")
+    assert (row["steps"], row["risk_score"], row["revision"], row["pushed_by_key_id"]) == (9, 60, 2, admin_id)
+    assert _revisions(srv.db.path, "sess-legacy") == [1]
+    run = _json(_http(base, "GET", "/api/runs/sess-legacy", headers=_auth(admin))[2])["run"]
+    assert run["receipt"]["totals"]["steps"] == 9 and run["revision"] == 2
+
+
+def test_revision_history_is_capped_at_twenty(env):
+    srv, base = env
+    _, key = srv.db.create_team("alpha")
+    payload = client.build_payload(FIX, user="dev@example.com")
+    for version in range(1, 26):
+        status, body = _push(base, key, _stored(
+            payload, "sess-many", steps=version * 2, ended=f"2026-10-15T10:{version:02d}:00Z",
+        ))
+        assert status in (200, 201), body
+        assert body["revision"] == version
+
+    assert _run_row(srv.db.path, "sess-many")["steps"] == 50
+    assert _revisions(srv.db.path, "sess-many") == list(range(5, 25))
+
+
+def test_superseding_refreshes_the_derived_fields_and_keeps_approvals(env):
+    srv, base = env
+    _, key = srv.db.create_team("alpha")
+    payload = client.build_payload(FIX, user="dev@example.com")
+    status, _, raw = _http(base, "POST", "/api/approvals",
+                           body={"session_id": "sess-d", "tool": "Bash", "summary": "Deploy to production",
+                                 "risks": [{"severity": "high", "code": "deploy", "reason": "Prod"}]},
+                           headers=_auth(key))
+    assert status == 201
+    approval_id = _json(raw)["id"]
+
+    first = _stored(payload, "sess-d", steps=4, ended="2026-10-15T10:05:00Z", cost=0.1, risk=20,
+                    quality={"score": 80, "grade": "B", "signals": []},
+                    ai_review={"verdict": "looks_safe"})
+    assert _push(base, key, first)[0] == 201
+
+    def derived():
+        row = _json(_http(base, "GET", "/api/runs", headers=_auth(key))[2])["runs"][0]
+        return (row["risk_score"], row["risk_level"], row["cost_usd"], row["quality_score"],
+                row["quality_grade"], row["ai_verdict"])
+
+    assert derived() == (20, "low", 0.1, 80, "B", "looks_safe")
+
+    second = _stored(payload, "sess-d", steps=9, ended="2026-10-15T10:30:00Z", cost=0.5, risk=70,
+                     quality={"score": 40, "grade": "D", "signals": []},
+                     ai_review={"verdict": "dangerous"})
+    assert _push(base, key, second)[1]["revision"] == 2
+    assert derived() == (70, "high", 0.5, 40, "D", "dangerous")
+
+    dangerous = _json(_http(base, "GET", "/api/runs?ai_verdict=dangerous", headers=_auth(key))[2])["runs"]
+    safe = _json(_http(base, "GET", "/api/runs?ai_verdict=looks_safe", headers=_auth(key))[2])["runs"]
+    assert [r["id"] for r in dangerous] == ["sess-d"] and safe == []
+
+    approvals = _json(_http(base, "GET", "/api/approvals", headers=_auth(key))[2])["approvals"]
+    assert [a["id"] for a in approvals] == [approval_id] and approvals[0]["status"] == "pending"
+
+
+def test_concurrent_pushes_of_one_session_keep_the_history_consistent(env):
+    srv, base = env
+    _, key = srv.db.create_team("alpha")
+    payload = client.build_payload(FIX, user="dev@example.com")
+    results = []
+    lock = threading.Lock()
+
+    def push_version(version):
+        answer = _push(base, key, _stored(
+            payload, "sess-c", steps=version * 3, ended=f"2026-10-15T10:{version:02d}:00Z",
+        ))
+        with lock:
+            results.append(answer)
+
+    threads = [threading.Thread(target=push_version, args=(version,)) for version in range(1, 13)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(30)
+
+    assert len(results) == 12
+    assert all(status in (200, 201, 409) for status, _ in results)
+    accepted = [body for status, body in results if status in (200, 201)]
+    row = _run_row(srv.db.path, "sess-c")
+    assert row["ended_at"] == "2026-10-15T10:12:00Z"
+    assert row["revision"] == len(accepted)
+    assert _revisions(srv.db.path, "sess-c") == list(range(1, len(accepted)))
+    assert _http(base, "GET", "/health")[0] == 200
+
+
+def test_agent_id_round_trips_and_the_agent_filter_keeps_working(env):
+    srv, base = env
+    _, key = srv.db.create_team("alpha")
+    payload = client.build_payload(FIX, user="dev@example.com")
+    droid = _stored(payload, "run-droid", agent="Factory Droid", agent_id="droid")
+    claude = _stored(payload, "run-claude", agent="Claude Code", agent_id="claude-code")
+    legacy = _stored(payload, "run-legacy")
+    legacy.pop("agent_id")
+    for body in (droid, claude, legacy):
+        assert _push(base, key, body)[0] == 201
+
+    rows = {r["id"]: r for r in _json(_http(base, "GET", "/api/runs", headers=_auth(key))[2])["runs"]}
+    assert rows["run-droid"]["agent_id"] == "droid" and rows["run-droid"]["agent"] == "Factory Droid"
+    assert rows["run-claude"]["agent_id"] == "claude-code"
+    assert rows["run-legacy"]["agent_id"] is None
+    run = _json(_http(base, "GET", "/api/runs/run-droid", headers=_auth(key))[2])["run"]
+    assert run["agent_id"] == "droid"
+    assert [r["id"] for r in _json(_http(base, "GET", "/api/runs?agent=droid", headers=_auth(key))[2])["runs"]] == ["run-droid"]
+
+
+def _receipts(base, key, run_id):
+    """The run row from the list, from the detail view and from the table."""
+    listed = {r["id"]: r for r in _json(_http(base, "GET", "/api/runs", headers=_auth(key))[2])["runs"]}
+    detail = _json(_http(base, "GET", f"/api/runs/{run_id}", headers=_auth(key))[2])["run"]
+    return listed.get(run_id), detail
+
+
+def test_missing_usage_is_stored_as_unknown_cost(env):
+    """A receipt whose agent recorded no usage is stored with a NULL cost, never 0.0."""
+    srv, base = env
+    _, key = srv.db.create_team("alpha")
+    payload = _stored(client.build_payload(FIX, user="dev@example.com"), "no-usage", cost=0.0)
+    payload["totals"] = dict(payload["totals"], tokens=0, cost_usd=0.0, usage_source="missing")
+    payload["models"] = {"claude-sonnet-4-5": {"tokens": 0, "cost_usd": 0.0}}
+    assert _push(base, key, payload)[0] == 201
+
+    listed, detail = _receipts(base, key, "no-usage")
+    for row in (listed, detail):
+        assert row["cost_usd"] is None
+        assert row["usage_source"] == "missing"
+        assert row["tokens"] == 0
+        assert row["cost_partial"] is False
+    assert _run_row(srv.db.path, "no-usage")["cost"] is None
+
+
+def test_missing_usage_receipt_is_served_without_a_zero_cost(env):
+    """VAL-SRV-015: an embedded receipt whose usage is missing carries an unknown cost. The
+    older client that still sends `cost_usd` 0.0 for the run and its model must not read as a
+    free run anywhere: the row, the stored JSON and the served receipt all say null."""
+    srv, base = env
+    _, key = srv.db.create_team("alpha")
+    payload = _stored(client.build_payload(FIX, user="dev@example.com"), "exact-missing", cost=0.0)
+    payload["agent"] = "Droid"
+    payload["totals"] = {"tokens": 0, "cost_usd": 0.0, "usage_source": "missing"}
+    payload["models"] = {"claude-sonnet-4-5": {"tokens": 0, "cost_usd": 0.0}}
+    assert _push(base, key, payload)[0] == 201
+
+    listed, detail = _receipts(base, key, "exact-missing")
+    assert listed["cost_usd"] is None and listed["usage_source"] == "missing"
+    assert listed["tokens"] == 0
+    assert detail["cost_usd"] is None and detail["cost_partial"] is False
+    receipt = detail["receipt"]
+    assert receipt["totals"]["cost_usd"] is None
+    assert receipt["totals"]["tokens"] == 0
+    assert receipt["models"]["claude-sonnet-4-5"]["cost_usd"] is None
+    stored = json.loads(_run_row(srv.db.path, "exact-missing")["receipt_json"])
+    assert stored["totals"]["cost_usd"] is None
+    assert stored["models"]["claude-sonnet-4-5"]["cost_usd"] is None
+
+
+def test_a_reported_zero_keeps_its_zero_in_the_embedded_receipt(env):
+    """A run that reports its usage and honestly costs $0.00 keeps 0.0 in the stored receipt."""
+    srv, base = env
+    _, key = srv.db.create_team("alpha")
+    payload = _stored(client.build_payload(FIX, user="dev@example.com"), "reported-zero-receipt", cost=0.0)
+    payload["totals"] = dict(payload["totals"], tokens=0, cost_usd=0.0, usage_source="messages")
+    payload["models"] = {"claude-sonnet-4-5": {"tokens": 0, "cost_usd": 0.0}}
+    assert _push(base, key, payload)[0] == 201
+
+    _, detail = _receipts(base, key, "reported-zero-receipt")
+    assert detail["cost_usd"] == 0.0
+    assert detail["receipt"]["totals"]["cost_usd"] == 0.0
+    assert detail["receipt"]["models"]["claude-sonnet-4-5"]["cost_usd"] == 0.0
+
+
+def test_a_stored_receipt_from_an_older_server_is_served_without_the_zero(env):
+    """A row an older server stored with the 0.0 of a missing-usage run is read back honestly;
+    an old client's receipt with no `usage_source` keeps its stored cost."""
+    srv, base = env
+    _, key = srv.db.create_team("alpha")
+    payload = _stored(client.build_payload(FIX, user="dev@example.com"), "pre-fix-row", cost=0.0)
+    payload["totals"] = {"tokens": 0, "cost_usd": 0.0, "usage_source": "missing"}
+    payload["models"] = {"claude-sonnet-4-5": {"tokens": 0, "cost_usd": 0.0}}
+    assert _push(base, key, payload)[0] == 201
+    legacy = _stored(client.build_payload(FIX, user="dev@example.com"), "old-client-row", cost=0.0)
+    legacy["totals"].pop("usage_source", None)
+    assert _push(base, key, legacy)[0] == 201
+
+    with closing(sqlite3.connect(str(srv.db.path))) as conn:
+        for run_id in ("pre-fix-row", "old-client-row"):
+            conn.execute(
+                "UPDATE runs SET receipt_json = ? WHERE id = ?",
+                (json.dumps({"totals": {"tokens": 0, "cost_usd": 0.0},
+                             "models": {"claude-sonnet-4-5": {"tokens": 0, "cost_usd": 0.0}}}), run_id),
+            )
+        conn.commit()
+
+    fixed = _json(_http(base, "GET", "/api/runs/pre-fix-row", headers=_auth(key))[2])["run"]
+    assert fixed["receipt"]["totals"]["cost_usd"] is None
+    assert fixed["receipt"]["models"]["claude-sonnet-4-5"]["cost_usd"] is None
+    old = _json(_http(base, "GET", "/api/runs/old-client-row", headers=_auth(key))[2])["run"]
+    assert old["usage_source"] is None
+    assert old["receipt"]["totals"]["cost_usd"] == 0.0
+    assert old["receipt"]["models"]["claude-sonnet-4-5"]["cost_usd"] == 0.0
+
+
+def test_a_droid_session_without_recorded_usage_leaves_its_model_unpriced(env, tmp_path):
+    """A real Droid transcript with a zero-token settings file, pushed through the client: the
+    model and agent groups read n/a, never a priced $0.00 that makes the model look free."""
+    srv, base = env
+    _, key = srv.db.create_team("alpha")
+    session = tmp_path / "droid-missing.jsonl"
+    session.write_bytes(DROID_FIX.read_bytes())
+    session.with_suffix(".settings.json").write_text(
+        json.dumps({"model": "claude-sonnet-4-5",
+                    "tokenUsage": {"inputTokens": 0, "outputTokens": 0}}),
+        encoding="utf-8",
+    )
+    payload = client.build_payload(session, user="dev@example.com")
+    payload["started"], payload["ended"] = "2026-10-15T10:00:00Z", "2026-10-15T10:05:00Z"
+    assert payload["totals"]["usage_source"] == "missing"
+    assert payload["models"] == {"claude-sonnet-4-5": {"tokens": 0, "cost_usd": None}}
+    assert _push(base, key, payload)[0] == 201
+
+    stats = _json(_http(base, "GET", "/api/stats?days=30", headers=_auth(key))[2])
+    assert stats["totals"]["cost_usd"] is None
+    (model,) = stats["by_model"]
+    assert "sonnet" in model["model"].lower() and model["runs"] == 1
+    assert model["cost_usd"] is None and model["priced_runs"] == 0
+    (agent,) = stats["by_agent"]
+    assert agent["agent"] == "Factory Droid"
+    assert agent["cost_usd"] is None and agent["priced_runs"] == 0
+
+    body = _json(_http(base, "GET", "/api/insights?days=30", headers=_auth(key))[2])
+    (model,) = body["models"]
+    assert "sonnet" in model["model"].lower() and model["runs"] == 1
+    assert model["cost_usd"] is None and model["priced_runs"] == 0 and model["cost_per_run"] is None
+    (agent,) = body["agents"]
+    assert agent["agent"] == "Factory Droid"
+    assert agent["cost_usd"] is None and agent["priced_runs"] == 0
+
+
+def test_missing_usage_model_buckets_are_not_priced(env):
+    """An older client still sends the priced-model zero the fix removes: the server normalizes
+    it, so the stored model group stays unpriced instead of a free $0.00."""
+    srv, base = env
+    _, key = srv.db.create_team("alpha")
+    payload = _stored(client.build_payload(FIX, user="dev@example.com"), "droid-unknown", cost=0.0)
+    payload["agent"] = "Factory Droid"
+    payload["totals"] = dict(payload["totals"], tokens=0, cost_usd=0.0, usage_source="missing")
+    payload["models"] = {"claude-sonnet-4-5": {"tokens": 0, "cost_usd": 0.0}}
+    assert _push(base, key, payload)[0] == 201
+
+    stats = _json(_http(base, "GET", "/api/stats?days=30", headers=_auth(key))[2])
+    assert stats["totals"]["cost_usd"] is None
+    (model,) = stats["by_model"]
+    assert "sonnet" in model["model"].lower() and model["runs"] == 1
+    assert model["cost_usd"] is None and model["priced_runs"] == 0
+    (agent,) = stats["by_agent"]
+    assert agent["agent"] == "Factory Droid"
+    assert agent["cost_usd"] is None and agent["priced_runs"] == 0
+
+    body = _json(_http(base, "GET", "/api/insights?days=30", headers=_auth(key))[2])
+    (model,) = body["models"]
+    assert "sonnet" in model["model"].lower() and model["runs"] == 1
+    assert model["cost_usd"] is None and model["priced_runs"] == 0 and model["cost_per_run"] is None
+    (agent,) = body["agents"]
+    assert agent["agent"] == "Factory Droid"
+    assert agent["cost_usd"] is None and agent["priced_runs"] == 0
+
+
+def test_a_reported_zero_keeps_its_model_cost(env):
+    """A run that reports its usage may honestly cost $0.00: the model bucket stays a priced zero."""
+    srv, base = env
+    _, key = srv.db.create_team("alpha")
+    payload = _stored(client.build_payload(FIX, user="dev@example.com"), "reported-zero-model", cost=0.0)
+    payload["totals"] = dict(payload["totals"], tokens=0, cost_usd=0.0, usage_source="messages")
+    payload["models"] = {"claude-sonnet-4-5": {"tokens": 0, "cost_usd": 0.0}}
+    assert _push(base, key, payload)[0] == 201
+    stats = _json(_http(base, "GET", "/api/stats?days=30", headers=_auth(key))[2])
+    (model,) = stats["by_model"]
+    assert model["cost_usd"] == 0.0 and model["priced_runs"] == 1
+
+
+def test_legacy_and_reported_zero_receipts_keep_their_meaning(env):
+    """Only a run that says its usage is missing loses its cost. An older client's 0.0 and a
+    reported zero stay at $0.00; a receipt with no cost at all stays unknown."""
+    srv, base = env
+    _, key = srv.db.create_team("alpha")
+    payload = _stored(client.build_payload(FIX, user="dev@example.com"), "legacy-zero", cost=0.0)
+    payload["totals"].pop("usage_source", None)          # an old client: no usage_source at all
+    assert _push(base, key, payload)[0] == 201
+
+    reported = _stored(client.build_payload(FIX, user="dev@example.com"), "reported-zero", cost=0.0)
+    reported["totals"] = dict(reported["totals"], tokens=0, usage_source="messages")
+    assert _push(base, key, reported)[0] == 201
+
+    unknown = _stored(client.build_payload(FIX, user="dev@example.com"), "no-cost")
+    unknown["totals"].pop("cost_usd", None)
+    unknown["models"] = {}
+    assert _push(base, key, unknown)[0] == 201
+
+    rows = {r["id"]: r for r in _json(_http(base, "GET", "/api/runs", headers=_auth(key))[2])["runs"]}
+    assert rows["legacy-zero"]["cost_usd"] == 0.0 and rows["legacy-zero"]["usage_source"] is None
+    assert rows["reported-zero"]["cost_usd"] == 0.0 and rows["reported-zero"]["usage_source"] == "messages"
+    assert rows["no-cost"]["cost_usd"] is None
+    stats = _json(_http(base, "GET", "/api/stats?days=30", headers=_auth(key))[2])
+    assert stats["totals"]["cost_usd"] == 0.0
+    assert stats["totals"]["runs"] == 3
+    assert stats["totals"]["unpriced_runs"] == 1
+    assert stats["totals"]["partial_runs"] == 0
+    assert stats["totals"]["cost_is_lower_bound"] is True
+
+
+def test_stats_report_partial_and_missing_costs(env):
+    """A partly priced run is a lower bound; the totals count it and say so."""
+    srv, base = env
+    _, key = srv.db.create_team("alpha")
+    fixture = client.build_payload(FIX, user="dev@example.com")
+
+    partial = _stored(fixture, "partial", cost=0.2)
+    partial["totals"] = dict(partial["totals"], cost_usd=0.2, cost_partial=True, usage_source="messages")
+    complete = _stored(fixture, "complete", cost=0.3)
+    complete["totals"] = dict(complete["totals"], cost_usd=0.3, usage_source="messages")
+    missing = _stored(fixture, "missing", cost=0.0)
+    missing["totals"] = dict(missing["totals"], cost_usd=0.0, usage_source="missing")
+    for body in (partial, complete, missing):
+        assert _push(base, key, body)[0] == 201
+
+    totals = _json(_http(base, "GET", "/api/stats?days=30", headers=_auth(key))[2])["totals"]
+    assert totals["runs"] == 3
+    assert totals["cost_usd"] == pytest.approx(0.5)
+    assert totals["priced_runs"] == 2
+    assert totals["partial_runs"] == 1
+    assert totals["missing_usage_runs"] == 1
+    assert totals["unpriced_runs"] == 2
+    assert totals["cost_is_lower_bound"] is True
+
+
+def test_a_fully_priced_window_is_not_a_lower_bound(tmp_path):
+    with running_server(tmp_path / "priced.db") as (srv, base):
+        _, key = srv.db.create_team("alpha")
+        payload = _stored(client.build_payload(FIX, user="dev@example.com"), "only", cost=0.3)
+        payload["totals"] = dict(payload["totals"], cost_usd=0.3, usage_source="messages")
+        assert _push(base, key, payload)[0] == 201
+        totals = _json(_http(base, "GET", "/api/stats?days=30", headers=_auth(key))[2])["totals"]
+        assert totals["cost_usd"] == pytest.approx(0.3)
+        assert totals["partial_runs"] == 0
+        assert totals["unpriced_runs"] == 0
+        assert totals["cost_is_lower_bound"] is False
+
+
+def test_group_with_no_priced_runs_is_null_and_mixed_groups_sum_priced_only(env):
+    """An all-unknown group is n/a in the API; a mixed group adds up only its priced runs."""
+    srv, base = env
+    _, key = srv.db.create_team("alpha")
+    fixture = client.build_payload(FIX, user="dev@example.com")
+
+    def push(run_id, user, project, cost):
+        payload = _stored(fixture, run_id, cost=0.0 if cost is None else cost, user=user, project=project)
+        if cost is None:
+            payload["totals"] = dict(payload["totals"], cost_usd=0.0, usage_source="missing")
+            payload["models"] = {}
+        else:
+            payload["totals"] = dict(payload["totals"], cost_usd=cost, usage_source="messages")
+        assert _push(base, key, payload)[0] == 201
+
+    push("u-1", "u-unknown", "p-unknown", None)
+    push("u-2", "u-unknown", "p-unknown", None)
+    push("m-1", "u-mixed", "p-mixed", None)
+    push("m-2", "u-mixed", "p-mixed", 0.10)
+    push("k-1", "u-known", "p-known", 0.25)
+
+    stats = _json(_http(base, "GET", "/api/stats?days=30", headers=_auth(key))[2])
+    by_user = {row["user"]: row for row in stats["by_user"]}
+    assert by_user["u-unknown"]["cost_usd"] is None and by_user["u-unknown"]["priced_runs"] == 0
+    assert by_user["u-mixed"]["cost_usd"] == pytest.approx(0.1)
+    assert by_user["u-mixed"]["priced_runs"] == 1 and by_user["u-mixed"]["runs"] == 2
+    assert by_user["u-known"]["cost_usd"] == pytest.approx(0.25)
+    by_project = {row["project"]: row for row in stats["by_project"]}
+    assert by_project["p-unknown"]["cost_usd"] is None and by_project["p-unknown"]["priced_runs"] == 0
+    assert by_project["p-mixed"]["cost_usd"] == pytest.approx(0.1)
+    by_agent = {row["agent"]: row for row in stats["by_agent"]}
+    assert by_agent["Claude Code"]["cost_usd"] == pytest.approx(0.35)
+    assert by_agent["Claude Code"]["priced_runs"] == 2
+    model = next(m for m in stats["by_model"] if m["model"] == "Sonnet 4.5")
+    assert model["cost_usd"] == pytest.approx(0.35) and model["priced_runs"] == 2
+    assert stats["totals"]["cost_usd"] == pytest.approx(0.35)
+    assert stats["totals"]["cost_is_lower_bound"] is True
+
+
+def test_a_window_of_only_unknown_costs_has_null_totals(env):
+    srv, base = env
+    _, key = srv.db.create_team("alpha")
+    payload = _stored(client.build_payload(FIX, user="dev@example.com"), "unknown", cost=0.0)
+    payload["totals"] = dict(payload["totals"], cost_usd=0.0, usage_source="missing")
+    payload["models"] = {}
+    assert _push(base, key, payload)[0] == 201
+    stats = _json(_http(base, "GET", "/api/stats?days=30", headers=_auth(key))[2])
+    assert stats["totals"]["cost_usd"] is None
+    assert stats["totals"]["priced_runs"] == 0
+    assert stats["totals"]["cost_is_lower_bound"] is True
+    assert stats["by_user"][0]["cost_usd"] is None
+    assert stats["by_user"][0]["priced_runs"] == 0
+
+
+def test_stats_by_model_rows_report_unpriced_runs_and_the_lower_bound(env):
+    """VAL-DOCS-005: a by_model row carries the same `unpriced_runs` and `cost_is_lower_bound`
+    fields as the other group rows, and every field of the docs/api.md example appears in a
+    live response."""
+    srv, base = env
+    _, key = srv.db.create_team("demo")
+    fixture = client.build_payload(FIX, user="Ana")
+
+    priced = _stored(fixture, "doc-priced", cost=0.25)
+    priced["totals"] = dict(priced["totals"], usage_source="messages", tokens=79661)
+    priced["models"] = {"claude-sonnet-4-5": {"tokens": 79661, "cost_usd": 0.25}}
+    priced["risk"] = {"score": 80, "level": "high",
+                      "reasons": [{"severity": "high", "code": "secret_file",
+                                   "reason": "read a secrets file", "step": 1}]}
+    assert _push(base, key, priced)[0] == 201
+
+    partial = _stored(fixture, "doc-partial", cost=0.2)
+    partial["totals"] = dict(partial["totals"], usage_source="messages", cost_partial=True)
+    partial["models"] = {"claude-opus-4-6": {"tokens": 10, "cost_usd": 0.2}}
+    assert _push(base, key, partial)[0] == 201
+
+    unknown = _stored(fixture, "doc-unknown", cost=0.0)
+    unknown["totals"] = {"tokens": 0, "cost_usd": 0.0, "usage_source": "missing"}
+    unknown["models"] = {"gpt-5-codex": {"tokens": 0, "cost_usd": 0.0}}
+    assert _push(base, key, unknown)[0] == 201
+
+    stats = _json(_http(base, "GET", "/api/stats?days=30", headers=_auth(key))[2])
+    rows = stats["by_model"]
+    assert all("unpriced_runs" in row and "cost_is_lower_bound" in row for row in rows)
+    sonnet = next(row for row in rows if row["model"] == "Sonnet 4.5")
+    assert sonnet["cost_usd"] == pytest.approx(0.25) and sonnet["priced_runs"] == 1
+    assert sonnet["unpriced_runs"] == 0 and sonnet["cost_is_lower_bound"] is False
+    opus = next(row for row in rows if "opus" in row["model"].lower())
+    assert opus["cost_usd"] == pytest.approx(0.2) and opus["priced_runs"] == 1
+    assert opus["unpriced_runs"] == 1 and opus["cost_is_lower_bound"] is True
+    codex = next(row for row in rows if "codex" in row["model"].lower())
+    assert codex["cost_usd"] is None and codex["priced_runs"] == 0
+    assert codex["unpriced_runs"] == 1 and codex["cost_is_lower_bound"] is True
+
+    doc = (ROOT / "docs" / "api.md").read_text(encoding="utf-8")
+    example = _docs_json_example(doc, "### `GET /api/stats`")
+    assert sorted(_example_keys(example) - _example_keys(stats)) == []
+
+
+def _docs_json_example(text, heading):
+    """The first fenced JSON example under a Markdown heading."""
+    return json.loads(text.split(heading, 1)[1].split("```json", 1)[1].split("```", 1)[0])
+
+
+def _example_keys(value, path=""):
+    """Every field name of a documented JSON example, by path, with `[]` for list elements."""
+    keys = set()
+    if isinstance(value, dict):
+        for name, item in value.items():
+            keys.add(f"{path}.{name}" if path else name)
+            keys |= _example_keys(item, f"{path}.{name}" if path else name)
+    elif isinstance(value, list):
+        for item in value:
+            keys |= _example_keys(item, path + "[]")
+    return keys
+
+
+def test_attribution_defaults_to_the_client_user_and_the_admin_can_opt_into_keys(env):
+    srv, base = env
+    team_id, admin = srv.db.create_team("alpha")
+    member = srv.db.create_key(team_id, "alice-laptop", "member", "test")["key"]
+    viewer = srv.db.create_key(team_id, "viewer-key", "viewer", "test")["key"]
+
+    settings = _json(_http(base, "GET", "/api/team/settings", headers=_auth(admin))[2])
+    assert settings["attribution"] == "client"
+
+    status, _, raw = _http(base, "PUT", "/api/team/settings", body={"attribution": "key"},
+                           headers={**_auth(admin)})
+    assert status == 200 and _json(raw)["attribution"] == "key"
+    assert _json(_http(base, "GET", "/api/team/settings", headers=_auth(admin))[2])["attribution"] == "key"
+
+    status, _, raw = _http(base, "PUT", "/api/team/settings", body={"attribution": "nope"},
+                           headers={**_auth(admin)})
+    assert status == 400 and _json(raw)["error"]["code"] == "invalid_settings"
+    assert _json(_http(base, "GET", "/api/team/settings", headers=_auth(admin))[2])["attribution"] == "key"
+
+    for key in (member, viewer):
+        assert _http(base, "PUT", "/api/team/settings", body={"attribution": "client"},
+                     headers={**_auth(key)})[0] == 403
+
+    events = _json(_http(base, "GET", "/api/audit?action=team.settings", headers=_auth(admin))[2])["events"]
+    assert any(e["details"].get("attribution") == "key" for e in events)
+
+
+def test_key_attribution_stamps_the_key_label_and_keeps_the_client_user(env):
+    """In key mode a member cannot choose the displayed user; the admin may still push for
+    someone else, and the client's own user value stays in the stored receipt."""
+    srv, base = env
+    team_id, admin = srv.db.create_team("alpha")
+    member = srv.db.create_key(team_id, "alice-laptop", "member", "test")["key"]
+    assert _http(base, "PUT", "/api/team/settings", body={"attribution": "key"},
+                 headers={**_auth(admin)})[0] == 200
+    fixture = client.build_payload(FIX, user="bob@example.com")
+
+    body = _stored(fixture, "member-run", cost=0.4)
+    body["started"] = "2026-10-01T10:00:00Z"
+    assert _push(base, member, body)[0] == 201
+    admin_body = _stored(fixture, "admin-run", cost=0.4)
+    admin_body["started"] = "2026-10-01T10:00:00Z"
+    admin_body["user"] = "carol"
+    assert _push(base, admin, admin_body)[0] == 201
+
+    rows = {r["id"]: r for r in _json(_http(base, "GET", "/api/runs", headers=_auth(admin))[2])["runs"]}
+    assert rows["member-run"]["user"] == "alice-laptop"
+    assert rows["member-run"]["pushed_by"] == "alice-laptop"
+    assert rows["admin-run"]["user"] == "carol"
+    assert rows["admin-run"]["pushed_by"] == "initial"
+
+    run = _json(_http(base, "GET", "/api/runs/member-run", headers=_auth(admin))[2])["run"]
+    assert run["user"] == "alice-laptop" and run["pushed_by"] == "alice-laptop"
+    assert run["receipt"]["user"] == "bob@example.com"
+
+    stats = _json(_http(base, "GET", "/api/stats?days=3650", headers=_auth(admin))[2])
+    assert sorted(row["user"] for row in stats["by_user"]) == ["alice-laptop", "carol"]
+
+    # Back to the default: the client value is the displayed user again, pushed_by still shows.
+    assert _http(base, "PUT", "/api/team/settings", body={"attribution": "client"},
+                 headers={**_auth(admin)})[0] == 200
+    client_body = _stored(fixture, "client-run", cost=0.4)
+    client_body["started"] = "2026-10-01T10:00:00Z"
+    assert _push(base, member, client_body)[0] == 201
+    run = _json(_http(base, "GET", "/api/runs/client-run", headers=_auth(admin))[2])["run"]
+    assert run["user"] == "bob@example.com" and run["pushed_by"] == "alice-laptop"
+
+
+def test_sort_at_drives_the_list_order_and_the_window(env):
+    srv, base = env
+    _, key = srv.db.create_team("alpha")
+    payload = client.build_payload(FIX, user="dev@example.com")
+    now = datetime.now(timezone.utc)
+    recent = (now - timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    old = (now - timedelta(days=40)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    assert _push(base, key, _stored(payload, "R-a", started=recent, ended=recent))[0] == 201
+    assert _push(base, key, _stored(payload, "R-b", started=None, ended=None))[0] == 201
+    assert _push(base, key, _stored(payload, "R-c", started=old, ended=old))[0] == 201
+
+    listed = [r["id"] for r in _json(_http(base, "GET", "/api/runs", headers=_auth(key))[2])["runs"]]
+    assert listed == ["R-b", "R-a", "R-c"]
+    assert _json(_http(base, "GET", "/api/stats?days=30", headers=_auth(key))[2])["totals"]["runs"] == 2
+    assert _json(_http(base, "GET", "/api/stats?days=60", headers=_auth(key))[2])["totals"]["runs"] == 3
 
 
 def _session_copy(tmp_path, session_id):
@@ -282,7 +1000,7 @@ def test_dashboard_sign_in_sets_http_only_cookie(env):
     status, headers, _ = _http(base, "GET", f"/?key={key}")
     assert status == 302 and headers["location"] == "/"
     cookie = headers["set-cookie"]
-    assert "HttpOnly" in cookie and "SameSite=Lax" in cookie
+    assert "HttpOnly" in cookie and "SameSite=Strict" in cookie
     token_pair = cookie.split(";")[0]
     assert key not in cookie  # the API key itself is not stored in the cookie
 
@@ -301,6 +1019,370 @@ def test_dashboard_sign_in_sets_http_only_cookie(env):
     assert _http(base, "POST", "/api/runs", body=body,
                  headers={"Cookie": token_pair, "X-Requested-With": "runledger"})[0] == 201
     assert _http(base, "GET", "/?key=rl_wrong")[0] == 401
+
+
+def test_sign_in_page_posts_the_key(env):
+    srv, base = env
+    srv.db.create_team("alpha")
+    status, _, page = _http(base, "GET", "/")
+    assert status == 401
+    text = page.decode("utf-8")
+    assert 'method="post"' in text
+    assert 'action="/session"' in text
+    assert 'name="key"' in text
+    assert "?key=" not in text  # the sign-in page never teaches the key-in-URL form
+
+
+def test_post_login_sets_cookie_and_redirects(env):
+    srv, base = env
+    _, admin = srv.db.create_team("alpha")
+    status, headers, _ = _http(
+        base, "POST", "/session", body=urlencode({"key": admin}).encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    assert status == 302 and headers["location"] == "/"
+    cookie = headers["set-cookie"]
+    assert "HttpOnly" in cookie and "SameSite=Strict" in cookie
+    token = cookie.split(";")[0]
+    assert _json(_http(base, "GET", "/api/me", headers={"Cookie": token})[2])["role"] == "admin"
+
+    status, headers, page = _http(
+        base, "POST", "/session", body=b"key=rl_wrong",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    assert status == 401 and "set-cookie" not in headers
+    assert b"not recognized" in page
+
+
+def _sessions(db_path):
+    """How many dashboard sessions the database holds (the tokens themselves are hashed)."""
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        return conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+
+
+def _sign_in_form(key):
+    """The body and headers of the sign-in form the dashboard page posts."""
+    return urlencode({"key": key}).encode(), {"Content-Type": "application/x-www-form-urlencoded"}
+
+
+def test_cross_site_sign_in_post_is_refused(env, tmp_path, capsys):
+    srv, base = env
+    db_path = tmp_path / "rl.db"
+    port = srv.server_address[1]
+    _, admin_a = srv.db.create_team("alpha")
+    _, admin_b = srv.db.create_team("beta")
+    body, form = _sign_in_form(admin_b)
+    capsys.readouterr()
+
+    cross_site = [
+        {"Origin": "http://evil.example"},
+        {"Origin": "null"},  # a sandboxed page or a local file
+        {"Origin": "null", "Sec-Fetch-Site": "none"},
+        {"Sec-Fetch-Site": "cross-site"},
+        {"Sec-Fetch-Site": "same-site"},  # a different port or a subdomain is another origin
+        {"Origin": f"http://127.0.0.1:{port + 1}", "Sec-Fetch-Site": "same-site"},
+        {"Origin": f"https://127.0.0.1:{port}"},  # right host, wrong scheme
+    ]
+    for extra in cross_site:
+        status, headers, raw = _http(base, "POST", "/session", body=body, headers={**form, **extra})
+        assert status == 403, extra
+        assert "set-cookie" not in headers, extra
+        assert _json(raw)["error"]["code"] == "cross_site"
+        assert headers["connection"] == "close"
+
+    assert _sessions(db_path) == 0  # no session row for a refused sign-in
+    assert _http(base, "GET", "/api/me", headers=_auth(admin_b))[0] == 200  # the key itself still works
+    err = capsys.readouterr().err
+    assert "cross-site sign-in" in err and admin_b not in err
+
+    # A session cookie that arrives anyway (a hand-made request; a browser sends none cross-site)
+    # is not replaced either.
+    _, headers, _ = _http(base, "POST", "/session", body=urlencode({"key": admin_a}).encode(), headers=form)
+    cookie_a = headers["set-cookie"].split(";")[0]
+    status, headers, _ = _http(
+        base, "POST", "/session", body=body,
+        headers={**form, "Cookie": cookie_a, "Origin": "http://evil.example"},
+    )
+    assert status == 403 and "set-cookie" not in headers
+    assert _sessions(db_path) == 1
+    me = _json(_http(base, "GET", "/api/me", headers={"Cookie": cookie_a})[2])
+    assert me["team"]["name"] == "alpha"
+
+
+def test_same_origin_and_headerless_sign_in_post_still_works(env, tmp_path):
+    srv, base = env
+    db_path = tmp_path / "rl.db"
+    port = srv.server_address[1]
+    _, admin = srv.db.create_team("alpha")
+    body, form = _sign_in_form(admin)
+
+    allowed = [
+        {"Origin": f"http://127.0.0.1:{port}", "Sec-Fetch-Site": "same-origin"},
+        # What Chromium really sends for the dashboard form: this server's Referrer-Policy
+        # no-referrer serializes the Origin of a same-origin form POST as "null" (Chrome 155).
+        {"Origin": "null", "Sec-Fetch-Site": "same-origin"},
+        {"Sec-Fetch-Site": "same-origin"},
+        {"Sec-Fetch-Site": "none"},  # a typed address or a bookmark
+        {"Host": "127.0.0.1", "Origin": "http://127.0.0.1"},  # the scheme's default port
+        {},  # curl, an agent, any non-browser client
+    ]
+    for extra in allowed:
+        status, headers, _ = _http(base, "POST", "/session", body=body, headers={**form, **extra})
+        assert status == 302 and headers["location"] == "/", extra
+        cookie = headers["set-cookie"]
+        assert "HttpOnly" in cookie and "SameSite=Strict" in cookie, extra
+    assert _sessions(db_path) == len(allowed)
+
+
+def test_a_foreign_origin_is_refused_even_when_fetch_metadata_says_same_origin(env, tmp_path, capsys):
+    """Fetch metadata never excuses an Origin that names another site: the two headers are
+    checked independently. Only the opaque "null" origin Chromium serializes for this server's
+    own form POST stays accepted with `Sec-Fetch-Site: same-origin`."""
+    srv, base = env
+    db_path = tmp_path / "rl.db"
+    port = srv.server_address[1]
+    _, admin_a = srv.db.create_team("alpha")
+    _, admin_b = srv.db.create_team("beta")
+    body, form = _sign_in_form(admin_b)
+    capsys.readouterr()
+
+    conflicting = [
+        {"Origin": "http://evil.example", "Sec-Fetch-Site": "same-origin"},
+        {"Origin": f"http://127.0.0.1:{port + 1}", "Sec-Fetch-Site": "same-origin"},
+        {"Origin": f"https://127.0.0.1:{port}", "Sec-Fetch-Site": "same-origin"},
+    ]
+    for extra in conflicting:
+        status, headers, raw = _http(base, "POST", "/session", body=body, headers={**form, **extra})
+        assert status == 403, extra
+        assert "set-cookie" not in headers, extra
+        assert _json(raw)["error"]["code"] == "cross_site", extra
+        assert headers["connection"] == "close", extra
+    assert _sessions(db_path) == 0
+
+    for extra in conflicting:  # the legacy GET sign-in shares the check
+        status, headers, _ = _http(base, "GET", f"/?key={admin_b}", headers=extra)
+        assert status == 403 and "set-cookie" not in headers, extra
+    assert _sessions(db_path) == 0
+
+    # A session of another team is not replaced by a refused request, however it arrives.
+    _, headers, _ = _http(base, "GET", f"/?key={admin_a}")
+    cookie_a = headers["set-cookie"].split(";")[0]
+    conflict = {"Origin": "http://evil.example", "Sec-Fetch-Site": "same-origin"}
+    for method, path in (("POST", "/session"), ("GET", f"/?key={admin_b}")):
+        status, headers, _ = _http(
+            base, method, path, body=body if method == "POST" else None,
+            headers={**form, **conflict, "Cookie": cookie_a},
+        )
+        assert status == 403 and "set-cookie" not in headers, (method, path)
+    assert _sessions(db_path) == 1
+    me = _json(_http(base, "GET", "/api/me", headers={"Cookie": cookie_a})[2])
+    assert me["team"]["name"] == "alpha"
+
+    # The dashboard's own form keeps working: Chromium sends Origin: null with same-origin here.
+    status, headers, _ = _http(base, "POST", "/session", body=body,
+                               headers={**form, "Origin": "null", "Sec-Fetch-Site": "same-origin"})
+    assert status == 302 and headers["location"] == "/" and "set-cookie" in headers
+    assert _sessions(db_path) == 2
+    err = capsys.readouterr().err
+    assert "cross-site sign-in" in err and admin_b not in err and "Origin: http://evil.example" in err
+
+
+def test_an_unparsable_origin_is_refused_not_a_server_error(env, capsys):
+    """An Origin the parser rejects is simply not this server's origin: a refusal, not a 500."""
+    srv, base = env
+    _, admin = srv.db.create_team("alpha")
+    body, form = _sign_in_form(admin)
+    capsys.readouterr()
+    for origin in ("http://[evil.example", "http://", "https://:@evil.example"):
+        status, headers, raw = _http(base, "POST", "/session", body=body,
+                                     headers={**form, "Origin": origin, "Sec-Fetch-Site": "same-origin"})
+        assert status == 403, origin
+        assert "set-cookie" not in headers, origin
+        assert _json(raw)["error"]["code"] == "cross_site", origin
+
+
+def test_sign_in_origin_check_follows_the_trusted_proxy_setting(tmp_path):
+    with running_server(tmp_path / "proxy.db", trust_proxy=True, trusted_proxies=["127.0.0.1"]) as (srv, base):
+        _, admin = srv.db.create_team("alpha")
+        body, form = _sign_in_form(admin)
+        proxy = {"Host": "runledger.example.com", "X-Forwarded-Proto": "https"}
+
+        status, headers, _ = _http(base, "POST", "/session", body=body, headers={
+            **form, **proxy, "Origin": "https://runledger.example.com", "Sec-Fetch-Site": "same-origin",
+        })
+        assert status == 302 and "set-cookie" in headers
+        assert "Secure" in headers["set-cookie"]  # the trusted proxy reports https, as before
+
+        for origin in (
+            "http://runledger.example.com",  # the scheme the proxy reports is the one to match
+            "https://evil.example",
+            "https://runledger.example.com.evil.example",
+            "https://runledger.example.com:8443",
+        ):
+            status, headers, _ = _http(base, "POST", "/session", body=body, headers={**form, **proxy, "Origin": origin})
+            assert status == 403, origin
+            assert "set-cookie" not in headers, origin
+
+    # Without --trust-proxy the forwarded protocol is not believed, so the scheme stays http.
+    with running_server(tmp_path / "plain.db") as (srv, base):
+        _, admin = srv.db.create_team("alpha")
+        body, form = _sign_in_form(admin)
+        status, headers, _ = _http(base, "POST", "/session", body=body, headers={
+            **form, "Host": "runledger.example.com", "X-Forwarded-Proto": "https",
+            "Origin": "https://runledger.example.com",
+        })
+        assert status == 403 and "set-cookie" not in headers
+
+
+def test_query_key_redirect_strips_key(env):
+    srv, base = env
+    _, admin = srv.db.create_team("alpha")
+    status, headers, _ = _http(base, "GET", f"/?key={admin}")
+    assert status == 302
+    assert headers["location"] == "/" and "key" not in headers["location"]
+    cookie = headers["set-cookie"]
+    assert "HttpOnly" in cookie and "SameSite=Strict" in cookie
+    token = cookie.split(";")[0]
+    assert _http(base, "GET", "/api/me", headers={"Cookie": token})[0] == 200
+    events = _json(_http(base, "GET", "/api/audit?action=auth.sign_in", headers=_auth(admin))[2])["events"]
+    assert [event["action"] for event in events] == ["auth.sign_in"]
+
+
+def _form_fields(page):
+    """The first form's action and named inputs, as a browser would submit them."""
+    text = page.decode("utf-8")
+    action = re.search(r'<form[^>]*action="([^"]*)"', text).group(1)
+    fields = dict(re.findall(r'<input[^>]*name="([^"]+)"[^>]*value="([^"]*)"', text))
+    return action, fields
+
+
+def test_query_key_does_not_override_existing_session(env):
+    srv, base = env
+    _, admin_a = srv.db.create_team("alpha")
+    team_b_id, admin_b = srv.db.create_team("beta")
+    member_b = srv.db.create_key(team_b_id, "member-b", "member", "test")["key"]
+
+    _, headers, _ = _http(base, "GET", f"/?key={admin_a}")
+    cookie_a = headers["set-cookie"].split(";")[0]
+
+    status, headers, page = _http(base, "GET", f"/?key={admin_b}", headers={"Cookie": cookie_a})
+    assert status == 200 and "set-cookie" not in headers
+    assert b"alpha" in page and b"beta" in page
+    action, fields = _form_fields(page)
+    assert action == "/session" and fields["key"] == admin_b
+    assert _json(_http(base, "GET", "/api/me", headers={"Cookie": cookie_a})[2])["team"]["name"] == "alpha"
+
+    status, headers, _ = _http(
+        base, "POST", action, body=urlencode(fields).encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded", "Cookie": cookie_a},
+    )
+    assert status == 302 and headers["location"] == "/"
+    cookie_b = headers["set-cookie"].split(";")[0]
+    assert _json(_http(base, "GET", "/api/me", headers={"Cookie": cookie_b})[2])["team"]["name"] == "beta"
+
+    # a key of the team already signed in needs no confirmation
+    status, headers, _ = _http(base, "GET", f"/?key={member_b}", headers={"Cookie": cookie_b})
+    assert status == 302 and "set-cookie" in headers
+
+
+def test_cross_site_query_key_sign_in_is_refused(env, tmp_path, capsys):
+    """The legacy GET sign-in refuses a browser request that comes from another origin, exactly
+    like POST /session: no cookie, no session row, and never a redirect that replaces one."""
+    srv, base = env
+    db_path = tmp_path / "rl.db"
+    port = srv.server_address[1]
+    _, admin_a = srv.db.create_team("alpha")
+    _, admin_b = srv.db.create_team("beta")
+    capsys.readouterr()
+
+    cross_site = [
+        {"Sec-Fetch-Site": "cross-site"},                       # another site
+        {"Sec-Fetch-Site": "same-site"},                        # another port or subdomain
+        {"Sec-Fetch-Site": "same-site", "Origin": f"http://127.0.0.1:{port + 1}"},
+        {"Origin": "http://evil.example"},
+        {"Origin": "null", "Sec-Fetch-Site": "cross-site"},
+        {"Origin": f"https://127.0.0.1:{port}"},                # right host, wrong scheme
+    ]
+    for extra in cross_site:
+        status, headers, raw = _http(base, "GET", f"/?key={admin_b}", headers=extra)
+        assert status == 403, extra
+        assert "set-cookie" not in headers, extra
+        assert _json(raw)["error"]["code"] == "cross_site"
+        assert headers["connection"] == "close"
+    assert _sessions(db_path) == 0
+
+    # A session cookie that arrives anyway is not replaced either.
+    _, headers, _ = _http(base, "GET", f"/?key={admin_a}")
+    cookie_a = headers["set-cookie"].split(";")[0]
+    status, headers, _ = _http(
+        base, "GET", f"/?key={admin_b}", headers={"Cookie": cookie_a, "Sec-Fetch-Site": "cross-site"},
+    )
+    assert status == 403 and "set-cookie" not in headers
+    assert _json(_http(base, "GET", "/api/me", headers={"Cookie": cookie_a})[2])["team"]["name"] == "alpha"
+
+    # A plain link, a pasted URL or a non-browser client keeps the old behaviour.
+    allowed = [{}, {"Sec-Fetch-Site": "none"}, {"Sec-Fetch-Site": "same-origin"},
+               {"Origin": f"http://127.0.0.1:{port}", "Sec-Fetch-Site": "same-origin"}]
+    before = _sessions(db_path)
+    for extra in allowed:
+        status, headers, _ = _http(base, "GET", f"/?key={admin_b}", headers=extra)
+        assert status == 302 and headers["location"] == "/", extra
+        assert "set-cookie" in headers, extra
+    assert _sessions(db_path) == before + len(allowed)
+    err = capsys.readouterr().err
+    assert "cross-site sign-in" in err and admin_b not in err
+
+
+def test_query_key_deprecation_logged_once(env, capsys):
+    srv, base = env
+    _, admin = srv.db.create_team("alpha")
+    capsys.readouterr()
+    for _ in range(3):
+        assert _http(base, "GET", f"/?key={admin}")[0] == 302
+    err = capsys.readouterr().err
+    lines = [line for line in err.splitlines() if "deprecated" in line and "?key=" in line]
+    assert len(lines) == 1
+    assert admin not in err
+
+
+def test_receipt_csp_has_sandbox(env):
+    srv, base = env
+    _, key = srv.db.create_team("alpha")
+    client.push(base, key, FIX, user="dev@example.com")
+    status, headers, _ = _http(base, "GET", f"/runs/{SESSION_ID}", headers=_auth(key))
+    assert status == 200
+    csp = headers["content-security-policy"]
+    assert csp == RECEIPT_CSP
+    assert "sandbox" in csp
+    assert "default-src 'none'" in csp and "script-src" not in csp
+    assert headers["x-content-type-options"] == "nosniff"
+
+
+def test_unauthenticated_post_rejected_without_reading_body(env):
+    srv, base = env
+    team_id, admin = srv.db.create_team("alpha")
+    member = srv.db.create_key(team_id, "member", "member", "test")
+    viewer = srv.db.create_key(team_id, "viewer", "viewer", "test")
+    oversized = {"Content-Length": str(MAX_BODY_BYTES * 10)}
+
+    writes = [
+        ("POST", "/api/runs"),
+        ("POST", "/api/approvals"),
+        ("POST", "/api/approvals/abc/decision"),
+        ("PUT", "/api/team/settings"),
+        ("POST", "/api/keys"),
+        ("PUT", "/api/budgets"),
+    ]
+    for method, path in writes:
+        status, _, _ = _http(base, method, path, body=b"x", headers={**_auth("rl_wrong"), **oversized})
+        assert status == 401, (method, path, status)
+        status, _, _ = _http(base, method, path, body=b"x", headers={**_auth(viewer["key"]), **oversized})
+        assert status == 403, (method, path, status)
+
+    status, _, raw = _http(base, "POST", "/api/runs", body=b"x", headers={**_auth(member["key"]), **oversized})
+    assert status == 413 and _json(raw)["error"]["code"] == "payload_too_large"
+    assert _http(base, "GET", "/health")[0] == 200
+    assert srv.db.list_runs(team_id) == []
 
 
 def test_bad_bodies_are_rejected_with_json_errors(env):
@@ -365,9 +1447,41 @@ def test_cli_team_create_then_push(tmp_path, capsys, monkeypatch):
         assert main(["push", str(FIX), "--server", "http://127.0.0.1:9", "--key", key]) == 1
         assert "Could not reach" in capsys.readouterr().err
 
-        # The environment push is an idempotent retry of the same immutable receipt.
+        # The environment push is an idempotent retry of the same receipt.
         runs = srv.db.list_runs(1)
         assert len(runs) == 1 and runs[0]["user"] == "dev@example.com"
+
+
+def test_cli_push_reports_the_revision_it_replaced(tmp_path, capsys, monkeypatch):
+    db_path = tmp_path / "cli-supersede.db"
+    monkeypatch.delenv("RUNLEDGER_API_KEY", raising=False)
+    monkeypatch.delenv("RUNLEDGER_SERVER", raising=False)
+    assert main(["team", "create", "demo", "--db", str(db_path)]) == 0
+    key = next(line.strip() for line in capsys.readouterr().out.splitlines() if line.strip().startswith("rl_"))
+
+    native = json.loads(NATIVE.read_text(encoding="utf-8"))
+    session = tmp_path / "session.runledger.json"
+    session.write_text(json.dumps(native), encoding="utf-8")
+
+    with running_server(db_path) as (srv, base):
+        assert main(["push", str(session), "--server", base, "--key", key, "--user", "dev@example.com"]) == 0
+        printed = capsys.readouterr().out
+        assert "Pushed demo-0001-native" in printed and "Updated" not in printed
+
+        native["steps"].append({
+            "tool": "Read",
+            "input": {"file_path": "/home/dev/demo-app/src/prices.py"},
+            "model": "claude-sonnet-5-5",
+            "result_text": "def lookup(sku):",
+            "is_error": False,
+        })
+        session.write_text(json.dumps(native), encoding="utf-8")
+        assert main(["push", str(session), "--server", base, "--key", key, "--user", "dev@example.com"]) == 0
+        printed = capsys.readouterr().out
+        assert "Updated demo-0001-native" in printed and "revision 2" in printed
+        run = _json(_http(base, "GET", "/api/runs/demo-0001-native", headers=_auth(key))[2])["run"]
+        assert run["revision"] == 2 and run["steps"] == 5
+        assert _revisions(db_path, "demo-0001-native") == [1]
 
 
 def test_cli_reports_bad_database_path_without_traceback(tmp_path, capsys):
@@ -387,3 +1501,4 @@ def test_push_needs_server_and_key(monkeypatch, tmp_path):
     with pytest.raises(client.PushError):
         client.push("http://127.0.0.1:9", "rl_x", tmp_path / "missing.jsonl")
     assert client.default_user()
+

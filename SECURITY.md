@@ -21,18 +21,17 @@ changelog if you want that.
 
 | Version | Security fixes |
 | --- | --- |
-| 0.4.x | Yes |
-| 0.3.x | Yes, until 0.5.0 |
-| 0.2.x | No; upgrade to 0.4.0. Since 0.3.0, receipts mask secrets |
-| Earlier versions | No |
+| 0.6.x | Yes |
+| 0.5.x | Yes, until 0.7.0 |
+| Earlier versions | No; upgrade to a supported version. Since 0.3.0, receipts mask secrets |
 
 ## Scope
 
 In scope: the `runledger` package (the CLI, the team server, the dashboard, the approval API
 and the guard hook), the Docker image and the files in `deploy/`, and the GitHub action.
 
-Out of scope: the agents RunLedger reads (Claude Code, Codex CLI, Aider) and third-party
-services.
+Out of scope: the agents RunLedger reads (Claude Code, Codex CLI, Factory Droid, Aider) and
+third-party services.
 
 ## Known limits
 
@@ -50,5 +49,10 @@ Read the security checklist and the "Known limits" section of
   a command line can still appear in one. `receipt --ai` sends session content to Anthropic.
 - The guard's log and approval requests use the same pattern-based masking, described in
   [docs/guard.md](docs/guard.md#the-guard-log).
+- The dashboard sign-in (`POST /session`) refuses a request a browser marks as coming from another
+  origin (`Sec-Fetch-Site: cross-site` or `same-site`, or an `Origin` header that is not the server's
+  own origin, `null` included) with `403`, so a cross-site page cannot sign the browser in to another
+  team. The session cookie is `SameSite=Strict`; a request with neither header (curl, a script) is
+  treated as a non-browser client and signs in as usual.
 - Behind a reverse proxy, configure the proxy as a trusted proxy (`--trusted-proxy`). Until then, the
   failed-sign-in limit and the audit log use the proxy's address.

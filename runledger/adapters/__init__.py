@@ -24,23 +24,49 @@ Anything else keeps the agent's own tool name.
 """
 from __future__ import annotations
 
+import functools
 import importlib
+import os
 from pathlib import Path
+import sys
 from typing import List, Optional
 
 from ..parser import mtime
 
 ADAPTER_MODULES = ["claude_code", "codex", "droid", "aider", "native"]
 
+_FAILURES_REPORTED = set()
 
-def adapters():
+
+def _debug_enabled() -> bool:
+    return os.environ.get("RUNLEDGER_DEBUG", "").strip().lower() in ("1", "true", "yes")
+
+
+@functools.lru_cache(maxsize=None)
+def _load(debug: bool) -> tuple:
     out = []
     for name in ADAPTER_MODULES:
         try:
             out.append(importlib.import_module(f"{__name__}.{name}"))
-        except ImportError:
-            continue
-    return out
+        except ImportError as exc:
+            if debug:
+                raise
+            if name not in _FAILURES_REPORTED:
+                _FAILURES_REPORTED.add(name)
+                print(f"runledger: adapter '{name}' failed to load: {exc}", file=sys.stderr)
+    return tuple(out)
+
+
+def adapters() -> List:
+    """Import the adapters once per process. A broken adapter is reported once on
+    stderr and skipped; RUNLEDGER_DEBUG=1 raises the import error instead."""
+    return list(_load(_debug_enabled()))
+
+
+def clear_cache() -> None:
+    """Drop the imported adapters and the reported-failure set (for tests)."""
+    _load.cache_clear()
+    _FAILURES_REPORTED.clear()
 
 
 def get(name: str):
@@ -73,4 +99,4 @@ def find_sessions(project: Optional[str] = None, agent: Optional[str] = None) ->
     found: List[Path] = []
     for a in chosen:
         found.extend(a.find_sessions(project))
-    return sorted(set(found), key=mtime, reverse=True)
+    return sorted(set(found), key=lambda p: (mtime(p), str(p)), reverse=True)

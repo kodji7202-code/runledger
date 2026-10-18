@@ -142,6 +142,25 @@ def push(base, key, run_id, **kwargs):
     return _json(raw)
 
 
+def push_unpriced(base, key, run_id, **kwargs):
+    """A run whose agent recorded no usage: its stored cost is unknown, never 0."""
+    payload = make_payload(run_id, cost=0.0, **kwargs)
+    payload["totals"] = dict(payload["totals"], cost_usd=0.0, usage_source="missing")
+    payload["models"] = {}
+    status, _, raw = _http(base, "POST", "/api/runs", body=payload, headers=_auth(key))
+    assert status == 201, raw
+    return _json(raw)
+
+
+def push_partial(base, key, run_id, cost, **kwargs):
+    """A run with some of its tokens unpriced: the stored cost is a lower bound."""
+    payload = make_payload(run_id, cost=cost, **kwargs)
+    payload["totals"] = dict(payload["totals"], cost_usd=cost, cost_partial=True, usage_source="messages")
+    status, _, raw = _http(base, "POST", "/api/runs", body=payload, headers=_auth(key))
+    assert status == 201, raw
+    return _json(raw)
+
+
 def team_with_keys(srv):
     team_id, admin = srv.db.create_team("alpha")
     member = srv.db.create_key(team_id, "member-key", "member", "test")["key"]
@@ -183,6 +202,16 @@ def test_runs_csv_values_match_the_stored_run(env):
     assert row["cost_usd"] == "0.6" and row["risk_score"] == "40" and row["risk_level"] == "medium"
     assert row["title"] == "Fix retry"
     assert row["steps"].isdigit() and row["tokens"].isdigit() and row["files_changed"].isdigit()
+
+
+def test_an_unknown_cost_leaves_the_csv_cell_empty(env):
+    srv, base = env
+    _, admin, _, _ = team_with_keys(srv)
+    push_unpriced(base, admin, "no-usage")
+    push_partial(base, admin, "partial", 0.6)
+    rows = {r[0]: dict(zip(RUN_HEADER, r)) for r in _rows(export(base, admin, "runs")[2])[1:]}
+    assert rows["no-usage"]["cost_usd"] == ""     # not "0.0": nothing was priced
+    assert rows["partial"]["cost_usd"] == "0.6"   # the priced part is still reported
 
 
 def test_audit_csv_has_its_header_and_the_details_as_json(env):
@@ -349,7 +378,7 @@ def test_head_returns_headers_only_and_builds_nothing(env, kind, monkeypatch):
     assert "content-length" not in headers  # the length of a body that was never built is not claimed
     assert headers["cache-control"] == "no-store"
     if kind == "report":
-        assert headers["content-security-policy"] == RECEIPT_CSP
+        assert headers["content-security-policy"] == exports.REPORT_CSP
 
 
 def test_head_is_refused_for_members_and_still_checks_the_days(env):
@@ -404,7 +433,10 @@ def test_report_is_self_contained_and_served_with_the_receipt_csp(env):
     status, headers, raw = export(base, admin, "report")
     assert status == 200
     assert headers["content-type"] == "text/html; charset=utf-8"
-    assert headers["content-security-policy"] == RECEIPT_CSP == exports.REPORT_CSP
+    # The report keeps its own CSP: it links to receipts, which the receipt's sandbox would block.
+    assert headers["content-security-policy"] == exports.REPORT_CSP
+    assert headers["content-security-policy"] != RECEIPT_CSP
+    assert "sandbox" in RECEIPT_CSP and "sandbox" not in exports.REPORT_CSP
     assert "frame-ancestors 'none'" in headers["content-security-policy"]
     assert headers["content-disposition"] == 'inline; filename="runledger-report-20261015.html"'
     body = raw.decode("utf-8")
@@ -488,6 +520,57 @@ def test_report_budget_section_shows_the_month_and_the_limit(env):
     push(base, admin, "run-1", cost=0.6)
     body = export(base, admin, "report")[2].decode("utf-8")
     assert "Month 2026-10: spend $0.6000, $1.0000 budget, 60.0% used." in body
+
+
+def test_report_says_na_for_a_period_with_no_priced_run(env):
+    """A window of runs with unknown costs reports n/a, never a fake $0.0000."""
+    srv, base = env
+    _, admin, _, _ = team_with_keys(srv)
+    push_unpriced(base, admin, "no-usage-1")
+    push_unpriced(base, admin, "no-usage-2", started="2026-10-06T10:00:00Z")
+    body = export(base, admin, "report")[2].decode("utf-8")
+    assert '<td>Estimated cost at list prices</td><td class="num">n/a</td>' in body
+    assert '<td>Runs without a complete price</td><td class="num">2</td>' in body
+    assert "Month 2026-10: spend n/a (2 of 2 runs unpriced), no team budget set." in body
+    assert "$0.0000" not in body
+
+
+def test_report_marks_a_partly_priced_period_as_a_lower_bound(env):
+    """A window with a partly priced run shows the figure as "≥" and names the runs it leaves out."""
+    srv, base = env
+    _, admin, _, _ = team_with_keys(srv)
+    push_partial(base, admin, "partial", 0.6)
+    push(base, admin, "priced", cost=0.4, started="2026-10-06T10:00:00Z")
+    body = export(base, admin, "report")[2].decode("utf-8")
+    assert '<td>Estimated cost at list prices (lower bound)</td><td class="num">≥ $1.0000</td>' in body
+    assert '<td>Runs without a complete price</td><td class="num">1</td>' in body
+
+
+def test_report_budget_section_shows_a_lower_bound_and_its_counts(env):
+    srv, base = env
+    _, admin, _, _ = team_with_keys(srv)
+    _http(base, "PUT", "/api/budgets", body={"monthly_usd": 1.0}, headers={**_auth(admin), **CSRF})
+    push_unpriced(base, admin, "no-usage")
+    push(base, admin, "run-1", cost=0.6)
+    body = export(base, admin, "report")[2].decode("utf-8")
+    assert (
+        "Month 2026-10: spend ≥ $0.6000 (lower bound: 1 of 2 runs unpriced), "
+        "$1.0000 budget, 60.0% used."
+    ) in body
+    assert '<td class="num">≥ $0.6000</td>' in body  # the developer row says so too
+
+
+def test_report_marks_a_partial_only_developer_as_a_lower_bound(env):
+    """One partly priced run and nothing else: the developer row must not read as complete."""
+    srv, base = env
+    _, admin, _, _ = team_with_keys(srv)
+    push_partial(base, admin, "partial", 0.6)
+    body = export(base, admin, "report")[2].decode("utf-8")
+    assert (
+        "Month 2026-10: spend ≥ $0.6000 (lower bound: 1 of 1 runs only partly priced), "
+        "no team budget set."
+    ) in body
+    assert '<td>dev@example.com</td><td class="num">≥ $0.6000</td>' in body  # the developer row
 
 
 def test_report_says_when_a_long_table_is_cut_short(env):

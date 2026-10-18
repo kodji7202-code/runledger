@@ -33,7 +33,8 @@ runledger receipt --open         # latest session as HTML, opened in your browse
 ```
 
 By default the receipt is written to the current folder as `runledger-<first 8 characters of the
-session id>.html`. Pick another name with `-o`:
+session id>.html` (or `-2.html`, `-3.html`, … if that file already exists). Pick another name
+(or overwrite an existing file) with `-o`:
 
 ```bash
 runledger receipt -o review.html
@@ -44,23 +45,42 @@ runledger receipt --format json -o -           # JSON to stdout
 
 ### Safe mode
 
-Markdown and JSON receipts are often pasted into pull requests or committed, so by default they
-are **safe** when they go to stdout (`-o -`) or to a file inside a Git work tree, including the
-default file in the current folder:
+Receipts are often shared, pasted into pull requests, or committed, so by default they are **safe**
+when they go to a file inside a Git work tree (including HTML, Markdown, and JSON in the current
+folder) or when Markdown or JSON is written to stdout (`-o -`):
 
 - paths inside the repository become relative, and the folder is shown as the repository name
   plus the subfolder the run started in (`app/src`);
-- the home folder (`/home/<user>`, `/Users/<user>`, `C:\Users\<user>`) becomes `~`;
+- the home folder (`/home/<user>`, `/Users/<user>`, `C:\Users\<user>`, including user names with
+  spaces or non-ASCII characters) becomes `~`, and an unknown user name is consumed up to the next
+  separator, quote or end of line (a run of spaces counts as part of the name);
 - other paths that share leading folders with the repository have that prefix shortened to `…`,
-  as do prefixes you list in `RUNLEDGER_SAFE_PREFIXES` (separated by `:`, or `;` on Windows);
-- temp paths such as `/tmp/...` stay as they are;
-- e-mail addresses become `[EMAIL]`, and `user:pass@` in URLs becomes `[REDACTED]@`.
+  as do prefixes you list in `RUNLEDGER_SAFE_PREFIXES` (separated by `:`, or `;` on Windows), and
+  unrelated non-system paths with more than two segments are trimmed to `…/<last two parts>`; a
+  path that contains spaces counts as one path, so a shell redirect target such as
+  `E:\Work\Client y\z.txt` is trimmed to `…/Client y/z.txt` instead of surviving as an unmasked
+  fragment, and a folder name with several words (`E:\Work\Client X Corp\secret.txt`) is one path
+  in the same way;
+- temp paths such as `/tmp/...` and standard system paths such as `/usr/bin/...` stay as they are;
+- e-mail addresses become `[EMAIL]`, an address that ends a sentence included: the punctuation
+  after it stays, so `contact me@example.com.` reads `contact [EMAIL].` (a prose colon does not
+  exempt one, and a comma, semicolon, question or exclamation mark, bracket or quote after an
+  address behaves the same way); `user:pass@` in URLs becomes `[REDACTED]@`, while scp-style
+  `git@host:org/repo` remotes (with a non-empty path after the colon) and `ssh://git@host/...`
+  Git remotes are kept verbatim.
 
-HTML receipts and files written outside any repository keep full paths, which help debugging.
+RunLedger reads a command the way the shell does, word by word. An unquoted path that contains
+spaces is several words to the shell, so `touch C:/repo/My Folder/x.txt` is listed as the separate
+words the shell sees (`My` and `Folder/x.txt`), while the receipt label for the finding shows the
+whole path. Quote such a path (`touch "C:/repo/My Folder/x.txt"`) to have it treated as one file.
+
+Files written outside any repository keep full paths, which help debugging. HTML sent to stdout
+follows the folder it is sent from: redacted inside a Git work tree, full paths outside one.
 `--safe` and `--no-safe` override the default. After writing a file, `receipt` prints the mode
 it used to stderr. JSON receipts record it as `"safe": true` or `false`. Session id, branch,
 models, scores and file counts are the same in both modes. The GitHub pull-request comment is
-always safe. `push` is not changed, because the team server needs the project folder.
+always safe. `push` sends full paths by default, because the team server needs the project folder;
+`push --safe` masks the receipt the same way before it is stored (see below).
 
 Choose a session explicitly with a file path:
 
@@ -104,7 +124,10 @@ runledger receipt --ai --open
 - **This sends session content to Anthropic.** The prompts, each step's inputs (up to 600
   characters per field, which can include file contents being written), each tool result (up to
   400 characters) and the agent's final message (up to 1,500 characters) go to
-  `api.anthropic.com`. Do not use `--ai` on sessions you may not send to that API.
+  `api.anthropic.com`. E-mail addresses and home folders (`C:\Users\<name>`, `/Users/<name>`,
+  `/home/<name>` become `~...`) are masked, and known secret formats become `[REDACTED]`, before
+  anything is sent; the masking is pattern-based. Do not use `--ai` on sessions you may not send
+  to that API.
 - If the request fails, RunLedger still writes the deterministic receipt and prints
   `AI summaries skipped: ...`.
 
@@ -173,8 +196,9 @@ runledger team create myteam --db runledger.db     # prints the team's API key o
 runledger serve --db runledger.db                  # listens on http://127.0.0.1:8787
 ```
 
-Keep the key and open the dashboard once with it: `http://127.0.0.1:8787/?key=YOUR_KEY`. The
-server sets a session cookie and redirects, so the key leaves the address bar.
+Keep the key and open `http://127.0.0.1:8787/`, then sign in with the key in the form. The key is
+sent in the request body, so it never appears in the address bar. The `?key=YOUR_KEY` link form still
+works for a first sign-in but is deprecated.
 
 Push a run from a developer's machine:
 
@@ -187,6 +211,16 @@ runledger push --user "ana@example.com"
 PowerShell uses `$env:RUNLEDGER_SERVER = "http://127.0.0.1:8787"` and the same for the key.
 `--user` is the developer name shown on the dashboard. Without it, RunLedger uses the git
 `user.email`, then the operating-system user.
+
+**Safe mode for a shared server.** The stored receipt keeps full local paths by default, so the
+dashboard can show which folder and which files a run touched. `runledger push --safe` masks the
+receipt before it is sent, exactly like `runledger receipt`: paths inside the project become
+relative, the home folder becomes `~`, e-mail addresses in prompts and commands become `[EMAIL]`,
+and the project folder name and the `--user` name are kept, because they are what the dashboard
+groups by. Set `RUNLEDGER_PUSH_SAFE=1` to mask every push, or `"push_safe": true` in
+`~/.runledger/config.json` (the flag wins over the environment, which wins over the config;
+`--no-safe` forces full detail). A push to a remote HTTPS server that is not masked prints one
+tip line on stderr; a local server stays silent.
 
 A local server is for trying things out. For a shared server, use HTTPS: see
 [self-hosting.md](self-hosting.md) for Docker Compose with automatic certificates, or a bare-metal
