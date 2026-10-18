@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Union
 from urllib.parse import urlsplit
 
 from . import __version__
+from . import _http
 from .cli import build
 from .pricing import cost_of
 from .receipt import render
@@ -93,7 +94,7 @@ def _opener_for(url: str) -> urllib.request.OpenerDirector:
 
 def _server_message(exc: urllib.error.HTTPError) -> str:
     try:
-        return str(json.loads(exc.read().decode("utf-8"))["error"]["message"])[:300]
+        return str(json.loads(_http.read_error(exc))["error"]["message"])[:300]
     except Exception:
         return str(exc.reason) if exc.reason else "no details"
 

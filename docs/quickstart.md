@@ -115,7 +115,10 @@ runledger receipt --ai --open
 - **This sends session content to Anthropic.** The prompts, each step's inputs (up to 600
   characters per field, which can include file contents being written), each tool result (up to
   400 characters) and the agent's final message (up to 1,500 characters) go to
-  `api.anthropic.com`. Do not use `--ai` on sessions you may not send to that API.
+  `api.anthropic.com`. E-mail addresses and home folders (`C:\Users\<name>`, `/Users/<name>`,
+  `/home/<name>` become `~...`) are masked, and known secret formats become `[REDACTED]`, before
+  anything is sent; the masking is pattern-based. Do not use `--ai` on sessions you may not send
+  to that API.
 - If the request fails, RunLedger still writes the deterministic receipt and prints
   `AI summaries skipped: ...`.
 

@@ -1,13 +1,17 @@
+import io
 import json
 import shutil
 import threading
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
 
 from runledger.cli import build
-from runledger.github import MARKER, MAX_COMMENT_CHARS, Scored, _next_link, main, render_comment
+from runledger.github import (MARKER, MAX_COMMENT_CHARS, GitHubClient, GitHubError, Scored, _next_link,
+                              main, render_comment)
 
 FIX = Path(__file__).parent / "fixtures" / "sample_session.jsonl"
 # Fake token. It must never appear in stdout, stderr or the step outputs.
@@ -312,3 +316,30 @@ def test_next_link_parsing():
     assert _next_link(link) == "https://api.example/x?page=2"
     assert _next_link('<https://api.example/x?page=1>; rel="prev"') is None
     assert _next_link("") is None
+
+
+class _RecordingBody(io.BytesIO):
+    """An error body that remembers being closed, the way a real response must be."""
+
+    def __init__(self, data: bytes = b""):
+        super().__init__(data)
+        self.closed_by_us = False
+
+    def close(self):
+        self.closed_by_us = True
+        super().close()
+
+
+def test_http_error_body_closed(monkeypatch):
+    body = _RecordingBody(json.dumps({"message": "Forbidden"}).encode("utf-8"))
+    error = urllib.error.HTTPError("https://api.github.com/repos/o/r/issues/1/comments", 403,
+                                   "Forbidden", {}, body)
+
+    def refuse(*_args, **_kwargs):
+        raise error
+
+    monkeypatch.setattr(urllib.request, "urlopen", refuse)
+    client = GitHubClient("https://api.github.com", TOKEN, "o/r", 1)
+    with pytest.raises(GitHubError, match="HTTP 403"):
+        client._send("POST", "https://api.github.com/repos/o/r/issues/1/comments", {"body": "x"})
+    assert body.closed_by_us
