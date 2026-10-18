@@ -65,7 +65,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: kodji7202-code/runledger@v0.6.0
+      - uses: kodji7202-code/runledger@v0.6.1
         with:
           sessions-dir: .runledger/sessions   # default
           fail-on: "60"                        # default; "" never fails the job
