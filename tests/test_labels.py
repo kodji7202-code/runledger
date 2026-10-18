@@ -69,15 +69,19 @@ def _event(cwd, tool, command):
             "tool_input": {"command": command}}
 
 
-def _observe(commands, cwd=REPO):
-    """Everything the label pass must never be able to change."""
+def _observe(commands, cwd=REPO, guard_cwd=None):
+    """Everything the label pass must never be able to change.
+
+    The risk and file parts use the spelled-out working folder `C:/repo` (pure string logic on
+    every host); the guard part runs with a real folder, because the guard resolves the project
+    root from the event's `cwd` and a folder that does not exist is not a project anywhere."""
     steps = [_step(tool, command, i + 1) for i, (tool, command) in enumerate(commands)]
     run = _run(steps, cwd)
     score, level, risks = risk.assess(run)
     changes = summarize.file_changes(run)
     ignored = [_findings(risk.assess_step(_step(tool, command), cwd, IGNORE_Y))
                for tool, command in commands]
-    decision = guard.decide(_event(cwd, commands[0][0], commands[0][1]), NO_POLICY)
+    decision = guard.decide(_event(guard_cwd or cwd, commands[0][0], commands[0][1]), NO_POLICY)
     return {
         "score": score, "level": level,
         "findings": _findings(risks),
@@ -125,14 +129,14 @@ def _receipt(capsys, *args):
 # ---------------------------------------------------------------- the invariance corpus
 
 @pytest.mark.parametrize("tool, command, label_fires", CORPUS)
-def test_decisions_do_not_depend_on_the_label_pass(monkeypatch, tool, command, label_fires):
+def test_decisions_do_not_depend_on_the_label_pass(monkeypatch, tmp_path, tool, command, label_fires):
     """R5-001..003: findings, guard decisions, user-policy results, file keys, deletion state
     and counts are identical whether the whole-path label rule is active or disabled."""
-    shown = _observe([(tool, command)])
+    shown = _observe([(tool, command)], guard_cwd=str(tmp_path))
     assert bool(command_labels(tool, command)) is label_fires
     with monkeypatch.context() as m:
         _no_labels(m)
-        plain = _observe([(tool, command)])
+        plain = _observe([(tool, command)], guard_cwd=str(tmp_path))
     assert plain == shown
 
 
@@ -143,11 +147,11 @@ def test_decisions_do_not_depend_on_the_label_pass(monkeypatch, tool, command, l
     [("PowerShell", r"Set-Content -Path C:\repo\My Folder\x.txt -Value x")],
     [("Bash", r"touch C:/repo/tests/My Folder/test_a.py")],
 ])
-def test_file_identity_does_not_depend_on_the_label_pass(monkeypatch, commands):
-    shown = _observe(commands)
+def test_file_identity_does_not_depend_on_the_label_pass(monkeypatch, tmp_path, commands):
+    shown = _observe(commands, guard_cwd=str(tmp_path))
     with monkeypatch.context() as m:
         _no_labels(m)
-        plain = _observe(commands)
+        plain = _observe(commands, guard_cwd=str(tmp_path))
     assert plain == shown
 
 
@@ -175,9 +179,9 @@ def test_two_high_deletes_of_different_targets_both_survive():
     ]
 
 
-def test_the_default_guard_asks_for_the_spaced_delete_with_a_read_in_front():
+def test_the_default_guard_asks_for_the_spaced_delete_with_a_read_in_front(tmp_path):
     command = r"cat E:/Work/Client y/z.txt; rm 'E:/Work/Client y/z.txt'"
-    d = guard.decide(_event(REPO, "Bash", command), NO_POLICY)
+    d = guard.decide(_event(str(tmp_path), "Bash", command), NO_POLICY)
     assert d["decision"] == "ask"
     assert sorted((r["severity"], r["code"]) for r in d["risks"]) == [
         ("high", "shell_outside"), ("low", "shell_outside")]
@@ -195,9 +199,9 @@ def test_a_user_ignore_rule_reads_the_shells_own_reason(isolated_settings):
          r"Shell command referenced a path outside the working folder (E:/Work/Client)")]
 
 
-def test_a_user_ignore_rule_cannot_turn_the_guard_ask_into_an_allow(isolated_settings):
+def test_a_user_ignore_rule_cannot_turn_the_guard_ask_into_an_allow(tmp_path, isolated_settings):
     _write_user_config(isolated_settings, {"ignore": ["y/z.txt"]})
-    d = guard.decide(_event(REPO, "Bash", r"rm E:/Work/Client y/z.txt"), {})
+    d = guard.decide(_event(str(tmp_path), "Bash", r"rm E:/Work/Client y/z.txt"), {})
     assert d["policy_decision"] == "ask" and d["decision"] == "ask"
 
 
@@ -211,11 +215,11 @@ def test_a_user_ignore_rule_cannot_hide_the_delete_in_a_receipt(tmp_path, capsys
                  r"(E:/Work/Client y/z.txt)")]
 
 
-def test_a_guard_reason_rule_matches_the_shells_own_reason(isolated_settings):
+def test_a_guard_reason_rule_matches_the_shells_own_reason(tmp_path, isolated_settings):
     """R5-002: the reason rule matches the raw reason (the shell's word), so the closing
     parenthesis of `(E:/Work/Client)` still matches and the delete stays denied."""
     _write_user_config(isolated_settings, {"guard": {"deny": ["reason:(e:/work/client)"], "ask": []}})
-    d = guard.decide(_event(REPO, "Bash", r"rm E:/Work/Client y/z.txt"), {})
+    d = guard.decide(_event(str(tmp_path), "Bash", r"rm E:/Work/Client y/z.txt"), {})
     assert d["policy_decision"] == "deny" and d["decision"] == "deny"
 
 
@@ -292,8 +296,8 @@ def test_a_receipt_shows_the_whole_path_and_the_label_rule_is_what_shows_it(tmp_
         r"Shell command wrote outside the working folder (E:\Work\Client)"]
 
 
-def test_the_guard_message_shows_the_whole_path_without_changing_the_decision():
-    d = guard.decide(_event(REPO, "Bash", r"rm E:\Work\Client y\z.txt"), NO_POLICY)
+def test_the_guard_message_shows_the_whole_path_without_changing_the_decision(tmp_path):
+    d = guard.decide(_event(str(tmp_path), "Bash", r"rm E:\Work\Client y\z.txt"), NO_POLICY)
     assert d["decision"] == "ask"
     assert r"(E:\Work\Client y\z.txt)" in d["reason"]
     assert [(r["severity"], r["code"], r["reason"]) for r in d["risks"]] == [
