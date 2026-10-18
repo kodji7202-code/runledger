@@ -111,7 +111,9 @@ A session may be pushed more than once. A session that grew replaces the run alr
 same key pushes it (or an admin key does), and the replaced version is kept in the run history (the
 newest 20 versions per run). An identical re-push is an accepted retry, and a receipt pushed by a
 different member key, or one that is older than the stored version (an earlier `ended`, or fewer
-steps), returns `409 run_conflict`.
+steps), returns `409 run_conflict`. A run stored before the server recorded pushing keys has none
+(it predates key attribution, and the migration leaves that column empty), so it can be replaced
+only by an admin key; a member key pushing a different receipt for it gets `409 run_conflict`.
 
 ```json
 {
@@ -687,12 +689,13 @@ and the failure counts toward the rate limit. A successful sign-in is recorded i
 
 A browser request that comes from another origin is refused with `403 cross_site`, before the body is
 read, with no cookie and no session: `Sec-Fetch-Site: cross-site` or `same-site` (another port, scheme
-or subdomain is a different origin), or, when that header is absent, an `Origin` header that is not
-this server's own origin (`null` included). `Sec-Fetch-Site: same-origin` is accepted on its own,
-because this server sends `Referrer-Policy: no-referrer` and Chromium then serializes the `Origin` of
-the dashboard's own form POST as `null`. A request with neither header (curl, `runledger`, any
-non-browser client) signs in as before, and the server writes a warning line that never contains the
-key.
+or subdomain is a different origin), or an `Origin` header that is not this server's own origin
+(`null` included). The two headers are checked independently, so `Sec-Fetch-Site: same-origin` does
+not excuse a concrete `Origin` that names another site. The fetch metadata only excuses an absent
+`Origin` and the opaque `null` one, because this server sends `Referrer-Policy: no-referrer` and
+Chromium then serializes the `Origin` of the dashboard's own form POST as `null`. A request with
+neither header (curl, `runledger`, any non-browser client) signs in as before, and the server writes
+a warning line that never contains the key.
 
 ### `GET /?key=<key>`
 
@@ -735,12 +738,12 @@ There is no sign-out endpoint. Revoke or rotate the key to end a session.
 | 403 | `forbidden` | The role is too low for the action. The message names the role needed. |
 | 403 | `self_approval` | The same authenticated key requested and attempted to decide an approval. |
 | 403 | `csrf_required` | A cookie-authenticated change lacks `X-Requested-With: runledger`. |
-| 403 | `cross_site` | `POST /session` came from another origin (`Origin` or `Sec-Fetch-Site`). |
+| 403 | `cross_site` | A sign-in (`POST /session`, `GET /?key=`) came from another origin. A concrete `Origin` that is not this server's own is always refused, even with `Sec-Fetch-Site: same-origin`. |
 | 404 | `not_found` | No such endpoint, run, approval or key. |
 | 405 | `method_not_allowed` | The path does not accept this method. The `Allow` header lists the allowed ones. |
 | 409 | `already_decided` | The approval was already approved or denied. |
 | 409 | `legacy_unverifiable` | The approval predates authenticated requester attribution and must be requested again. |
-| 409 | `run_conflict` | A different key pushed this team's session id, or the new receipt is older (an earlier `ended`, or fewer steps) than the stored version. |
+| 409 | `run_conflict` | A different key pushed this team's session id, the stored run has no recorded pushing key (a pre-attribution run, admin keys only), or the new receipt is older (an earlier `ended`, or fewer steps) than the stored version. |
 | 409 | `expired` | The approval expired before a decision. |
 | 409 | `already_revoked` | The key is already revoked. |
 | 409 | `last_admin` | The team's last active admin key cannot be revoked. |

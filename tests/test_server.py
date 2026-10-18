@@ -345,6 +345,52 @@ def test_an_admin_key_may_supersede_a_members_run(env):
     assert admin not in json.dumps(events)  # the key itself is never written to the audit log
 
 
+def test_a_run_without_stored_provenance_needs_an_admin_to_be_superseded(env):
+    """A run stored before key attribution has no pushing key: the migration leaves
+    `pushed_by_key_id` NULL, so no member key can be the one that pushed it. An identical retry
+    stays an accepted duplicate, a member key that sends a different receipt is refused without
+    touching the stored run, and an admin key may replace it and becomes its pushing key."""
+    srv, base = env
+    team_id, admin = srv.db.create_team("alpha")
+    admin_id = srv.db.key_for_token(admin)["id"]
+    member = srv.db.create_key(team_id, "alice-laptop", "member", "test")["key"]
+    other = srv.db.create_key(team_id, "bob-laptop", "member", "test")["key"]
+    payload = client.build_payload(FIX, user="dev@example.com")
+
+    legacy = _stored(payload, "sess-legacy", steps=4, ended="2026-10-15T10:05:00Z", cost=0.1, risk=20)
+    assert _push(base, member, legacy)[0] == 201
+    with closing(sqlite3.connect(str(srv.db.path))) as conn:
+        conn.execute("UPDATE runs SET pushed_by_key_id = NULL WHERE team_id = ? AND id = 'sess-legacy'",
+                     (team_id,))
+        conn.commit()
+    stored = _run_row(srv.db.path, "sess-legacy")
+    assert stored["pushed_by_key_id"] is None
+
+    # An identical retry is still a duplicate for whoever sends it.
+    for key in (member, other):
+        status, body = _push(base, key, legacy)
+        assert (status, body["status"], body["revision"]) == (200, "duplicate", 1)
+    assert _run_row(srv.db.path, "sess-legacy") == stored
+
+    # A member key cannot claim it: 409, the run and its provenance untouched, no history row.
+    grown = _stored(payload, "sess-legacy", steps=9, ended="2026-10-15T10:20:00Z", cost=0.3, risk=60)
+    status, body = _push(base, other, grown)
+    assert status == 409 and body["error"]["code"] == "run_conflict"
+    assert _run_row(srv.db.path, "sess-legacy") == stored
+    assert _revisions(srv.db.path, "sess-legacy") == []
+    events = _json(_http(base, "GET", "/api/audit?action=run.supersede", headers=_auth(admin))[2])["events"]
+    assert events == []
+
+    # An admin key replaces it and becomes its pushing key.
+    status, body = _push(base, admin, grown)
+    assert (status, body) == (200, {"status": "updated", "id": "sess-legacy", "revision": 2})
+    row = _run_row(srv.db.path, "sess-legacy")
+    assert (row["steps"], row["risk_score"], row["revision"], row["pushed_by_key_id"]) == (9, 60, 2, admin_id)
+    assert _revisions(srv.db.path, "sess-legacy") == [1]
+    run = _json(_http(base, "GET", "/api/runs/sess-legacy", headers=_auth(admin))[2])["run"]
+    assert run["receipt"]["totals"]["steps"] == 9 and run["revision"] == 2
+
+
 def test_revision_history_is_capped_at_twenty(env):
     srv, base = env
     _, key = srv.db.create_team("alpha")
@@ -873,6 +919,73 @@ def test_same_origin_and_headerless_sign_in_post_still_works(env, tmp_path):
         cookie = headers["set-cookie"]
         assert "HttpOnly" in cookie and "SameSite=Strict" in cookie, extra
     assert _sessions(db_path) == len(allowed)
+
+
+def test_a_foreign_origin_is_refused_even_when_fetch_metadata_says_same_origin(env, tmp_path, capsys):
+    """Fetch metadata never excuses an Origin that names another site: the two headers are
+    checked independently. Only the opaque "null" origin Chromium serializes for this server's
+    own form POST stays accepted with `Sec-Fetch-Site: same-origin`."""
+    srv, base = env
+    db_path = tmp_path / "rl.db"
+    port = srv.server_address[1]
+    _, admin_a = srv.db.create_team("alpha")
+    _, admin_b = srv.db.create_team("beta")
+    body, form = _sign_in_form(admin_b)
+    capsys.readouterr()
+
+    conflicting = [
+        {"Origin": "http://evil.example", "Sec-Fetch-Site": "same-origin"},
+        {"Origin": f"http://127.0.0.1:{port + 1}", "Sec-Fetch-Site": "same-origin"},
+        {"Origin": f"https://127.0.0.1:{port}", "Sec-Fetch-Site": "same-origin"},
+    ]
+    for extra in conflicting:
+        status, headers, raw = _http(base, "POST", "/session", body=body, headers={**form, **extra})
+        assert status == 403, extra
+        assert "set-cookie" not in headers, extra
+        assert _json(raw)["error"]["code"] == "cross_site", extra
+        assert headers["connection"] == "close", extra
+    assert _sessions(db_path) == 0
+
+    for extra in conflicting:  # the legacy GET sign-in shares the check
+        status, headers, _ = _http(base, "GET", f"/?key={admin_b}", headers=extra)
+        assert status == 403 and "set-cookie" not in headers, extra
+    assert _sessions(db_path) == 0
+
+    # A session of another team is not replaced by a refused request, however it arrives.
+    _, headers, _ = _http(base, "GET", f"/?key={admin_a}")
+    cookie_a = headers["set-cookie"].split(";")[0]
+    conflict = {"Origin": "http://evil.example", "Sec-Fetch-Site": "same-origin"}
+    for method, path in (("POST", "/session"), ("GET", f"/?key={admin_b}")):
+        status, headers, _ = _http(
+            base, method, path, body=body if method == "POST" else None,
+            headers={**form, **conflict, "Cookie": cookie_a},
+        )
+        assert status == 403 and "set-cookie" not in headers, (method, path)
+    assert _sessions(db_path) == 1
+    me = _json(_http(base, "GET", "/api/me", headers={"Cookie": cookie_a})[2])
+    assert me["team"]["name"] == "alpha"
+
+    # The dashboard's own form keeps working: Chromium sends Origin: null with same-origin here.
+    status, headers, _ = _http(base, "POST", "/session", body=body,
+                               headers={**form, "Origin": "null", "Sec-Fetch-Site": "same-origin"})
+    assert status == 302 and headers["location"] == "/" and "set-cookie" in headers
+    assert _sessions(db_path) == 2
+    err = capsys.readouterr().err
+    assert "cross-site sign-in" in err and admin_b not in err and "Origin: http://evil.example" in err
+
+
+def test_an_unparsable_origin_is_refused_not_a_server_error(env, capsys):
+    """An Origin the parser rejects is simply not this server's origin: a refusal, not a 500."""
+    srv, base = env
+    _, admin = srv.db.create_team("alpha")
+    body, form = _sign_in_form(admin)
+    capsys.readouterr()
+    for origin in ("http://[evil.example", "http://", "https://:@evil.example"):
+        status, headers, raw = _http(base, "POST", "/session", body=body,
+                                     headers={**form, "Origin": origin, "Sec-Fetch-Site": "same-origin"})
+        assert status == 403, origin
+        assert "set-cookie" not in headers, origin
+        assert _json(raw)["error"]["code"] == "cross_site", origin
 
 
 def test_sign_in_origin_check_follows_the_trusted_proxy_setting(tmp_path):

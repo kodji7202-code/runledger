@@ -489,9 +489,11 @@ change behavior, so read the entry before you upgrade.
   scheme or subdomain is a different origin, which is what a page on a second loopback port sends),
   and so is an `Origin` header that is not this server's own origin, `null` included, when compared at
   the scheme the server believes the client used (so a reverse proxy it already trusts for
-  `X-Forwarded-Proto` matches). A `Sec-Fetch-Site: same-origin` request is accepted without comparing
-  the Origin, because every response carries `Referrer-Policy: no-referrer` and Chromium then
-  serializes the Origin of the dashboard's own form POST as `null` (measured with Chrome 155). Because
+  `X-Forwarded-Proto` matches). The two headers are checked independently: `Sec-Fetch-Site:
+  same-origin` still has to agree with a concrete `Origin`, so a request whose headers contradict
+  each other is refused; the fetch metadata only excuses an absent `Origin` and the opaque `null`
+  one, because every response carries `Referrer-Policy: no-referrer` and Chromium then serializes
+  the Origin of the dashboard's own form POST as `null` (measured with Chrome 155). Because
   the session cookie is `SameSite=Strict`, a cross-site form arrives without the cookie the visitor
   holds, so the confirmation page could not be shown and the cookie it set replaced the visitor's
   session; that request is now refused instead. Same-origin sign-ins (the dashboard form) and clients
@@ -528,7 +530,8 @@ change behavior, so read the entry before you upgrade.
   replaced version is kept in the new `run_revisions` table with its receipt JSON, HTML, risk score and
   cost, the newest 20 versions per run; `runledger push` reports the revision it replaced. An identical
   re-push is still an accepted retry (`200`, `"status": "duplicate"`, no new revision), a different
-  member key still gets `409`,
+  member key still gets `409` (a run stored before the server recorded pushing keys has none after
+  the migration, so only an admin key can replace it),
   and a receipt older than the stored version (an earlier `ended`, or fewer steps) is still `409`. The
   run keeps its URL, its `created_at` and its approvals; its risk, quality, AI review, insights,
   dashboard counts, budget spend and audit log are recomputed from the new version, and the supersede

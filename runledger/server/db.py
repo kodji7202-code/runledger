@@ -302,8 +302,11 @@ def _extraction_json(receipt: Dict[str, Any]) -> Tuple[str, str]:
 
 def _supersedes(existing: sqlite3.Row, run: Dict[str, Any], key_id: Optional[str], role: Optional[str]) -> bool:
     """Whether a new push may replace the stored version of a run: the same key pushed it (or an
-    admin key), and the new receipt is not a regression (an older end time, or fewer steps)."""
-    if role != "admin" and existing["pushed_by_key_id"] and existing["pushed_by_key_id"] != key_id:
+    admin key), and the new receipt is not a regression (an older end time, or fewer steps).
+
+    A run stored before key attribution has no pushing key at all (the migration leaves the
+    column NULL), so no member key can be the one that pushed it: only an admin may replace it."""
+    if role != "admin" and existing["pushed_by_key_id"] != key_id:
         return False
     old_ended, new_ended = existing["ended_at"], run["ended_at"]
     if old_ended is not None and new_ended is not None and new_ended < old_ended:
