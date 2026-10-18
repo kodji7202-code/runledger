@@ -66,6 +66,11 @@ folder) or when Markdown or JSON is written to stdout (`-o -`):
   becomes `[REDACTED]@`, while scp-style `git@host:org/repo` remotes (with a non-empty path after
   the colon) and `ssh://git@host/...` Git remotes are kept verbatim.
 
+RunLedger reads a command the way the shell does, word by word. An unquoted path that contains
+spaces is several words to the shell, so `touch C:/repo/My Folder/x.txt` is listed as the separate
+words the shell sees (`My` and `Folder/x.txt`), while the receipt label for the finding shows the
+whole path. Quote such a path (`touch "C:/repo/My Folder/x.txt"`) to have it treated as one file.
+
 Files written outside any repository keep full paths, which help debugging. HTML sent to stdout
 follows the folder it is sent from: redacted inside a Git work tree, full paths outside one.
 `--safe` and `--no-safe` override the default. After writing a file, `receipt` prints the mode

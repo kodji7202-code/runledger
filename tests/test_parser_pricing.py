@@ -380,6 +380,9 @@ def test_partial_cost_is_marked_as_a_lower_bound(fmt):
         assert "1 model unpriced" in result
     if fmt == "md":
         assert "≥ $" in result
+    if fmt == "html":
+        # The card carries the same lower-bound mark as the Markdown receipt.
+        assert "≥ $" in result and "at least" in result
 
 
 @pytest.mark.parametrize("fmt", ["md", "html", "json"])

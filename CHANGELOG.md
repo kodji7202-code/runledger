@@ -419,7 +419,8 @@ change behavior, so read the entry before you upgrade.
   run of theirs is priced, `GET /api/budgets/status` counts the runs behind the month's spend and says
   when it is a lower bound, budget alerts name the unpriced runs ("lower bound: 2 of 30 runs
   unpriced"), the runs CSV leaves an unknown cost cell empty, and the compliance report reads `n/a`
-  for a window with no priced run and `(lower bound)` with the counts otherwise. A reported zero
+  for a window with no priced run and `(lower bound)` with the counts otherwise. Markdown, HTML and
+  pull-request-comment receipts carry the same `≥` mark on a partly priced total. A reported zero
   (`usage_source: "messages"` and `cost_usd: 0.0`) and a receipt from an older client keep their old
   meaning and still show `$0.00`. JSON consumers that assumed a number must handle `null` (see
   docs/api.md).
@@ -526,7 +527,8 @@ change behavior, so read the entry before you upgrade.
   answers `200 {"status": "updated", "id": ..., "revision": n}` instead of `409 run_conflict`. The
   replaced version is kept in the new `run_revisions` table with its receipt JSON, HTML, risk score and
   cost, the newest 20 versions per run; `runledger push` reports the revision it replaced. An identical
-  re-push is still an accepted retry (`200`, no new revision), a different member key still gets `409`,
+  re-push is still an accepted retry (`200`, `"status": "duplicate"`, no new revision), a different
+  member key still gets `409`,
   and a receipt older than the stored version (an earlier `ended`, or fewer steps) is still `409`. The
   run keeps its URL, its `created_at` and its approvals; its risk, quality, AI review, insights,
   dashboard counts, budget spend and audit log are recomputed from the new version, and the supersede
@@ -886,3 +888,14 @@ First working prototype (MVP).
 - Public Claude API list prices in `runledger/prices.json`, with `RUNLEDGER_PRICES` to
   override them.
 - No runtime dependencies; Python 3.9 and later.
+
+[Unreleased]: https://github.com/kodji7202-code/runledger/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/kodji7202-code/runledger/compare/v0.5.2...v0.6.0
+[0.5.2]: https://github.com/kodji7202-code/runledger/compare/v0.5.1...v0.5.2
+[0.5.1]: https://github.com/kodji7202-code/runledger/compare/v0.5.0...v0.5.1
+[0.5.0]: https://github.com/kodji7202-code/runledger/compare/v0.4.1...v0.5.0
+[0.4.1]: https://github.com/kodji7202-code/runledger/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/kodji7202-code/runledger/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/kodji7202-code/runledger/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/kodji7202-code/runledger/releases/tag/v0.2.0
+[0.1.0]: https://github.com/kodji7202-code/runledger/commit/b756b1ba48e37fa9aa4247857bf7bd24f7e5dc15

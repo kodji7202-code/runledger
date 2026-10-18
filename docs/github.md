@@ -30,6 +30,11 @@ The action scores every `.jsonl` and `.runledger.json` file in that folder, so c
 the sessions for the work in the pull request. A Droid session needs its sibling
 `<session-id>.settings.json` next to it: that file carries the token usage and cost.
 
+Aider's `.aider.chat.history.md` is not scored directly: the action reads session files, not the
+markdown history. To get an Aider run into the comment, write it in the RunLedger format
+([format.md](format.md)) into the folder, or run `runledger receipt --agent aider` locally and
+share that receipt.
+
 > **Privacy.** A session transcript is a record of everything the agent saw: your
 > prompts, file contents it read or wrote, command output, and anything pasted into
 > the chat. It can contain secrets, such as API keys or the contents of `.env` files.
@@ -45,8 +50,8 @@ the sessions for the work in the pull request. A Droid session needs its sibling
 ## 2. Add the workflow
 
 Copy [`examples/workflows/runledger.yml`](../examples/workflows/runledger.yml) to
-`.github/workflows/runledger.yml` and replace `OWNER` with the account that hosts
-RunLedger. The job needs `pull-requests: write` to post the comment.
+`.github/workflows/runledger.yml`. The job needs `pull-requests: write` to post the
+comment.
 
 ```yaml
 - uses: actions/checkout@v4

@@ -50,6 +50,11 @@ _REDIR_OP_RE = re.compile(r"^(?:[1-6*]?>>|[1-6*]?>(?!&))$")
 _REDIR_MERGE_RE = re.compile(r"^[1-6*]?>>&?[0-9]?$|^[1-6*]?✨$")
 _STREAM_MERGE_PREFIX_RE = re.compile(r"^(?:[1-6*]?>>|[1-6*]?>)(?:&[1-6]?)?(.*)$")
 
+# A PowerShell provider qualifier (`HKLM:\Software`, `Cert:\LocalMachine`, `Env:\Path`) names
+# a registry key, a certificate store or a variable, never a file; a drive letter is one letter
+# followed by `:\` or `:/`, so it does not match.
+_PROVIDER_RE = re.compile(r"^(?![A-Za-z]:[\\/])[A-Za-z][A-Za-z0-9_.-]*:")
+
 _DEVICES = {
     "/dev/null",
     "/dev/stdout",
@@ -196,6 +201,8 @@ def _clean_ps_path(raw: Optional[str], cwd: Optional[str] = None) -> Optional[st
     if "$" in s or "*" in s or "?" in s or "`" in s:
         return None
     if s.lower() in _DEVICES or re.match(r"^(?:com|lpt)[1-9]$", s, re.I):
+        return None
+    if _PROVIDER_RE.match(s):
         return None
     if s.endswith(("/", "\\")):
         return None

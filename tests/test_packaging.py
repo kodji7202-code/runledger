@@ -222,6 +222,37 @@ def test_version_references_are_consistent():
     assert minor in first_row and "Yes" in first_row, f"first supported-versions row must be {minor}"
 
 
+def test_changelog_links_cover_headings():
+    """VAL-DOCS-009: every version heading has a link definition, Unreleased compares from the
+    newest tag, and each released version compares the previous tag with its own."""
+    changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    headings = re.findall(r"^## \[([^\]]+)\]", changelog, re.M)
+    links = dict(re.findall(r"^\[([^\]]+)\]: (\S+)$", changelog, re.M))
+    assert headings, "the changelog has no version headings"
+    missing = [name for name in headings if name not in links]
+    assert missing == [], f"CHANGELOG headings without a link definition: {missing}"
+    assert [name for name in links if name not in headings] == [], "stale CHANGELOG link"
+    base = "https://github.com/kodji7202-code/runledger"
+    assert links["Unreleased"] == f"{base}/compare/v0.6.0...HEAD"
+    assert links["0.2.0"] == f"{base}/releases/tag/v0.2.0"
+    # 0.1.0 is the untagged prototype, so it points at its own commit instead of a comparison.
+    assert links["0.1.0"].startswith(f"{base}/commit/")
+    for index, version in enumerate(headings):
+        if version in ("Unreleased", "0.2.0", "0.1.0"):
+            continue
+        previous = headings[index + 1]
+        assert links[version] == f"{base}/compare/v{previous}...v{version}", links[version]
+
+
+def test_action_yml_not_claude_only():
+    """P9: the Action describes every agent it reads, not Claude Code only."""
+    action = (ROOT / "action.yml").read_text(encoding="utf-8")
+    description = action.splitlines()[1]
+    assert description.startswith("description:")
+    assert "AI coding agent sessions (.jsonl, .runledger.json)" in description
+    assert "Claude Code session" not in description
+
+
 def test_ci_lints_the_production_compose_file():
     ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     assert "docker compose -f deploy/docker-compose.yml config -q" in ci

@@ -746,13 +746,16 @@ class _Handler(BaseHTTPRequestHandler):
                 "revision": result["revision"],
             })
             return
-        self._send_json(201 if outcome == "inserted" else 200, {
+        body: Dict[str, Any] = {
             "id": run["id"],
             "url": "/runs/" + quote(run["id"], safe=""),
             "risk_score": result["risk_score"],
             "risk_level": result["risk_level"],
             "revision": result["revision"],
-        })
+        }
+        if outcome == "duplicate":
+            body["status"] = "duplicate"
+        self._send_json(201 if outcome == "inserted" else 200, body)
 
     def _list_runs(self, query: Dict[str, List[str]]) -> None:
         ident = self._identify()

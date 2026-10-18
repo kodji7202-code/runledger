@@ -216,6 +216,10 @@ def test_spaced_drive_redirect_target_keeps_a_traversing_operand(command):
     "Set-Content (Join-Path $a $b) x",
     "Remove-Item -Path .env -WhatIf",
     "[System.IO.File]::WriteAllText($p, 'x')",
+    r"Set-Content HKLM:\Software\RunLedger -Value x",
+    r"Remove-Item Cert:\CurrentUser\My\abc123",
+    r"Out-File Env:\RUNLEDGER_TEST",
+    r"New-Item -Path Function:\prompt -Value x",
 ])
 def test_powershell_variable_and_wildcard_targets_are_skipped(command):
     assert ps_writes(command) == []
