@@ -51,14 +51,24 @@ share that receipt.
 
 Copy [`examples/workflows/runledger.yml`](../examples/workflows/runledger.yml) to
 `.github/workflows/runledger.yml`. The job needs `pull-requests: write` to post the
-comment.
+comment, and `contents: read` to check the repository out:
 
 ```yaml
-- uses: actions/checkout@v4
-- uses: kodji7202-code/runledger@v0.6.0
-  with:
-    sessions-dir: .runledger/sessions   # default
-    fail-on: "60"                        # default; "" never fails the job
+name: RunLedger receipt
+on:
+  pull_request:
+permissions:
+  contents: read
+  pull-requests: write
+jobs:
+  receipt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: kodji7202-code/runledger@v0.6.0
+        with:
+          sessions-dir: .runledger/sessions   # default
+          fail-on: "60"                        # default; "" never fails the job
 ```
 
 | Input | Default | Meaning |

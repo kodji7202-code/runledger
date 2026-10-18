@@ -78,7 +78,7 @@ from .auth import (
     identity_from_row,
 )
 from .dashboard import APPROVAL_HTML, DASHBOARD_HTML
-from .db import TIME_FORMAT, Database
+from .db import TIME_FORMAT, Database, normalize_missing_costs
 
 MAX_BODY_BYTES = 10 * 1024 * 1024
 SIGN_IN_BODY_LIMIT = 4096
@@ -1427,6 +1427,7 @@ def receipt_to_run(
     receipt["user"] = client_user
     receipt["project"] = project
     receipt.update({k: review[k] for k in ("quality", "recommendations", "ai_review")})
+    normalize_missing_costs(receipt, usage_source)
 
     cost = None if missing_usage else _money(totals.get("cost_usd"))
     return {

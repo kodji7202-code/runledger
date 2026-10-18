@@ -388,6 +388,24 @@ def _group_row(row: sqlite3.Row, name_key: str) -> Dict[str, Any]:
     }
 
 
+def normalize_missing_costs(receipt: Dict[str, Any], usage_source: Optional[str]) -> None:
+    """In place: the embedded receipt of a run whose usage is missing carries an unknown cost.
+    An older client still sends `cost_usd` 0.0 for such a run and for each of its models, which
+    would read as a free run, so the stored and served receipt is normalized to null the same
+    way the flattened run row is. A run that reports its usage keeps its cost, including a
+    reported zero."""
+    if usage_source != "missing":
+        return
+    totals = receipt.get("totals")
+    if isinstance(totals, dict):
+        totals["cost_usd"] = None
+    models = receipt.get("models")
+    if isinstance(models, dict):
+        for bucket in models.values():
+            if isinstance(bucket, dict):
+                bucket["cost_usd"] = None
+
+
 def _in_memory(path: str) -> bool:
     """Whether a second connection would be a different, empty database."""
     return path == ":memory:" or ":memory:" in path
@@ -1082,6 +1100,7 @@ class Database:
             ).fetchall()
         run = _summary(row)
         run["receipt"] = json.loads(row["receipt_json"])
+        normalize_missing_costs(run["receipt"], run["usage_source"])
         run["risks"] = [dict(r) for r in risks]
         return run
 
@@ -1118,7 +1137,7 @@ class Database:
             by_project = self._group(conn, "project", window, args)
             by_agent = self._group(conn, "COALESCE(agent, 'unknown')", window, args)
             model_rows = conn.execute(
-                f"SELECT models FROM runs WHERE {window}", args
+                f"SELECT models, cost_partial FROM runs WHERE {window}", args
             ).fetchall()
             top = conn.execute(
                 "SELECT r.code AS code, COUNT(*) AS occurrences, COUNT(DISTINCT r.run_id) AS runs "
@@ -1130,16 +1149,23 @@ class Database:
 
         models: Dict[str, Dict[str, Any]] = {}
         for row in model_rows:
+            partial = bool(row["cost_partial"])
             for name, info in json.loads(row["models"] or "{}").items():
                 label = friendly_model(name)
                 slot = models.setdefault(
-                    label, {"model": label, "runs": 0, "tokens": 0, "cost_usd": None, "priced_runs": 0},
+                    label, {"model": label, "runs": 0, "tokens": 0, "cost_usd": None,
+                            "priced_runs": 0, "unpriced_runs": 0},
                 )
                 slot["runs"] += 1
                 slot["tokens"] += int(info.get("tokens") or 0)
-                if info.get("cost_usd") is not None:
+                priced = info.get("cost_usd") is not None
+                if priced:
                     slot["priced_runs"] += 1
                     slot["cost_usd"] = round((slot["cost_usd"] or 0.0) + float(info["cost_usd"]), 6)
+                # A model bucket with no price and a partly priced run both leave the model
+                # figure below the real spend, exactly as they do for the other group rows.
+                if not priced or partial:
+                    slot["unpriced_runs"] += 1
         by_model = sorted(
             models.values(),
             key=lambda m: (m["cost_usd"] is None, -(m["cost_usd"] or 0.0), -m["tokens"], m["model"]),
@@ -1169,6 +1195,8 @@ class Database:
                 {
                     "model": m["model"], "runs": m["runs"], "tokens": m["tokens"],
                     "cost_usd": m["cost_usd"], "priced_runs": m["priced_runs"],
+                    "unpriced_runs": m["unpriced_runs"],
+                    "cost_is_lower_bound": bool(m["unpriced_runs"]),
                 }
                 for m in by_model[:20]
             ],

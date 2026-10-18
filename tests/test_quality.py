@@ -129,6 +129,21 @@ def test_a_prefixed_runner_footer_is_read(text, counts):
     assert parse_test_output(text, "pytest") == counts
 
 
+@pytest.mark.parametrize("text, counts", [
+    ("3 passed", (3, 0)),
+    ("3 passed, 1 skipped", (3, 0)),
+    ("=== 3 passed ===", (3, 0)),
+    ("============ 12 passed ============", (12, 0)),
+    ("1 failed, 11 passed", (11, 1)),
+    ("app  | 3 passed", (3, 0)),
+    ("2026-10-18T12:00:00Z 3 passed", (3, 0)),
+    ("[12:00:01] 2 failed, 3 passed", (3, 2)),
+])
+def test_a_bare_pytest_count_line_is_a_summary(text, counts):
+    """VAL-QUAL-004: v0.6.0 read a bare `3 passed` footer; the timing pytest adds is optional."""
+    assert parse_test_output(text, "pytest") == counts
+
+
 @pytest.mark.parametrize("text", [
     "app  | retried after 3 errors in 0.10s",
     "2026-10-18T12:00:00Z retried after 3 errors in 0.10s",
@@ -171,7 +186,7 @@ def test_noise_lines_parse_fast():
         "x" * 20_000,
         "retried after 3 errors in 0.10s " * 625,
         "app  | " + "1 passed, " * 2_000 + "in",
-        ("1 passed, " * 1_500) + " " * 5_000,
+        ("1 passed, " * 2_000) + "but only after a retry",
         "app  | " * 3_000,
         "2026-10-18T12:00:00Z " * 1_000,
         "=" * 20_000,
@@ -186,6 +201,10 @@ def test_noise_lines_parse_fast():
     footer = "app  | " + ", ".join(["1 passed"] * 2_000) + " in 0.5s"
     assert len(footer) >= 20_000
     assert parse_test_output(footer, "pytest") == (2_000, 0)
+    # A long count list with no timing at all is a summary as well.
+    bare_footer = "app  | " + ", ".join(["1 passed"] * 2_000)
+    assert len(bare_footer) >= 20_000
+    assert parse_test_output(bare_footer, "pytest") == (2_000, 0)
     assert parse_test_output("1 passed in " + "9" * 20_000 + "s", "pytest") == (1, 0)
     # The elapsed-time suffix stays linear too: an unclosed one is not a summary, a long
     # count list with one still is.
@@ -365,6 +384,35 @@ def test_unreadable_test_output_is_unknown_not_pass():
     assert _sig(unknown, "tests_run")["impact"] == 10
     assert _sig(unknown, "test_outcome") is None
     assert readable["score"] - unknown["score"] == 15
+
+
+def test_a_bare_count_line_without_a_timing_is_a_pass():
+    """VAL-QUAL-004: v0.6.0 read a bare `3 passed` footer as a pass, so the same session scores
+    15 more than one whose output says only `Done.`; the `Done.` run keeps its tests_run credit
+    without an outcome."""
+    bare = score_run(_run([_write(1, "src/a.py"),
+                           _bash(2, "python -m pytest -q", result="3 passed")]), [])
+    skipped = score_run(_run([_write(1, "src/a.py"),
+                              _bash(2, "python -m pytest -q", result="3 passed, 1 skipped")]), [])
+    unknown = score_run(_run([_write(1, "src/a.py"),
+                              _bash(2, "python -m pytest -q", result="Done.")]), [])
+    for scored in (bare, skipped):
+        assert _sig(scored, "tests_run")["value"] == 1
+        assert _sig(scored, "tests_run")["impact"] == 10
+        assert _sig(scored, "test_outcome")["value"] == "pass"
+        assert _sig(scored, "test_outcome")["impact"] == 15
+        assert scored["score"] - unknown["score"] == 15
+    assert _sig(unknown, "test_outcome") is None
+
+
+def test_a_timed_log_error_line_stays_unknown():
+    """`retried after 3 errors in 0.10s` is log text, not a pytest footer, with or without a
+    timing; free-text error counts are not test failures either."""
+    assert parse_test_output("retried after 3 errors in 0.10s", "pytest") is None
+    assert parse_test_output("retried after 3 errors", "pytest") is None
+    assert parse_test_output("lint found 7 errors", "pytest") is None
+    q = score_run(_run([_bash(1, "python -m pytest -q", result="retried after 3 errors in 0.10s")]), [])
+    assert _sig(q, "test_outcome") is None
 
 
 def test_free_text_error_counts_are_not_test_failures():

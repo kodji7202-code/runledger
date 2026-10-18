@@ -25,6 +25,7 @@ from runledger.server.db import Database
 FIX = Path(__file__).parent / "fixtures" / "sample_session.jsonl"
 DROID_FIX = Path(__file__).parent / "fixtures" / "droid_session.jsonl"
 NATIVE = Path(__file__).parent / "fixtures" / "native_session.json"
+ROOT = Path(__file__).resolve().parent.parent
 SESSION_ID = "7f3c2a10-9b1e-4c55-a1d2-0e6f8b3c9d42"
 XSS = "<script>alert(1)</script>"
 
@@ -519,6 +520,77 @@ def test_missing_usage_is_stored_as_unknown_cost(env):
     assert _run_row(srv.db.path, "no-usage")["cost"] is None
 
 
+def test_missing_usage_receipt_is_served_without_a_zero_cost(env):
+    """VAL-SRV-015: an embedded receipt whose usage is missing carries an unknown cost. The
+    older client that still sends `cost_usd` 0.0 for the run and its model must not read as a
+    free run anywhere: the row, the stored JSON and the served receipt all say null."""
+    srv, base = env
+    _, key = srv.db.create_team("alpha")
+    payload = _stored(client.build_payload(FIX, user="dev@example.com"), "exact-missing", cost=0.0)
+    payload["agent"] = "Droid"
+    payload["totals"] = {"tokens": 0, "cost_usd": 0.0, "usage_source": "missing"}
+    payload["models"] = {"claude-sonnet-4-5": {"tokens": 0, "cost_usd": 0.0}}
+    assert _push(base, key, payload)[0] == 201
+
+    listed, detail = _receipts(base, key, "exact-missing")
+    assert listed["cost_usd"] is None and listed["usage_source"] == "missing"
+    assert listed["tokens"] == 0
+    assert detail["cost_usd"] is None and detail["cost_partial"] is False
+    receipt = detail["receipt"]
+    assert receipt["totals"]["cost_usd"] is None
+    assert receipt["totals"]["tokens"] == 0
+    assert receipt["models"]["claude-sonnet-4-5"]["cost_usd"] is None
+    stored = json.loads(_run_row(srv.db.path, "exact-missing")["receipt_json"])
+    assert stored["totals"]["cost_usd"] is None
+    assert stored["models"]["claude-sonnet-4-5"]["cost_usd"] is None
+
+
+def test_a_reported_zero_keeps_its_zero_in_the_embedded_receipt(env):
+    """A run that reports its usage and honestly costs $0.00 keeps 0.0 in the stored receipt."""
+    srv, base = env
+    _, key = srv.db.create_team("alpha")
+    payload = _stored(client.build_payload(FIX, user="dev@example.com"), "reported-zero-receipt", cost=0.0)
+    payload["totals"] = dict(payload["totals"], tokens=0, cost_usd=0.0, usage_source="messages")
+    payload["models"] = {"claude-sonnet-4-5": {"tokens": 0, "cost_usd": 0.0}}
+    assert _push(base, key, payload)[0] == 201
+
+    _, detail = _receipts(base, key, "reported-zero-receipt")
+    assert detail["cost_usd"] == 0.0
+    assert detail["receipt"]["totals"]["cost_usd"] == 0.0
+    assert detail["receipt"]["models"]["claude-sonnet-4-5"]["cost_usd"] == 0.0
+
+
+def test_a_stored_receipt_from_an_older_server_is_served_without_the_zero(env):
+    """A row an older server stored with the 0.0 of a missing-usage run is read back honestly;
+    an old client's receipt with no `usage_source` keeps its stored cost."""
+    srv, base = env
+    _, key = srv.db.create_team("alpha")
+    payload = _stored(client.build_payload(FIX, user="dev@example.com"), "pre-fix-row", cost=0.0)
+    payload["totals"] = {"tokens": 0, "cost_usd": 0.0, "usage_source": "missing"}
+    payload["models"] = {"claude-sonnet-4-5": {"tokens": 0, "cost_usd": 0.0}}
+    assert _push(base, key, payload)[0] == 201
+    legacy = _stored(client.build_payload(FIX, user="dev@example.com"), "old-client-row", cost=0.0)
+    legacy["totals"].pop("usage_source", None)
+    assert _push(base, key, legacy)[0] == 201
+
+    with closing(sqlite3.connect(str(srv.db.path))) as conn:
+        for run_id in ("pre-fix-row", "old-client-row"):
+            conn.execute(
+                "UPDATE runs SET receipt_json = ? WHERE id = ?",
+                (json.dumps({"totals": {"tokens": 0, "cost_usd": 0.0},
+                             "models": {"claude-sonnet-4-5": {"tokens": 0, "cost_usd": 0.0}}}), run_id),
+            )
+        conn.commit()
+
+    fixed = _json(_http(base, "GET", "/api/runs/pre-fix-row", headers=_auth(key))[2])["run"]
+    assert fixed["receipt"]["totals"]["cost_usd"] is None
+    assert fixed["receipt"]["models"]["claude-sonnet-4-5"]["cost_usd"] is None
+    old = _json(_http(base, "GET", "/api/runs/old-client-row", headers=_auth(key))[2])["run"]
+    assert old["usage_source"] is None
+    assert old["receipt"]["totals"]["cost_usd"] == 0.0
+    assert old["receipt"]["models"]["claude-sonnet-4-5"]["cost_usd"] == 0.0
+
+
 def test_a_droid_session_without_recorded_usage_leaves_its_model_unpriced(env, tmp_path):
     """A real Droid transcript with a zero-token settings file, pushed through the client: the
     model and agent groups read n/a, never a priced $0.00 that makes the model look free."""
@@ -717,6 +789,68 @@ def test_a_window_of_only_unknown_costs_has_null_totals(env):
     assert stats["totals"]["cost_is_lower_bound"] is True
     assert stats["by_user"][0]["cost_usd"] is None
     assert stats["by_user"][0]["priced_runs"] == 0
+
+
+def test_stats_by_model_rows_report_unpriced_runs_and_the_lower_bound(env):
+    """VAL-DOCS-005: a by_model row carries the same `unpriced_runs` and `cost_is_lower_bound`
+    fields as the other group rows, and every field of the docs/api.md example appears in a
+    live response."""
+    srv, base = env
+    _, key = srv.db.create_team("demo")
+    fixture = client.build_payload(FIX, user="Ana")
+
+    priced = _stored(fixture, "doc-priced", cost=0.25)
+    priced["totals"] = dict(priced["totals"], usage_source="messages", tokens=79661)
+    priced["models"] = {"claude-sonnet-4-5": {"tokens": 79661, "cost_usd": 0.25}}
+    priced["risk"] = {"score": 80, "level": "high",
+                      "reasons": [{"severity": "high", "code": "secret_file",
+                                   "reason": "read a secrets file", "step": 1}]}
+    assert _push(base, key, priced)[0] == 201
+
+    partial = _stored(fixture, "doc-partial", cost=0.2)
+    partial["totals"] = dict(partial["totals"], usage_source="messages", cost_partial=True)
+    partial["models"] = {"claude-opus-4-6": {"tokens": 10, "cost_usd": 0.2}}
+    assert _push(base, key, partial)[0] == 201
+
+    unknown = _stored(fixture, "doc-unknown", cost=0.0)
+    unknown["totals"] = {"tokens": 0, "cost_usd": 0.0, "usage_source": "missing"}
+    unknown["models"] = {"gpt-5-codex": {"tokens": 0, "cost_usd": 0.0}}
+    assert _push(base, key, unknown)[0] == 201
+
+    stats = _json(_http(base, "GET", "/api/stats?days=30", headers=_auth(key))[2])
+    rows = stats["by_model"]
+    assert all("unpriced_runs" in row and "cost_is_lower_bound" in row for row in rows)
+    sonnet = next(row for row in rows if row["model"] == "Sonnet 4.5")
+    assert sonnet["cost_usd"] == pytest.approx(0.25) and sonnet["priced_runs"] == 1
+    assert sonnet["unpriced_runs"] == 0 and sonnet["cost_is_lower_bound"] is False
+    opus = next(row for row in rows if "opus" in row["model"].lower())
+    assert opus["cost_usd"] == pytest.approx(0.2) and opus["priced_runs"] == 1
+    assert opus["unpriced_runs"] == 1 and opus["cost_is_lower_bound"] is True
+    codex = next(row for row in rows if "codex" in row["model"].lower())
+    assert codex["cost_usd"] is None and codex["priced_runs"] == 0
+    assert codex["unpriced_runs"] == 1 and codex["cost_is_lower_bound"] is True
+
+    doc = (ROOT / "docs" / "api.md").read_text(encoding="utf-8")
+    example = _docs_json_example(doc, "### `GET /api/stats`")
+    assert sorted(_example_keys(example) - _example_keys(stats)) == []
+
+
+def _docs_json_example(text, heading):
+    """The first fenced JSON example under a Markdown heading."""
+    return json.loads(text.split(heading, 1)[1].split("```json", 1)[1].split("```", 1)[0])
+
+
+def _example_keys(value, path=""):
+    """Every field name of a documented JSON example, by path, with `[]` for list elements."""
+    keys = set()
+    if isinstance(value, dict):
+        for name, item in value.items():
+            keys.add(f"{path}.{name}" if path else name)
+            keys |= _example_keys(item, f"{path}.{name}" if path else name)
+    elif isinstance(value, list):
+        for item in value:
+            keys |= _example_keys(item, path + "[]")
+    return keys
 
 
 def test_attribution_defaults_to_the_client_user_and_the_admin_can_opt_into_keys(env):
