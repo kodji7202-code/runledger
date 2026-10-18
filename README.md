@@ -155,9 +155,10 @@ as `API_KEY=…`, `password="…"` and `?access_token=…`, flags such as `--tok
 Masking is pattern-based, so an unusual secret can still get through. Treat a receipt like the
 session transcript it came from.
 
-**Safe mode** is on by default for Markdown and JSON receipts written to stdout or inside a Git
-repository, and always on for the PR comment: local paths are shortened (repository-relative, `~`
-for the home folder) and e-mail addresses are masked. HTML receipts keep full paths. Use `--safe` or
+**Safe mode** is on by default for receipts written inside a Git repository (HTML included) and
+for Markdown and JSON written to stdout, and always on for the PR comment: local paths are
+shortened (repository-relative, `~` for the home folder) and e-mail addresses are masked. A
+receipt written outside a repository keeps full paths unless `--safe` is passed. Use `--safe` or
 `--no-safe` to choose. See [docs/quickstart.md](docs/quickstart.md#safe-mode).
 
 - **`--ai`** sends the prompts, each step's inputs (up to 600 characters per field, which can include

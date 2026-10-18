@@ -129,6 +129,12 @@ change behavior, so read the entry before you upgrade.
 
 ### Fixed
 
+- **The README's safe-mode sentence matches the code (`README.md`):** it promised that "HTML
+  receipts keep full paths", while `runledger.cli.default_safe` writes every format safe by default
+  inside a Git repository, HTML included, and only Markdown and JSON to stdout are always safe. The
+  page now says the same as `docs/quickstart.md`: a receipt written outside a repository keeps full
+  paths unless `--safe` is passed.
+
 - **A test summary behind a log prefix is read again (`runledger.quality`):** a pytest footer
   written by a container, a wrapper or a log stream keeps its counts when it carries a
   docker-compose or container service name (`app  | 3 passed in 0.5s`, `web-1  | 1 failed, 2 passed

@@ -2,6 +2,7 @@
 import json
 import shutil
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -9,6 +10,7 @@ from runledger import github
 from runledger.cli import main
 
 needs_git = pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
+README = Path(__file__).resolve().parents[1] / "README.md"
 
 
 def _session(tmp_path):
@@ -94,6 +96,17 @@ def test_html_safe_inside_repo(tmp_path, capsys):
     assert str(tmp_path / "repo") in body_full
     assert "dev@example.com" in body_full
     assert "Safe mode: off" in err_full and "--safe" in err_full
+
+
+def test_readme_safe_mode_default_matches_the_code():
+    """`cli.default_safe`: a receipt written inside a repo is safe whatever its format, HTML
+    included; only Markdown and JSON to stdout are always safe."""
+    paragraph = README.read_text(encoding="utf-8")
+    paragraph = " ".join(paragraph.split("**Safe mode**", 1)[1].split("\n\n", 1)[0].split())
+    assert "HTML receipts keep full paths" not in paragraph
+    assert "inside a Git repository (HTML included)" in paragraph
+    assert "Markdown and JSON written to stdout" in paragraph
+    assert "written outside a repository keeps full paths unless `--safe` is passed" in paragraph
 
 
 
