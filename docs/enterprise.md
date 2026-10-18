@@ -280,16 +280,17 @@ exports as confidential.
   cannot set it, so a forged request is refused with `csrf_required`. Requests that use an API key in
   the `Authorization` header do not need it.
 - The sign-in POST itself is checked too: a request a browser marks as coming from another origin
-  (`Sec-Fetch-Site: cross-site` or `same-site`, which covers another port or a subdomain; or, without
-  that header, an `Origin` header that is not this server's own origin, `null` included) is refused
-  with `403 cross_site` before the key is read. No cookie is set, so a page that auto-submits a form to
+  (`Sec-Fetch-Site: cross-site` or `same-site`, which covers another port or a subdomain; or an
+  `Origin` header that is not this server's own origin, `null` included) is refused with
+  `403 cross_site` before the key is read. No cookie is set, so a page that auto-submits a form to
   `POST /session` with someone else's key cannot replace the session you are signed in with, and the
   server writes a warning line that never contains the key. This matters because the cookie is
   `SameSite=Strict`: a cross-site form arrives without your session, so the server could not show the
-  switch confirmation below. `Sec-Fetch-Site: same-origin` is accepted without comparing the `Origin`,
-  because every response carries `Referrer-Policy: no-referrer` and Chromium then sends `Origin: null`
-  for the dashboard's own form. A request with neither header (curl, a script) is not a browser and
-  signs in as usual.
+  switch confirmation below. The two headers are checked independently, so `Sec-Fetch-Site:
+  same-origin` never excuses a concrete `Origin` that names another site. The fetch metadata only
+  excuses an absent `Origin` and the opaque `null` one, which is what Chromium sends for the
+  dashboard's own form because every response carries `Referrer-Policy: no-referrer`. A request with
+  neither header (curl, a script) is not a browser and signs in as usual.
 
 ## HTTPS, proxies and cookies
 

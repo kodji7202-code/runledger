@@ -838,21 +838,23 @@ class _Handler(BaseHTTPRequestHandler):
         Sec-Fetch-Site, so a mismatch is refused here, before the body is read.
 
         Sec-Fetch-Site is the browser's own statement and page script cannot set it, so
-        "same-origin" is trusted on its own: every response carries `Referrer-Policy:
-        no-referrer`, which makes Chromium serialize the Origin of a same-origin form POST as
-        "null" (measured with Chrome 155). Without the header, the Origin is compared with the
-        Host header at the scheme the server believes the client used, so a request behind a
-        reverse proxy still matches when the server already trusts X-Forwarded-Proto (see
-        RunLedgerServer.secure_for). A request with neither header is not a browser (curl, a
-        pasted link, an agent) and keeps working; a browser navigation from another origin
-        sends Sec-Fetch-Site: same-site or cross-site, never "none"."""
+        "same-origin" is accepted without the Origin header: every response carries
+        `Referrer-Policy: no-referrer`, which makes Chromium serialize the Origin of a
+        same-origin form POST as "null" (measured with Chrome 155). That opaque "null" is the
+        only Origin `same-origin` excuses; a concrete Origin is still compared, so a request
+        that contradicts its own fetch metadata is refused. Without the fetch metadata, the
+        Origin is compared with the Host header at the scheme the server believes the client
+        used, so a request behind a reverse proxy still matches when the server already trusts
+        X-Forwarded-Proto (see RunLedgerServer.secure_for). A request with neither header is not
+        a browser (curl, a pasted link, an agent) and keeps working; a browser navigation from
+        another origin sends Sec-Fetch-Site: same-site or cross-site, never "none"."""
         site = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
         if site in CROSS_ORIGIN_FETCH_SITES:
             self._refuse_sign_in(f"Sec-Fetch-Site: {site}")
-        if site == "same-origin":
-            return
         origin = self.headers.get("Origin")
         if origin is None:
+            return
+        if site == "same-origin" and origin.strip().lower() == "null":
             return
         host = (self.headers.get("Host") or "").strip()
         scheme = "https" if self._secure() else "http"
@@ -1140,8 +1142,12 @@ def _attested_identity(ident: Identity) -> str:
 
 def _same_origin(origin: str, scheme: str, host: str) -> bool:
     """Whether an Origin header names exactly the scheme and host of this request. "null", an
-    opaque origin, and a value without a scheme are never this request's origin."""
-    parts = urlsplit(origin.strip())
+    opaque origin, a value without a scheme and a value the parser rejects (such as a malformed
+    bracketed IPv6 authority) are never this request's origin."""
+    try:
+        parts = urlsplit(origin.strip())
+    except ValueError:
+        return False
     if parts.scheme.lower() != scheme or not parts.netloc:
         return False
     return _authority(parts.netloc, scheme) == _authority(host, scheme)
