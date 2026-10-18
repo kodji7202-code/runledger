@@ -70,12 +70,15 @@ _RUN_SUBWORDS = {"run", "exec", "x", "dlx", "tool"}
 _RUNNER_NAMES = {"pytest", "py.test", "unittest", "tox", "nox", "jest", "vitest", "mocha", "rspec"}
 _PACKAGE_MANAGERS = {"npm", "pnpm", "yarn", "bun", "deno"}
 _TEST_TOOLS = {"go", "cargo", "dotnet", "mvn", "maven", "gradle", "make", "rake", "mix"}
-# flags and verbs that inspect or install a runner instead of running the suite.
+# package managers that install a runner when their subcommand is an install verb.
+_INSTALLERS = {"pip", "pip2", "pip3", "pipenv", "pdm", "uv", "poetry", "hatch", "rye",
+               "npm", "pnpm", "yarn", "bun", "deno"}
+_INSTALL_VERBS = {"install", "uninstall", "add", "i", "remove"}
+# flags that ask a runner about itself instead of running the suite.
 # `-v` is pytest's verbose flag, so the single-letter ones keep their case.
 _INSPECT_FLAGS = {"-V", "-h"}
 _INSPECT_FLAGS_LOWER = {"--version", "--help", "--collect-only", "--co", "--list", "--list-tests",
                         "--listtests", "--dry-run", "--dryrun"}
-_INSTALL_VERBS = {"install", "uninstall", "add"}
 _TESTS_LINE = re.compile(r"^\s*Tests:?\s+(.+)$", re.M)  # jest and vitest summary line
 _COUNT_WORD = re.compile(
     r"\d+\s+(?:passed|failed|errors?|skipped|xfailed|xpassed|deselected|warnings?)\b")
@@ -205,15 +208,26 @@ def _runner_from(words: List[str]) -> Optional[str]:
     return None
 
 
+def _installs(words: List[str], i: int) -> bool:
+    """True when position `i` is a package manager and the next word its install subcommand."""
+    return (_head_word(words[i]) in _INSTALLERS and i + 1 < len(words)
+            and _head_word(words[i + 1]) in _INSTALL_VERBS)
+
+
 def _runner_of(words: List[str]) -> Optional[str]:
     """The runner a simple command invokes, or None when it installs, inspects or only
-    mentions one. Leading env assignments and wrappers (`uv run`, `python -m`) are skipped."""
+    mentions one. Leading env assignments and wrappers (`uv run`, `python -m`) are skipped.
+    An install verb disqualifies the segment only in a package manager's subcommand slot
+    (`pip install`, `uv add`, `npm i`), so a word that is an argument to a runner
+    (`pytest -k add`, `npm test -- --grep install`) is not read as an install."""
     i = 0
     while i < len(words):
         head = _head_word(words[i])
         if _ENV_ASSIGN.match(words[i]) or head in _COMMAND_WRAPPERS:
             i += 1
             continue
+        if _installs(words, i):
+            return None
         if _PYTHON.match(head):
             i += 1
             while i < len(words) and _PYTHON_VERSION.match(words[i]):
@@ -235,10 +249,10 @@ def _runner_of(words: List[str]) -> Optional[str]:
 
 
 def _inspecting(words: List[str]) -> bool:
-    """True when a segment installs a runner or asks one about itself instead of running."""
+    """True when a segment asks a runner about itself instead of running."""
     for w in words:
         low = w.lower()
-        if w in _INSPECT_FLAGS or low in _INSPECT_FLAGS_LOWER or low in _INSTALL_VERBS:
+        if w in _INSPECT_FLAGS or low in _INSPECT_FLAGS_LOWER:
             return True
     return False
 

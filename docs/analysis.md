@@ -43,7 +43,11 @@ the command word it starts with, after `FOO=1` assignments and wrappers (`uv run
 mocha, rspec, `go test`, `cargo test`, `dotnet test`, `mvn test`, `gradle test`, `make test` and a
 `npm`/`pnpm`/`yarn`/`bun` `test` script. Installing (`pip install pytest`, `npm install jest`),
 inspecting (`pytest --version`, `--help`, `--collect-only`, `jest --list-tests`) and merely
-mentioning a runner (`grep pytest`, `echo npm test`) is not a run. Results are read from the
+mentioning a runner (`grep pytest`, `echo npm test`) is not a run. An install verb (`install`,
+`uninstall`, `add`, `i`, `remove`) only counts as an install when it is a package manager's
+subcommand (`pip install pytest`, `uv add pytest`, `npm i jest`), so a run whose arguments contain
+one of those words (`pytest -k add`, `npm test -- --grep install`) still counts. Results are read
+from the
 runner's summary lines: the pytest footer or quiet form (`... in 0.12s`), the jest/vitest `Tests:`
 line, mocha's `N passing`/`N failing`, go's `ok`/`FAIL` lines, cargo's `test result:` line and
 unittest's `Ran N tests` footer. A count in free-form text (`retried after 3 errors`) is not a
