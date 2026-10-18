@@ -1,4 +1,4 @@
-﻿"""Tests for the RunLedger team server, the push client and the team CLI.
+"""Tests for the RunLedger team server, the push client and the team CLI.
 
 Each test runs a real server on a free port in a background thread, with a
 temporary SQLite database.
