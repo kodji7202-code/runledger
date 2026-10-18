@@ -110,6 +110,17 @@ def test_parse_zero_errors_is_not_a_failure():
     assert parse_test_output("5 passed, 0 errors in 1.2s", "pytest") == (5, 0)
 
 
+def test_timed_log_errors_are_not_a_summary_line():
+    assert parse_test_output("retried after 3 errors in 0.10s", "pytest") is None
+    assert parse_test_output("retried after 3 errors in 0.10s\n3 passed in 0.20s", "pytest") == (3, 0)
+
+
+def test_parse_keeps_the_failed_count_fallback():
+    assert parse_test_output("2 failed, 3 passed", "pytest") == (3, 2)
+    assert parse_test_output("Done.", "pytest") is None
+    assert parse_test_output("the retry failed twice", "pytest") is None
+
+
 @pytest.mark.parametrize("text, runner, counts", [
     ("=== 2 failed, 3 passed, 1 error in 0.50s ===", "pytest", (3, 3)),
     ("2 failed, 3 passed in 0.5s", "pytest", (3, 2)),
@@ -162,6 +173,22 @@ def test_inspecting_a_runner_is_not_a_test_run(command):
 ])
 def test_real_runner_invocations_are_still_test_runs(command):
     assert _is_test_command(command)
+
+
+@pytest.mark.parametrize("command", [
+    "& pytest -q", '& "pytest" -q', '& "C:\\Python312\\python.exe" -m pytest -q',
+    '& "C:\\Users\\dev\\.venv\\Scripts\\python.exe" -m pytest -q tests',
+    "& .\\venv\\Scripts\\pytest.exe -q", "cd app; & pytest -q",
+])
+def test_powershell_call_operator_invocations_are_test_runs(command):
+    assert _is_test_command(command)
+
+
+@pytest.mark.parametrize("command", [
+    "echo 'pytest'", 'Write-Output "pytest"', "& echo pytest", "& 'echo' pytest",
+])
+def test_a_call_operator_before_a_non_runner_is_not_a_test_run(command):
+    assert not _is_test_command(command)
 
 
 def test_a_path_containing_install_does_not_disqualify_a_run():
@@ -269,6 +296,39 @@ def test_log_errors_before_a_passing_summary_are_not_a_failure():
 def test_zero_errors_footer_still_passes():
     q = score_run(_run([_bash(1, "python -m pytest -q", result="5 passed, 0 errors in 1.2s")]), [])
     assert _sig(q, "test_outcome")["value"] == "pass"
+
+
+def test_timed_log_errors_before_a_passing_summary_end_as_a_pass():
+    q = score_run(_run([_write(1, "src/a.py"),
+                        _bash(2, "python -m pytest -q",
+                              result="retried after 3 errors in 0.10s\n3 passed in 0.20s")]), [])
+    assert _sig(q, "tests_run")["impact"] == 10
+    assert _sig(q, "test_outcome")["value"] == "pass"
+    assert _sig(q, "test_outcome")["impact"] == 15
+
+
+@pytest.mark.parametrize("command", [
+    "& pytest -q", '& "C:\\Python312\\python.exe" -m pytest -q',
+])
+def test_powershell_call_operator_earns_test_credit_and_outcome(command):
+    q = score_run(_run([_write(1, "src/a.py"),
+                        _step(2, "PowerShell", {"command": command}, result="3 passed in 0.10s")]), [])
+    assert _sig(q, "tests_run") == {
+        "name": "tests_run", "value": 1, "impact": 10,
+        "note": "1 test command(s) ran in the session.",
+    }
+    assert _sig(q, "test_outcome")["value"] == "pass"
+    assert _sig(q, "test_outcome")["impact"] == 15
+
+
+def test_explicit_failed_counts_after_a_pass_end_the_run_as_failed():
+    steps = [
+        _bash(1, "pytest -q", result="3 passed in 0.10s"),
+        _bash(2, "python -m pytest -q", result="2 failed, 3 passed"),
+    ]
+    q = score_run(_run(steps), [])
+    assert _sig(q, "test_outcome")["value"] == "fail"
+    assert _sig(q, "test_outcome")["impact"] == -15
 
 
 def test_fail_then_pass_is_a_recovery():
