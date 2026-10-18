@@ -1629,11 +1629,14 @@ def test_is_guard_hook_rejects_attached_shell_operators(command):
     '"/usr/$(printf bin)/python3.13t" -m runledger guard',
     '"/usr/`printf bin`/python3.13t" -m runledger guard',
     '"$PYTHON3" -m runledger guard',
+    r'"/usr/\$python/python3.13t" -m runledger guard',
 ])
 def test_is_guard_hook_rejects_executable_substitutions(command):
     """CORE-SCR-R4-004: POSIX `$(...)` and backticks stay executable inside double quotes, so a
     quoted executable that computes its own path is not the single command the installer
-    writes: it must never be replaced or removed (VAL-CORE-036/037)."""
+    writes: it must never be replaced or removed (VAL-CORE-036/037). A backslash-escaped `$` is
+    read as an operator too: an entry that spells a `$` at all is not the command install
+    writes, and the conservative reading never touches someone else's hook."""
     assert guard._is_guard_hook({"type": "command", "command": command}) is False
 
 
