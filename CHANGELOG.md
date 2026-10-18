@@ -546,6 +546,17 @@ change behavior, so read the entry before you upgrade.
   not masked prints one line on stderr: `tip: --safe (or RUNLEDGER_PUSH_SAFE=1) masks local paths and
   e-mail addresses before they are sent`; a loopback server and plain HTTP stay silent. The developer
   name from `--user` is kept as given: it is the name the dashboard attributes the run to.
+- **Packaging and releases describe and check the whole product (`pyproject.toml`, `.github/`,
+  `tools/check_release.py`):** the package description and keywords now name every supported agent
+  (Claude Code, Codex CLI, Factory Droid, Aider), and the wheel discovers its packages instead of
+  listing them, so a new subpackage ships without a second edit. CI runs the test matrix on Python
+  3.9-3.13 on Ubuntu, Windows and macOS, caches pip, times every job out, builds the sdist and wheel
+  and runs `twine check` on them, and lints `deploy/docker-compose.yml`; it no longer runs twice for
+  a branch with an open pull request. Pushing a `v*` tag now refuses to publish unless the tag,
+  `pyproject.toml`, `runledger.__version__` and the CHANGELOG heading agree and the tagged commit is
+  on `main`, and after PyPI succeeds it creates the GitHub Release from that CHANGELOG section. The
+  publish action is pinned by commit and Dependabot watches the actions, the Docker base image and
+  the build tools.
 
 ## [0.6.0] - 2026-10-15
 

@@ -6,13 +6,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "runledger-ai"
 version = "0.6.0"
-description = "A black box recorder for AI coding agents: turn Claude Code runs into shareable receipts."
+description = "Audit, cost and real-time guard for AI coding agents: receipts, risk score, rollback. Claude Code, Codex CLI, Factory Droid, Aider."
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.9"
 authors = [{ name = "RunLedger", email = "hello@runledger.site" }]
-keywords = ["ai", "coding-agents", "claude-code", "codex", "aider", "audit", "receipts", "guardrails", "observability"]
+keywords = ["ai", "ai-agents", "coding-agents", "claude-code", "codex", "factory-droid", "droid", "aider", "audit", "receipts", "guardrails", "observability"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
@@ -39,8 +39,9 @@ Documentation = "https://github.com/kodji7202-code/runledger/tree/main/docs"
 [project.scripts]
 runledger = "runledger.cli:main"
 
-[tool.setuptools]
-packages = ["runledger", "runledger.server", "runledger.adapters"]
+[tool.setuptools.packages.find]
+# Discover every runledger package, so a new subpackage ships without a second edit.
+include = ["runledger*"]
 
 [tool.setuptools.package-data]
 runledger = ["prices.json", "receipt.schema.json"]

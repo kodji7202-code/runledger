@@ -1,0 +1,25 @@
+# Keep the workflow actions, the Docker base image and the build tools current.
+# The publish action in release.yml is pinned by commit SHA, so Dependabot proposes the bumps.
+version: 2
+
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    labels:
+      - dependencies
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    labels:
+      - dependencies
+
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    labels:
+      - dependencies
