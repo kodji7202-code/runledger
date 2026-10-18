@@ -215,6 +215,26 @@ def test_missing_usage_or_unreadable_settings_never_fabricate_run_cost(tmp_path,
     assert run.cost is None
 
 
+def test_zero_settings_usage_is_missing_not_a_free_run(tmp_path, monkeypatch, capsys):
+    """A settings file that names a priced model but reports zero tokens recorded no usage:
+    the receipt shows n/a (json null), never $0.00."""
+    monkeypatch.setenv("FACTORY_HOME", str(tmp_path / "factory"))
+    path = _session(tmp_path, [_message([_call("Read", {"file_path": "a.py"})])],
+                    settings={"model": MODEL, "tokenUsage": {"inputTokens": 0, "outputTokens": 0}})
+    run = droid.parse(path)
+    apply_costs(run)
+    assert run.usage_source == "missing"
+    assert run.models == {MODEL: Usage()}
+    assert run.cost is None and not run.cost_partial
+
+    data = _receipt(capsys, path, "json")
+    assert data["totals"]["usage_source"] == "missing"
+    assert data["totals"]["cost_usd"] is None
+    assert data["totals"]["cost_partial"] is False
+    md = _receipt(capsys, path, "md")
+    assert "**Cost:** n/a" in md and "**Tokens:** n/a" in md
+
+
 SHELL_FIX = FIXTURES / "droid_shell_edits.jsonl"
 SHELL_ID = "4f081969-21df-49b2-9272-75a305796c06"
 SHELL_MODEL = "claude-sonnet-5-5"

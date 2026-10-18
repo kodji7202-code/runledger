@@ -168,6 +168,7 @@ class RunLedgerServer(ThreadingHTTPServer):
         trust_proxy: bool = False,
         trusted_proxies: Sequence[_IPNetwork] = (),
         retention_days: Optional[int] = None,
+        audit_retention_days: Optional[int] = None,
     ) -> None:
         self.db = db
         self.log_requests = log_requests
@@ -177,6 +178,7 @@ class RunLedgerServer(ThreadingHTTPServer):
         self.trusted_proxies: Tuple[_IPNetwork, ...] = tuple(trusted_proxies)
         self.limiter = FailureLimiter()
         self.retention_days = retention_days
+        self.audit_retention_days = audit_retention_days
         self._maintenance_stop = threading.Event()
         super().__init__(address, _Handler)
         # The base URL people see in approval links. The default is the bound address,
@@ -199,14 +201,18 @@ class RunLedgerServer(ThreadingHTTPServer):
 
     def start_maintenance(self, interval_s: float = MAINTENANCE_INTERVAL_S) -> bool:
         """Apply retention now and then every interval_s, on a daemon thread, until
-        server_close(). Does nothing (returns False) when retention is not configured."""
-        if not self.retention_days:
+        server_close(). Does nothing (returns False) when neither retention period is set."""
+        if not self.retention_days and not self.audit_retention_days:
             return False
 
         def loop() -> None:
             while True:
                 try:
-                    removed = {k: v for k, v in maintenance.run_maintenance(self.db, self.retention_days).items() if v}
+                    removed = {
+                        k: v for k, v in maintenance.run_maintenance(
+                            self.db, self.retention_days, audit_days=self.audit_retention_days,
+                        ).items() if v
+                    }
                     if removed:
                         sys.stderr.write(f"RunLedger: maintenance removed {removed}\n")
                 except Exception:
@@ -308,6 +314,7 @@ def make_server(
     trust_proxy: bool = False,
     trusted_proxies: Optional[Sequence[str]] = None,
     retention_days: Optional[int] = None,
+    audit_retention_days: Optional[int] = None,
 ) -> RunLedgerServer:
     """Open the database and bind the server. Port 0 picks a free port (see server_address).
     The caller owns the server: call shutdown(), server_close() and db.close() when done.
@@ -317,7 +324,10 @@ def make_server(
     the Secure flag on the session cookie. trust_proxy honours X-Forwarded-Proto from a
     reverse proxy the same way. trusted_proxies (and $RUNLEDGER_TRUSTED_PROXIES, comma
     separated) are the proxy addresses or CIDR ranges whose X-Forwarded-For is believed.
-    retention_days defaults to RUNLEDGER_RETENTION_DAYS (unset keeps all history).
+    retention_days defaults to RUNLEDGER_RETENTION_DAYS (unset keeps all history, and a value
+    below the 35-day floor is raised to it with a warning). audit_retention_days defaults to
+    RUNLEDGER_AUDIT_RETENTION_DAYS: unset keeps audit events for 365 days while runs are being
+    pruned, and 0 keeps them forever.
     Raises ValueError for an invalid address, range or retention setting before the
     database is opened."""
     if bool(tls_cert) != bool(tls_key):
@@ -325,6 +335,8 @@ def make_server(
     networks = parse_trusted_proxies(list(trusted_proxies or []) + _env_list(TRUSTED_PROXIES_ENV))
     if retention_days is None:
         retention_days = maintenance.retention_from_env()
+    if audit_retention_days is None:
+        audit_retention_days = maintenance.audit_retention_from_env()
     tls_context = make_tls_context(tls_cert, tls_key) if tls_cert else None
     secure = bool(secure_cookies) or _env_flag(SECURE_COOKIES_ENV)
     db = Database(db_path)
@@ -334,6 +346,7 @@ def make_server(
             (host, port), db, log_requests=log_requests, public_url=public_url,
             tls_context=tls_context, secure_cookies=secure, trust_proxy=bool(trust_proxy),
             trusted_proxies=networks, retention_days=retention_days,
+            audit_retention_days=audit_retention_days,
         )
     except Exception:
         db.close()
@@ -639,7 +652,12 @@ class _Handler(BaseHTTPRequestHandler):
             raise _HttpError(400, "invalid_json", "The body must be UTF-8 JSON.") from None
         if not isinstance(payload, dict):
             raise _HttpError(400, "invalid_json", "The body must be a JSON object.")
-        run = receipt_to_run(payload)
+        run = receipt_to_run(
+            payload,
+            attribution=self.server.db.team_attribution(ident.team_id),
+            pushed_by=ident.label,
+            role=ident.role,
+        )
         result = self.server.db.upsert_run(
             ident.team_id,
             run,
@@ -1153,12 +1171,23 @@ def _title(payload: Dict[str, Any]) -> str:
     return _text(payload.get("overview"), 200) or ""
 
 
-def receipt_to_run(payload: Dict[str, Any]) -> Dict[str, Any]:
+def receipt_to_run(
+    payload: Dict[str, Any],
+    *,
+    attribution: str = "client",
+    pushed_by: Optional[str] = None,
+    role: Optional[str] = None,
+) -> Dict[str, Any]:
     """Validate a pushed receipt and flatten it into the columns the store keeps.
 
     Accepts the output of `runledger receipt --format json`, plus the fields the
     client adds: user, project, html, and models with cost_usd. Missing or odd
-    values fall back to safe defaults. Only a missing session_id is rejected."""
+    values fall back to safe defaults. Only a missing session_id is rejected.
+
+    With `attribution` "key" a run pushed by a member is displayed under the label of the
+    key that pushed it (`pushed_by`), leaving the client's own user value in the receipt;
+    admin keys always keep the client user. A receipt whose usage is missing keeps an
+    unknown cost even when it carries a cost of 0.0."""
     session_id = payload.get("session_id")
     if not isinstance(session_id, str) or not _valid_id(session_id):
         raise _HttpError(400, "invalid_receipt", "The receipt needs a session_id of 1-200 characters.")
@@ -1167,7 +1196,10 @@ def receipt_to_run(payload: Dict[str, Any]) -> Dict[str, Any]:
     risk = _dict(payload.get("risk"))
     steps = [s for s in _list(payload.get("steps")) if isinstance(s, dict)]
     cwd = _text(payload.get("cwd"), 500)
-    user = _text(payload.get("user"), 200) or "unknown"
+    client_user = _text(payload.get("user"), 200) or "unknown"
+    user = client_user
+    if attribution == "key" and pushed_by and role != "admin":
+        user = pushed_by
     project = _text(payload.get("project"), 200) or _folder_name(cwd) or "unknown"
     agent = _text(payload.get("agent"), 100)  # the agent's label, e.g. "Claude Code"
 
@@ -1209,9 +1241,14 @@ def receipt_to_run(payload: Dict[str, Any]) -> Dict[str, Any]:
     # stored as null (or dropped item by item) and never rejects the push.
     review = insights.review_fields(payload)
     receipt = {k: v for k, v in payload.items() if k != "html"}
-    receipt["user"] = user
+    receipt["user"] = client_user
     receipt["project"] = project
     receipt.update({k: review[k] for k in ("quality", "recommendations", "ai_review")})
+
+    usage_source = _enum(totals.get("usage_source"), USAGE_SOURCES)
+    # An agent that recorded no usage has an unknown cost: whatever the client put in cost_usd
+    # (usually 0.0) would read as a free run.
+    cost = None if usage_source == "missing" else _money(totals.get("cost_usd"))
 
     return {
         "id": session_id,
@@ -1219,6 +1256,7 @@ def receipt_to_run(payload: Dict[str, Any]) -> Dict[str, Any]:
         "project": project,
         "agent": agent,
         "agent_id": _text(payload.get("agent_id"), 100),
+        "pushed_by": pushed_by,
         "title": _title(payload),
         "started_at": _iso(payload.get("started")),
         "ended_at": _iso(payload.get("ended")),
@@ -1226,9 +1264,9 @@ def receipt_to_run(payload: Dict[str, Any]) -> Dict[str, Any]:
         "steps": _int(totals.get("steps"), len(steps)) or 0,
         "tokens": _int(totals.get("tokens"), 0) or 0,
         "files_changed": _int(totals.get("files_changed"), 0) or 0,
-        "cost": _money(totals.get("cost_usd")),
-        "usage_source": _enum(totals.get("usage_source"), USAGE_SOURCES),
-        "cost_partial": totals.get("cost_partial") is True,
+        "cost": cost,
+        "usage_source": usage_source,
+        "cost_partial": totals.get("cost_partial") is True and cost is not None,
         "risk_score": score,
         "risk_level": level,
         "risks": risks,

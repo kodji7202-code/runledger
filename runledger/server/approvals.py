@@ -176,7 +176,8 @@ def check_webhook_url(field: str, value: Any) -> Optional[str]:
     )
 
 
-_SETTING_NAMES = ("slack_webhook_url", "webhook_url", "approval_ttl_s")
+_SETTING_NAMES = ("slack_webhook_url", "webhook_url", "approval_ttl_s", "attribution")
+ATTRIBUTIONS = ("client", "key")
 
 
 def validate_settings(payload: Any) -> Dict[str, Any]:
@@ -188,6 +189,11 @@ def validate_settings(payload: Any) -> Dict[str, Any]:
             changes[key] = check_webhook_url(key, value)
         elif key == "approval_ttl_s":
             changes[key] = check_ttl(value)
+        elif key == "attribution":
+            text = value.strip().lower() if isinstance(value, str) else ""
+            if text not in ATTRIBUTIONS:
+                raise InvalidInput(f"'attribution' must be one of: {', '.join(ATTRIBUTIONS)}.")
+            changes[key] = text
         else:
             shown = str(key)[:50]
             raise InvalidInput(
@@ -307,17 +313,33 @@ def _usd(amount: float) -> str:
 
 
 def budget_slack_text(alert: Dict[str, Any]) -> str:
-    """One line for Slack, e.g. "RunLedger budget: team spend $0.11 is 216% of $0.05 for 2026-10"."""
+    """One line for Slack, e.g. "RunLedger budget: team spend $0.11 is 216% of $0.05 for 2026-10".
+    When some runs of the month have no known cost, the figure is named as a lower bound."""
     who = "team spend" if alert.get("user") is None else f"developer {alert['user']} spend"
     text = (
         f"RunLedger budget: {who} {_usd(alert['spend_usd'])} is {math.floor(alert['pct'])}% "
-        f"of {_usd(alert['limit_usd'])} for {alert['month']}"
+        f"of {_usd(alert['limit_usd'])} for {alert['month']}{_lower_bound_note(alert)}"
     )
     return _slack_escape(text)
 
 
+def _lower_bound_note(alert: Dict[str, Any]) -> str:
+    """How the alerted figure falls short, or "" for a fully priced month. The counts say what
+    part of the month's runs is unknown, so a reader never takes the spend for the whole bill."""
+    if not alert.get("lower_bound"):
+        return ""
+    unpriced = int(alert.get("unpriced_runs") or 0)
+    runs = int(alert.get("runs") or 0)
+    partial = int(alert.get("partial_runs") or 0)
+    if unpriced:
+        return f" (lower bound: {unpriced} of {runs} runs unpriced)"
+    if partial:
+        return f" (lower bound: {partial} of {runs} runs only partly priced)"
+    return " (lower bound)"
+
+
 def budget_webhook_payload(team_name: str, alert: Dict[str, Any]) -> Dict[str, Any]:
-    return {
+    payload = {
         "type": "budget_alert",
         "team": team_name,
         "month": alert["month"],
@@ -328,6 +350,14 @@ def budget_webhook_payload(team_name: str, alert: Dict[str, Any]) -> Dict[str, A
         "limit_usd": alert["limit_usd"],
         "pct": alert["pct"],
     }
+    if alert.get("lower_bound"):
+        # The spend of a month with unknown costs is a floor, not the bill.
+        payload["cost_is_lower_bound"] = True
+        payload["runs"] = int(alert.get("runs") or 0)
+        payload["unpriced_runs"] = int(alert.get("unpriced_runs") or 0)
+        payload["partial_runs"] = int(alert.get("partial_runs") or 0)
+        payload["note"] = _lower_bound_note(alert).strip(" ()")
+    return payload
 
 
 def notify_budget_alerts(settings: Dict[str, Any], team_name: str, alerts: List[Dict[str, Any]]) -> None:

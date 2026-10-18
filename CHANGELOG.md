@@ -296,6 +296,31 @@ change behavior, so read the entry before you upgrade.
   are unchanged - the shell's own words still decide - and the whole spaced path stays visible,
   with the assignment inside it masked.
 
+- **An unknown cost is `null` (n/a), never `$0.00`, and a partly priced one is a lower bound
+  (`runledger.server`, `runledger.pricing`):** a run whose agent recorded no usage keeps an unknown
+  cost (`usage_source: "missing"`, `cost_usd: null`) instead of a free-looking `0`, and a Droid session
+  without usage gets no cost in the receipt at all. Runs whose cost is only partly priced are counted
+  as `partial_runs` and reported with a `≥` prefix: `GET /api/stats` totals and every breakdown carry
+  `cost_usd` (`null` when nothing in the group is priced), `priced_runs`, `unpriced_runs` (null or
+  partly priced) and `cost_is_lower_bound`, insights agents and models show `cost_usd: null` when no
+  run of theirs is priced, `GET /api/budgets/status` counts the runs behind the month's spend and says
+  when it is a lower bound, budget alerts name the unpriced runs ("lower bound: 2 of 30 runs
+  unpriced"), the runs CSV leaves an unknown cost cell empty, and the compliance report reads `n/a`
+  for a window with no priced run and `(lower bound)` with the counts otherwise. A reported zero
+  (`usage_source: "messages"` and `cost_usd: 0.0`) and a receipt from an older client keep their old
+  meaning and still show `$0.00`. JSON consumers that assumed a number must handle `null` (see
+  docs/api.md).
+
+- **Retention can no longer delete the runs behind a budget alert, and audit events do not follow the
+  runs' period (`runledger.server.maintenance`):** `RUNLEDGER_RETENTION_DAYS` below 35 is raised to 35
+  with a warning on startup, because a shorter period deleted the current month's runs, dropped the
+  month's spend and fired the same `budget.alert` threshold a second time. Budget alerts are purged by
+  the calendar month they belong to (`month < cutoff month`), never by when they fired, so an alert of
+  the current month survives any period. Audit events are deleted against
+  `RUNLEDGER_AUDIT_RETENTION_DAYS` only (default 365 days while runs are pruned, `0` keeps them for
+  ever), so a 35-day run period keeps a year of audit history instead of deleting it with the runs.
+  With neither variable set, nothing is deleted, whatever its age, as in v0.6.0.
+
 ### Added
 
 - **A re-pushed session supersedes the run it replaces, and its history is kept (`runledger.server`):**
@@ -317,6 +342,15 @@ change behavior, so read the entry before you upgrade.
   hold (no data is rewritten or dropped). Runs are listed, filtered by window and purged by `sort_at`
   (the start time, or the push time when a receipt has none), so a run without a start time is no
   longer sorted or counted by a different column than the one the list uses.
+- **Optional key attribution, and audit events on their own retention period (`runledger.server`):**
+  the new team setting `attribution` (`client`, the default, or `key`) decides whether a pushed run is
+  stored under the name the client sent or under the label of the key that pushed it. With `key` a
+  member cannot choose the displayed user (admin keys still push under the client's name for someone
+  else), the client's own value stays in the stored receipt, the run reports `pushed_by` in the API,
+  and per-user budgets and the dashboard follow the key label. Every change is a `team.settings` audit
+  event. The new `RUNLEDGER_AUDIT_RETENTION_DAYS` variable deletes audit events on their own schedule
+  (default 365 days while runs are pruned, `0` keeps them for ever), so audit history is no longer
+  deleted on the runs' period.
 
 ## [0.6.0] - 2026-10-15
 

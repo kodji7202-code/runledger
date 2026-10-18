@@ -282,12 +282,14 @@ def _models_block(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
         out.append({
             "model": label,
             "runs": slot["runs"],
-            "cost_usd": round(slot["cost"], 6),
+            # No priced run: the model's cost is unknown (n/a), not zero.
+            "cost_usd": round(slot["cost"], 6) if slot["priced"] else None,
+            "priced_runs": slot["priced"],
             "avg_quality": round(slot["q_sum"] / slot["q_n"], 1) if slot["q_n"] else None,
             "cost_per_run": round(slot["cost"] / slot["priced"], 6) if slot["priced"] else None,
             "share_of_cost": round(slot["cost"] / total, 4) if total > 0 else None,
         })
-    out.sort(key=lambda m: (-m["cost_usd"], -m["runs"], m["model"]))
+    out.sort(key=lambda m: (m["cost_usd"] is None, -(m["cost_usd"] or 0.0), -m["runs"], m["model"]))
     return out[:TABLE_LIMIT]
 
 
@@ -296,14 +298,18 @@ def _agents_block(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     for row in rows:
         avg_quality = row["avg_quality"]
         avg_risk = row["avg_risk"]
+        priced = int(row["priced_runs"] or 0) if "priced_runs" in row.keys() else 0
+        cost = row["cost_usd"]
         out.append({
             "agent": row["name"],
             "runs": int(row["runs"]),
             "avg_quality": None if avg_quality is None else round(float(avg_quality), 1),
             "avg_risk": None if avg_risk is None else round(float(avg_risk), 1),
-            "cost_usd": round(float(row["cost_usd"] or 0.0), 6),
+            # An agent whose runs were never priced has an unknown cost, not a zero one.
+            "cost_usd": None if cost is None else round(float(cost), 6),
+            "priced_runs": priced,
         })
-    out.sort(key=lambda a: (-a["cost_usd"], -a["runs"], a["agent"]))
+    out.sort(key=lambda a: (a["cost_usd"] is None, -(a["cost_usd"] or 0.0), -a["runs"], a["agent"]))
     return out[:TABLE_LIMIT]
 
 

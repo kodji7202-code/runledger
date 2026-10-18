@@ -398,9 +398,14 @@ def partial_note(run: Run) -> str:
 def apply_costs(run: Run) -> None:
     """Price every step and model bucket. Tiering follows each request's own usage;
     buckets that are only cumulative estimates (Droid settings totals, aggregate
-    native totals) keep the base tier and are noted."""
+    native totals) keep the base tier and are noted. An agent that recorded no usage
+    leaves the run cost unknown, never a priced zero."""
     for s in run.steps:
         s.cost = cost_of(s.usage, s.model) if s.usage_known else None
+    if run.usage_source == "missing":
+        run.cost = None
+        run.cost_partial = False
+        return
     total = 0.0
     known = False
     for model, u in run.models.items():

@@ -22,8 +22,12 @@ services:
       # client address from X-Forwarded-For and counts each user separately. See ../docs/self-hosting.md
       # ("Trusted proxy on the Compose network") for how to find the subnet.
       RUNLEDGER_TRUSTED_PROXIES: ${RUNLEDGER_TRUSTED_PROXIES:-}
-      # Delete runs, approvals and audit events older than this many days. Empty keeps everything.
+      # Delete runs, their history, approvals and budget alerts older than this many days.
+      # 35 or more; a smaller value is raised to 35. Empty keeps everything.
       RUNLEDGER_RETENTION_DAYS: ${RUNLEDGER_RETENTION_DAYS:-}
+      # Delete audit events older than this many days, on their own schedule. Empty keeps them
+      # for 365 days while runs are pruned; 0 keeps them for ever.
+      RUNLEDGER_AUDIT_RETENTION_DAYS: ${RUNLEDGER_AUDIT_RETENTION_DAYS:-}
     volumes:
       - runledger-data:/data
     # Not published on the host. Only the Caddy service can reach this port.
