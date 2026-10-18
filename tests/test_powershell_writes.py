@@ -245,6 +245,31 @@ def test_powershell_cmdlets_inside_bash_step_get_powershell_analysis():
     assert "test_deleted" in codes
 
 
+def test_receipt_lists_powershell_writes_and_deletes(tmp_path, capsys):
+    """VAL-QUAL-009: a native session whose writes go through PowerShell still lists
+    the written file and the deleted one, and counts them in the totals."""
+    from runledger.cli import main
+    session = {
+        "runledger_format": 1, "agent": "native", "session_id": "ps-writes",
+        "cwd": str(tmp_path), "prompts": ["Change the payment retry logic"],
+        "steps": [
+            {"tool": "PowerShell", "input": {"command": "Set-Content -Path src/b.py -Value 'x'"},
+             "result_text": "", "is_error": False},
+            {"tool": "PowerShell", "input": {"command": "Remove-Item old.py"},
+             "result_text": "", "is_error": False},
+        ],
+    }
+    path = tmp_path / "ps.runledger.json"
+    path.write_text(json.dumps(session), encoding="utf-8")
+
+    assert main(["receipt", str(path), "--format", "json", "-o", "-", "--no-safe"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    files = {f["path"]: f for f in data["files"]}
+    assert files["src/b.py"]["deleted"] is False
+    assert files["old.py"]["deleted"] is True
+    assert data["totals"]["files_changed"] == 2
+
+
 def test_guard_evaluates_powershell_tool_events(tmp_path):
     ev_secret = {
         "session_id": "s-ps",

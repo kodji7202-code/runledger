@@ -67,6 +67,25 @@ change behavior, so read the entry before you upgrade.
 
 ### Fixed
 
+- **Quality score: installing or inspecting a runner is no longer a test run, and an unreadable
+  result is unknown instead of a pass (`runledger.quality`, `runledger.risk`, `runledger.parser`):**
+  each `&&`/`;`/`|`/newline segment is judged by the command word it starts with, after `FOO=1`
+  assignments and wrappers (`uv run`, `poetry run`, `npx`, `python -m`) are stripped, so
+  `pip install pytest`, `npm install --save-dev jest` and `python -m pip install pytest` earn no
+  `tests_run` credit and no pass outcome, while `uv run pytest`, `cd app && pytest`, `pytest | tee`,
+  `npx jest`, `npm test`, `go test`, `cargo test` and `dotnet test` still count (a path such as
+  `tests/test_install.py` never disqualifies a real run). `pytest --version`, `--help`,
+  `--collect-only`, `--co` and `jest --list-tests` are inspections, not runs. Counts are read only
+  from a runner's summary lines (the pytest footer or quiet form, the jest/vitest `Tests:` line,
+  mocha's `N passing`/`N failing`, go's `ok`/`FAIL` lines, cargo's `test result:` line, unittest's
+  `Ran N tests` footer), so "retried after 3 errors" in log text is not a failure, `0 errors` is
+  not one either, and a run whose output has no readable summary is unknown: it earns neither the
+  +15 nor the -15 instead of counting as a pass. The test-file diff verdicts are computed once per
+  receipt and shared with the risk rules, and a file rewritten five or more times through the shell
+  (`echo x >> a.py`, `sed -i`, `Set-Content`) now counts toward `retry_loops`, as PowerShell writes
+  already count toward the changed-file list. Sessions that only installed a runner score up to 25
+  points lower than before.
+
 - **Secrets in assignments whose name only contains a keyword (`runledger.secrets`,
   `runledger.guard`):** `MYTOKEN=abc123`, `TOKEN2=abc123` and `MY_ACCESS_TOKEN2=abc123` are masked
   again in `guard.log`, receipts and the text sent to an LLM, as they were in v0.6.0. The redaction

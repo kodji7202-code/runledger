@@ -16,7 +16,7 @@ run with no prompts has no scope signal, and a run with no steps has no step-bas
 | Signal | Points | What it measures |
 | --- | --- | --- |
 | `tests_run` | +10, or -10 | A test command ran. -10 when files changed and no test command ran. |
-| `test_outcome` | +15, or -15 | The last test run with a readable result passed or failed. |
+| `test_outcome` | +15, or -15 | The last test run with a readable summary passed or failed. Output with no summary is unknown: it earns no test points either way. |
 | `failing_then_passing` | +5 | A failing run was followed by a passing run that ends green. |
 | `failing_streak` | -5 per repeat, max -15 | Consecutive failing test runs beyond the first. |
 | `test_tampering` | -10 per test deleted or skipped, -5 per test weakened, max -25 | Test changes flagged by the risk rules. Low-severity fixture deletions do not count. |
@@ -29,17 +29,26 @@ replaced; fewer assertions, or a removed test with no replacement, is weakened. 
 diff verdict, it replaces what the per-step Edit rule said about that file. When HEAD is newer
 than the session start (the changes were committed before the receipt ran), the diff is taken
 against the last commit before the session start instead, recorded as `git_base` in JSON.
+The diff is read once per receipt and shared with the risk rules.
 | `error_rate` | +5 down to -15 | Share of steps that returned an error. 0% gives +5, and 100% gives -15 at most. |
-| `retry_loops` | -5 each, max -15 | A non-test command repeated 3+ times, or a file edited 5+ times. |
+| `retry_loops` | -5 each, max -15 | A non-test command repeated 3+ times, or a file edited 5+ times through an edit tool or a shell command (`echo x >> a.py`, `sed -i`, `Set-Content`). |
 | `scope` | -1 per unrelated file past the fourth, max -10 | Changed files that share no word with the prompts. Mild, and only when at least 5 files are unrelated and they are over half of the changes. |
 | `unfinished` | -10 | The final message says it could not finish, is unable to do something, has a TODO, is not implemented, or is incomplete. |
 | `cost_efficiency` | +5, 0, -5 or -10 | Estimated USD per changed line: up to $0.02, $0.10, $0.25, more. |
 | `risk_level` | -20 High, -8 Medium, 0 Low | The rule-based risk level from `risk.py`. |
 
-Test commands are recognised by name: pytest, unittest, jest, vitest, mocha, `go test`,
-`cargo test`, and `npm`, `pnpm`, `yarn` or `bun` test. Results are read from their summary lines.
-A failed command with no summary counts as a failure. A successful command with output but no
-summary counts as a pass.
+A test command is a command that runs a runner: each `&&`, `;`, `|` or newline segment is judged by
+the command word it starts with, after `FOO=1` assignments and wrappers (`uv run`, `poetry run`,
+`npx`, `python -m`) are stripped. Runners are pytest, `py.test`, unittest, tox, nox, jest, vitest,
+mocha, rspec, `go test`, `cargo test`, `dotnet test`, `mvn test`, `gradle test`, `make test` and a
+`npm`/`pnpm`/`yarn`/`bun` `test` script. Installing (`pip install pytest`, `npm install jest`),
+inspecting (`pytest --version`, `--help`, `--collect-only`, `jest --list-tests`) and merely
+mentioning a runner (`grep pytest`, `echo npm test`) is not a run. Results are read from the
+runner's summary lines: the pytest footer or quiet form (`... in 0.12s`), the jest/vitest `Tests:`
+line, mocha's `N passing`/`N failing`, go's `ok`/`FAIL` lines, cargo's `test result:` line and
+unittest's `Ran N tests` footer. A count in free-form text (`retried after 3 errors`) is not a
+summary, and `0 errors` is not a failure. A failed command with no summary counts as a failure;
+a successful command whose output has no readable summary is unknown, so it adds no test points.
 
 ## Cost recommendations
 
