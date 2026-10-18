@@ -217,9 +217,13 @@ def test_spaced_drive_redirect_target_keeps_a_traversing_operand(command):
     "Remove-Item -Path .env -WhatIf",
     "[System.IO.File]::WriteAllText($p, 'x')",
     r"Set-Content HKLM:\Software\RunLedger -Value x",
+    r"Set-Content HKCU:\Software\RunLedger -Value x",
     r"Remove-Item Cert:\CurrentUser\My\abc123",
     r"Out-File Env:\RUNLEDGER_TEST",
     r"New-Item -Path Function:\prompt -Value x",
+    r"Set-Content Variable:\x -Value 1",
+    r"Set-Content Alias:\ll -Value x",
+    r"Set-Content WSMan:\localhost\Client -Value x",
 ])
 def test_powershell_variable_and_wildcard_targets_are_skipped(command):
     assert ps_writes(command) == []
@@ -229,6 +233,32 @@ def test_powershell_variable_and_wildcard_targets_are_skipped(command):
     assert file_changes(run) == {}
     codes = {r.code for r in assess_step(step, r"C:\proj", NO_POLICY)}
     assert not (codes & {"secret_file", "test_deleted", "db_write", "db_migration", "git_internals", "write_outside", "shell_outside"})
+
+
+@pytest.mark.parametrize("command, expected", [
+    ("[System.IO.File]::WriteAllText('notes:2026.txt', 'x')", [("notes:2026.txt", False)]),
+    ("[System.IO.File]::AppendAllText('notes:2026.txt', 'x')", [("notes:2026.txt", False)]),
+    ("Set-Content -Path notes:2026.txt -Value x", [("notes:2026.txt", False)]),
+    (r"Set-Content .\notes:2026.txt x", [("notes:2026.txt", False)]),
+    ("Set-Content C:notes.txt x", [("C:notes.txt", False)]),
+    ("Remove-Item notes:2026.txt", [("notes:2026.txt", True)]),
+])
+def test_only_provider_names_name_a_non_file_target(command, expected):
+    """SGD-018: the skip is for the PowerShell providers' own names, so a literal file such as
+    `notes:2026.txt` (valid on Linux and macOS) or a drive-relative `C:notes.txt` stays a file.
+    A `[System.IO.File]` call takes a plain filesystem path whatever it contains."""
+    assert [(w.path, w.deleted) for w in ps_writes(command)] == expected
+
+
+def test_a_dotnet_write_to_a_colon_path_is_still_a_file_change():
+    """SGD-018: the write reaches file_changes instead of disappearing from the receipt."""
+    command = "[System.IO.File]::WriteAllText('notes:2026.txt', 'x')"
+    step = Step(1, "PowerShell", {"command": command}, "s1", "m", None)
+    run = Run("s", "p", "/proj", "main", None, None, ["go"], [step], "", Usage(), {})
+    changes = file_changes(run)
+    assert "notes:2026.txt" in changes
+    assert changes["notes:2026.txt"].shell is True
+    assert changes["notes:2026.txt"].deleted is False
 
 
 def test_powershell_cmdlets_inside_bash_step_get_powershell_analysis():
