@@ -6,6 +6,8 @@ the current Database class and inspects the result through a second connection.
 """
 import json
 import sqlite3
+import threading
+import time
 from contextlib import closing
 
 from runledger.server.app import receipt_to_run
@@ -240,6 +242,42 @@ def test_a_superseded_run_keeps_its_replaced_versions_and_purge_removes_them(tmp
     assert removed["run_revisions"] == 2
     assert _rows(path, "SELECT run_id FROM run_revisions ORDER BY run_id") == [("young",), ("young",)]
     assert _rows(path, "SELECT id FROM runs") == [("young",)]
+
+
+def test_reports_read_on_their_own_connection_while_a_writer_holds_the_store(tmp_path):
+    """A report does not wait for the lock a writer holds, and never sees its uncommitted rows."""
+    path = tmp_path / "reports.db"
+    with closing(Database(str(path))) as db:
+        team_id, _ = db.create_team("alpha")
+        db.upsert_run(team_id, _stored_run("one"))
+        started = threading.Event()
+        release = threading.Event()
+
+        def writer():
+            with db._lock:
+                db._conn.execute(
+                    "INSERT INTO audit_log (team_id, at, actor, action, target, details) "
+                    "VALUES (?, '2026-10-15T12:00:00Z', 'test', 'run.push', 'one', '{}')",
+                    (team_id,),
+                )
+                started.set()
+                release.wait(3)
+                db._conn.rollback()
+
+        thread = threading.Thread(target=writer, daemon=True)
+        thread.start()
+        assert started.wait(5)
+        began = time.monotonic()
+        stats = db.stats(team_id)
+        events = db.audit_events(team_id)
+        elapsed = time.monotonic() - began
+        release.set()
+        thread.join(5)
+
+        assert elapsed < 1.0
+        assert stats["totals"]["runs"] == 1
+        # Only the committed key.create row is there: the writer's uncommitted row is invisible.
+        assert [event["action"] for event in events] == ["key.create"]
 
 
 def test_session_cap_per_key(tmp_path):

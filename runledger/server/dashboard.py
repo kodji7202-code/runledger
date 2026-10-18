@@ -7,8 +7,9 @@ API with cookie credentials; every POST or PUT sends X-Requested-With, which a
 cross-site form cannot set.
 
 Views are switched by location hash (#runs, #insights, #approvals, and for admins #keys,
-#audit, #settings). Features whose endpoints are not on the server yet (budgets,
-exports, notification settings) hide themselves on 404 or 403. The Insights view reads
+#audit, #settings), and the runs filters live in that hash too, so a reload keeps them. Members
+and viewers never see the admin-only panels: the page hides their tabs, and the panels the API
+refuses with 403 (the budget card, the export links) hide themselves. The Insights view reads
 /api/insights; its trend chart is an inline SVG built with createElementNS.
 """
 
@@ -135,6 +136,12 @@ dialog::backdrop{background:rgba(5,6,8,.6)}
 .dialog-body{padding:18px}
 .dialog-title{font-weight:650;font-size:16px;margin:0 0 8px}
 .dialog-actions{display:flex;justify-content:flex-end;gap:10px;flex-wrap:wrap;margin-top:16px}
+.detail-grid{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;margin:0}
+.detail-grid dt{color:var(--muted);font-size:12px;letter-spacing:.04em;text-transform:uppercase}
+.detail-grid dd{margin:0;overflow-wrap:anywhere}
+.detail-pushed{font-weight:600;margin:0 0 12px}
+tr.pickable{cursor:pointer}
+tr.pickable:hover{background:var(--chip)}
 .insights-head{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:baseline;gap:8px;margin:26px 0 10px}
 .insights-head h2{margin:0}
 .kpi-grade{margin-left:8px;vertical-align:middle}
@@ -264,6 +271,13 @@ dialog::backdrop{background:rgba(5,6,8,.6)}
   <input id="f-agent" type="search" placeholder="Agent" aria-label="Filter by agent" maxlength="200">
   <input id="f-min" type="number" min="0" max="100" placeholder="Min risk" aria-label="Minimum risk score">
   <input id="f-quality" type="number" min="0" max="100" placeholder="Min quality" aria-label="Minimum quality score">
+  <input id="f-max-quality" type="number" min="0" max="100" placeholder="Max quality" aria-label="Maximum quality score">
+  <select id="f-verdict" aria-label="Filter by AI verdict">
+    <option value="" selected>Any AI verdict</option>
+    <option value="looks_safe">looks_safe</option>
+    <option value="needs_review">needs_review</option>
+    <option value="dangerous">dangerous</option>
+  </select>
 </div>
 <div class="table-wrap">
 <table>
@@ -431,11 +445,25 @@ dialog::backdrop{background:rgba(5,6,8,.6)}
   </form>
 </dialog>
 
+<dialog id="run-detail" aria-labelledby="run-detail-title">
+  <div class="dialog-body">
+    <p class="dialog-title" id="run-detail-title">Run detail</p>
+    <p class="detail-pushed" id="run-detail-pushed"></p>
+    <dl class="detail-grid" id="run-detail-body"></dl>
+    <p class="msg" id="run-detail-msg" role="status" aria-live="polite"></p>
+    <div class="dialog-actions">
+      <a class="linkbtn" id="run-detail-receipt" target="_blank" rel="noopener" hidden>Open receipt</a>
+      <button type="button" id="run-detail-close">Close</button>
+    </div>
+  </div>
+</dialog>
+
 <script nonce="__CSP_NONCE__">
 (function () {
   "use strict";
 
   var APPROVAL_POLL_MS = 3000;
+  var APPROVAL_POLL_MAX_MS = 30000;
   var VIEWS = ["runs", "insights", "approvals", "keys", "audit", "settings"];
   var ADMIN_VIEWS = { keys: true, audit: true, settings: true };
   var ROLES = ["admin", "member", "viewer"];
@@ -450,7 +478,7 @@ dialog::backdrop{background:rgba(5,6,8,.6)}
 
   var state = { days: 30, role: null, keyRef: null, meLoaded: false, view: null, thresholds: [50, 80, 100] };
   var budgetState = { edited: false, settings: null, status: null };
-  var approvalsView = { seq: 0, signature: null, items: [] };
+  var approvalsView = { seq: 0, signature: null, items: [], failed: false };
   var keysView = { items: [] };
   var auditView = { events: [], busy: false, more: false };
   var exportReady = {};
@@ -577,6 +605,93 @@ dialog::backdrop{background:rgba(5,6,8,.6)}
     return err.status === 404 || err.status === 403;
   }
 
+  // Polling. One timer, never while the tab is hidden, and a growing delay after a failure:
+  // the first attempt is 3 s after the previous one, then 6 s, 12 s, ... capped at 30 s, and a
+  // successful request starts the base delay again. Returning to the tab refreshes at once.
+  function makePoller(load, baseMs, maxMs) {
+    var timer = null;
+    var delay = baseMs;
+    var stopped = false;
+
+    function clearTimer() {
+      if (timer) { clearTimeout(timer); timer = null; }
+    }
+
+    function stop() {
+      stopped = true;
+      clearTimer();
+    }
+
+    function later() {
+      if (stopped) { return; }
+      clearTimer();
+      timer = setTimeout(run, delay);
+    }
+
+    function run() {
+      timer = null;  // the timer that fired is spent; resume() clears a pending one first
+      if (stopped) { return; }
+      if (document.hidden) { later(); return; }  // hidden: stay scheduled, send nothing
+      load().then(function (ok) {
+        if (stopped) { return; }
+        delay = ok ? baseMs : Math.min(maxMs, delay * 2);
+        later();
+      });
+    }
+
+    return {
+      start: function () { stopped = false; delay = baseMs; later(); },
+      stop: stop,
+      resume: function () { stopped = false; delay = baseMs; clearTimer(); run(); }
+    };
+  }
+
+  function pollWhileVisible(poller) {
+    document.addEventListener("visibilitychange", function () {
+      if (document.hidden) { poller.stop(); } else { poller.resume(); }
+    });
+  }
+
+  // Cost honesty: an unknown cost reads "n/a" (never $0.00), and a figure that leaves unpriced
+  // tokens out is a lower bound, so it reads "≥$X". A group with no priced run stays "n/a".
+
+  function costText(value, lowerBound) {
+    var text = money(value);
+    return (lowerBound && text !== "n/a") ? "≥" + text : text;
+  }
+
+  function costNode(value, lowerBound, title) {
+    var text = costText(value, lowerBound);
+    if (!title) { return text; }
+    var span = el("span", null, text);
+    span.title = title;
+    return span;
+  }
+
+  function costTitle(run) {
+    return run.usage_source === "missing" ? "token usage was not recorded by the agent" : "";
+  }
+
+  // A group is a lower bound when any of its runs has no price or only a partial one.
+  function groupLowerBound(row) {
+    if (row.cost_is_lower_bound === true) { return true; }
+    var priced = Number(row.priced_runs);
+    return isFinite(priced) && priced < (Number(row.runs) || 0);
+  }
+
+  // The unpriced hint names the cause: the agent recorded no usage, the model has no known
+  // price, or both.
+  function unpricedHint(t) {
+    var unpriced = Number(t.unpriced_runs) || 0;
+    if (!unpriced) { return ""; }
+    var missing = Math.min(Number(t.missing_usage_runs) || 0, unpriced);
+    var unknown = unpriced - missing;
+    var causes = [];
+    if (missing) { causes.push(runCount(missing) + " without recorded token usage"); }
+    if (unknown) { causes.push(runCount(unknown) + " with an unknown model price"); }
+    return runCount(unpriced) + " left out: " + causes.join(", ") + ".";
+  }
+
   function notify(message, isError) {
     var box = $("notice");
     box.textContent = message;
@@ -623,10 +738,9 @@ dialog::backdrop{background:rgba(5,6,8,.6)}
     var t = stats.totals || {};
     if (stats.team) { setTeam(stats.team); }
 
-    $("k-cost").textContent = money(t.cost_usd);
-    $("k-cost-sub").textContent = t.unpriced_runs
-      ? runCount(t.unpriced_runs) + " left out: model price unknown"
-      : "last " + state.days + " days";
+    $("k-cost").textContent = costText(t.cost_usd, t.cost_is_lower_bound);
+    var hint = unpricedHint(t);
+    $("k-cost-sub").textContent = hint || ("last " + state.days + " days");
     $("k-runs").textContent = String(t.runs || 0);
     $("k-runs-sub").textContent = tokens(t.tokens) + " tokens · " + (t.steps || 0) + " steps · " + (t.files_changed || 0) + " files";
     $("k-risk").textContent = (t.avg_risk === null || t.avg_risk === undefined) ? "-" : Number(t.avg_risk).toFixed(1);
@@ -638,7 +752,7 @@ dialog::backdrop{background:rgba(5,6,8,.6)}
     renderBars($("by-user"), stats.by_user,
       function (r) { return nameOf(r.user, "unknown"); },
       function (r) { return r.cost_usd; },
-      function (r) { return money(r.cost_usd) + " · " + runCount(r.runs); },
+      function (r) { return costText(r.cost_usd, groupLowerBound(r)) + " · " + runCount(r.runs); },
       "No runs in this window.");
 
     var agentCard = $("card-by-agent");
@@ -647,19 +761,19 @@ dialog::backdrop{background:rgba(5,6,8,.6)}
       renderBars($("by-agent"), stats.by_agent,
         function (r) { return nameOf(r.agent, "unknown"); },
         function (r) { return r.cost_usd; },
-        function (r) { return money(r.cost_usd) + " · " + runCount(r.runs); },
+        function (r) { return costText(r.cost_usd, groupLowerBound(r)) + " · " + runCount(r.runs); },
         "No runs in this window.");
     }
 
     renderBars($("by-model"), stats.by_model,
       function (r) { return nameOf(r.model, "unknown"); },
       function (r) { return r.cost_usd; },
-      function (r) { return money(r.cost_usd) + " · " + tokens(r.tokens) + " tok"; },
+      function (r) { return costText(r.cost_usd, groupLowerBound(r)) + " · " + tokens(r.tokens) + " tok"; },
       "No runs in this window.");
     renderBars($("by-project"), stats.by_project,
       function (r) { return nameOf(r.project, "unknown"); },
       function (r) { return r.cost_usd; },
-      function (r) { return money(r.cost_usd) + " · " + runCount(r.runs); },
+      function (r) { return costText(r.cost_usd, groupLowerBound(r)) + " · " + runCount(r.runs); },
       "No runs in this window.");
     renderBars($("top-risks"), stats.top_risk_codes,
       function (r) { return String(r.code).replace(/_/g, " "); },
@@ -677,7 +791,8 @@ dialog::backdrop{background:rgba(5,6,8,.6)}
       : "No runs match these filters. Push a session with: runledger push --server URL --key KEY";
     runs.forEach(function (r) {
       var lv = level(r.risk_level);
-      var tr = el("tr");
+      var tr = el("tr", "pickable");
+      tr.title = "Show run detail";
       tr.appendChild(cell(when(r.started_at || r.created_at), "mono"));
       tr.appendChild(cell(r.user || "-"));
       tr.appendChild(cell(r.project || "-"));
@@ -686,21 +801,80 @@ dialog::backdrop{background:rgba(5,6,8,.6)}
       req.title = r.title || "";
       tr.appendChild(req);
       tr.appendChild(cell(r.steps, "num"));
-      tr.appendChild(cell(money(r.cost_usd), "num"));
+      tr.appendChild(cell(costNode(r.cost_usd, r.cost_partial, costTitle(r)), "num"));
       tr.appendChild(cell(el("span", "badge " + lv, String(r.risk_score) + " " + lv)));
       tr.appendChild(cell(qualityNode(r), "num"));
       tr.appendChild(cell(verdictNode(r.ai_verdict)));
-      var link = cell("", "num");
+      var actions = cell("", "num");
+      var detail = el("button", null, "Details");
+      detail.type = "button";
+      detail.title = "Show who pushed this run";
+      detail.addEventListener("click", function () { openRunDetail(r); });
+      actions.appendChild(detail);
       if (r.has_html) {
         var a = el("a", null, "Open");
         a.href = "/runs/" + encodeURIComponent(r.id);
         a.target = "_blank";
         a.rel = "noopener";
-        link.appendChild(a);
+        actions.appendChild(a);
       }
-      tr.appendChild(link);
+      tr.appendChild(actions);
+      tr.addEventListener("click", function (event) {
+        if (event.target.closest("a,button")) { return; }
+        openRunDetail(r);
+      });
       tbody.appendChild(tr);
     });
+  }
+
+  // Filters. The bar writes them into the URL hash, so a reload (or a shared link) shows the
+  // same runs. Only keys with a value are kept; "runs" stays the view.
+
+  var FILTER_IDS = {
+    "f-user": "user",
+    "f-project": "project",
+    "f-agent": "agent",
+    "f-min": "min_risk",
+    "f-quality": "min_quality",
+    "f-max-quality": "max_quality",
+    "f-verdict": "ai_verdict"
+  };
+
+  function filterValues() {
+    var out = {};
+    Object.keys(FILTER_IDS).forEach(function (id) {
+      var box = $(id);
+      var value = (box.value || "").trim();
+      if (value !== "") { out[FILTER_IDS[id]] = value; }
+    });
+    return out;
+  }
+
+  function filterHash() {
+    var params = new URLSearchParams();
+    var values = filterValues();
+    Object.keys(values).forEach(function (key) { params.set(key, values[key]); });
+    var query = params.toString();
+    return "#runs" + (query ? "?" + query : "");
+  }
+
+  function writeFilterHash() {
+    var hash = filterHash();
+    if (location.hash !== hash) { location.hash = hash; }
+  }
+
+  function applyFilterHash() {
+    var query = location.hash.replace(/^#[^?]*/, "");
+    if (query.charAt(0) === "?") { query = query.slice(1); }
+    var params = new URLSearchParams(query);
+    Object.keys(FILTER_IDS).forEach(function (id) {
+      var value = params.get(FILTER_IDS[id]);
+      $(id).value = value === null ? "" : value;
+    });
+  }
+
+  function boundedNumber(raw) {
+    return String(Math.min(100, Math.max(0, Math.floor(Number(raw)) || 0)));
   }
 
   function runQuery() {
@@ -712,13 +886,13 @@ dialog::backdrop{background:rgba(5,6,8,.6)}
     var agent = $("f-agent").value.trim();
     if (agent) { params.set("agent", agent); }
     var min = $("f-min").value.trim();
-    if (min !== "") {
-      params.set("min_risk", String(Math.min(100, Math.max(0, Math.floor(Number(min)) || 0))));
-    }
+    if (min !== "") { params.set("min_risk", boundedNumber(min)); }
     var minQuality = $("f-quality").value.trim();
-    if (minQuality !== "") {
-      params.set("min_quality", String(Math.min(100, Math.max(0, Math.floor(Number(minQuality)) || 0))));
-    }
+    if (minQuality !== "") { params.set("min_quality", boundedNumber(minQuality)); }
+    var maxQuality = $("f-max-quality").value.trim();
+    if (maxQuality !== "") { params.set("max_quality", boundedNumber(maxQuality)); }
+    var verdict = $("f-verdict").value.trim();
+    if (verdict) { params.set("ai_verdict", verdict); }
     params.set("limit", "200");
     return params.toString();
   }
@@ -743,7 +917,10 @@ dialog::backdrop{background:rgba(5,6,8,.6)}
     };
   }
 
-  var applyFilters = debounce(function () { report(loadRuns()); }, 300);
+  var applyFilters = debounce(function () {
+    writeFilterHash();
+    report(loadRuns());
+  }, 300);
 
   // Budget card. Hidden when /api/budgets is missing or forbidden.
 
@@ -952,10 +1129,12 @@ dialog::backdrop{background:rgba(5,6,8,.6)}
     var mine = ++approvalsView.seq;
     return getJSON("/api/approvals?status=pending&limit=50").then(function (body) {
       if (mine !== approvalsView.seq) { return; }
+      approvalsView.failed = false;
       notifyApproval("");
       renderApprovals((body && body.approvals) || []);
     }, function (err) {
       if (mine !== approvalsView.seq) { return; }
+      approvalsView.failed = true;
       notifyApproval(explain(err));
     });
   }
@@ -1278,7 +1457,8 @@ dialog::backdrop{background:rgba(5,6,8,.6)}
 
   // Quality and AI review cells for the runs table.
 
-  var GRADE_LIST = ["A", "B", "C", "D", "E", "F"];
+  // The E bucket is gone. A run stored with that grade keeps its score and shows no badge.
+  var GRADE_LIST = ["A", "B", "C", "D", "F"];
   var VERDICT_INFO = {
     looks_safe: { tone: "v-safe", glyph: "✓", label: "Looks safe" },
     needs_review: { tone: "v-review", glyph: "!", label: "Needs review" },
@@ -1459,8 +1639,8 @@ dialog::backdrop{background:rgba(5,6,8,.6)}
       var tr = el("tr");
       tr.appendChild(cell(nameOf(m.model, "unknown")));
       tr.appendChild(cell(String(m.runs || 0), "num"));
-      tr.appendChild(cell(money(m.cost_usd), "num"));
-      tr.appendChild(cell(money(m.cost_per_run), "num"));
+      tr.appendChild(cell(costNode(m.cost_usd, groupLowerBound(m)), "num"));
+      tr.appendChild(cell(costNode(m.cost_per_run, groupLowerBound(m)), "num"));
       tr.appendChild(cell(scoreText(m.avg_quality), "num"));
       tr.appendChild(cell(shareNode(m.share_of_cost)));
       body.appendChild(tr);
@@ -1478,7 +1658,7 @@ dialog::backdrop{background:rgba(5,6,8,.6)}
       tr.appendChild(cell(String(a.runs || 0), "num"));
       tr.appendChild(cell(scoreText(a.avg_quality), "num"));
       tr.appendChild(cell(scoreText(a.avg_risk), "num"));
-      tr.appendChild(cell(money(a.cost_usd), "num"));
+      tr.appendChild(cell(costNode(a.cost_usd, groupLowerBound(a)), "num"));
       body.appendChild(tr);
     });
     $("i-agents-empty").textContent = list.length ? "" : "No agent runs in this window.";
@@ -1533,7 +1713,7 @@ dialog::backdrop{background:rgba(5,6,8,.6)}
   }
 
   function currentRoute() {
-    var name = (location.hash || "").replace("#", "");
+    var name = (location.hash || "").replace("#", "").split("?")[0];
     return VIEWS.indexOf(name) >= 0 ? name : "runs";
   }
 
@@ -1570,6 +1750,11 @@ dialog::backdrop{background:rgba(5,6,8,.6)}
   }
 
   function go(name) {
+    if (name === "runs") {
+      var hash = filterHash();
+      if (location.hash === hash) { showView(name); } else { location.hash = hash; }
+      return;
+    }
     if (location.hash === "#" + name) { showView(name); } else { location.hash = name; }
   }
 
@@ -1620,9 +1805,10 @@ dialog::backdrop{background:rgba(5,6,8,.6)}
     if (state.view === "insights") { loadInsights(); }
   });
   $("refresh").addEventListener("click", refreshAll);
-  ["f-user", "f-project", "f-agent", "f-min", "f-quality"].forEach(function (id) {
+  ["f-user", "f-project", "f-agent", "f-min", "f-quality", "f-max-quality"].forEach(function (id) {
     $(id).addEventListener("input", applyFilters);
   });
+  $("f-verdict").addEventListener("change", applyFilters);
 
   VIEWS.forEach(function (v) {
     $("tab-" + v).addEventListener("click", function () { go(v); });
@@ -1641,7 +1827,12 @@ dialog::backdrop{background:rgba(5,6,8,.6)}
     tabs[next].focus();
     go(tabs[next].getAttribute("data-view"));
   });
-  window.addEventListener("hashchange", function () { showView(currentRoute()); });
+  window.addEventListener("hashchange", function () {
+    var before = JSON.stringify(filterValues());
+    applyFilterHash();
+    showView(currentRoute());
+    if (JSON.stringify(filterValues()) !== before) { report(loadRuns()); }
+  });
 
   $("key-form").addEventListener("submit", function (ev) {
     ev.preventDefault();
@@ -1718,13 +1909,68 @@ dialog::backdrop{background:rgba(5,6,8,.6)}
   });
 
 
+  // Run detail: the row (or its Details button) opens a dialog. "Pushed by" is the label of the
+  // API key that pushed the run, which is not always the developer the run is attributed to.
+
+  function detailPair(label, value) {
+    var dt = el("dt", null, label);
+    var dd = el("dd");
+    if (value instanceof Node) { dd.appendChild(value); } else { dd.textContent = String(value); }
+    return [dt, dd];
+  }
+
+  function pushedByText(run) {
+    return "Pushed by " + nameOf(run.pushed_by, "an unknown key");
+  }
+
+  function openRunDetail(run) {
+    $("run-detail-pushed").textContent = pushedByText(run);
+    var body = $("run-detail-body");
+    clear(body);
+    var pairs = [
+      ["Request", nameOf(run.title, "-")],
+      ["Developer", nameOf(run.user, "-")],
+      ["Pushed by", nameOf(run.pushed_by, "an unknown key")],
+      ["Project", nameOf(run.project, "-")],
+      ["Agent", nameOf(run.agent, "-")],
+      ["Cost", costNode(run.cost_usd, run.cost_partial, costTitle(run))],
+      ["Risk", String(run.risk_score) + " " + level(run.risk_level)],
+      ["Quality", qualityNode(run)],
+      ["AI review", verdictNode(run.ai_verdict)],
+      ["Steps", String(run.steps || 0)],
+      ["Tokens", tokens(run.tokens)],
+      ["Files changed", String(run.files_changed || 0)],
+      ["Started", when(run.started_at || run.created_at)],
+      ["Ended", when(run.ended_at)],
+      ["Revision", String(run.revision || 1)]
+    ];
+    pairs.forEach(function (pair) {
+      var nodes = detailPair(pair[0], pair[1]);
+      body.appendChild(nodes[0]);
+      body.appendChild(nodes[1]);
+    });
+    var receipt = $("run-detail-receipt");
+    receipt.hidden = !run.has_html;
+    receipt.href = "/runs/" + encodeURIComponent(run.id);
+    setMsg($("run-detail-msg"), "", false);
+    var dialog = $("run-detail");
+    if (typeof dialog.showModal === "function") { dialog.showModal(); } else { dialog.setAttribute("open", ""); }
+  }
+
+  $("run-detail-close").addEventListener("click", function () { $("run-detail").close(); });
+
   // Start
 
+  applyFilterHash();
   loadMe();
   refresh();
   loadBudget();
   loadApprovals();
-  setInterval(loadApprovals, APPROVAL_POLL_MS);
+  var approvalPoller = makePoller(function () {
+    return loadApprovals().then(function () { return !approvalsView.failed; });
+  }, APPROVAL_POLL_MS, APPROVAL_POLL_MAX_MS);
+  pollWhileVisible(approvalPoller);
+  approvalPoller.start();
   showView(currentRoute());
 })();
 </script>
@@ -1832,9 +2078,10 @@ a{color:var(--accent)}
   "use strict";
 
   var POLL_MS = 3000;
+  var POLL_MAX_MS = 30000;
   var approvalId = location.pathname.slice("/approvals/".length);
-  var timer = null;
   var busy = false;
+  var failed = false;
   var role = null;
   var keyRef = null;
   var meLoaded = false;
@@ -1965,7 +2212,7 @@ a{color:var(--accent)}
     $("reason").textContent = a.reason || "-";
     var open = status === "pending";
     applyDecisionAccess();
-    if (!open && timer) { clearInterval(timer); timer = null; }
+    if (!open) { poller.stop(); }
   }
 
   function loadMe() {
@@ -1982,11 +2229,55 @@ a{color:var(--accent)}
     });
   }
 
+  // Polling. Never while the tab is hidden, and a growing delay after a failure (3 s, 6 s,
+  // 12 s, ... capped at 30 s). Returning to the tab refreshes at once, and only one request is
+  // ever in flight: a resume cancels the timer that was already scheduled.
+
+  function makePoller(load, baseMs, maxMs) {
+    var timer = null;
+    var delay = baseMs;
+    var stopped = false;
+
+    function clearTimer() {
+      if (timer) { clearTimeout(timer); timer = null; }
+    }
+
+    function stop() {
+      stopped = true;
+      clearTimer();
+    }
+
+    function later() {
+      if (stopped) { return; }
+      clearTimer();
+      timer = setTimeout(run, delay);
+    }
+
+    function run() {
+      timer = null;  // the timer that fired is spent; resume() clears a pending one first
+      if (stopped) { return; }
+      if (document.hidden) { later(); return; }  // hidden: stay scheduled, send nothing
+      load().then(function (ok) {
+        if (stopped) { return; }
+        delay = ok ? baseMs : Math.min(maxMs, delay * 2);
+        later();
+      });
+    }
+
+    return {
+      start: function () { stopped = false; delay = baseMs; later(); },
+      stop: stop,
+      resume: function () { stopped = false; delay = baseMs; clearTimer(); run(); }
+    };
+  }
+
   function load() {
     return request("GET", "/api/approvals/" + encodeURIComponent(approvalId)).then(function (a) {
+      failed = false;
       notice("");
       render(a);
     }, function (err) {
+      failed = true;
       notice(explain(err));
     });
   }
@@ -2021,9 +2312,15 @@ a{color:var(--accent)}
 
   $("approve").addEventListener("click", function () { decide("approve"); });
   $("deny").addEventListener("click", function () { decide("deny"); });
+  var poller = makePoller(function () {
+    return load().then(function () { return !failed; });
+  }, POLL_MS, POLL_MAX_MS);
+  document.addEventListener("visibilitychange", function () {
+    if (document.hidden) { poller.stop(); } else { poller.resume(); }
+  });
+  poller.start();
   loadMe();
   load();
-  timer = setInterval(load, POLL_MS);
 })();
 </script>
 </body>

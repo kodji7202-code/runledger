@@ -374,14 +374,14 @@ def test_failed_backup_leaves_no_partial_file(tmp_path, monkeypatch, capsys):
         finally:
             tmp.unlink(missing_ok=True)
 
-    # Also test Database.backup_to directly when _conn.backup fails mid-copy
+    # Also test Database.backup_to directly when the connection it copies from fails mid-copy.
     live = Database(str(good_db))
     try:
         class FailingConn:
             def __init__(self, real):
                 self._real = real
 
-            def backup(self, target):
+            def backup(self, target, **kwargs):
                 target.execute("CREATE TABLE partial_data (x INT)")
                 raise sqlite3.OperationalError("simulated mid-copy failure")
 
@@ -389,17 +389,116 @@ def test_failed_backup_leaves_no_partial_file(tmp_path, monkeypatch, capsys):
                 self._real.close()
 
         real_conn = live._conn
-        live._conn = FailingConn(real_conn)
+        monkeypatch.setattr(live, "_backup_source", lambda: FailingConn(real_conn), raising=False)
         dest = folder / "runledger-good-20261016-000000.db"
         with pytest.raises(sqlite3.OperationalError, match="mid-copy"):
             live.backup_to(str(dest))
-        live._conn = real_conn
     finally:
         live.close()
 
     assert list(folder.glob("runledger-*.db")) == []
     assert list(folder.glob("*.tmp")) == []
     assert list(folder.glob("*.lock")) == []
+
+
+def _pushable(run_id, cost=0.1):
+    """A receipt as the push endpoint flattens it, without going through the HTTP layer."""
+    return receipt_to_run({
+        "session_id": run_id,
+        "started": "2026-10-15T10:00:00Z",
+        "ended": "2026-10-15T10:05:00Z",
+        "totals": {"steps": 4, "tokens": 1000, "cost_usd": cost, "usage_source": "messages"},
+        "models": {"claude-sonnet-4-5": {"tokens": 1000, "cost_usd": cost}},
+        "risk": {"score": 20, "reasons": []},
+        "html": "<h1>Receipt</h1>",
+    })
+
+
+def test_a_backup_does_not_hold_the_store_while_it_copies(tmp_path, monkeypatch):
+    """The copy runs on its own connection: a report and a push go through while it runs."""
+    db = Database(str(tmp_path / "held.db"))
+    try:
+        team_id, key = db.create_team("held")
+        key_id = db.key_for_token(key)["id"]
+        db.upsert_run(team_id, _pushable("before"), key_id=key_id)
+        seen = {}
+        real_backup = sqlite3.Connection.backup
+
+        class HoldingSource:
+            """A stand-in for the backup's own connection: while it copies, another thread reads
+            and writes."""
+
+            def backup(self, target, **kwargs):
+                def other():
+                    seen["stats"] = db.stats(team_id)
+                    db.upsert_run(team_id, _pushable("during"), key_id=key_id)
+                    seen["pushed"] = True
+
+                worker = threading.Thread(target=other, daemon=True)
+                worker.start()
+                worker.join(3)
+                seen["finished"] = not worker.is_alive()
+                try:
+                    return real_backup(self.source, target, **kwargs)
+                finally:
+                    worker.join(10)
+
+            def close(self):
+                pass
+
+        with sqlite3.connect(db.path) as source:
+            holder = HoldingSource()
+            holder.source = source
+            monkeypatch.setattr(db, "_backup_source", lambda: holder, raising=False)
+            dest = tmp_path / "copy.db"
+            db.backup_to(str(dest))
+        assert seen["finished"] is True and seen["pushed"] is True
+        assert seen["stats"]["totals"]["runs"] == 1  # the concurrent push is not in this report
+        assert db.stats(team_id)["totals"]["runs"] == 2
+        with sqlite3.connect(str(dest)) as copy:
+            assert copy.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+            assert copy.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 2
+    finally:
+        db.close()
+
+
+def test_a_backup_of_a_busy_store_runs_beside_the_pushes(tmp_path):
+    """2,000 runs, then 20 pushes while the copy runs: every push stays fast and the copy is a
+    complete, consistent database."""
+    import time
+
+    db = Database(str(tmp_path / "busy.db"))
+    try:
+        team_id, key = db.create_team("busy")
+        key_id = db.key_for_token(key)["id"]
+        for index in range(2000):
+            db.upsert_run(team_id, _pushable(f"seed-{index}"), key_id=key_id)
+        dest = tmp_path / "copy.db"
+        failures = []
+
+        def copy():
+            try:
+                db.backup_to(str(dest))
+            except BaseException as err:  # reported below, never swallowed
+                failures.append(err)
+
+        thread = threading.Thread(target=copy)
+        thread.start()
+        latencies = []
+        for index in range(20):
+            began = time.monotonic()
+            db.upsert_run(team_id, _pushable(f"live-{index}"), key_id=key_id)
+            latencies.append(time.monotonic() - began)
+        thread.join(60)
+        assert failures == [] and not thread.is_alive()
+        assert max(latencies) < 2.0
+        assert db.stats(team_id)["totals"]["runs"] == 2020
+        with sqlite3.connect(str(dest)) as copy_db:
+            assert copy_db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+            copied = copy_db.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
+        assert 2000 <= copied <= 2020
+    finally:
+        db.close()
 
 
 def test_backup_stems_keep_distinct_database_names():

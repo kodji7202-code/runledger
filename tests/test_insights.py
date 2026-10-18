@@ -428,7 +428,7 @@ def test_insights_on_an_empty_team_report_nulls_and_zeros(env):
     body = insights_of(base, viewer)
     assert body["days"] == 30 and body["since"] == "2026-09-15T12:00:00Z"
     assert body["quality"]["avg"] is None and body["quality"]["scored_runs"] == 0
-    assert body["quality"]["by_grade"] == {g: 0 for g in "ABCDEF"}
+    assert body["quality"]["by_grade"] == {g: 0 for g in "ABCDF"}
     assert body["quality"]["trend"] == [] and body["models"] == [] and body["agents"] == []
     assert body["top_recommendations"] == [] and body["est_savings_usd"] == 0
     assert body["ai_review"] == {"reviewed_runs": 0, "dangerous": 0, "needs_review": 0, "looks_safe": 0,
@@ -445,7 +445,7 @@ def test_quality_average_grade_counts_and_scored_run_count(env):
     quality_block = insights_of(base, admin)["quality"]
     assert quality_block["avg"] == 80.0
     assert quality_block["scored_runs"] == 3
-    assert quality_block["by_grade"] == {"A": 1, "B": 1, "C": 1, "D": 0, "E": 0, "F": 0}
+    assert quality_block["by_grade"] == {"A": 1, "B": 1, "C": 1, "D": 0, "F": 0}
 
 
 def test_trend_has_one_point_per_scored_day_in_date_order(env):
@@ -831,8 +831,20 @@ def test_the_served_dashboard_includes_the_insights_view(tmp_path, clock):
 
 # Pure helpers
 
+def test_a_stored_grade_e_is_kept_in_the_row_but_is_no_distribution_bucket(env):
+    """Quality never produces an E (85/70/55/40 are the cutoffs), so the distribution has five
+    buckets. A receipt that still carries one keeps its grade in the row."""
+    srv, base = env
+    team_id, admin, _, _ = team_with_keys(srv)
+    push(base, admin, receipt("run-e", quality={"score": 30, "grade": "E", "signals": []}))
+    assert stored(srv, team_id, "run-e")["quality_grade"] == "E"
+    by_grade = insights_of(base, admin)["quality"]["by_grade"]
+    assert set(by_grade) == {"A", "B", "C", "D", "F"}
+    assert by_grade == {"A": 0, "B": 0, "C": 0, "D": 0, "F": 0}
+
+
 def test_the_grade_and_verdict_vocabularies_are_the_documented_ones():
-    assert insights.GRADES == ("A", "B", "C", "D", "E", "F")
+    assert insights.GRADES == ("A", "B", "C", "D", "F")
     assert insights.VERDICTS == ("looks_safe", "needs_review", "dangerous")
     assert insights.ASSESSMENTS == ("confirmed", "false_positive", "uncertain")
     assert insights.MAX_ITEMS == 50 and insights.MAX_TEXT == 2000

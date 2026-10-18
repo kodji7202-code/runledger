@@ -250,6 +250,103 @@ def test_approvals_section_keeps_its_contract_with_the_existing_tests():
     assert "Approve" in DASHBOARD_HTML and "Deny" in DASHBOARD_HTML
 
 
+def test_header_comment_describes_the_real_hiding_rules():
+    """The old comment claimed panels hide on 404/403 because endpoints may not exist."""
+    import runledger.server.dashboard as dashboard
+
+    header = dashboard.__doc__
+    assert header
+    assert "may not exist" not in header
+    assert "may not exist" not in dashboard.DASHBOARD_HTML
+    assert "may not exist" not in _script(DASHBOARD_HTML)
+    assert "403" in header and "admin" in header
+    assert "filters live in that hash" in header
+
+
+def test_filter_bar_offers_max_quality_and_ai_verdict():
+    page = _page(DASHBOARD_HTML)
+    attrs = {a["id"]: a for _, a in page.elements if a.get("id")}
+    assert attrs["f-max-quality"].get("type") == "number"
+    assert "aria-label" in attrs["f-max-quality"]
+    assert any(tag == "select" and a.get("id") == "f-verdict" for tag, a in page.elements)
+
+    select = re.search(r'<select id="f-verdict".*?</select>', DASHBOARD_HTML, re.S).group(0)
+    for value in ("looks_safe", "needs_review", "dangerous"):
+        assert f'value="{value}"' in select, value
+    assert '<option value="" selected>' in select
+
+    js = _script(DASHBOARD_HTML)
+    assert 'params.set("max_quality", boundedNumber(maxQuality));' in js
+    assert 'params.set("ai_verdict", verdict);' in js
+    assert 'params.set("min_quality", boundedNumber(minQuality));' in js
+
+
+def test_filters_are_written_to_the_url_hash_and_restored_from_it():
+    js = _script(DASHBOARD_HTML)
+    assert '"f-max-quality": "max_quality",' in js
+    assert '"f-verdict": "ai_verdict"' in js
+    assert "function applyFilterHash()" in js and "function writeFilterHash()" in js
+    assert "applyFilterHash();" in js                     # on load, before the first query
+    assert "writeFilterHash();" in js                     # every change lands in the hash
+    assert "if (location.hash !== hash) { location.hash = hash; }" in js
+    assert "window.addEventListener(\"hashchange\"" in js
+    assert "filterValues()" in js                          # a hash the user edits is applied too
+
+
+def test_polling_pauses_while_hidden_and_backs_off_after_a_failure():
+    js = _script(DASHBOARD_HTML)
+    assert "var APPROVAL_POLL_MS = 3000;" in js
+    assert "var APPROVAL_POLL_MAX_MS = 30000;" in js
+    assert "if (document.hidden) { later(); return; }  // hidden: stay scheduled, send nothing" in js
+    assert 'document.addEventListener("visibilitychange", function () {' in js
+    assert "approvalPoller.start();" in js
+    assert "delay = ok ? baseMs : Math.min(maxMs, delay * 2);" in js
+    assert "setInterval(loadApprovals" not in js
+    # A resume cancels the timer that was already scheduled, so requests cannot multiply.
+    assert "function clearTimer() {" in js
+    assert "resume: function () { stopped = false; delay = baseMs; clearTimer(); run(); }" in js
+
+    approval = _script(APPROVAL_HTML)
+    assert "var POLL_MS = 3000;" in approval
+    assert "var POLL_MAX_MS = 30000;" in approval
+    assert "if (document.hidden) { later(); return; }  // hidden: stay scheduled, send nothing" in approval
+    assert "resume: function () { stopped = false; delay = baseMs; clearTimer(); run(); }" in approval
+    assert 'document.addEventListener("visibilitychange", function () {' in approval
+    assert "poller.start();" in approval
+    assert "setInterval(" not in approval
+    assert "if (!open) { poller.stop(); }" in approval   # a decided approval stops polling
+
+
+def test_cost_cells_render_unknown_cost_as_not_available_and_partial_as_a_lower_bound():
+    js = _script(DASHBOARD_HTML)
+    # n/a for an unknown cost, "≥" for a figure that leaves unpriced tokens out.
+    assert 'return (lowerBound && text !== "n/a") ? "≥" + text : text;' in js
+    assert 'return run.usage_source === "missing" ? "token usage was not recorded by the agent" : "";' in js
+    assert 'costNode(r.cost_usd, r.cost_partial, costTitle(r))' in js
+    assert "function groupLowerBound(row)" in js
+    assert 'costText(r.cost_usd, groupLowerBound(r))' in js
+    assert 'var GRADE_LIST = ["A", "B", "C", "D", "F"];' in js   # no E bucket, no E badge
+    # The hint names the cause instead of blaming the model price for everything.
+    assert "without recorded token usage" in js
+    assert "with an unknown model price" in js
+    assert "left out: model price unknown" not in js
+    assert "var hint = unpricedHint(t);" in js
+
+
+def test_run_detail_dialog_shows_who_pushed_the_run():
+    page = _page(DASHBOARD_HTML)
+    ids = {a["id"] for _, a in page.elements if a.get("id")}
+    for name in ("run-detail", "run-detail-body", "run-detail-pushed", "run-detail-close", "run-detail-receipt"):
+        assert name in ids, name
+
+    js = _script(DASHBOARD_HTML)
+    assert 'return "Pushed by " + nameOf(run.pushed_by, "an unknown key");' in js
+    assert '["Pushed by", nameOf(run.pushed_by, "an unknown key")],' in js
+    assert 'detail.addEventListener("click", function () { openRunDetail(r); });' in js
+    assert "openRunDetail(r);" in js
+    assert 'receipt.href = "/runs/" + encodeURIComponent(run.id);' in js
+
+
 def test_new_key_is_shown_once_with_a_warning_and_copy_button():
     page = _page(DASHBOARD_HTML)
     assert "won't see it again" in DASHBOARD_HTML

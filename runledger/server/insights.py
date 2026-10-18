@@ -25,7 +25,11 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from ..pricing import friendly_model
 
-GRADES = ("A", "B", "C", "D", "E", "F")
+# Quality never produces an E (the cutoffs are 85, 70, 55 and 40), so the distribution has
+# five buckets. A receipt from another tool may still carry one: GRADE_LETTERS accepts it and
+# the row keeps it, while GRADES decides what the distribution counts.
+GRADES = ("A", "B", "C", "D", "F")
+GRADE_LETTERS = ("A", "B", "C", "D", "E", "F")
 VERDICTS = ("looks_safe", "needs_review", "dangerous")
 ASSESSMENTS = ("confirmed", "false_positive", "uncertain")
 MAX_ITEMS = 50
@@ -89,7 +93,7 @@ def _score(value: Any) -> Optional[int]:
 
 def _grade(value: Any) -> Optional[str]:
     text = value.strip().upper() if isinstance(value, str) else ""
-    return text if text in GRADES else None
+    return text if text in GRADE_LETTERS else None
 
 
 def _enum(value: Any, allowed: Tuple[str, ...]) -> Optional[str]:
