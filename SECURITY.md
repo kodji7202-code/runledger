@@ -50,5 +50,10 @@ Read the security checklist and the "Known limits" section of
   a command line can still appear in one. `receipt --ai` sends session content to Anthropic.
 - The guard's log and approval requests use the same pattern-based masking, described in
   [docs/guard.md](docs/guard.md#the-guard-log).
+- The dashboard sign-in (`POST /session`) refuses a request a browser marks as coming from another
+  origin (`Sec-Fetch-Site: cross-site` or `same-site`, or an `Origin` header that is not the server's
+  own origin, `null` included) with `403`, so a cross-site page cannot sign the browser in to another
+  team. The session cookie is `SameSite=Strict`; a request with neither header (curl, a script) is
+  treated as a non-browser client and signs in as usual.
 - Behind a reverse proxy, configure the proxy as a trusted proxy (`--trusted-proxy`). Until then, the
   failed-sign-in limit and the audit log use the proxy's address.
