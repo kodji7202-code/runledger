@@ -3,8 +3,9 @@
 Used by the optional Claude features: `--ai` step summaries (summarize.py) and
 `--review` risk review (review.py). Nothing here runs unless a caller asks for it.
 
-- Every text sent is passed through redact() first, using the same secret patterns
-  as the risk rules, so a key pasted into a command does not leave the machine.
+- Every text sent is passed through scrub() first: the secret patterns shared with the
+  risk rules, e-mail addresses, and home folders (`C:\\Users\\<name>`, `/Users/<name>`,
+  `/home/<name>`, which become `~...`). Nothing a session contains identifies a person.
 - Transient failures (429, 500, 502, 503, 529 and network errors) are retried up to
   MAX_RETRIES times with exponential backoff and jitter. A retry-after header
   replaces the computed delay (capped at MAX_RETRY_AFTER_S).
@@ -27,7 +28,12 @@ import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from . import _http
 from . import guard as _guard  # the secret patterns shared with the risk rules
+try:
+    from . import secrets as _secrets
+except Exception:  # pragma: no cover - fallback when runledger.secrets is unavailable
+    _secrets = None  # type: ignore[assignment]
 from .parser import Usage, _usage
 
 API_VERSION = "2023-06-01"
@@ -42,6 +48,28 @@ MAX_RETRY_AFTER_S = 60.0     # a longer retry-after is cut to this
 ERROR_TEXT_CHARS = 300
 _LOOPBACK = {"127.0.0.1", "localhost", "::1"}
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+# A home folder in free text. The user name may contain spaces or a parenthesized word
+# ('Jane (Smith)'), and it runs to a separator, a quote or the end of a word, so no part of
+# it can leave the machine; shell operators and quotes end it, so a command keeps its shape.
+# `~` and `…` paths are left alone, and a URL (`https://host/Users/x`) is not a path start. A
+# separator may be doubled where the text was serialized to JSON, so a nested step input
+# cannot smuggle a home path past this.
+_HOME_WORD = r"[^\s\\/:*?\"<>|,;\[\]{}&`]+"
+_HOME_SEP = r"[\\/]{1,2}"
+_HOME_PREFIX = (r"(?:[A-Za-z]:" + _HOME_SEP + r"[Uu]sers" + _HOME_SEP
+                + r"|/(?:[Hh]ome|[Uu]sers)/)")
+_HOME_REST = r"(?P<rest>" + _HOME_SEP + r"[^\s'\"`<>|;&]*)?"
+_HOME_PATH_RE = re.compile(
+    r"(?<![\w.~/\\-])" + _HOME_PREFIX
+    + _HOME_WORD + r"(?:[ \t]+" + _HOME_WORD + r")*" + _HOME_REST,
+    re.I)
+# The same path inside quotes, where no shell delimiter ends the name: it runs to the next
+# path separator or the closing quote, so punctuation in a real folder name ('Jane (Smith)')
+# goes whole. The other quote character stays a legal name character.
+_QUOTED_HOME_PATH_RES = (
+    re.compile(r'(?<=")' + _HOME_PREFIX + r'[^\\/"\r\n]+' + _HOME_REST, re.I),
+    re.compile(r"(?<=')" + _HOME_PREFIX + r"[^\\/'\r\n]+" + _HOME_REST, re.I),
+)
 
 
 class LLMError(RuntimeError):
@@ -63,14 +91,35 @@ def redact(text: Any, emails: bool = False) -> str:
     return s
 
 
+def scrub_paths(text: Any) -> str:
+    """Mask home folders in free text: the user name of `C:\\Users\\<name>`, `/Users/<name>`
+    or `/home/<name>` becomes `~`, keeping the rest of the path. A quoted path is masked
+    first, where the name runs to the next separator instead of to a shell delimiter."""
+    s = "" if text is None else str(text)
+    for pattern in _QUOTED_HOME_PATH_RES:
+        s = pattern.sub(_mask_home, s)
+    return _HOME_PATH_RE.sub(_mask_home, s)
+
+
+def _mask_home(match: "re.Match[str]") -> str:
+    """`~` plus the part of the path the pattern kept separately."""
+    return "~" + (match.group("rest") or "")
+
+
+def scrub(text: Any) -> str:
+    """What may leave the machine for the Claude API: secrets, e-mail addresses and home
+    folders are masked. Applied to every message and system block in call()."""
+    return redact(scrub_paths(text), emails=True)
+
+
 def _redact_messages(messages: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for message in messages:
         content = message.get("content")
         if isinstance(content, str):
-            content = redact(content)
+            content = scrub(content)
         elif isinstance(content, list):
-            content = [dict(block, text=redact(block["text"]))
+            content = [dict(block, text=scrub(block["text"]))
                        if isinstance(block, dict) and isinstance(block.get("text"), str) else block
                        for block in content]
         out.append(dict(message, content=content))
@@ -81,11 +130,11 @@ def _system_blocks(system: Any, cache: bool) -> Optional[List[Dict[str, Any]]]:
     if system is None:
         return None
     if isinstance(system, str):
-        block: Dict[str, Any] = {"type": "text", "text": redact(system)}
+        block: Dict[str, Any] = {"type": "text", "text": scrub(system)}
         if cache:
             block["cache_control"] = {"type": "ephemeral"}   # prompt caching for the static prompt
         return [block]
-    return [dict(block, text=redact(block["text"]))
+    return [dict(block, text=scrub(block["text"]))
             if isinstance(block, dict) and isinstance(block.get("text"), str)
             else dict(block) if isinstance(block, dict) else block
             for block in system]
@@ -119,10 +168,7 @@ def _scrub(text: str, api_key: str) -> str:
 
 
 def _error_text(exc: urllib.error.HTTPError, api_key: str) -> str:
-    try:
-        raw = exc.read().decode("utf-8", "replace")
-    except Exception:  # the body is optional detail
-        raw = ""
+    raw = _http.read_error(exc)     # always closes the response
     message = raw
     try:
         parsed = json.loads(raw)

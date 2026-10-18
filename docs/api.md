@@ -21,12 +21,14 @@ Contents:
 ## Conventions
 
 **Authentication.** Send an API key as `Authorization: Bearer <key>`. The dashboard uses a session
-cookie instead: `rl_session`, set by `GET /?key=<key>`.
+cookie instead: `rl_session`, set by the sign-in form (`POST /session`).
 
 - A request with an API key needs no extra header.
 - A `POST` or `PUT` that uses the session cookie must also send `X-Requested-With: runledger`. Without
   it, the response is `403 csrf_required`.
 - A valid API key is checked first. The session cookie is used when the request carries no valid key.
+- Endpoints that require a role authenticate before they read the request body, so a large body sent
+  with a bad key gets `401` (or `403` for a role that is too low) instead of `413`.
 
 **Roles.** Each key has one role: `viewer` (read only), `member` (also pushes runs and requests
 approvals) or `admin` (also decides approvals, manages settings, keys, the audit log, budgets and exports).
@@ -43,14 +45,17 @@ server's log.
 {"error": {"code": "forbidden", "message": "The viewer role cannot push runs. This needs the member role or higher."}}
 ```
 
-**Body size and length.** Every request with a body must send `Content-Length` (otherwise `411`). The
-size is checked before authentication, so an oversized request gets `413` even without a key:
+**Body size and length.** Every request with a body must send `Content-Length` (otherwise `411`).
+Writes are authenticated before the body is read, so a bad key or a role that is too low is answered
+`401` or `403` at once, whatever the declared length; the size is checked next, so an oversized
+request from a caller that may write gets `413`:
 
 | Endpoint | Limit |
 | --- | --- |
 | `POST /api/runs` | 10 MB |
 | `POST /api/approvals` | 128 KB |
 | `POST /api/approvals/{id}/decision`, `PUT /api/team/settings`, `PUT /api/budgets`, `POST /api/keys` | 16 KB |
+| `POST /session` | 4 KB |
 
 **Rate limit.** An address with more than 20 failed credentials in five minutes gets `429` with a
 `Retry-After` header in seconds. `/health` is never limited. Behind a reverse proxy, the address is the
@@ -73,7 +78,7 @@ body. Methods the server does not implement, such as `OPTIONS`, return `501`.
 No authentication. Use it for load balancers and container health checks.
 
 ```json
-{"ok": true, "version": "0.6.0"}
+{"ok": true, "version": "0.6.1"}
 ```
 
 ### `GET /api/me`
@@ -98,7 +103,17 @@ Role: `member`. Pushes one receipt. This is what `runledger push` sends: the JSO
 `runledger receipt --format json`, plus `user`, `project`, `html` and per-model costs.
 
 Only `session_id` is required (1 to 200 characters). Other fields are optional and fall back to safe
-defaults. Pushing a session again with the same `session_id` replaces the earlier run.
+defaults. The receipt arrives exactly as the client built it: `runledger push --safe` (or
+`RUNLEDGER_PUSH_SAFE=1`) sends a masked one, with `"safe": true`, relative paths and `[EMAIL]`
+instead of e-mail addresses, while `user` and `project` are kept as the client sent them.
+
+A session may be pushed more than once. A session that grew replaces the run already stored when the
+same key pushes it (or an admin key does), and the replaced version is kept in the run history (the
+newest 20 versions per run). An identical re-push is an accepted retry, and a receipt pushed by a
+different member key, or one that is older than the stored version (an earlier `ended`, or fewer
+steps), returns `409 run_conflict`. A run stored before the server recorded pushing keys has none
+(it predates key attribution, and the migration leaves that column empty), so it can be replaced
+only by an admin key; a member key pushing a different receipt for it gets `409 run_conflict`.
 
 ```json
 {
@@ -116,7 +131,7 @@ defaults. Pushing a session again with the same `session_id` replaces the earlie
     "level": "high",
     "reasons": [{"severity": "high", "code": "secret_file", "reason": "Read a secrets file (.env)", "step": 3}]
   },
-  "totals": {"steps": 10, "tokens": 116416, "cost_usd": 0.108408, "files_changed": 3},
+  "totals": {"steps": 10, "tokens": 116416, "cost_usd": 0.108408, "files_changed": 3, "usage_source": "messages"},
   "models": {"claude-sonnet-4-5-20250929": {"tokens": 79661, "cost_usd": 0.103563}},
   "steps": [{"n": 1, "tool": "Read", "summary": "Read src/retry.py", "model": "claude-sonnet-4-5-20250929", "tokens": 1200, "cost_usd": 0.0012, "error": false, "risks": []}],
   "files": [{"path": "src/retry.py", "added": 12, "removed": 4, "created": false, "deleted": false}],
@@ -126,24 +141,35 @@ defaults. Pushing a session again with the same `session_id` replaces the earlie
 }
 ```
 
-Response `201`:
+Response `201` (a new run) and `200` (an identical retry: `revision` stays as stored). An identical
+retry adds `"status": "duplicate"` to the same fields, so a client can tell a retry from a first push:
 
 ```json
 {
   "id": "7f3c2a10-9b1e-4c55-a1d2-0e6f8b3c9d42",
   "url": "/runs/7f3c2a10-9b1e-4c55-a1d2-0e6f8b3c9d42",
   "risk_score": 80,
-  "risk_level": "high"
+  "risk_level": "high",
+  "revision": 1
 }
+```
+
+Response `200` when the push replaced the stored version. The URL of a run never changes, and
+`created_at` stays at the first push:
+
+```json
+{"status": "updated", "id": "7f3c2a10-9b1e-4c55-a1d2-0e6f8b3c9d42", "revision": 2}
 ```
 
 Stored fields: `user` defaults to `unknown`; `project` defaults to the last folder name of `cwd`;
 `risk_level` is derived from the score when absent (below 25 low, below 60 medium, otherwise high).
-Runs are immutable: a byte-equivalent/semantically identical re-push is accepted as an idempotent
-retry, while different content for an existing team/session id returns `409 run_conflict`.
+`usage_source` is stored as sent (`messages`, `settings` or `missing`; anything else is `null`), and
+`cost_partial` is `true` only when the receipt says the cost is a lower bound. A receipt whose
+`usage_source` is `missing` is stored with no cost at all: `cost_usd` and every `models[].cost_usd`
+are `null`, never the `0.0` an unrecorded usage would otherwise produce.
 Errors: `400` `empty_body`, `invalid_json`, `invalid_receipt`; `401`;
-`403` (viewer); `409` `run_conflict`; `411`; `413`
-(over 10 MB, "Receipts are limited to 10 MB.").
+`403` (viewer); `409` `run_conflict` (a different key pushed this session, or the new receipt is
+older); `411`; `413` (over 10 MB, "Receipts are limited to 10 MB.").
 
 ### `GET /api/runs`
 
@@ -168,6 +194,8 @@ Each text filter is limited to 200 characters.
     "user": "Ana",
     "project": "payments-service",
     "agent": "Claude Code",
+    "agent_id": "claude-code",
+    "pushed_by": "alice-laptop",
     "title": "The payment retry logic gives up after the first failure. Add exponential backoff (3 attempts) and make the tests pass.",
     "started_at": "2026-10-08T10:00:17Z",
     "ended_at": "2026-10-08T10:06:14Z",
@@ -175,18 +203,31 @@ Each text filter is limited to 200 characters.
     "tokens": 116416,
     "files_changed": 3,
     "cost_usd": 0.108408,
+    "usage_source": "messages",
+    "cost_partial": false,
     "risk_score": 80,
     "risk_level": "high",
     "quality_score": 62,
     "quality_grade": "C",
     "ai_verdict": "needs_review",
     "est_savings_usd": 0.031,
+    "revision": 1,
     "has_html": true,
     "created_at": "2026-10-08T16:37:34Z",
     "updated_at": "2026-10-08T16:37:34Z"
   }
 ]}
 ```
+
+The list is ordered by the run's start time, or by its push time when it has none (`sort_at`), newest
+first. `revision` is 1 until the same session is pushed again and replaces it. Runs stored before
+`agent_id` existed report `null`, and a receipt from a client that did not report how it measured
+usage has `usage_source` `null`.
+
+`cost_usd` is `null` when nothing could be priced: the agent recorded no usage
+(`usage_source: "missing"`), or no model had a known price. It is never `0.0` for an unknown cost; a
+reported zero is stored and shown as `0.0`. `cost_partial` is `true` when some of the run's tokens had
+no price, so the figure is a lower bound. `pushed_by` is the label of the key that pushed the run.
 
 Errors: `400` `bad_request` (for example `limit=0`, or `min_risk=101`); `401`.
 
@@ -197,15 +238,26 @@ Role: any. One run with its full receipt JSON and its risk reasons.
 ```json
 {"run": {
   "id": "7f3c2a10-9b1e-4c55-a1d2-0e6f8b3c9d42",
-  "user": "Ana", "project": "payments-service", "agent": "Claude Code",
+  "user": "Ana", "project": "payments-service", "agent": "Claude Code", "agent_id": "claude-code",
+  "pushed_by": "alice-laptop",
   "title": "...", "started_at": "2026-10-08T10:00:17Z", "ended_at": "2026-10-08T10:06:14Z",
   "steps": 10, "tokens": 116416, "files_changed": 3, "cost_usd": 0.108408,
-  "risk_score": 80, "risk_level": "high", "has_html": true,
+  "usage_source": "messages", "cost_partial": false,
+  "risk_score": 80, "risk_level": "high", "revision": 1, "has_html": true,
   "created_at": "2026-10-08T16:37:34Z", "updated_at": "2026-10-08T16:37:34Z",
-  "receipt": {"runledger_version": "0.6.0", "session_id": "7f3c2a10-...", "...": "..."},
+  "receipt": {"runledger_version": "0.6.1", "session_id": "7f3c2a10-...", "...": "..."},
   "risks": [{"severity": "high", "code": "secret_file", "reason": "Read a secrets file (.env)", "step": 3}]
 }}
 ```
+
+With the team setting `attribution: "key"`, `user` is the pushing key's label and the `receipt` object
+still holds the client's own `user` value. With the default `attribution: "client"`, `user` is what the
+client sent and `pushed_by` is the key's label.
+
+The embedded `receipt` follows the same cost rule as the flattened fields: a run whose
+`usage_source` is `missing` stores `cost_usd` `null` in `receipt.totals` and in every
+`receipt.models` bucket, even when an older client sent `0.0`, while a run that reports its usage
+keeps its figure (including a reported `0.0`).
 
 Errors: `401`; `404` `not_found` ("Run not found.").
 
@@ -225,16 +277,29 @@ project, agent and model, and the most common risk codes.
 {
   "days": 30,
   "since": "2026-09-08T16:37:34Z",
-  "totals": {"runs": 1, "cost_usd": 0.108408, "unpriced_runs": 0, "avg_risk": 80.0,
-             "high_risk_runs": 1, "steps": 10, "tokens": 116416, "files_changed": 3},
-  "by_user": [{"user": "Ana", "runs": 1, "cost_usd": 0.108408}],
-  "by_project": [{"project": "payments-service", "runs": 1, "cost_usd": 0.108408}],
-  "by_agent": [{"agent": "Claude Code", "runs": 1, "cost_usd": 0.108408}],
-  "by_model": [{"model": "Sonnet 4.5", "runs": 1, "tokens": 79661, "cost_usd": 0.103563}],
+  "totals": {"runs": 1, "cost_usd": 0.108408, "priced_runs": 1, "unpriced_runs": 0,
+             "partial_runs": 0, "missing_usage_runs": 0, "cost_is_lower_bound": false,
+             "avg_risk": 80.0, "high_risk_runs": 1, "steps": 10, "tokens": 116416,
+             "files_changed": 3},
+  "by_user": [{"user": "Ana", "runs": 1, "cost_usd": 0.108408, "priced_runs": 1,
+               "unpriced_runs": 0, "cost_is_lower_bound": false}],
+  "by_project": [{"project": "payments-service", "runs": 1, "cost_usd": 0.108408, "priced_runs": 1,
+                  "unpriced_runs": 0, "cost_is_lower_bound": false}],
+  "by_agent": [{"agent": "Claude Code", "runs": 1, "cost_usd": 0.108408, "priced_runs": 1,
+                "unpriced_runs": 0, "cost_is_lower_bound": false}],
+  "by_model": [{"model": "Sonnet 4.5", "runs": 1, "tokens": 79661, "cost_usd": 0.103563,
+                "priced_runs": 1, "unpriced_runs": 0, "cost_is_lower_bound": false}],
   "top_risk_codes": [{"code": "secret_file", "occurrences": 2, "runs": 1}],
   "team": "demo"
 }
 ```
+
+A `cost_usd` is `null` when nothing in that group could be priced: the group had no priced run at all.
+It is never `0` for a group with unknown costs. `priced_runs` counts the runs whose cost is a number
+(including a reported zero), so `runs` minus `priced_runs` is how many are left out of the figure.
+`unpriced_runs` counts the runs whose cost is `null` or only partly priced (`cost_partial`), and
+`cost_is_lower_bound` is `true` when it is not 0: the figure then understates the month or window.
+`missing_usage_runs` counts the runs whose agent recorded no usage at all.
 
 Errors: `400` `bad_request` (`days` outside 1 to 3650); `401`.
 
@@ -344,11 +409,11 @@ response is a sign-in page with status `401`. An unknown id returns the JSON `40
 
 ### `GET /api/team/settings`
 
-Role: any. Webhook URLs and the approval timeout. For roles other than admin, the URLs show only the
-scheme, host and port, followed by `/[hidden]`.
+Role: any. Webhook URLs, the approval timeout, and which name a run is attributed to. For roles other
+than admin, the URLs show only the scheme, host and port, followed by `/[hidden]`.
 
 ```json
-{"team": "demo", "slack_webhook_url": null, "webhook_url": "http://127.0.0.1:8798/[hidden]", "approval_ttl_s": 600}
+{"team": "demo", "slack_webhook_url": null, "webhook_url": "http://127.0.0.1:8798/[hidden]", "approval_ttl_s": 600, "attribution": "client"}
 ```
 
 Errors: `401`.
@@ -362,6 +427,15 @@ Role: `admin`. Changes only the fields you send.
 | `slack_webhook_url` | string or `null` | Public `https://` URL. Private, loopback and link-local destinations are blocked. `null` or `""` clears it. |
 | `webhook_url` | string or `null` | As above. |
 | `approval_ttl_s` | integer | 1 to 604800 (seven days). The time a pending approval stays open. |
+| `attribution` | string | `client` (default) or `key`. See below. |
+
+`attribution` decides whose name a pushed run is stored under. With `client`, `user` is what the
+client sent (its default is the Git email), which a member can change on every push. With `key`, the
+pushing key's label is stored as `user`, so per-user budgets and the dashboard cannot be dodged by
+editing the receipt; the client's own value stays visible in the run's `receipt` object, and admin keys
+still push under the client's user (an admin pushing on someone's behalf keeps that person's name).
+Every change is recorded as a `team.settings` audit event. The setting applies to runs pushed after it
+is changed; stored runs keep the attribution they were given.
 
 Response `200`: the same shape as `GET`, with full URLs.
 
@@ -370,8 +444,8 @@ For local development only, `RUNLEDGER_ALLOW_LOOPBACK_WEBHOOKS=1` permits HTTP w
 Webhook delivery validates all DNS answers and connects to a checked address to prevent
 internal-network requests and DNS rebinding. Redirects and proxy routing are not followed.
 
-Errors: `400` `invalid_settings` (unknown field, an empty body, a bad URL, a TTL out of range); `401`;
-`403` (not admin); `411`; `413` (over 16 KB).
+Errors: `400` `invalid_settings` (unknown field, an empty body, a bad URL, a TTL out of range, an
+attribution other than `client` or `key`); `401`; `403` (not admin); `411`; `413` (over 16 KB).
 
 ## API keys
 
@@ -477,7 +551,8 @@ Role: any. Quality, model, agent and AI-review aggregates over the last `days`
   "models": [{"model": "claude-sonnet-5-5", "runs": 9, "cost_usd": 1.42,
               "avg_quality": 73.1, "cost_per_run": 0.158, "share_of_cost": 0.81}],
   "agents": [{"agent": "Claude Code", "runs": 10, "avg_quality": 72.0,
-              "avg_risk": 31.5, "cost_usd": 1.61}],
+              "avg_risk": 31.5, "cost_usd": 1.61, "priced_runs": 9, "partial_runs": 1,
+              "cost_is_lower_bound": true}],
   "top_recommendations": [{"kind": "model_downgrade", "title": "Run read-only steps on Haiku",
                            "count": 6, "est_savings_usd": 0.42}],
   "est_savings_usd": 0.57,
@@ -488,6 +563,9 @@ Role: any. Quality, model, agent and AI-review aggregates over the last `days`
 
 `share_of_cost` and `false_positive_rate` are ratios from 0 to 1. `cost_per_run`
 divides by priced runs only. A run's quality counts toward every model it used.
+An agent whose runs were never priced has a `cost_usd` of `null` with `priced_runs` 0, and
+`cost_is_lower_bound` is `true` when the agent's figure leaves a run out: it has an unpriced run
+(`priced_runs` below `runs`) or a partly priced one (`partial_runs`).
 `top_recommendations` is ranked by total estimated savings, then count, at most 10.
 
 Errors: `400` `bad_request` (bad `days`); `401`.
@@ -538,11 +616,26 @@ Role: any. This month's spend (UTC calendar month) against the budget.
   "spend_usd": 412.37,
   "monthly_usd": 500.0,
   "pct": 82.5,
-  "per_user": [{"user": "ana@example.com", "spend_usd": 58.1, "pct": 96.8}]
+  "runs": 30,
+  "priced_runs": 28,
+  "unpriced_runs": 2,
+  "partial_runs": 1,
+  "cost_is_lower_bound": true,
+  "per_user": [{"user": "ana@example.com", "spend_usd": 58.1, "pct": 96.8,
+                "runs": 5, "priced_runs": 5, "unpriced_runs": 0, "partial_runs": 0}]
 }
 ```
 
 `pct` is `null` when there is no limit. `per_user` is sorted by spend, largest first.
+
+Only runs with a known cost add to `spend_usd`, so a month of unknown costs reads `0`, never a made-up
+figure. That numeric zero is what the alert thresholds are compared against; the dashboard shows
+`n/a` for it instead. The run counts say how much of the month the figure covers: here
+`unpriced_runs` counts the runs with no cost at all and `partial_runs` the runs whose cost is only
+partly known (the `stats` endpoint counts both together), and `cost_is_lower_bound` is `true` when
+the real spend is at least `spend_usd`. A developer whose runs all have unknown costs shows
+`spend_usd` 0 with their counts. The effective `user` follows the team's `attribution` setting (see
+[Team settings](#get-apiteamsettings)).
 
 Errors: `401`.
 
@@ -565,11 +658,13 @@ and no body, and nothing is built or audited.
 **`runs.csv`** has this header row, and one row per run:
 
 ```
-id,started_at,user,project,agent,models,steps,tokens,files_changed,cost_usd,risk_score,risk_level,title
-7f3c2a10-9b1e-4c55-a1d2-0e6f8b3c9d42,2026-10-08T10:00:17Z,Ana,payments-service,Claude Code,claude-haiku-4-5-20251001; claude-sonnet-4-5-20250929,10,116416,3,0.108408,80,high,The payment retry logic gives up after the first failure. Add exponential backoff (3 attempts) and make the tests pass.
+id,started_at,user,project,agent,models,steps,tokens,files_changed,cost_usd,risk_score,risk_level,title,quality_score,quality_grade,ai_verdict,est_savings_usd
+7f3c2a10-9b1e-4c55-a1d2-0e6f8b3c9d42,2026-10-08T10:00:17Z,Ana,payments-service,Claude Code,claude-haiku-4-5-20251001; claude-sonnet-4-5-20250929,10,116416,3,0.108408,80,high,The payment retry logic gives up after the first failure. Add exponential backoff (3 attempts) and make the tests pass.,62,C,needs_review,0.031
 ```
 
 `models` lists the model names joined with `; `. The receipt JSON and the HTML receipt are never included.
+A run whose cost is unknown has an empty `cost_usd` cell, never `0`; `quality_score` and
+`est_savings_usd` are empty in the same way when they are unknown.
 
 **`audit.csv`** has the header `id,at,actor,action,target,details_json`. `details_json` is the event's
 details as JSON text.
@@ -594,14 +689,48 @@ Errors: `400` `bad_request` (`days` outside 1 to 3650); `401`; `403` (not admin)
 
 ### `GET /`
 
-Role: any. The dashboard. Without a valid session it returns a sign-in page with status `401`.
+Role: any. The dashboard. Without a valid session it returns a sign-in page with status `401`. The
+form on that page posts the key to `POST /session`, so the key never enters the address bar.
+
+### `POST /session`
+
+The sign-in form. Body: `application/x-www-form-urlencoded` with one field, `key`. On success the
+response is `302` to `/`, with `Set-Cookie: rl_session=...; Path=/; HttpOnly; SameSite=Strict;
+Max-Age=43200` (plus `Secure` over HTTPS). On failure it returns the sign-in page with status `401`,
+and the failure counts toward the rate limit. A successful sign-in is recorded in the audit log as
+`auth.sign_in`, with the role and the client address.
+
+A browser request that comes from another origin is refused with `403 cross_site`, before the body is
+read, with no cookie and no session: `Sec-Fetch-Site: cross-site` or `same-site` (another port, scheme
+or subdomain is a different origin), or an `Origin` header that is not this server's own origin
+(`null` included). The two headers are checked independently, so `Sec-Fetch-Site: same-origin` does
+not excuse a concrete `Origin` that names another site. The fetch metadata only excuses an absent
+`Origin` and the opaque `null` one, because this server sends `Referrer-Policy: no-referrer` and
+Chromium then serializes the `Origin` of the dashboard's own form POST as `null`. A request with
+neither header (curl, `runledger`, any non-browser client) signs in as before, and the server writes
+a warning line that never contains the key.
 
 ### `GET /?key=<key>`
 
-Signs in with an API key. On success the response is `302` to `/`, with `Set-Cookie: rl_session=...;
-Path=/; HttpOnly; SameSite=Lax; Max-Age=43200` (plus `Secure` over HTTPS). On failure it returns the
-sign-in page with status `401`, and the failure counts toward the rate limit. A successful sign-in is
-recorded in the audit log as `auth.sign_in`, with the role and the client address.
+Legacy sign-in, kept for links printed by `runledger serve` and `team create`. It is deprecated (the
+server logs one warning per process) and strips the key from the address bar by redirecting.
+
+- With no session, or with a session of the same team: `302` to `/` with the same `Strict` cookie as
+  `POST /session`.
+- With a valid session of a **different** team: `200` with a confirmation page naming both teams and
+  a form that posts the key to `POST /session`. Nothing changes until that form is submitted, so a
+  link cannot silently sign you into someone else's team.
+- An unknown key returns the sign-in page with status `401`, and the failure counts toward the rate
+  limit.
+
+The cross-site rule of `POST /session` applies here too, so a link on another page cannot sign a
+visitor into a team. A request that carries `Sec-Fetch-Site: cross-site` or `same-site`, or an
+`Origin` header that is not this server's own origin, is refused with `403 cross_site` before any key
+is checked: no cookie is set and no session row is created. A plain link click, a pasted URL or any
+non-browser client sends no such headers (`Sec-Fetch-Site: none`), so those keep working as above.
+
+At most 20 sessions are kept per key; signing in again past that cap drops the oldest session of that
+key, and other keys are unaffected.
 
 There is no sign-out endpoint. Revoke or rotate the key to end a session.
 
@@ -622,11 +751,12 @@ There is no sign-out endpoint. Revoke or rotate the key to end a session.
 | 403 | `forbidden` | The role is too low for the action. The message names the role needed. |
 | 403 | `self_approval` | The same authenticated key requested and attempted to decide an approval. |
 | 403 | `csrf_required` | A cookie-authenticated change lacks `X-Requested-With: runledger`. |
+| 403 | `cross_site` | A sign-in (`POST /session`, `GET /?key=`) came from another origin. A concrete `Origin` that is not this server's own is always refused, even with `Sec-Fetch-Site: same-origin`. |
 | 404 | `not_found` | No such endpoint, run, approval or key. |
 | 405 | `method_not_allowed` | The path does not accept this method. The `Allow` header lists the allowed ones. |
 | 409 | `already_decided` | The approval was already approved or denied. |
 | 409 | `legacy_unverifiable` | The approval predates authenticated requester attribution and must be requested again. |
-| 409 | `run_conflict` | A different receipt already exists with this team's session id. |
+| 409 | `run_conflict` | A different key pushed this team's session id, the stored run has no recorded pushing key (a pre-attribution run, admin keys only), or the new receipt is older (an earlier `ended`, or fewer steps) than the stored version. |
 | 409 | `expired` | The approval expired before a decision. |
 | 409 | `already_revoked` | The key is already revoked. |
 | 409 | `last_admin` | The team's last active admin key cannot be revoked. |

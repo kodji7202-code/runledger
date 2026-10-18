@@ -113,23 +113,82 @@ def _mtime(path: Path) -> float:
 
 
 def find_sessions(project: Optional[str] = None) -> List[Path]:
+    from .. import session_cache
+
     root = factory_home() / "sessions"
+    if not root.is_dir():
+        return []
     wanted = _absolute(str(project)) if project else None
+    wanted_norm = _norm(wanted) if wanted else None
+    entries, dirty = session_cache.load()
     found = []
-    for path in root.glob("*/*.jsonl"):
-        if not path.is_file():
-            continue
-        header = _header(path)
-        if not _is_header(header):
-            continue
-        # Encoding is lossy: /demo/a-b and /demo/a/b share a directory.
-        cwd = header["cwd"]
-        if wanted and _is_absolute(cwd) and _norm(cwd) != _norm(wanted):
-            continue
-        if wanted and not _is_absolute(cwd) and not _is_project_folder(path.parent.name, wanted):
-            continue  # `droid exec --cwd .` records ".": the folder name is the only clue
-        found.append(path)
-    return sorted(found, key=_mtime, reverse=True)
+
+    def scan_folder(folder: Path, folder_matches: bool) -> None:
+        nonlocal dirty
+        try:
+            paths = list(folder.glob("*.jsonl"))
+        except OSError:
+            return
+        for path in paths:
+            try:
+                st = path.stat()
+            except OSError:
+                continue
+            key = str(path)
+            cached = entries.get(key)
+            if (isinstance(cached, dict)
+                    and cached.get("mtime_ns") == st.st_mtime_ns
+                    and cached.get("size") == st.st_size
+                    and "valid" in cached):
+                valid = bool(cached.get("valid"))
+                cwd = cached.get("cwd") or ""
+            else:
+                header = _header(path)
+                valid = _is_header(header)
+                cwd = header["cwd"] if valid else ""
+                entries[key] = {
+                    "mtime_ns": st.st_mtime_ns,
+                    "size": st.st_size,
+                    "valid": valid,
+                    "cwd": cwd,
+                    "id": header.get("id") if valid else None,
+                }
+                dirty = True
+            if not valid:
+                continue
+            # Encoding is lossy: /demo/a-b and /demo/a/b share a directory.
+            if wanted_norm and _is_absolute(cwd) and _norm(cwd) != wanted_norm:
+                continue
+            if wanted and not _is_absolute(cwd) and not folder_matches:
+                continue  # `droid exec --cwd .` records ".": the folder name is the only clue
+            found.append((st.st_mtime, path))
+
+    try:
+        subdirs = [d for d in root.iterdir() if d.is_dir()]
+    except OSError:
+        subdirs = []
+
+    if wanted:
+        matching_dirs = []
+        other_dirs = []
+        for d in subdirs:
+            if _is_project_folder(d.name, wanted):
+                matching_dirs.append(d)
+            else:
+                other_dirs.append(d)
+        for d in matching_dirs:
+            scan_folder(d, True)
+        if not found:
+            for d in other_dirs:
+                scan_folder(d, False)
+    else:
+        for d in subdirs:
+            scan_folder(d, False)
+
+    if dirty:
+        session_cache.save(entries)
+    found.sort(key=lambda item: item[0], reverse=True)
+    return [p for _, p in found]
 
 
 def _objects(path: Path) -> Iterator[Dict[str, Any]]:
@@ -252,7 +311,9 @@ def _child_model(settings_path: Optional[Path], child_id: Any) -> Optional[str]:
 def _child_usage(settings: Dict[str, Any], own: Usage, settings_path: Optional[Path]) -> Dict[str, Usage]:
     """Sub-agent usage: inclusiveTokenUsage minus the session's own tokenUsage. Each child
     session is credited to the model in its own settings file when that file is found;
-    the rest is unattributed, never priced as the parent's model."""
+    the rest is unattributed, never priced as the parent's model. Every child total is a
+    cumulative estimate, so it is marked before aggregation: the mark then travels with the
+    leaf snapshot, and a large child next to a genuinely long parent request is not tiered."""
     raw = settings.get("inclusiveTokenUsage")
     if not isinstance(raw, dict):
         return {}
@@ -269,9 +330,11 @@ def _child_usage(settings: Dict[str, Any], own: Usage, settings_path: Optional[P
         if not model or not isinstance(child_raw, dict):
             continue
         share = Usage(*(min(getattr(_usage(child_raw), f), getattr(extra, f)) for f in _USAGE_FIELDS))
+        share._cumulative_only = True
         out.setdefault(model, Usage()).add(share)
         extra = _minus(extra, share)
     if extra.total:
+        extra._cumulative_only = True
         out.setdefault(UNATTRIBUTED, Usage()).add(extra)
     return out
 
@@ -474,6 +537,10 @@ def parse(path: Path) -> Run:
             # Never price a mixed-model remainder as the last selected model.
             model = next(iter(observed_models)) if len(observed_models) == 1 else (
                 UNATTRIBUTED if observed_models else default_model)
+            if remainder.total:
+                # Cumulative only: per-request boundaries are unavailable, so the
+                # remainder must not be tiered as one long request.
+                remainder._cumulative_only = True
             run.usage.add(remainder)
             run.models.setdefault(model, Usage()).add(remainder)
             from_settings = remainder.total > 0
@@ -485,6 +552,8 @@ def parse(path: Path) -> Run:
                     step.usage_known = from_settings
         children = _child_usage(settings, own, settings_path)
         for model, usage in children.items():
+            if usage.total:
+                usage._cumulative_only = True
             run.usage.add(usage)
             run.models.setdefault(model, Usage()).add(usage)
             from_settings = from_settings or usage.total > 0

@@ -5,7 +5,8 @@ This module checks them leniently. A value of the wrong type becomes null, a lis
 not validate is dropped, lists are capped at MAX_ITEMS entries and strings at MAX_TEXT
 characters, and no value can reject a push. The validated copies are what the server stores:
 in receipt_json under the same keys, and in the runs columns quality_score, quality_grade,
-ai_verdict and est_savings_usd.
+ai_verdict and est_savings_usd, plus the extracted inputs of the summary (recommendations and
+ai_assessment), which keep a report from reading every receipt.
 
 compute() builds the Insights summary (GET /api/insights and the compliance report): the quality
 average, grade counts and daily trend; cost and quality by model and by agent; the
@@ -24,7 +25,11 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from ..pricing import friendly_model
 
-GRADES = ("A", "B", "C", "D", "E", "F")
+# Quality never produces an E (the cutoffs are 85, 70, 55 and 40), so the distribution has
+# five buckets. A receipt from another tool may still carry one: GRADE_LETTERS accepts it and
+# the row keeps it, while GRADES decides what the distribution counts.
+GRADES = ("A", "B", "C", "D", "F")
+GRADE_LETTERS = ("A", "B", "C", "D", "E", "F")
 VERDICTS = ("looks_safe", "needs_review", "dangerous")
 ASSESSMENTS = ("confirmed", "false_positive", "uncertain")
 MAX_ITEMS = 50
@@ -88,7 +93,7 @@ def _score(value: Any) -> Optional[int]:
 
 def _grade(value: Any) -> Optional[str]:
     text = value.strip().upper() if isinstance(value, str) else ""
-    return text if text in GRADES else None
+    return text if text in GRADE_LETTERS else None
 
 
 def _enum(value: Any, allowed: Tuple[str, ...]) -> Optional[str]:
@@ -200,10 +205,12 @@ def normalize_ai_review(value: Any) -> Optional[Dict[str, Any]]:
 
 
 def review_fields(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """The validated keys for a pushed receipt, and the four runs columns derived from them.
-    Keys: quality, recommendations, ai_review (stored in receipt_json), and quality_score,
-    quality_grade, ai_verdict, est_savings_usd (stored as columns). est_savings_usd is the sum of
-    the recommendations' estimates, or None when no recommendation has one."""
+    """The validated keys for a pushed receipt, and the runs columns derived from them.
+    Keys: quality, recommendations, ai_review (stored in receipt_json), plus quality_score,
+    quality_grade, ai_verdict, est_savings_usd, recommendation_counts and assessment_counts.
+    est_savings_usd is the sum of the recommendations' estimates, or None when no recommendation
+    has one. recommendation_counts and assessment_counts are the extracted inputs of the Insights
+    summary, kept on the run row so a report never has to read a receipt."""
     quality = normalize_quality(payload.get("quality"))
     recommendations = normalize_recommendations(payload.get("recommendations"))
     ai_review = normalize_ai_review(payload.get("ai_review"))
@@ -216,6 +223,23 @@ def review_fields(payload: Dict[str, Any]) -> Dict[str, Any]:
         "quality_grade": quality["grade"] if quality else None,
         "ai_verdict": ai_review["verdict"] if ai_review else None,
         "est_savings_usd": round(sum(estimates), 6) if estimates else None,
+        "recommendation_counts": [
+            {"kind": r["kind"], "title": r["title"], "est_savings_usd": r["est_savings_usd"]}
+            for r in recommendations
+        ],
+        "assessment_counts": assessment_counts(ai_review),
+    }
+
+
+def assessment_counts(review: Optional[Dict[str, Any]]) -> Dict[str, int]:
+    """How many rule risks a validated AI review assessed, and how many it called false positives.
+    Those two numbers are all the Insights summary needs from a review."""
+    if review is None:
+        return {"assessed": 0, "false_positive": 0}
+    return {
+        "assessed": len(review["risk_assessments"]),
+        "false_positive": sum(1 for item in review["risk_assessments"]
+                              if item["assessment"] == "false_positive"),
     }
 
 
@@ -262,12 +286,14 @@ def _models_block(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
         out.append({
             "model": label,
             "runs": slot["runs"],
-            "cost_usd": round(slot["cost"], 6),
+            # No priced run: the model's cost is unknown (n/a), not zero.
+            "cost_usd": round(slot["cost"], 6) if slot["priced"] else None,
+            "priced_runs": slot["priced"],
             "avg_quality": round(slot["q_sum"] / slot["q_n"], 1) if slot["q_n"] else None,
             "cost_per_run": round(slot["cost"] / slot["priced"], 6) if slot["priced"] else None,
             "share_of_cost": round(slot["cost"] / total, 4) if total > 0 else None,
         })
-    out.sort(key=lambda m: (-m["cost_usd"], -m["runs"], m["model"]))
+    out.sort(key=lambda m: (m["cost_usd"] is None, -(m["cost_usd"] or 0.0), -m["runs"], m["model"]))
     return out[:TABLE_LIMIT]
 
 
@@ -276,47 +302,85 @@ def _agents_block(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     for row in rows:
         avg_quality = row["avg_quality"]
         avg_risk = row["avg_risk"]
+        keys = row.keys()
+        runs = int(row["runs"])
+        priced = int(row["priced_runs"] or 0) if "priced_runs" in keys else 0
+        partial = int(row["partial_runs"] or 0) if "partial_runs" in keys else 0
+        cost = row["cost_usd"]
         out.append({
             "agent": row["name"],
-            "runs": int(row["runs"]),
+            "runs": runs,
             "avg_quality": None if avg_quality is None else round(float(avg_quality), 1),
             "avg_risk": None if avg_risk is None else round(float(avg_risk), 1),
-            "cost_usd": round(float(row["cost_usd"] or 0.0), 6),
+            # An agent whose runs were never priced has an unknown cost, not a zero one, and a
+            # run whose price is only partly known leaves the agent's figure a lower bound.
+            "cost_usd": None if cost is None else round(float(cost), 6),
+            "priced_runs": priced,
+            "partial_runs": partial,
+            "cost_is_lower_bound": bool(priced < runs or partial),
         })
-    out.sort(key=lambda a: (-a["cost_usd"], -a["runs"], a["agent"]))
+    out.sort(key=lambda a: (a["cost_usd"] is None, -(a["cost_usd"] or 0.0), -a["runs"], a["agent"]))
     return out[:TABLE_LIMIT]
 
 
-def _decode_reviews(raw_receipts: Iterable[str]) -> List[Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]]:
-    """(recommendations, ai_review) for each stored receipt. A receipt that does not parse is skipped."""
-    out = []
-    for raw in raw_receipts:
+def _extracted_recommendations(raw: Any) -> List[Dict[str, Any]]:
+    """The recommendation entries a stored extraction holds. Unreadable or odd values are skipped."""
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    return normalize_recommendations(value)
+
+
+def _extracted_assessment(raw: Any) -> Tuple[int, int]:
+    """The (assessed, false positive) pair a stored extraction holds, or zeroes."""
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return 0, 0
+    if not isinstance(value, dict):
+        return 0, 0
+    return _whole(value.get("assessed")) or 0, _whole(value.get("false_positive")) or 0
+
+
+def _review_inputs(parts: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], int, int]:
+    """Everything the recommendations and AI review blocks count for the window: the copies the
+    server extracted at push time, plus the receipts stored before those columns existed."""
+    recommendations: List[Dict[str, Any]] = []
+    assessed = 0
+    false_positive = 0
+    for row in parts["recommendation_rows"]:
+        recommendations.extend(_extracted_recommendations(row["recommendations"]))
+    for row in parts["assessment_rows"]:
+        counts = _extracted_assessment(row["ai_assessment"])
+        assessed += counts[0]
+        false_positive += counts[1]
+    for raw in parts["legacy_receipts"]:
         try:
-            receipt = json.loads(raw)
+            stored = json.loads(raw)
         except ValueError:
             continue
-        if not isinstance(receipt, dict):
+        if not isinstance(stored, dict):
             continue
-        out.append((
-            normalize_recommendations(receipt.get("recommendations")),
-            normalize_ai_review(receipt.get("ai_review")),
-        ))
-    return out
+        recommendations.extend(normalize_recommendations(stored.get("recommendations")))
+        legacy = assessment_counts(normalize_ai_review(stored.get("ai_review")))
+        assessed += legacy["assessed"]
+        false_positive += legacy["false_positive"]
+    return recommendations, assessed, false_positive
 
 
-def _recommendations_block(reviews: List[Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]]) -> List[Dict[str, Any]]:
+def _recommendations_block(recommendations: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Recommendations grouped by kind and title. count is how often it was given; the savings
     add up the estimates given, and are null when none was estimated."""
     slots: Dict[Tuple[str, str], Dict[str, Any]] = {}
-    for recommendations, _ in reviews:
-        for rec in recommendations:
-            key = (rec["kind"], rec["title"])
-            slot = slots.setdefault(key, {"kind": rec["kind"], "title": rec["title"], "count": 0,
-                                          "savings": 0.0, "priced": False})
-            slot["count"] += 1
-            if rec["est_savings_usd"] is not None:
-                slot["savings"] += rec["est_savings_usd"]
-                slot["priced"] = True
+    for rec in recommendations:
+        key = (rec["kind"], rec["title"])
+        slot = slots.setdefault(key, {"kind": rec["kind"], "title": rec["title"], "count": 0,
+                                      "savings": 0.0, "priced": False})
+        slot["count"] += 1
+        if rec["est_savings_usd"] is not None:
+            slot["savings"] += rec["est_savings_usd"]
+            slot["priced"] = True
     out = [
         {
             "kind": s["kind"], "title": s["title"], "count": s["count"],
@@ -328,21 +392,11 @@ def _recommendations_block(reviews: List[Tuple[List[Dict[str, Any]], Optional[Di
     return out[:TOP_LIMIT]
 
 
-def _ai_block(verdict_rows: Iterable[Dict[str, Any]],
-              reviews: List[Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]]) -> Dict[str, Any]:
+def _ai_block(verdict_rows: Iterable[Dict[str, Any]], assessed: int, false_positive: int) -> Dict[str, Any]:
     counts = {verdict: 0 for verdict in VERDICTS}
     for row in verdict_rows:
         if row["verdict"] in counts:
             counts[row["verdict"]] += int(row["n"])
-    assessed = 0
-    false_positive = 0
-    for _, review in reviews:
-        if review is None:
-            continue
-        for item in review["risk_assessments"]:
-            assessed += 1
-            if item["assessment"] == "false_positive":
-                false_positive += 1
     return {
         "reviewed_runs": sum(counts.values()),
         "dangerous": counts["dangerous"],
@@ -357,14 +411,14 @@ def compute(db: Any, team_id: int, since: str, days: int) -> Dict[str, Any]:
     """The Insights summary for one team, for runs that started (or were pushed) at or after `since`.
     `db` is a runledger.server.db.Database; its insight_parts() supplies the raw rows."""
     parts = db.insight_parts(team_id, since)
-    reviews = _decode_reviews(parts["review_receipts"])
+    recommendations, assessed, false_positive = _review_inputs(parts)
     return {
         "days": days,
         "since": since,
         "quality": _quality_block(parts),
         "models": _models_block(parts["model_rows"]),
         "agents": _agents_block(parts["agents"]),
-        "top_recommendations": _recommendations_block(reviews),
+        "top_recommendations": _recommendations_block(recommendations),
         "est_savings_usd": round(float(parts["est_savings_usd"] or 0.0), 6),
-        "ai_review": _ai_block(parts["verdicts"], reviews),
+        "ai_review": _ai_block(parts["verdicts"], assessed, false_positive),
     }

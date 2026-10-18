@@ -2,13 +2,14 @@
 
 **Receipts and safe rollback for AI coding agents.**
 
-RunLedger reads the session logs of your coding agents and turns each run into a receipt: what
-changed, what ran, which model did each step, what it cost, and what looked risky. A Claude Code hook
-can stop risky calls before they run, and a small team server collects receipts from the whole team.
+RunLedger reads the session logs of your coding agents (Claude Code, Codex CLI, Factory Droid and
+Aider) and turns each run into a receipt: what changed, what ran, which model did each step, what it
+cost, and what looked risky. A Claude Code hook can stop risky calls before they run, and a small team
+server collects receipts from the whole team.
 Local Git checkpoints let you restore files from before a run, with a safety checkpoint for undo.
 
 RunLedger is fully free and open source, including the self-hosted team server.
-Version 0.6.0. Python 3.9 or later, no runtime dependencies.
+Version 0.6.1. Python 3.9 or later, no runtime dependencies.
 
 ## Quickstart
 
@@ -108,7 +109,9 @@ project's `.runledger.json` may only make the guard stricter. See [docs/guard.md
 ## GitHub Action
 
 Post a receipt on every pull request. Commit the session files you want reviewed to
-`.runledger/sessions/`, then add this workflow:
+`.runledger/sessions/`: Claude Code `.jsonl` transcripts, Codex rollouts, Factory Droid transcripts
+(with their `.settings.json` sidecar, which carries the token usage), or `.runledger.json` written by
+any agent. Then add this workflow:
 
 ```yaml
 name: RunLedger receipt
@@ -121,7 +124,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: kodji7202-code/runledger@v0.6.0
+      - uses: kodji7202-code/runledger@v0.6.1
         with:
           fail-on: "60"                   # the job fails at 60 or above; "" never fails
 ```
@@ -152,18 +155,21 @@ as `API_KEY=…`, `password="…"` and `?access_token=…`, flags such as `--tok
 Masking is pattern-based, so an unusual secret can still get through. Treat a receipt like the
 session transcript it came from.
 
-**Safe mode** is on by default for Markdown and JSON receipts written to stdout or inside a Git
-repository, and always on for the PR comment: local paths are shortened (repository-relative, `~`
-for the home folder) and e-mail addresses are masked. HTML receipts keep full paths. Use `--safe` or
+**Safe mode** is on by default for receipts written inside a Git repository (HTML included) and
+for Markdown and JSON written to stdout, and always on for the PR comment: local paths are
+shortened (repository-relative, `~` for the home folder) and e-mail addresses are masked. A
+receipt written outside a repository keeps full paths unless `--safe` is passed. Use `--safe` or
 `--no-safe` to choose. See [docs/quickstart.md](docs/quickstart.md#safe-mode).
 
 - **`--ai`** sends the prompts, each step's inputs (up to 600 characters per field, which can include
   file contents being written), each tool result (up to 400 characters) and the agent's final message to
-  `api.anthropic.com`. Known secret formats are masked first, but masking is pattern-based. Do not use it
-  on sessions you may not share with that service.
-- **`--review`** sends redacted prompts, commands, relative file paths, edit snippets and the rule
-  findings to Claude Sonnet for an explanation of each risk. Tool output is not sent. See
+  `api.anthropic.com`. Do not use it on sessions you may not share with that service.
+- **`--review`** sends prompts, commands, relative file paths, edit snippets and the rule findings to
+  Claude Sonnet for an explanation of each risk. Tool output is not sent. See
   [docs/analysis.md](docs/analysis.md#ai-risk-review).
+- **Both mask before sending, with no opt-out:** e-mail addresses become `[EMAIL]`, home folders
+  (`C:\Users\<name>`, `/Users/<name>`, `/home/<name>`) become `~...`, and known secret formats become
+  `[REDACTED]`. Masking is pattern-based, so an unusual secret can still get through.
 - **The guard log** (`.runledger/guard.log`) records tool names, commands and paths, masked the same
   way. Add `.runledger/` to your `.gitignore`.
 - **Checkpoints** store real file contents locally in Git, without secret masking. Ignore sensitive

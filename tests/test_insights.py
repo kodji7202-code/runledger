@@ -428,7 +428,7 @@ def test_insights_on_an_empty_team_report_nulls_and_zeros(env):
     body = insights_of(base, viewer)
     assert body["days"] == 30 and body["since"] == "2026-09-15T12:00:00Z"
     assert body["quality"]["avg"] is None and body["quality"]["scored_runs"] == 0
-    assert body["quality"]["by_grade"] == {g: 0 for g in "ABCDEF"}
+    assert body["quality"]["by_grade"] == {g: 0 for g in "ABCDF"}
     assert body["quality"]["trend"] == [] and body["models"] == [] and body["agents"] == []
     assert body["top_recommendations"] == [] and body["est_savings_usd"] == 0
     assert body["ai_review"] == {"reviewed_runs": 0, "dangerous": 0, "needs_review": 0, "looks_safe": 0,
@@ -445,7 +445,7 @@ def test_quality_average_grade_counts_and_scored_run_count(env):
     quality_block = insights_of(base, admin)["quality"]
     assert quality_block["avg"] == 80.0
     assert quality_block["scored_runs"] == 3
-    assert quality_block["by_grade"] == {"A": 1, "B": 1, "C": 1, "D": 0, "E": 0, "F": 0}
+    assert quality_block["by_grade"] == {"A": 1, "B": 1, "C": 1, "D": 0, "F": 0}
 
 
 def test_trend_has_one_point_per_scored_day_in_date_order(env):
@@ -495,8 +495,51 @@ def test_a_model_without_prices_has_no_cost_per_run_and_no_share(env):
     payload = receipt("unpriced", models={SONNET: {"tokens": 10, "cost_usd": None}}, cost=None, steps=[])
     push(base, admin, payload)
     (model,) = insights_of(base, admin)["models"]
-    assert model["runs"] == 1 and model["cost_usd"] == 0
+    assert model["runs"] == 1 and model["cost_usd"] is None and model["priced_runs"] == 0
     assert model["cost_per_run"] is None and model["share_of_cost"] is None and model["avg_quality"] is None
+
+
+def test_an_agent_with_no_priced_run_has_a_null_cost(env):
+    """Droid runs whose usage was never recorded have no cost: n/a, never 0."""
+    srv, base = env
+    _, admin, _, _ = team_with_keys(srv)
+    unpriced = receipt("droid-1", cost=0.0, agent="Factory Droid")
+    unpriced["totals"] = dict(unpriced["totals"], cost_usd=0.0, usage_source="missing")
+    unpriced["models"] = {}
+    push(base, admin, unpriced)
+    priced = receipt("claude-1", cost=1.0, agent="Claude Code",
+                     models={SONNET: {"tokens": 10, "cost_usd": 1.0}})
+    push(base, admin, priced)
+
+    agents = {a["agent"]: a for a in insights_of(base, admin)["agents"]}
+    assert agents["Factory Droid"]["cost_usd"] is None
+    assert agents["Factory Droid"]["priced_runs"] == 0 and agents["Factory Droid"]["runs"] == 1
+    assert agents["Claude Code"]["cost_usd"] == pytest.approx(1.0)
+    assert agents["Claude Code"]["priced_runs"] == 1
+
+
+def test_an_agent_with_only_partial_runs_is_a_lower_bound(env):
+    """An agent whose runs are all only partly priced shows a lower bound, not a complete amount."""
+    srv, base = env
+    _, admin, _, _ = team_with_keys(srv)
+    payload = receipt("partial-1", cost=0.2, agent="Factory Droid")
+    payload["totals"] = dict(payload["totals"], cost_usd=0.2, cost_partial=True, usage_source="messages")
+    push(base, admin, payload)
+
+    (agent,) = insights_of(base, admin)["agents"]
+    assert agent["agent"] == "Factory Droid"
+    assert agent["runs"] == 1 and agent["priced_runs"] == 1
+    assert agent["cost_usd"] == pytest.approx(0.2)
+    assert agent["partial_runs"] == 1
+    assert agent["cost_is_lower_bound"] is True
+
+
+def test_an_agent_with_a_complete_price_is_not_a_lower_bound(env):
+    srv, base = env
+    _, admin, _, _ = team_with_keys(srv)
+    push(base, admin, receipt("complete-1", cost=0.2, agent="Factory Droid"))
+    (agent,) = insights_of(base, admin)["agents"]
+    assert agent["partial_runs"] == 0 and agent["cost_is_lower_bound"] is False
 
 
 def test_agents_are_compared_with_unknown_for_runs_without_one(env):
@@ -555,6 +598,57 @@ def test_the_false_positive_rate_is_null_when_no_risk_was_assessed(env):
     push(base, admin, receipt("no-risks", ai_review=ai("looks_safe", [])))
     review = insights_of(base, admin)["ai_review"]
     assert review["reviewed_runs"] == 1 and review["false_positive_rate"] is None
+
+
+def test_a_superseded_run_replaces_its_insight_contributions(env):
+    srv, base = env
+    _, admin, _, _ = team_with_keys(srv)
+    push(base, admin, receipt("s-1", recommendations=[rec("model_downgrade", "Use Haiku for search", 0.4)],
+                              ai_review=ai("needs_review", ["confirmed"])))
+    before = insights_of(base, admin)
+    assert before["top_recommendations"] == [
+        {"kind": "model_downgrade", "title": "Use Haiku for search", "count": 1, "est_savings_usd": 0.4},
+    ]
+    assert before["ai_review"]["needs_review"] == 1 and before["est_savings_usd"] == pytest.approx(0.4)
+
+    push(base, admin, receipt("s-1", recommendations=[rec("repeated_reads", "Cache the file", 0.1)],
+                              ai_review=ai("looks_safe", [])), expect=200)
+
+    after = insights_of(base, admin)
+    assert after["top_recommendations"] == [
+        {"kind": "repeated_reads", "title": "Cache the file", "count": 1, "est_savings_usd": 0.1},
+    ]
+    assert after["ai_review"]["needs_review"] == 0 and after["ai_review"]["looks_safe"] == 1
+    assert after["ai_review"]["false_positive_rate"] is None      # the old assessments are gone
+    assert after["est_savings_usd"] == pytest.approx(0.1)         # no double counting
+
+
+def test_a_run_stored_before_the_extraction_columns_still_counts(tmp_path):
+    """A database written before the extracted columns keeps its aggregates: the migration fills
+    them in, and a receipt stored without them is read as a fallback."""
+    path = tmp_path / "old.db"
+    with closing(sqlite3.connect(str(path))) as conn:
+        conn.executescript(SCHEMA)
+        conn.execute("INSERT INTO teams (name, api_key_hash, created_at) VALUES ('old', 'h', '2026-10-01T00:00:00Z')")
+        stored = receipt("legacy", recommendations=[rec("k", "Cut retries", 0.25)],
+                         ai_review=ai("dangerous", ["false_positive", "confirmed"]))
+        conn.execute(
+            "INSERT INTO runs (id, team_id, user, project, agent, title, started_at, ended_at, models, steps, "
+            "tokens, files_changed, cost, risk_score, risk_level, ai_verdict, receipt_json, receipt_html, created_at, "
+            "updated_at) VALUES ('legacy', 1, 'dev', 'p', 'Claude Code', NULL, '2026-10-05T10:00:00Z', NULL, '{}', "
+            "0, 0, 0, NULL, 10, 'low', 'dangerous', ?, NULL, '2026-10-05T10:00:00Z', '2026-10-05T10:00:00Z')",
+            (json.dumps(stored),),
+        )
+        # A row with no extraction at all: the fallback must read its receipt.
+        conn.execute("UPDATE runs SET recommendations = NULL, ai_assessment = NULL")
+        conn.commit()
+
+    with closing(Database(str(path))) as db:
+        summary = insights.compute(db, 1, "2026-10-01T00:00:00Z", 30)
+    assert summary["top_recommendations"] == [
+        {"kind": "k", "title": "Cut retries", "count": 1, "est_savings_usd": 0.25},
+    ]
+    assert summary["ai_review"]["dangerous"] == 1 and summary["ai_review"]["false_positive_rate"] == 0.5
 
 
 def test_insights_are_scoped_to_the_callers_team(env):
@@ -761,8 +855,20 @@ def test_the_served_dashboard_includes_the_insights_view(tmp_path, clock):
 
 # Pure helpers
 
+def test_a_stored_grade_e_is_kept_in_the_row_but_is_no_distribution_bucket(env):
+    """Quality never produces an E (85/70/55/40 are the cutoffs), so the distribution has five
+    buckets. A receipt that still carries one keeps its grade in the row."""
+    srv, base = env
+    team_id, admin, _, _ = team_with_keys(srv)
+    push(base, admin, receipt("run-e", quality={"score": 30, "grade": "E", "signals": []}))
+    assert stored(srv, team_id, "run-e")["quality_grade"] == "E"
+    by_grade = insights_of(base, admin)["quality"]["by_grade"]
+    assert set(by_grade) == {"A", "B", "C", "D", "F"}
+    assert by_grade == {"A": 0, "B": 0, "C": 0, "D": 0, "F": 0}
+
+
 def test_the_grade_and_verdict_vocabularies_are_the_documented_ones():
-    assert insights.GRADES == ("A", "B", "C", "D", "E", "F")
+    assert insights.GRADES == ("A", "B", "C", "D", "F")
     assert insights.VERDICTS == ("looks_safe", "needs_review", "dangerous")
     assert insights.ASSESSMENTS == ("confirmed", "false_positive", "uncertain")
     assert insights.MAX_ITEMS == 50 and insights.MAX_TEXT == 2000

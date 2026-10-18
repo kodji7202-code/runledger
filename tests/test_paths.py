@@ -4,7 +4,9 @@ import pytest
 
 from runledger.cli import main
 from runledger.parser import Run, Step, Usage
-from runledger.paths import join, native, relative
+from runledger.paths import (is_unc, is_windows_style, join, native, relative,
+                             show_spaced_drive_paths, spaced_drive_labels, strip_long_prefix,
+                             within)
 from runledger.shell_writes import shell_deletes, shell_writes
 from runledger.summarize import file_changes
 
@@ -137,9 +139,127 @@ def test_shell_deletes_keep_windows_paths():
     assert shell_deletes("rm C:\\Users\\dev\\repo\\tmp.log") == ["C:\\Users\\dev\\repo\\tmp.log"]
 
 
+# ------------------------------------------------ spaced drive paths: the display label
+
+def test_spaced_drive_labels_map_the_leading_fragment_only():
+    """The rule is the one description of "a folder name with spaces is one path" for display:
+    it maps the word a shell cuts the text at to the whole path, and nothing else."""
+    assert spaced_drive_labels(r"echo hi > E:\Work\Client y\z.txt") == {
+        r"E:\Work\Client": r"E:\Work\Client y\z.txt"}
+
+
+def test_spaced_drive_labels_ignore_quoted_paths():
+    """A quoted path is one word to the shell already, so there is no fragment to relabel."""
+    assert spaced_drive_labels(r'type "E:\Work\Client X\secret.txt"') == {}
+    assert spaced_drive_labels(r"type 'E:\Work\Client y\z.txt'") == {}
+
+
+def test_show_spaced_drive_paths_never_relabels_a_whole_path_twice():
+    labels = spaced_drive_labels(r"echo hi > E:\Work\Client y\z.txt")
+    reason = r"Shell command wrote outside the working folder (E:\Work\Client y\z.txt)"
+    assert show_spaced_drive_paths(reason, labels) == reason
+    assert show_spaced_drive_paths(r"a fragment E:\Work\Client here", labels) == \
+        r"a fragment E:\Work\Client y\z.txt here"
+
+
 def test_windows_shell_writes_are_listed_relative_to_the_project():
     command = (f"cd {WIN_REPO} && echo hi > notes.txt && python3 - <<'EOF'\n"
                "open('tests/test_api.py','w').write(s)\nEOF")
     fc = _changes(command, cwd=WIN_REPO)
     assert sorted(fc) == ["notes.txt", "tests/test_api.py"]
     assert all(c.shell for c in fc.values())
+
+
+# ---------------------------------------------------------------- UNC & \\?\ long paths (VAL-CORE-027, 028)
+
+def test_unc_paths_are_windows_style_and_compare_correctly():
+    base = r"\\srv\share\proj"
+    assert is_windows_style(base) is True
+    assert is_windows_style("//srv/share/proj/a.py") is True
+    assert is_unc(base) is True
+    assert is_unc("//srv/share/proj") is True
+    assert is_unc(r"\\?\UNC\srv\share\proj") is True
+    assert is_unc(r"\\.\PhysicalDrive0") is False
+    assert is_unc(r"\\?\GLOBALROOT\Device\HarddiskVolume1") is False
+    assert within(r"\\srv\share\proj\a.py", base) is True
+    assert within("//srv/share/proj/a.py", base) is True
+    assert within(r"\\SRV\Share\Proj\b.py", base) is True
+    assert within(r"\\srv\share2\x.py", base) is False
+    assert within(r"\\srv\share\other\x.py", base) is False
+    assert relative(r"\\srv\share\proj\src\a.py", base) == "src/a.py"
+
+
+def test_long_path_prefix_is_normalised():
+    assert strip_long_prefix(r"\\?\C:\Windows\x.txt") == r"C:\Windows\x.txt"
+    assert strip_long_prefix(r"\\?\UNC\srv\share\x") == r"\\srv\share\x"
+    assert strip_long_prefix(r"\\.\PhysicalDrive0") == r"\\.\PhysicalDrive0"
+    assert strip_long_prefix(r"\\?\GLOBALROOT\Device\HarddiskVolume1") == r"\\?\GLOBALROOT\Device\HarddiskVolume1"
+    assert within(r"\\?\C:\proj\a.py", r"C:\proj") is True
+    assert within(r"\\?\C:\Windows\x.txt", r"C:\proj") is False
+    assert within(r"\\?\UNC\srv\share\x", r"\\srv\share\proj") is False
+    assert within(r"\\?\UNC\srv\share\proj\a.py", r"\\srv\share\proj") is True
+
+
+# ---------------------------------------------------------------- >200-char Claude project folder hash (VAL-CORE-061)
+
+def _ref_java_hash_base36(raw_path: str) -> str:
+    data = raw_path.encode("utf-16-le")
+    h = 0
+    for i in range(0, len(data), 2):
+        unit = data[i] | (data[i + 1] << 8)
+        h = (h * 31 + unit) & 0xFFFFFFFF
+    if h >= 0x80000000:
+        h -= 0x100000000
+    n = abs(h)
+    if n == 0:
+        return "0"
+    digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+    out = ""
+    while n:
+        n, r = divmod(n, 36)
+        out = digits[r] + out
+    return out
+
+
+def test_encode_project_path_over_200_chars_and_prefix_fallback(tmp_path, monkeypatch):
+    import re
+    from runledger.parser import encode_project_path, find_sessions
+
+    # Short path (<= 200) is unchanged
+    short_p = "/srv/short/project"
+    assert encode_project_path(short_p) == "-srv-short-project"
+
+    # Long BMP path (> 200 chars)
+    long_p = "D:\\rl-ready\\core\\long\\" + "\\".join(f"seg{i}_{'a' * 32}" for i in range(6))
+    sanitized = re.sub(r"[^a-zA-Z0-9]", "-", long_p)
+    assert len(sanitized) > 200
+    expected_long = f"{sanitized[:200]}-{_ref_java_hash_base36(long_p)}"
+    assert encode_project_path(long_p) == expected_long
+
+    # Non-BMP path (surrogate pair in UTF-16 code units)
+    non_bmp = "/work/rocket-\U0001f680/" + "/".join(f"dir{i}_{'b' * 32}" for i in range(6))
+    sanitized_nb = re.sub(r"[^a-zA-Z0-9]", "-", non_bmp)
+    assert len(sanitized_nb) > 200
+    assert encode_project_path(non_bmp) == f"{sanitized_nb[:200]}-{_ref_java_hash_base36(non_bmp)}"
+
+    # Session discovery finds exact >200 hash dir and falls back to 200-char prefix scan
+    from pathlib import Path
+    from runledger.parser import _fs_str
+
+    cfg = tmp_path / "claude"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg))
+    exact_dir = cfg / "projects" / expected_long
+    Path(_fs_str(exact_dir)).mkdir(parents=True)
+    sess = exact_dir / "s.jsonl"
+    Path(_fs_str(sess)).write_text(
+        json.dumps({"type": "user", "sessionId": "s", "cwd": long_p, "message": {"content": "hello"}}) + "\n",
+        encoding="utf-8",
+    )
+    assert find_sessions(long_p) == [sess]
+
+    # Rename suffix to something different with the same 200-char prefix
+    fallback_dir = cfg / "projects" / f"{sanitized[:200]}-differentsuffix"
+    Path(_fs_str(exact_dir)).rename(Path(_fs_str(fallback_dir)))
+    assert find_sessions(long_p) == [fallback_dir / "s.jsonl"]
+
+

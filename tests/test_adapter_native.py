@@ -126,8 +126,37 @@ def test_models_and_run_cost_are_derived_from_priced_steps_when_header_models_ar
     apply_costs(run)
 
     assert run.models == {"claude-haiku-5-5": run.usage}
-    assert run.cost == pytest.approx(0.6)
+    # Two requests: the 1M-input one bills tier 2 ($0.50), the output-only one base ($0.50)
+    assert run.cost == pytest.approx(1.0)
     assert sum(step.cost or 0 for step in run.steps) == pytest.approx(run.cost)
+
+
+def test_aggregate_only_model_totals_use_the_base_tier(tmp_path):
+    doc = {"runledger_format": 1, "models": {"gemini-2.5-pro": {"input_tokens": 1_000_000}},
+           "steps": [{"tool": "Read", "input": {"file_path": "a.py"}}]}
+    run = native.parse(_doc(tmp_path, "agg.runledger.json", doc))
+    apply_costs(run)
+    # No request data: base tier $1.25/MTok, never the >200k tier ($2.50/MTok)
+    assert run.cost == pytest.approx(1.25)
+
+
+def test_supplied_model_total_keeps_per_step_request_tiering(tmp_path):
+    doc = {"runledger_format": 1, "models": {"gemini-2.5-pro": {"input_tokens": 300_000}},
+           "steps": [{"tool": "Read", "input": {"file_path": "a.py"}, "usage": {"input_tokens": 150_000}},
+                     {"tool": "Read", "input": {"file_path": "b.py"}, "usage": {"input_tokens": 150_000}}]}
+    run = native.parse(_doc(tmp_path, "steps.runledger.json", doc))
+    apply_costs(run)
+    # Two 150k requests stay under the 200k threshold, so the 300k total bills at base
+    assert run.cost == pytest.approx(0.375)
+
+
+def test_partial_step_coverage_never_tiers_the_whole_aggregate(tmp_path):
+    doc = {"runledger_format": 1, "models": {"gemini-2.5-pro": {"input_tokens": 1_000_000}},
+           "steps": [{"tool": "Read", "input": {"file_path": "a.py"}, "usage": {"input_tokens": 300_000}}]}
+    run = native.parse(_doc(tmp_path, "partial.runledger.json", doc))
+    apply_costs(run)
+    # The known 300k request pays tier 2 ($0.75); the remaining 700k stays on the base tier ($0.875)
+    assert run.cost == pytest.approx(0.75 + 0.875)
 
 
 def test_result_text_is_capped_like_the_claude_adapter(tmp_path):

@@ -69,3 +69,114 @@ def test_cached_results_cannot_be_changed_by_callers():
     assert [w.path for w in shell_writes(command)] == ["pkg/a.txt"]
     assert shell_deletes(command) == ["pkg/b.txt"]
     assert shell_deletes(command) == ["pkg/b.txt"]
+
+
+def test_parse_session_is_single_pass_with_bounded_memory(tmp_path):
+    import inspect
+    import tracemalloc
+    from runledger import parser
+
+    src = inspect.getsource(parser.parse_session)
+    assert "events: List" not in src and "events = [" not in src
+
+    # Write a ~10 MB JSONL session with 20 tool calls each returning a 500 KB tool_result
+    big_chunk = "A" * 500_000
+    session = tmp_path / "big.jsonl"
+    with session.open("w", encoding="utf-8") as f:
+        for i in range(20):
+            f.write(json.dumps({
+                "type": "assistant",
+                "message": {
+                    "id": f"m{i}",
+                    "model": "claude-opus-4-6",
+                    "usage": {"input_tokens": 100, "output_tokens": 10},
+                    "content": [{"type": "tool_use", "id": f"t{i}", "name": "Read", "input": {"file_path": f"f{i}.txt"}}],
+                },
+            }) + "\n")
+            f.write(json.dumps({
+                "type": "user",
+                "message": {
+                    "content": [{"type": "tool_result", "tool_use_id": f"t{i}", "content": big_chunk}],
+                },
+            }) + "\n")
+
+    tracemalloc.start()
+    try:
+        run = parser.parse_session(session)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert len(run.steps) == 20
+    # Peak allocation stays under 3x the largest single event (~1.8 MB << 10 MB file)
+    assert peak < 3 * 650_000
+
+
+def test_list_is_fast_on_large_sessions(tmp_path, monkeypatch, capsys):
+    from runledger.parser import encode_project_path
+
+    cfg = tmp_path / "claude_cfg"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg))
+    prj = tmp_path / "proj"
+    prj.mkdir()
+    proj_dir = cfg / "projects" / encode_project_path(str(prj))
+    proj_dir.mkdir(parents=True)
+
+    fake_tok = "sk-" + "ant-api03-" + ("a" * 24)
+    big_chunk = "B" * 200_000
+    for s in range(6):
+        sid = f"large-{s:02d}"
+        sf = proj_dir / f"{sid}.jsonl"
+        with sf.open("w", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "type": "user",
+                "sessionId": sid,
+                "cwd": str(prj),
+                "message": {"content": f"fix task {s} with token {fake_tok}"},
+            }) + "\n")
+            for i in range(10):
+                f.write(json.dumps({
+                    "type": "assistant",
+                    "sessionId": sid,
+                    "message": {
+                        "id": f"m-{s}-{i}",
+                        "model": "claude-sonnet-4-5-20250929",
+                        "usage": {"input_tokens": 100, "output_tokens": 10},
+                        "content": [{"type": "tool_use", "id": f"t-{s}-{i}", "name": "Read",
+                                     "input": {"file_path": f"f{i}.txt"}}],
+                    },
+                }) + "\n")
+                f.write(json.dumps({
+                    "type": "user",
+                    "sessionId": sid,
+                    "message": {
+                        "content": [{"type": "tool_result", "tool_use_id": f"t-{s}-{i}", "content": big_chunk}],
+                    },
+                }) + "\n")
+
+    assert main(["list", "--project", str(prj), "--limit", "6"]) == 0
+    out1 = capsys.readouterr().out
+    assert "10 steps" in out1
+    assert "sk-ant-" not in out1
+    assert "[REDACTED" in out1
+
+    # Warm run uses the session cache without re-opening the multi-megabyte session files
+    from pathlib import Path
+    opened = []
+    real_open = Path.open
+
+    def spy_open(self, *args, **kwargs):
+        if self.suffix == ".jsonl":
+            opened.append(self)
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", spy_open)
+    start = time.perf_counter()
+    assert main(["list", "--project", str(prj), "--limit", "6"]) == 0
+    elapsed = time.perf_counter() - start
+    out2 = capsys.readouterr().out
+    assert out2 == out1
+    assert elapsed < 1.0
+    assert opened == []
+
+

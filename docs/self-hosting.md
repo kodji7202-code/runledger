@@ -74,9 +74,11 @@ Run these commands on the host, from the repository's `deploy` folder.
    The team's first key is an admin key labelled `initial`. It is printed once. Save it in a password
    manager. The server stores only a hash of it, so it cannot show the key again.
 
-6. Open the dashboard once with the key: `https://runledger.example.com/?key=YOUR_KEY`. The
-   server sets a session cookie and redirects, so the key leaves the address bar. After that,
-   open the plain address.
+6. Open the dashboard at `https://runledger.example.com/` and sign in with the key in the form. The
+   key travels in the request body, so it never enters the address bar. Links with
+   `?key=YOUR_KEY` still work for a first sign-in (they redirect to strip the key) but are
+   deprecated, and they never replace an existing session of another team without a confirming
+   click.
 
 7. Push a run from a developer's machine, with a member or admin key:
 
@@ -85,6 +87,12 @@ Run these commands on the host, from the repository's `deploy` folder.
    export RUNLEDGER_API_KEY=YOUR_KEY
    runledger push --user "Ana"
    ```
+
+   The stored receipt keeps full local paths and e-mail addresses unless safe mode is on, and a
+   push to this server without it prints a one-line tip on stderr. Add `--safe` (or set
+   `RUNLEDGER_PUSH_SAFE=1`, or `"push_safe": true` in `~/.runledger/config.json`) so the receipts
+   on a shared server carry relative paths and `[EMAIL]` only; `--no-safe` forces full detail and
+   wins over the environment and the config.
 
 Day-to-day commands, from `deploy`:
 
@@ -96,46 +104,38 @@ docker compose down                # stop; keeps the volumes and the data
 
 Do not run `docker compose down -v` unless you want to delete the data volumes.
 
-### Trusted proxy on the Compose network (recommended)
+### Trusted proxy on the Compose network
 
 Caddy reaches the server over the Compose network, so the server sees Caddy's address as the client.
-Until the server is told that Caddy is a trusted proxy:
+The compose file pins that network to `172.28.0.0/16` and passes the subnet as
+`RUNLEDGER_TRUSTED_PROXIES`, so the server already knows Caddy is a proxy and reads each client's
+address from `X-Forwarded-For`. Without a trusted proxy named:
 
 - every user shares one failed-sign-in counter with Caddy's address, so a few bad keys from anyone can
   lock out everyone for up to five minutes (`429`);
 - the audit log records Caddy's address instead of the user's.
 
-Name the Compose network as a trusted proxy:
+Change `RUNLEDGER_TRUSTED_PROXIES` in `deploy/.env` when the stack does not use that subnet, for
+example after you change the network in `deploy/docker-compose.yml`. The subnet of the network is:
 
-1. After the stack is running, find the subnet of the network. Compose names it `<project>_default`,
-   which is `deploy_default` in this folder:
+```bash
+docker network inspect deploy_runledger-net --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}'
+```
 
-   ```bash
-   docker network inspect deploy_default --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}'
-   ```
+```yaml
+environment:
+  RUNLEDGER_PUBLIC_URL: ${RUNLEDGER_PUBLIC_URL:?set RUNLEDGER_PUBLIC_URL in deploy/.env}
+  RUNLEDGER_TRUSTED_PROXIES: "172.20.0.0/16"   # the subnet of your network
+```
 
-2. Tell the server the subnet. The simplest way is the environment of the `runledger` service in
-   `deploy/docker-compose.yml`, which needs no change to the command:
+The equivalent flag is `--trusted-proxy 172.20.0.0/16` in the server command (the `CMD` in the
+`Dockerfile`, or a `command:` in the compose file). Apply the change with `docker compose up -d`; the
+server prints `Trusting X-Forwarded-For from: 172.20.0.0/16` when it starts.
 
-   ```yaml
-   environment:
-     RUNLEDGER_PUBLIC_URL: ${RUNLEDGER_PUBLIC_URL:?set RUNLEDGER_PUBLIC_URL in deploy/.env}
-     RUNLEDGER_TRUSTED_PROXIES: "172.20.0.0/16"   # the subnet from step 1
-   ```
-
-   The equivalent flag is `--trusted-proxy 172.20.0.0/16` in the server command (the `CMD` in the
-   `Dockerfile`, or a `command:` in the compose file).
-
-3. Apply the change with `docker compose up -d`. The server prints
-   `Trusting X-Forwarded-For from: 172.20.0.0/16` when it starts.
-
-Docker assigns subnets, and a network that is recreated can get a different one. Check the subnet again
-after you change the network, and pin it in the compose file if it must stay the same. Only the Caddy
-container should be on this network, which is the case by default.
-
-With a trusted proxy named, the server takes the client address from `X-Forwarded-For`, and it honours
-`X-Forwarded-Proto` (set by Caddy) only from that proxy. The `Dockerfile` command also passes
-`--trust-proxy`, so the HTTPS cookie flags work through Caddy.
+Only the Caddy container and the server are on this network. With a trusted proxy named, the server
+takes the client address from `X-Forwarded-For`, and it honours `X-Forwarded-Proto` (set by Caddy)
+only from that proxy. The `Dockerfile` command also passes `--trust-proxy`, so the HTTPS cookie flags
+work through Caddy.
 
 ## Bare metal: pip, systemd and nginx
 
@@ -299,7 +299,8 @@ Keys do not expire. Rotate a key when a person leaves or when a key may have lea
 | `--trust-proxy` | `runledger serve` | Honours `X-Forwarded-Proto: https` for the `Secure` flag and HSTS. Only from the `--trusted-proxy` addresses when any are given; otherwise from any address. |
 | `--trusted-proxy CIDR` (repeatable), or `RUNLEDGER_TRUSTED_PROXIES` (comma-separated) | `runledger serve`, environment | The addresses or ranges of your reverse proxies, for example `127.0.0.1` or `172.20.0.0/16`. The client address is read from `X-Forwarded-For` only for these peers. It is used for the failed-sign-in limit and the audit log. |
 | `RUNLEDGER_PUBLIC_URL` | environment | Public base URL used in approval links. Set it whenever the server is behind a proxy. |
-| `RUNLEDGER_RETENTION_DAYS` | environment | Delete runs, approvals, audit events and budget alerts older than this many days. Checked at start and every hour. Unset keeps everything. |
+| `RUNLEDGER_RETENTION_DAYS` | environment | Delete runs, their history, approvals and budget alerts older than this many days. Checked at start and every hour. Unset keeps everything. The shortest useful period is 35 days: a value from 1 to 34 is raised to 35 with a warning, because a shorter one could delete the runs of the month a budget alert belongs to and fire the alert again. Budget alerts are kept by the calendar month they belong to, never by their fire time. |
+| `RUNLEDGER_AUDIT_RETENTION_DAYS` | environment | Delete audit events older than this many days, on their own schedule. Default 365 while `RUNLEDGER_RETENTION_DAYS` is set, and `0` keeps them forever. Unset with no run retention keeps everything. |
 
 The database is upgraded automatically when the server starts. Missing columns are added, so an old
 database keeps working. A database from before roles existed keeps its one key as an admin key labelled
@@ -317,8 +318,16 @@ mechanism instead.
 sudo sqlite3 /var/lib/runledger/runledger.db ".backup '/var/backups/runledger-$(date +%F).db'"
 ```
 
-**Any install**, with `runledger backup` (0.4.0 and later). It uses SQLite's online backup, so the
-server keeps running, writes `runledger-YYYYmmdd-HHMMSS.db` and keeps the newest 14 copies:
+**Any install**, with `runledger backup` (0.4.0 and later). It uses SQLite's online backup via a
+temporary file and atomic rename so the server keeps running, writes
+`runledger-<db-stem>-YYYYmmdd-HHMMSS[-N].db`, and keeps the newest 14 copies for that database stem.
+Each database keeps its own retention namespace: the stem is its file name with characters outside
+`A-Za-z0-9._-` percent-encoded, so `team a.db` and `team_a.db` do not prune each other. Concurrent
+backups in the same second reserve different names (`<name>.db.lock` markers), and retention never
+counts an unfinished copy: the marker, an empty placeholder or a `.tmp` file stays out of the count,
+so two overlapping `--keep 1` runs still leave at least one finished backup. A run that read the
+names before another run finished checks the final name again while it holds its own marker, so a
+completed copy is never overwritten by a delayed run:
 
 ```bash
 runledger backup --db /var/lib/runledger/runledger.db --dir /var/backups/runledger --keep 14
@@ -332,9 +341,12 @@ chmod +x deploy/backup.sh
 crontab -e   # add: 15 3 * * * cd /path/to/runledger/deploy && ./backup.sh >> backup.log 2>&1
 ```
 
-**Whole volume.** For a complete copy, including the certificates in the Caddy volume, stop
-the stack and archive the volumes. The volume names start with the project name, which is the
-folder name (`deploy`). Check them with `docker volume ls`.
+**Whole data volume.** For a complete copy of the server's data, stop the stack and archive the
+volume. It holds the database, its `-wal` and `-shm` files and the copies under `/data/backups`.
+Caddy's certificates are **not** in it: they live in the `caddy-data` volume (mounted at `/data` in
+the Caddy container) and the `caddy-config` volume (`/config`), which this recipe leaves alone. The
+volume names start with the project name, which is the folder name (`deploy`). Check them with
+`docker volume ls`.
 
 ```bash
 docker compose down
@@ -343,12 +355,114 @@ docker run --rm -v deploy_runledger-data:/data -v "$PWD":/backup alpine \
 docker compose up -d
 ```
 
+The archive is named `runledger-data-<date>.tgz`, with the date in `YYYY-MM-DD` form
+(`date +%F`), for example `runledger-data-2026-10-18.tgz`. The restore recipe below reads that same
+name.
+
+If you also want the certificates, archive those two volumes the same way. Caddy asks Let's
+Encrypt for them again on the next start, so you need that only to stay away from the request
+limits.
+
 Store backups off the host, encrypted. They contain the same data as the live database,
 including keys' hashes, prompts, file paths and webhook URLs. Test a restore before you need one.
 
-**Restore.** Stop the server. Replace `runledger.db` with the backup file, and delete any
-`runledger.db-wal` and `runledger.db-shm` files that belong to the old database. Start the
-server again.
+**Restore.** Stop the server first, so nothing writes to the database while you replace it, and
+delete the `runledger.db-wal` and `runledger.db-shm` files that belong to the old database. A
+backup is owner-only (`0600`) and the server runs as an unprivileged user, so both recipes hand the
+restored database to that user before the server starts again.
+
+**Bare metal:**
+
+```bash
+sudo systemctl stop runledger
+sudo cp /var/backups/runledger/runledger-runledger-20261018-030000.db /var/lib/runledger/runledger.db
+sudo rm -f /var/lib/runledger/runledger.db-wal /var/lib/runledger/runledger.db-shm
+sudo chown runledger:runledger /var/lib/runledger/runledger.db
+sudo chmod 600 /var/lib/runledger/runledger.db
+sudo systemctl start runledger
+```
+
+`runledger:runledger` is the service user from the systemd unit above. The `cp` runs as `root`, so
+without the `chown` the restored file belongs to `root` and the service cannot open it.
+
+**Docker.** The data lives in the `runledger-data` volume of the Compose project, so copy the
+backup into the volume with a throwaway container instead of the host filesystem. Host copies made
+by `deploy/backup.sh` are in `deploy/backups/`, which is `/backup/backups/` in the container. The
+volume is named `<compose project>_runledger-data` and the image `<compose project>-runledger`; the
+project name is the folder the compose file is run from (`deploy`), or the `-p` name you pass:
+
+```bash
+cd deploy
+docker compose down
+docker run --rm -v deploy_runledger-data:/data -v "$PWD":/backup alpine \
+  sh -c "cp /backup/backups/runledger-runledger-20261018-030000.db /data/runledger.db \
+         && rm -f /data/runledger.db-wal /data/runledger.db-shm"
+docker run --rm --user root -v deploy_runledger-data:/data --entrypoint sh deploy-runledger \
+  -c "chown -R runledger:runledger /data && chmod 700 /data && chmod 600 /data/runledger.db"
+docker compose up -d
+```
+
+The Alpine helper runs as `root`, so the database it copies belongs to `root`; the second command
+is the image's own shell, started as `root`, and gives the volume and the file back to the
+`runledger` user the server runs as (`USER runledger` in the `Dockerfile`), with `/data` writable by
+that user and the database owner-only. Without it the server cannot open its database, and a data
+volume that was created by an Alpine helper is not writable by that user either.
+
+With `docker compose -p myproject ...` the volume is `myproject_runledger-data` and the image is
+`myproject-runledger`; use those names in the helper commands. If you built the image yourself with
+`docker build -t <name> .`, use `<name>` in the helper commands.
+
+**Whole data volume (tar).** Restore the archive from the "Whole data volume" backup into the
+volume, with the `runledger` service stopped. The backup command names the archive with `date +%F`,
+so the file is `runledger-data-YYYY-MM-DD.tgz`; name the file you actually took the same way
+(`runledger-data-2026-10-18.tgz` below is one example). The backup archives the data directory
+(`tar czf ... -C /data .`), so its members are relative to it and the restore has to put them back
+where they came from. Nothing may be deleted before the archive has been proven usable.
+
+The recipe stops the `runledger` service only, leaving Caddy and its volumes alone, then runs one
+helper container from the server's own image, with the data volume on `/data` and the `deploy`
+folder on `/backup`. It runs a single `sh -c` script with `set -e` that does everything in order:
+check the archive is readable, list it with `tar tzf`, extract it into the fresh `/restore`
+directory, check that the extracted tree holds the database, and only then empty `/data` and copy
+the extracted tree into it (`cp -a /restore/. /data/`), ending by handing the volume back to the
+service user. The `&&` starts the service only when that container exited 0, so a missing,
+unreadable, corrupt or unusable archive leaves the volume exactly as it was, with the server still
+stopped:
+
+```bash
+cd deploy
+docker compose stop runledger
+archive=runledger-data-2026-10-18.tgz     # the YYYY-MM-DD name the backup command wrote
+docker run --rm --user root \
+  -v deploy_runledger-data:/data -v "$PWD":/backup --entrypoint sh deploy-runledger \
+  -c '
+set -e
+archive="/backup/$1"
+test -r "$archive"                    # a missing or unreadable archive stops here
+tar tzf "$archive" > /dev/null        # a corrupt archive stops here
+rm -rf /restore
+mkdir -p /restore
+tar xzf "$archive" -C /restore        # the members are relative to the data directory
+test -f /restore/runledger.db         # no database means no restore
+find /data -mindepth 1 -delete        # the archive is usable: replace the old contents
+cp -a /restore/. /data/
+rm -rf /restore
+chown -R runledger:runledger /data
+chmod 700 /data
+chmod 600 /data/runledger.db
+' sh "$archive" \
+  && docker compose start runledger
+```
+
+The archive holds what the volume held when it was taken, with the files' own modes (the database
+is `0600`), and copying it in replaces the old contents, including the `-wal` and `-shm` files that
+belonged to the database you replaced. It does not touch Caddy's volumes, so the certificates are
+still there; the recipe removes no volume at all, while `docker compose down -v` would delete
+`caddy-data` and `caddy-config`, which this archive does not hold. `tar` and the copy run as `root`
+in the helper, so the last lines give the volume back to the `runledger` user that the server runs
+as. If the server runs with a different `--db` name, use that file name in the `test -f` and
+`chmod` lines. When the helper exits non-zero, nothing has been deleted and the server stays
+stopped: fix the archive, the name or the file name above and run the recipe again.
 
 ## Upgrades
 
@@ -397,19 +511,25 @@ roll back, install the older version and restore the backup from before the upgr
       and HTML exports. They contain developer and project names, run titles (the first request, up to 200
       characters), risk findings, approval decisions and audit details. Treat them as confidential. They are
       records, not a compliance certification.
-- [ ] **Choose a retention period.** Without `RUNLEDGER_RETENTION_DAYS`, runs stay until the database
-      is removed. With it, older runs, approvals and audit events are deleted every hour. To erase
+- [ ] **Choose a retention period.** Without `RUNLEDGER_RETENTION_DAYS`, nothing is deleted
+      automatically, whatever its age. With it (35 days or more; shorter values are raised to 35),
+      older runs, their history, approvals and budget alerts are deleted every hour. Audit events
+      follow their own period (`RUNLEDGER_AUDIT_RETENTION_DAYS`, default 365 days while runs are
+      pruned, `0` for ever), so a 35-day run period still keeps a year of audit history. To erase
       everything, stop the server, back up what you need, and delete the database file and its
       `-wal` and `-shm` files. This removes every team.
 - [ ] **Keep the host and the images updated.** Rebuild the Docker image with `--pull` when a new
-      base image is released. The container runs as the unprivileged `runledger` user.
+      base image is released. The container runs as the unprivileged `runledger` user, its filesystem
+      is read-only (only the data volume and `/tmp` are writable), and it drops every Linux capability
+      and cannot gain new privileges (`deploy/docker-compose.yml`).
 - [ ] **Back up regularly, and test the restore.**
 
-## Known limits in 0.4.0
+## Known limits
 
 - No single sign-on, no per-person accounts, no multi-factor authentication, and no key expiry.
-- Retention is one period for the whole server (`RUNLEDGER_RETENTION_DAYS`), not per team. There is no
-  command to delete a single run.
+- Retention is one run period for the whole server (`RUNLEDGER_RETENTION_DAYS`), not per team, with
+  a separate period for audit events (`RUNLEDGER_AUDIT_RETENTION_DAYS`). There is no command to
+  delete a single run.
 - One server process and one SQLite file. This is not a multi-node cluster.
 - There is no sign-out endpoint. Sessions end when their key is revoked or rotated, or after 12 hours.
 - Receipts and the guard's log mask secrets by pattern. A secret in an unknown format, or a short
@@ -431,8 +551,9 @@ roll back, install the older version and restore the backup from before the upgr
 - **Everyone gets `429 rate_limited`**: one address sent more than 20 failed credentials in five
   minutes. Wait for the `Retry-After` time. If the server is behind a proxy, set the proxy as a trusted
   proxy (see above) so that the limit counts each client.
-- **The dashboard asks you to sign in**: open `https://YOUR_DOMAIN/?key=YOUR_KEY` once, as in
-  step 6 of the quickstart. Sessions last 12 hours.
+- **The dashboard asks you to sign in**: open `https://YOUR_DOMAIN/` and sign in with the key in the
+  form (or the deprecated `/?key=YOUR_KEY` link), as in step 6 of the quickstart. Sessions last 12
+  hours.
 - **`runledger push` says there is no server or key**: set `RUNLEDGER_SERVER` and
   `RUNLEDGER_API_KEY`, or pass `--server` and `--key`.
 - **`runledger push` answers `403`**: the key has the viewer role. Use a member or admin key.

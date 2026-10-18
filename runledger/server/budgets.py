@@ -97,48 +97,84 @@ def _pct(spend: float, limit: Optional[float]) -> Optional[float]:
 
 
 def status(db: Database, team_id: int, when: Optional[datetime] = None) -> Dict[str, Any]:
-    """This month's spend against the team budget, and each developer's spend, largest first."""
+    """This month's spend against the team budget, and each developer's spend, largest first.
+
+    Only runs with a known cost add to a spend figure; the run counts next to it say how much of
+    the month the figure covers, and `cost_is_lower_bound` is true when some run is unpriced or
+    only partly priced. A developer whose runs all have unknown costs shows a spend of 0."""
     month, start, end = month_window(when or now())
     settings = db.budget_settings(team_id)
-    total, by_user = db.month_spend(team_id, start, end)
+    spend = db.month_spend(team_id, start, end)
+    total = spend["spend_usd"] or 0.0
     per_user = [
-        {"user": name, "spend_usd": round(spend, 6), "pct": _pct(spend, settings["per_user_monthly_usd"])}
-        for name, spend in sorted(by_user, key=lambda item: (-item[1], item[0]))
+        {
+            "user": row["user"],
+            "spend_usd": round(row["spend_usd"] or 0.0, 6),
+            "pct": _pct(row["spend_usd"] or 0.0, settings["per_user_monthly_usd"]),
+            "runs": row["runs"],
+            "priced_runs": row["priced_runs"],
+            "unpriced_runs": row["runs"] - row["priced_runs"],
+            "partial_runs": row["partial_runs"],
+        }
+        for row in spend["users"]
     ]
     return {
         "month": month,
         "spend_usd": round(total, 6),
         "monthly_usd": settings["monthly_usd"],
         "pct": _pct(total, settings["monthly_usd"]),
+        "runs": spend["runs"],
+        "priced_runs": spend["priced_runs"],
+        "unpriced_runs": spend["runs"] - spend["priced_runs"],
+        "partial_runs": spend["partial_runs"],
+        "cost_is_lower_bound": bool(
+            spend["runs"] > spend["priced_runs"] or spend["partial_runs"]
+        ),
         "per_user": per_user,
     }
 
 
 def _crossed(month: str, scope: str, user: Optional[str], spend: float, limit: float,
-             thresholds: List[int]) -> List[Dict[str, Any]]:
+             thresholds: List[int], counts: Dict[str, int]) -> List[Dict[str, Any]]:
     pct = 100.0 * spend / limit
     return [
         {"scope": scope, "user": user, "threshold": t, "month": month,
-         "spend_usd": round(spend, 6), "limit_usd": round(limit, 6), "pct": round(pct, 2)}
+         "spend_usd": round(spend, 6), "limit_usd": round(limit, 6), "pct": round(pct, 2),
+         "runs": counts["runs"], "unpriced_runs": counts["unpriced_runs"],
+         "partial_runs": counts["partial_runs"],
+         "lower_bound": bool(counts["unpriced_runs"] or counts["partial_runs"])}
         for t in thresholds if pct >= t
     ]
 
 
+def _counts(row: Dict[str, Any]) -> Dict[str, int]:
+    return {
+        "runs": row["runs"],
+        "unpriced_runs": row["runs"] - row["priced_runs"],
+        "partial_runs": row["partial_runs"],
+    }
+
+
 def check_alerts(db: Database, team_id: int, when: Optional[datetime] = None) -> List[Dict[str, Any]]:
     """Record every threshold the team or a developer has crossed this month and has not yet
-    alerted on. Returns only the newly fired alerts, for the caller to send."""
+    alerted on. Returns only the newly fired alerts, for the caller to send. Each alert carries
+    the run counts behind the figure, so a lower bound is never announced as a final amount."""
     month, start, end = month_window(when or now())
     settings = db.budget_settings(team_id)
     thresholds = settings["alert_thresholds"]
-    total, by_user = db.month_spend(team_id, start, end)
+    spend = db.month_spend(team_id, start, end)
+    total = spend["spend_usd"] or 0.0
     candidates: List[Dict[str, Any]] = []
     limit = settings["monthly_usd"]
     if limit:  # None and 0 both mean no limit
-        candidates += _crossed(month, "team", None, total, limit, thresholds)
+        candidates += _crossed(month, "team", None, total, limit, thresholds, _counts(spend))
     per_user_limit = settings["per_user_monthly_usd"]
     if per_user_limit:
-        for name, spend in by_user:
-            candidates += _crossed(month, f"user:{name}", name, spend, per_user_limit, thresholds)
+        for row in spend["users"]:
+            candidates += _crossed(
+                month, f"user:{row['user']}", row["user"], row["spend_usd"] or 0.0,
+                per_user_limit, thresholds, _counts(row),
+            )
     if not candidates:
         return []
     return db.record_budget_alerts(team_id, month, candidates)

@@ -24,19 +24,6 @@ APPROVAL = {"timeout_s": 5}   # the server is never read from the policy; see RU
 SERVER = "https://approvals.example.test"
 
 
-@pytest.fixture(autouse=True)
-def isolated_settings(tmp_path, monkeypatch):
-    """HOME and USERPROFILE point at an empty folder, and the approval variables are
-    cleared, so no test reads the real ~/.runledger/config.json or the environment."""
-    home = tmp_path / "isolated-home"
-    home.mkdir()
-    monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setenv("USERPROFILE", str(home))
-    monkeypatch.delenv("RUNLEDGER_SERVER", raising=False)
-    monkeypatch.delenv("RUNLEDGER_API_KEY", raising=False)
-    return home
-
-
 def bash_event(cwd, command, session="sess-1"):
     return {"session_id": session, "transcript_path": "t.jsonl", "cwd": str(cwd),
             "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": command}}
@@ -93,6 +80,92 @@ def test_default_asks_on_sudo(tmp_path):
 def test_default_still_denies_rm_rf_under_sudo(tmp_path):
     d = guard.decide(bash_event(tmp_path, "sudo rm -rf /var/data"), {})
     assert d["decision"] == "deny"
+
+
+def test_default_denies_a_delete_after_a_multiline_ansi_c_string(tmp_path):
+    """CORE-SCR-R2-002: a `$'...'` string may contain literal newlines; the `rm -rf` after its
+    closing quote is still read, so the default deny stays in effect."""
+    d = guard.decide(bash_event(tmp_path, "echo $'first\nsecond'\nrm -rf ./build"), {})
+    assert d["decision"] == "deny"
+    assert "command" in d["codes"]
+
+
+def test_default_asks_again_for_an_operand_after_a_spaced_drive_path(tmp_path):
+    """CORE-SCR-R2-004: `../outside.txt` is an argument of its own, so deleting it is still a
+    high finding and the guard asks instead of allowing the command."""
+    repo = tmp_path / "client work"
+    repo.mkdir()
+    command = "rm " + str(repo).replace(chr(92), "/") + "/a.txt ../outside.txt"
+    d = guard.decide(bash_event(repo, command), {})
+    assert d["policy_decision"] == "ask"
+    assert d["decision"] == "ask"
+    assert any(r["code"] == "shell_outside" and r["severity"] == "high" for r in d["risks"])
+
+
+@pytest.mark.parametrize("template", [
+    "rm {root}/sub/a.txt nested/../../outside.txt",
+    "rm {root}/sub/a.txt > {root}/sub/log nested/../../outside.txt",
+    "rm < {root}/sub/input nested/../../outside.txt",
+])
+def test_default_asks_again_for_a_traversing_operand_after_a_spaced_drive_path(tmp_path, template):
+    """CORE-SCR-R3-001: `nested/../../outside.txt` climbs out of the project, so its high
+    finding survives the display join and the default guard asks instead of deleting it."""
+    repo = tmp_path / "client work"
+    repo.mkdir()
+    command = template.format(root=str(repo).replace(chr(92), "/"))
+    d = guard.decide(bash_event(repo, command), {})
+    assert d["policy_decision"] == "ask"
+    assert d["decision"] == "ask"
+    outside = [r for r in d["risks"] if r["code"] == "shell_outside"
+               and r["severity"] == "high" and r["reason"].endswith("(nested/../../outside.txt)")]
+    assert len(outside) == 1
+
+
+def test_default_asks_and_names_the_traversing_operand_of_a_backslash_drive_path(tmp_path):
+    """CORE-SCR-R3-001, the literal reproducer: `rm C:\\a b\\x nested/../../outside.txt` asks
+    again, and the escaping operand is named next to the whole-path finding."""
+    d = guard.decide(bash_event(tmp_path, r"rm C:\a b\x nested/../../outside.txt"), {})
+    assert d["policy_decision"] == "ask"
+    assert d["decision"] == "ask"
+    reasons = [r["reason"] for r in d["risks"]
+               if r["code"] == "shell_outside" and r["severity"] == "high"]
+    assert any(reason.endswith("(nested/../../outside.txt)") for reason in reasons)
+
+
+def test_default_asks_for_the_escaping_operand_of_an_explicit_rm_executable(tmp_path):
+    """CORE-SCR-R4-001: the executable `bin/rm` and the plain argument `sub/echo` stay separate
+    words, so deleting `../outside.txt` is a high finding and the guard asks instead of
+    allowing an outside delete."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    command = str(repo).replace(chr(92), "/") + "/bin/rm sub/echo ../outside.txt"
+    d = guard.decide(bash_event(repo, command), {})
+    assert d["policy_decision"] == "ask"
+    assert d["decision"] == "ask"
+    assert [(r["severity"], r["code"]) for r in d["risks"] if r["code"] == "shell_outside"] == [
+        ("high", "shell_outside")]
+
+
+def test_the_spaced_path_label_does_not_change_the_guard_decision(tmp_path):
+    """The label only rewrites the path a receipt shows: the unquoted spaced path asks exactly
+    like the same command with the path quoted, with the same codes and severities."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    loose = guard.decide(bash_event(repo, r"echo hi > E:\Work\Client y\z.txt"), {})
+    quoted = guard.decide(bash_event(repo, r"echo hi > 'E:\Work\Client y\z.txt'"), {})
+    assert loose["decision"] == quoted["decision"]
+    assert [(r["code"], r["severity"]) for r in loose["risks"]] == \
+        [(r["code"], r["severity"]) for r in quoted["risks"]]
+
+
+def test_default_denies_a_delete_after_a_queued_heredoc_past_a_multiline_ansi_c_string(tmp_path):
+    """CORE-SCR-R3-002: a newline inside `$'...'` is part of that word, not the end of the
+    command line, so the queued heredoc starts after the real terminator and the `rm -rf`
+    following it is still read: the default guard denies it."""
+    command = "echo <<EOF $'first\nsecond'\npayload\nEOF\nrm -rf ./build"
+    d = guard.decide(bash_event(tmp_path, command), {})
+    assert d["decision"] == "deny"
+    assert "command" in d["codes"]
 
 
 def test_default_allows_ls_and_prints_nothing(tmp_path):
@@ -503,7 +576,7 @@ def test_install_merges_and_keeps_every_existing_setting(tmp_path):
     assert data["hooks"]["Stop"] == original["hooks"]["Stop"]
     pre = data["hooks"]["PreToolUse"]
     assert pre[0] == original["hooks"]["PreToolUse"][0]
-    assert pre[1] == {"matcher": "*", "hooks": [{"type": "command", "command": "runledger guard", "timeout": 135}]}
+    assert pre[1] == {"matcher": "*", "hooks": [{"type": "command", "command": f'"{sys.executable}" -m runledger guard', "timeout": 135}]}
 
 
 def test_install_is_idempotent(tmp_path):
@@ -514,7 +587,7 @@ def test_install_is_idempotent(tmp_path):
     assert settings.read_bytes() == first
     assert not settings.with_name("settings.json.bak").exists()
     entries = [h for g in json.loads(first)["hooks"]["PreToolUse"] for h in g["hooks"]]
-    assert sum("runledger guard" in h["command"] for h in entries) == 1
+    assert sum(guard._is_guard_hook(h) for h in entries) == 1
 
 
 def test_install_recognises_a_guard_entry_under_another_matcher(tmp_path):
@@ -523,11 +596,11 @@ def test_install_recognises_a_guard_entry_under_another_matcher(tmp_path):
         {"matcher": "Bash", "hooks": [{"type": "command", "command": "runledger guard"}]}]}}
     settings.write_text(json.dumps(existing), encoding="utf-8")
     changed, backup = guard.install_hook(settings)
-    assert changed is True and backup is not None          # timeout added to the existing entry
+    assert changed is True and backup is not None          # command and timeout updated on the existing entry
     pre = json.loads(settings.read_text(encoding="utf-8"))["hooks"]["PreToolUse"]
     assert len(pre) == 1                                    # no second entry
     assert pre[0]["matcher"] == "Bash"                      # the user's matcher is kept
-    assert pre[0]["hooks"][0] == {"type": "command", "command": "runledger guard", "timeout": 135}
+    assert pre[0]["hooks"][0] == {"type": "command", "command": f'"{sys.executable}" -m runledger guard', "timeout": 135}
 
 
 def test_install_refuses_invalid_json_and_leaves_the_file(tmp_path):
@@ -959,7 +1032,7 @@ def test_install_writes_the_default_hook_timeout(tmp_path):
     settings = tmp_path / "s" / "settings.json"
     guard.install_hook(settings)
     hook = json.loads(settings.read_text(encoding="utf-8"))["hooks"]["PreToolUse"][0]["hooks"][0]
-    assert hook == {"type": "command", "command": "runledger guard", "timeout": 135}
+    assert hook == {"type": "command", "command": f'"{sys.executable}" -m runledger guard', "timeout": 135}
 
 
 def test_install_hook_timeout_is_approval_wait_plus_15(tmp_path):
@@ -1032,3 +1105,624 @@ def test_hook_process_end_to_end(tmp_path):
 
     garbage = run("definitely not json")
     assert garbage.returncode == 0 and garbage.stdout == b""
+
+
+def test_guard_redos_extra_secret_paths_is_fast_and_logs_warning(tmp_path):
+    import time
+    from runledger.parser import Run, Step, Usage
+    from runledger.risk import assess
+
+    (tmp_path / ".runledger.json").write_text(json.dumps({
+        "extra_secret_paths": ["(a+)+$", r"\.vault$"],
+    }), encoding="utf-8")
+    (tmp_path / ".runledger").mkdir(parents=True, exist_ok=True)
+    (tmp_path / ".runledger" / "guard.log").write_text("", encoding="utf-8")
+
+    evil_target = "a" * 50 + "!"
+    evt = {"session_id": "sess-redos", "cwd": str(tmp_path), "hook_event_name": "PreToolUse",
+           "tool_name": "Read", "tool_input": {"file_path": str(tmp_path / evil_target)}}
+    t0 = time.perf_counter()
+    dec = guard.evaluate(evt)
+    elapsed_guard = time.perf_counter() - t0
+    assert elapsed_guard < 0.05
+    assert dec.decision == "allow"
+
+    log_text = (tmp_path / ".runledger" / "guard.log").read_text(encoding="utf-8")
+    assert "ignored unsafe/invalid extra_secret_paths pattern" in log_text
+
+    run = Run(
+        session_id="sess-redos", path="", agent="claude-code", cwd=str(tmp_path), git_branch="main",
+        started="2026-03-01T10:00:00Z", ended="2026-03-01T10:01:00Z", prompts=["check"],
+        steps=[Step(index=1, tool_use_id="t1", tool="Read", input={"file_path": evil_target},
+                    model=None, timestamp=None)],
+        final_message="done", usage=Usage(), models={},
+    )
+    t1 = time.perf_counter()
+    assess(run)
+    elapsed_assess = time.perf_counter() - t1
+    assert elapsed_assess < 0.05
+
+    vault_evt = {"session_id": "sess-redos", "cwd": str(tmp_path), "hook_event_name": "PreToolUse",
+                 "tool_name": "Read", "tool_input": {"file_path": str(tmp_path / "app.vault")}}
+    vault_dec = guard.evaluate(vault_evt)
+    assert vault_dec.decision in ("ask", "deny")
+    assert "secret_file" in vault_dec.codes
+
+
+# ---------------------------------------------------------------- project root, subfolder policy/log, and installer command verification
+
+def test_guard_project_root_resolution_order(tmp_path, monkeypatch):
+    r = tmp_path / "R"
+    nested = r / "a" / "b" / "c"
+    nested.mkdir(parents=True)
+    write_project(r, {"guard": {"deny": ["severity:medium"]}})
+    ev = bash_event(nested, "git push origin main")
+
+    # (a) CLAUDE_PROJECT_DIR set (R is not a git repo)
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(r))
+    out = guard.handle(json.dumps(ev))
+    assert out is not None and out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert (r / ".runledger" / "guard.log").exists()
+    assert not (nested / ".runledger" / "guard.log").exists()
+
+    # Precedence: CLAUDE_PROJECT_DIR > FACTORY_PROJECT_DIR > DROID_PROJECT_DIR
+    r_factory = tmp_path / "R_factory"
+    r_droid = tmp_path / "R_droid"
+    r_factory.mkdir()
+    r_droid.mkdir()
+    monkeypatch.setenv("FACTORY_PROJECT_DIR", str(r_factory))
+    monkeypatch.setenv("DROID_PROJECT_DIR", str(r_droid))
+    assert guard.project_root(ev) == str(r)
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR")
+    assert guard.project_root(ev) == str(r_factory)
+    monkeypatch.delenv("FACTORY_PROJECT_DIR")
+    assert guard.project_root(ev) == str(r_droid)
+    monkeypatch.delenv("DROID_PROJECT_DIR")
+
+    # (b) Env vars unset, R holds only the policy marker (no .git): the nearest ancestor
+    # with `.runledger.json` or `.git` is the project root, so the root policy applies here too
+    (r / ".runledger" / "guard.log").unlink()
+    out_b = guard.handle(json.dumps(ev))
+    assert out_b is not None and out_b["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert (r / ".runledger" / "guard.log").exists()
+    assert not (nested / ".runledger").exists()
+    (r / ".runledger" / "guard.log").unlink()
+
+    # (c) Env vars unset, R initialized as git repo (.git exists) -> resolves to R as well
+    (r / ".git").mkdir()
+    out_c = guard.handle(json.dumps(ev))
+    assert out_c is not None and out_c["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert (r / ".runledger" / "guard.log").exists()
+    assert not (nested / ".runledger").exists()
+
+    # (d) No env var and no marker anywhere above -> falls back to the event cwd
+    plain = tmp_path / "plain" / "deep"
+    plain.mkdir(parents=True)
+    assert guard.project_root(bash_event(plain, "ls")) == str(plain)
+
+
+def test_guard_log_written_only_at_project_root(tmp_path):
+    r = tmp_path / "R"
+    pkg = r / "pkg"
+    sub = pkg / "sub"
+    sub.mkdir(parents=True)
+    (r / ".git").mkdir()
+
+    for folder in (r, pkg, sub):
+        guard.handle(json.dumps(bash_event(folder, "ls")))
+
+    log_file = r / ".runledger" / "guard.log"
+    assert log_file.exists()
+    assert len(log_file.read_text(encoding="utf-8").splitlines()) == 3
+    assert not (pkg / ".runledger").exists()
+    assert not (sub / ".runledger").exists()
+
+
+def test_guard_project_policy_in_root_enforced_from_subfolder(tmp_path):
+    r = tmp_path / "R"
+    sub = r / "pkg" / "sub"
+    sub.mkdir(parents=True)
+    (r / ".git").mkdir()
+    write_project(r, {"guard": {"deny": ["reason:Installed packages"]}})
+
+    out = guard.handle(json.dumps(bash_event(sub, "npm install left-pad")))
+    assert out is not None
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_guard_inside_outside_project_rule_uses_project_root(tmp_path):
+    r = tmp_path / "R"
+    pkg = r / "pkg"
+    other = r / "other"
+    sibling = tmp_path / "R_sibling"
+    pkg.mkdir(parents=True)
+    other.mkdir(parents=True)
+    sibling.mkdir(parents=True)
+    (r / ".git").mkdir()
+
+    # (a) Write to R/other/out.txt or ../other/out.txt from cwd=R/pkg -> allowed (inside project R)
+    ev_abs_inside = {
+        "session_id": "s", "cwd": str(pkg), "hook_event_name": "PreToolUse",
+        "tool_name": "Write", "tool_input": {"file_path": str(other / "out.txt"), "content": "hi"},
+    }
+    ev_rel_inside = {
+        "session_id": "s", "cwd": str(pkg), "hook_event_name": "PreToolUse",
+        "tool_name": "Write", "tool_input": {"file_path": str(Path("..") / "other" / "out.txt"), "content": "hi"},
+    }
+    assert guard.decide(ev_abs_inside)["decision"] == "allow"
+    assert guard.decide(ev_rel_inside)["decision"] == "allow"
+    assert guard.decide(bash_event(pkg, "rm ../other/out.txt"))["decision"] == "allow"
+
+    # (b) Write to sibling folder outside R -> triggers write_outside (ask by default)
+    ev_abs_outside = {
+        "session_id": "s", "cwd": str(pkg), "hook_event_name": "PreToolUse",
+        "tool_name": "Write", "tool_input": {"file_path": str(sibling / "out.txt"), "content": "hi"},
+    }
+    ev_rel_outside = {
+        "session_id": "s", "cwd": str(pkg), "hook_event_name": "PreToolUse",
+        "tool_name": "Write", "tool_input": {"file_path": str(Path("..") / ".." / "R_sibling" / "out.txt"), "content": "hi"},
+    }
+    d_abs = guard.decide(ev_abs_outside)
+    d_rel = guard.decide(ev_rel_outside)
+    assert d_abs["decision"] == "ask" and "write_outside" in d_abs["codes"]
+    assert d_rel["decision"] == "ask" and "write_outside" in d_rel["codes"]
+    d_sh = guard.decide(bash_event(pkg, "rm ../../R_sibling/out.txt"))
+    assert d_sh["decision"] == "ask" and "shell_outside" in d_sh["codes"]
+
+
+def test_guard_install_default_and_portable_commands(tmp_path, capsys):
+    p1 = tmp_path / "P1"
+    p1.mkdir()
+    assert cli_main(["guard", "install", "--project", str(p1)]) == 0
+    captured = capsys.readouterr()
+    expected_guard = f'"{sys.executable}" -m runledger guard'
+    expected_cp = f'"{sys.executable}" -m runledger checkpoint --hook'
+    assert expected_guard in captured.out
+    assert "Verified hook command:" in captured.out
+    data1 = json.loads((p1 / ".claude" / "settings.json").read_text(encoding="utf-8"))
+    assert data1["hooks"]["PreToolUse"][0]["hooks"][0] == {
+        "type": "command", "command": expected_guard, "timeout": 135,
+    }
+    for event_name in ("SessionStart", "UserPromptSubmit"):
+        assert data1["hooks"][event_name][0]["hooks"][0] == {
+            "type": "command", "command": expected_cp, "timeout": 120,
+        }
+
+    p2 = tmp_path / "P2"
+    p2.mkdir()
+    assert cli_main(["guard", "install", "--project", str(p2), "--portable"]) == 0
+    capsys.readouterr()
+    data2 = json.loads((p2 / ".claude" / "settings.json").read_text(encoding="utf-8"))
+    assert data2["hooks"]["PreToolUse"][0]["hooks"][0] == {
+        "type": "command", "command": "runledger guard", "timeout": 135,
+    }
+    for event_name in ("SessionStart", "UserPromptSubmit"):
+        assert data2["hooks"][event_name][0]["hooks"][0] == {
+            "type": "command", "command": "runledger checkpoint --hook", "timeout": 120,
+        }
+
+
+def test_guard_install_upgrades_bare_entries_in_place_and_is_idempotent(tmp_path, capsys):
+    p2 = tmp_path / "P2"
+    settings = p2 / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    initial = {
+        "customKey": 42,
+        "hooks": {
+            "PreToolUse": [
+                {"matcher": "Write", "hooks": [{"type": "command", "command": "echo custom"}]},
+                {"matcher": "*", "hooks": [{"type": "command", "command": "runledger guard", "timeout": 135}]},
+            ],
+            "SessionStart": [
+                {"hooks": [{"type": "command", "command": "runledger checkpoint --hook", "timeout": 120}]},
+            ],
+            "UserPromptSubmit": [
+                {"hooks": [{"type": "command", "command": "runledger checkpoint --hook", "timeout": 120}]},
+            ],
+        },
+    }
+    settings.write_text(json.dumps(initial, indent=2), encoding="utf-8")
+
+    assert cli_main(["guard", "install", "--project", str(p2)]) == 0
+    capsys.readouterr()
+    first_bytes = settings.read_bytes()
+    data = json.loads(first_bytes.decode("utf-8"))
+    assert data["customKey"] == 42
+    assert len(data["hooks"]["PreToolUse"]) == 2
+    assert data["hooks"]["PreToolUse"][0] == {"matcher": "Write", "hooks": [{"type": "command", "command": "echo custom"}]}
+    assert data["hooks"]["PreToolUse"][1]["hooks"] == [{
+        "type": "command", "command": f'"{sys.executable}" -m runledger guard', "timeout": 135,
+    }]
+    for event_name in ("SessionStart", "UserPromptSubmit"):
+        assert len(data["hooks"][event_name]) == 1
+        assert data["hooks"][event_name][0]["hooks"] == [{
+            "type": "command", "command": f'"{sys.executable}" -m runledger checkpoint --hook', "timeout": 120,
+        }]
+
+    assert cli_main(["guard", "install", "--project", str(p2)]) == 0
+    out2 = capsys.readouterr().out
+    assert "already up to date" in out2
+    assert settings.read_bytes() == first_bytes
+
+
+def test_guard_uninstall_removes_interpreter_portable_and_quoted_spaces(tmp_path):
+    # (a) interpreter form
+    s1 = tmp_path / "s1" / "settings.json"
+    guard.install_hook(s1)
+    assert guard.uninstall_hook(s1)[0] is True
+    assert json.loads(s1.read_text(encoding="utf-8")) == {}
+
+    # (b) portable form
+    s2 = tmp_path / "s2" / "settings.json"
+    guard.install_hook(s2, portable=True)
+    assert guard.uninstall_hook(s2)[0] is True
+    assert json.loads(s2.read_text(encoding="utf-8")) == {}
+
+    # (c) hand-written quoted interpreter with spaces + foreign hook
+    s3 = tmp_path / "s3" / "settings.json"
+    s3.parent.mkdir(parents=True)
+    s3.write_text(json.dumps({
+        "hooks": {
+            "PreToolUse": [
+                {"matcher": "Write", "hooks": [{"type": "command", "command": "echo keep"}]},
+                {"matcher": "*", "hooks": [{"type": "command", "command": r'"C:\Program Files\Python 3\python.exe" -m runledger guard', "timeout": 135}]},
+            ],
+            "SessionStart": [
+                {"hooks": [{"type": "command", "command": r'"C:\Program Files\Python 3\python.exe" -m runledger checkpoint --hook', "timeout": 120}]},
+            ],
+        },
+    }), encoding="utf-8")
+    assert guard.uninstall_hook(s3)[0] is True
+    assert json.loads(s3.read_text(encoding="utf-8")) == {
+        "hooks": {
+            "PreToolUse": [
+                {"matcher": "Write", "hooks": [{"type": "command", "command": "echo keep"}]},
+            ],
+        },
+    }
+
+
+def test_guard_install_portable_warns_when_runledger_not_on_path(tmp_path, monkeypatch, capsys):
+    p4 = tmp_path / "P4"
+    p4.mkdir()
+    monkeypatch.setenv("PATH", str(tmp_path / "empty_bin"))
+    rc = cli_main(["guard", "install", "--project", str(p4), "--portable"])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert (p4 / ".claude" / "settings.json").exists()
+    assert "Verified hook command:" not in captured.out
+    assert "Verified hook command:" not in captured.err
+    combined = (captured.out + "\n" + captured.err).lower()
+    assert "warning" in combined and ("not found" in combined or "127" in combined or "could not be run" in combined)
+
+
+def test_guard_cold_start_when_secrets_module_raises_import_error(tmp_path):
+    import shutil
+    import runledger
+
+    pkg_src = Path(runledger.__file__).resolve().parent
+    shadow_root = tmp_path / "shadow"
+    shutil.copytree(pkg_src, shadow_root / "runledger")
+    (shadow_root / "runledger" / "secrets.py").write_text("raise ImportError('secrets unavailable')\n", encoding="utf-8")
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / ".git").mkdir()
+
+    secret = "sk-ant-" + "api03-" + "Z" * 36
+    event = json.dumps(bash_event(proj, f"echo {secret}"))
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(shadow_root)
+
+    res = subprocess.run(
+        [sys.executable, "-m", "runledger", "guard"],
+        input=event,
+        text=True,
+        capture_output=True,
+        env=env,
+        cwd=str(proj),
+        timeout=30,
+    )
+    assert res.returncode == 0, res.stderr
+    log_file = proj / ".runledger" / "guard.log"
+    assert log_file.exists()
+    log_text = log_file.read_text(encoding="utf-8")
+    assert secret not in log_text
+    assert "[REDACTED]" in log_text
+
+    write_ev = json.dumps({
+        "session_id": "s1",
+        "cwd": str(proj),
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Write",
+        "tool_input": {"file_path": str(proj / "cfg.py"), "content": f'KEY = "{secret}"'},
+    })
+    res_write = subprocess.run(
+        [sys.executable, "-m", "runledger", "guard"],
+        input=write_ev,
+        text=True,
+        capture_output=True,
+        env=env,
+        cwd=str(proj),
+        timeout=30,
+    )
+    assert res_write.returncode == 0, res_write.stderr
+    out_data = json.loads(res_write.stdout)
+    assert out_data["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+# ---------------------------------------------------------------- scrutiny fixes: policy-only roots, foreign hooks, install checks
+
+def test_guard_project_root_prefers_the_nearest_policy_marker_or_git(tmp_path):
+    outer = tmp_path / "outer"
+    inner = outer / "pkg"
+    deep = inner / "sub"
+    deep.mkdir(parents=True)
+    (outer / ".git").mkdir()
+    write_project(inner, {})
+
+    assert guard.project_root(str(deep)) == str(inner)        # the nearest marker wins
+
+    (inner / ".runledger.json").unlink()
+    assert guard.project_root(str(deep)) == str(outer)        # a policy-only ancestor is a root too
+
+
+def test_guard_policy_only_project_is_enforced_from_a_subfolder(tmp_path):
+    r = tmp_path / "policy-only"
+    pkg = r / "pkg"
+    deep = pkg / "deep"
+    deep.mkdir(parents=True)
+    write_project(r, {"guard": {"deny": ["secret_file"]},
+                      "extra_secret_paths": [r"(^|/)vault\.txt$"]})
+
+    for folder in (r, pkg, deep):
+        out = guard.handle(json.dumps(bash_event(folder, "cat vault.txt")))
+        assert out is not None
+        assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    log_file = r / ".runledger" / "guard.log"
+    assert len(log_file.read_text(encoding="utf-8").splitlines()) == 3
+    assert not (pkg / ".runledger").exists()
+
+
+@pytest.mark.parametrize("command, owned", [
+    ("runledger guard", True),
+    ("runledger.exe guard", True),
+    (f'"{sys.executable}" -m runledger guard', True),
+    ('"C:\\Program Files\\Python 3\\python.exe" -m runledger guard', True),
+    ("echo runledger guard", False),
+    ("my-audit.sh && runledger guard", False),
+    ("runledger guard | tee hook.log", False),
+    ("sudo runledger guard", False),
+    ("runledger guard-extra", False),
+    ("runledger checkpoint --hook", False),
+    ("echo 'runledger guard'", False),
+])
+def test_is_guard_hook_matches_only_a_complete_owned_command(command, owned):
+    assert guard._is_guard_hook({"type": "command", "command": command}) is owned
+
+
+def test_guard_install_keeps_foreign_hooks_that_mention_the_command(tmp_path):
+    settings = tmp_path / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    foreign = [
+        {"matcher": "Bash", "hooks": [{"type": "command", "command": "echo runledger guard"}]},
+        {"matcher": "Edit", "hooks": [{"type": "command", "command": "my-audit.sh && runledger guard"}]},
+    ]
+    settings.write_text(json.dumps({"hooks": {"PreToolUse": foreign}}), encoding="utf-8")
+
+    changed, _ = guard.install_hook(settings)
+    assert changed is True
+    pre = json.loads(settings.read_text(encoding="utf-8"))["hooks"]["PreToolUse"]
+    assert pre[:2] == foreign                                  # neither foreign hook was touched
+    owned = [h for g in pre for h in g["hooks"] if guard._is_guard_hook(h)]
+    assert len(owned) == 1
+    assert owned[0]["command"] == guard.guard_hook_command()
+
+    assert guard.uninstall_hook(settings)[0] is True
+    assert json.loads(settings.read_text(encoding="utf-8"))["hooks"]["PreToolUse"] == foreign
+
+
+def test_guard_install_verification_uses_the_project_environment(tmp_path, monkeypatch, capsys):
+    """The self-test must probe the stored command where the hook runs: no injected
+    PYTHONPATH and no installer cwd, so an interpreter that cannot import RunLedger
+    from the project is reported as a warning instead of a false success."""
+    shadow = tmp_path / "shadow"
+    (shadow / "runledger").mkdir(parents=True)
+    (shadow / "runledger" / "__init__.py").write_text(
+        "raise ImportError('runledger is not installed here')\n", encoding="utf-8")
+    monkeypatch.setenv("PYTHONPATH", str(shadow))
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    assert cli_main(["guard", "install", "--project", str(proj)]) == 0
+    out = capsys.readouterr().out
+    assert (proj / ".claude" / "settings.json").exists()
+    assert "Verified hook command:" not in out
+    assert "Warning" in out and "exit" in out
+
+
+def test_guard_install_default_writes_settings_at_the_project_root(tmp_path, monkeypatch, capsys):
+    repo = tmp_path / "repo"
+    sub = repo / "pkg" / "sub"
+    sub.mkdir(parents=True)
+    (repo / ".git").mkdir()
+    monkeypatch.chdir(sub)
+
+    assert cli_main(["guard", "install"]) == 0
+    capsys.readouterr()
+    assert (repo / ".claude" / "settings.json").exists()
+    assert not (sub / ".claude").exists()
+    assert not (repo / "pkg" / ".claude").exists()
+
+    assert cli_main(["guard", "uninstall"]) == 0
+    assert "hooks" not in json.loads((repo / ".claude" / "settings.json").read_text(encoding="utf-8"))
+
+
+def test_guard_install_default_uses_a_policy_only_project_root(tmp_path, monkeypatch):
+    policy_only = tmp_path / "policy"
+    sub = policy_only / "pkg"
+    sub.mkdir(parents=True)
+    write_project(policy_only, {})
+    monkeypatch.chdir(sub)
+
+    assert cli_main(["guard", "install"]) == 0
+    assert (policy_only / ".claude" / "settings.json").exists()
+    assert not (sub / ".claude").exists()
+
+
+@pytest.mark.parametrize("command, owned", [
+    (r'"C:\Python313\python3.13t.exe" -m runledger guard', True),
+    ('"/opt/py313t/bin/python3.13t" -m runledger guard', True),
+    ('"python3.14t" -m runledger guard', True),
+    (r'"C:\Python313\pythonw.exe" -m runledger guard', True),
+    (r'"C:\Python313\node.exe" -m runledger guard', False),
+    ('"python3.13t" -m runledger checkpoint --hook', False),
+])
+def test_is_guard_hook_accepts_the_interpreter_names_the_installer_can_write(command, owned):
+    """CORE-SCR-R2-007: `guard_hook_command` stores the literal `sys.executable`, so a
+    free-threaded or versioned interpreter name is still our own entry, while a foreign
+    executable or another hook stays foreign."""
+    assert guard._is_guard_hook({"type": "command", "command": command}) is owned
+
+
+def test_guard_install_round_trips_with_a_free_threaded_interpreter(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys, "executable", r"C:\Python313\python3.13t.exe")
+    settings = tmp_path / ".claude" / "settings.json"
+
+    changed, _ = guard.install_hook(settings)
+    assert changed is True
+    data = json.loads(settings.read_text(encoding="utf-8"))
+    stored = data["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+    assert stored == r'"C:\Python313\python3.13t.exe" -m runledger guard'
+    assert data["hooks"]["SessionStart"][0]["hooks"][0]["command"] == \
+        r'"C:\Python313\python3.13t.exe" -m runledger checkpoint --hook'
+
+    assert guard.install_hook(settings) == (False, None)      # a second install changes nothing
+    _, message = guard.verify_hook_command(stored)            # the self-test recognises it
+    assert "not a RunLedger guard command" not in message
+
+    assert guard.uninstall_hook(settings)[0] is True          # nothing is left behind
+    assert json.loads(settings.read_text(encoding="utf-8")) == {}
+
+
+@pytest.mark.parametrize("command", [
+    "true;/usr/bin/python3.13t -m runledger guard",
+    "true&&/usr/bin/python3.13t -m runledger guard",
+    "true||/usr/bin/python3.13t -m runledger guard",
+    "true|/usr/bin/python3.13t -m runledger guard",
+    "true&/usr/bin/python3.13t -m runledger guard",
+    '"/usr/bin/python3.13t" -m runledger guard > hook.log',
+    '"/usr/bin/python3.13t" -m runledger guard 2>&1',
+    "(/usr/bin/python3.13t -m runledger guard)",
+    "/usr/bin/python3.13t -m runledger guard\nrm -rf ./build",
+    "/usr/bin/python3.13t -m runledger guard;echo hi",
+    "true;runledger guard",
+])
+def test_is_guard_hook_rejects_attached_shell_operators(command):
+    """CORE-SCR-R3-004: an operator written without spaces is still an operator, so the
+    basename of the first word must never decide ownership of a compound command."""
+    assert guard._is_guard_hook({"type": "command", "command": command}) is False
+
+
+@pytest.mark.parametrize("command", [
+    '"/usr/$(printf bin)/python3.13t" -m runledger guard',
+    '"/usr/`printf bin`/python3.13t" -m runledger guard',
+    '"$PYTHON3" -m runledger guard',
+    r'"/usr/\$python/python3.13t" -m runledger guard',
+])
+def test_is_guard_hook_rejects_executable_substitutions(command):
+    """CORE-SCR-R4-004: POSIX `$(...)` and backticks stay executable inside double quotes, so a
+    quoted executable that computes its own path is not the single command the installer
+    writes: it must never be replaced or removed (VAL-CORE-036/037). A backslash-escaped `$` is
+    read as an operator too: an entry that spells a `$` at all is not the command install
+    writes, and the conservative reading never touches someone else's hook."""
+    assert guard._is_guard_hook({"type": "command", "command": command}) is False
+
+
+def test_guard_install_preserves_a_substitution_bearing_hook(tmp_path):
+    """The round-4 reproducer: v0.6.0 preserved this foreign entry, so install appends beside it
+    and uninstall leaves it in place."""
+    settings = tmp_path / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    foreign = [{"matcher": "Bash", "hooks": [
+        {"type": "command", "command": '"/usr/$(printf bin)/python3.13t" -m runledger guard'}]}]
+    settings.write_text(json.dumps({"hooks": {"PreToolUse": foreign}}), encoding="utf-8")
+
+    assert guard.install_hook(settings)[0] is True
+    pre = json.loads(settings.read_text(encoding="utf-8"))["hooks"]["PreToolUse"]
+    assert pre[0] == foreign[0]
+    owned = [h for group in pre for h in group["hooks"] if guard._is_guard_hook(h)]
+    assert len(owned) == 1 and owned[0]["command"] == guard.guard_hook_command()
+
+    assert guard.uninstall_hook(settings)[0] is True
+    assert json.loads(settings.read_text(encoding="utf-8"))["hooks"]["PreToolUse"] == foreign
+
+
+def test_guard_install_preserves_a_compound_interpreter_hook(tmp_path):
+    """The installer writes one simple command, so a compound entry that mentions ours is a
+    foreign hook: install appends beside it and uninstall leaves it in place (VAL-CORE-036)."""
+    settings = tmp_path / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    foreign = [{"matcher": "Bash", "hooks": [
+        {"type": "command", "command": "true;/usr/bin/python3.13t -m runledger guard"}]}]
+    settings.write_text(json.dumps({"hooks": {"PreToolUse": foreign}}), encoding="utf-8")
+
+    assert guard.install_hook(settings)[0] is True
+    pre = json.loads(settings.read_text(encoding="utf-8"))["hooks"]["PreToolUse"]
+    assert pre[0] == foreign[0]
+    owned = [h for group in pre for h in group["hooks"] if guard._is_guard_hook(h)]
+    assert len(owned) == 1 and owned[0]["command"] == guard.guard_hook_command()
+
+    assert guard.uninstall_hook(settings)[0] is True
+    assert json.loads(settings.read_text(encoding="utf-8"))["hooks"]["PreToolUse"] == foreign
+
+
+@pytest.mark.parametrize("executable, command, owned", [
+    (r"D:\tools\bin\agent-python.exe", r'"D:\tools\bin\agent-python.exe" -m runledger guard', True),
+    (r"D:\tools\bin\agent-python.exe", '"D:/tools/bin/agent-python.exe" -m runledger guard', True),
+    (r"D:\Tools\Agent Python\agent-python.exe",
+     r'"d:\tools\agent python\AGENT-PYTHON.EXE" -m runledger guard', True),
+    ("/opt/agents/bin/agent-python", '"/opt/agents/bin/agent-python" -m runledger guard', True),
+    (r"D:\Tools & Runtimes\agent-python.exe",
+     r'"D:\Tools & Runtimes\agent-python.exe" -m runledger guard', True),
+    ("/opt/agents/bin/agent-python", '"/opt/Agents/bin/agent-python" -m runledger guard', False),
+    (r"D:\tools\bin\agent-python.exe", r'"D:\other\bin\agent-python.exe" -m runledger guard', False),
+    (r"D:\tools\bin\agent-python.exe",
+     r'"D:\tools\bin\agent-python.exe" -m runledger checkpoint --hook', False),
+])
+def test_is_guard_hook_follows_the_current_interpreter(monkeypatch, executable, command, owned):
+    """CORE-SCR-R3-003: the installer writes the literal `sys.executable`, so a copied
+    interpreter that does not look like python is our own entry, and another path is not."""
+    monkeypatch.setattr(sys, "executable", executable)
+    assert guard._is_guard_hook({"type": "command", "command": command}) is owned
+
+
+def test_guard_install_round_trips_with_a_renamed_interpreter(tmp_path, monkeypatch):
+    """The whole lifecycle of an installer-emitted command for a renamed interpreter:
+    idempotent install, recognised verification and uninstall without leftovers."""
+    renamed = r"D:\tools\bin\agent-python.exe"
+    monkeypatch.setattr(sys, "executable", renamed)
+    settings = tmp_path / ".claude" / "settings.json"
+
+    assert guard.install_hook(settings)[0] is True
+    data = json.loads(settings.read_text(encoding="utf-8"))
+    stored = data["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+    assert stored == fr'"{renamed}" -m runledger guard'
+    assert data["hooks"]["SessionStart"][0]["hooks"][0]["command"] == \
+        fr'"{renamed}" -m runledger checkpoint --hook'
+
+    assert guard.install_hook(settings) == (False, None)      # no duplicate entry
+    data = json.loads(settings.read_text(encoding="utf-8"))
+    assert len(data["hooks"]["PreToolUse"]) == 1
+    assert len(data["hooks"]["SessionStart"]) == 1
+
+    _, message = guard.verify_hook_command(stored)            # recognised, not refused
+    assert "not a RunLedger guard command" not in message
+
+    assert guard.uninstall_hook(settings)[0] is True
+    assert json.loads(settings.read_text(encoding="utf-8")) == {}
+
+
+
+

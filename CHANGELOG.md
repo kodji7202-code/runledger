@@ -7,6 +7,722 @@ change behavior, so read the entry before you upgrade.
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-10-18
+
+### Changed
+
+- **A Droid run with no recorded usage no longer prices its models (`runledger.client`,
+  `runledger.server`):** the push body and the stored run keep `cost_usd` `null` on every model of
+  such a run instead of the `0.0` the priced-model bucket used to carry, so a model group made only
+  of missing-usage runs shows `cost_usd` `null` with `priced_runs` 0 in `GET /api/stats` and
+  `GET /api/insights` (n/a in the dashboard), not a free `$0.00`.
+- **Insights agent aggregates carry their lower-bound flag (`runledger.server`):** `agents[]` in
+  `GET /api/insights` now returns `priced_runs`, `partial_runs` and `cost_is_lower_bound`, so an agent
+  whose runs are all only partly priced reads `≥ $X` in the dashboard instead of a complete figure.
+- **The compliance report marks a partly priced developer as a lower bound (`runledger.server`):** a
+  developer row in `GET /api/export/report.html` reads `≥ $X` when any of that developer's runs is
+  only partly priced, matching the team figure above it (previously only a run with no cost at all
+  produced a mark).
+- **The dashboard budget card shows `n/a` for an unpriced month and `≥ $X` for a partly priced one
+  (`runledger.server`):** a month whose runs all have unknown costs no longer reads `$0.00 spent`, and
+  a month with partly priced runs is marked `≥`, in both the team figure and the developer rows. The
+  note next to the figure names how many runs it leaves out. The numeric spend behind the alert
+  thresholds and the progress bar is unchanged.
+- **Quality score: an install word inside a test argument no longer hides the run
+  (`runledger.quality`):** an install verb (`install`, `uninstall`, `add`, `i`, `remove`)
+  disqualifies a segment only when it is a package manager's subcommand in the command word or
+  wrapper chain (`pip install pytest`, `python -m pip install pytest`, `uv pip install`, `uv add`,
+  `poetry add`, `npm install`, `npm i`, `pnpm add`, `yarn add`, `bun add`). Real runs whose
+  arguments contain those words earn their `tests_run` credit again, as they did in v0.6.0:
+  `pytest -k add`, `pytest -k "install and not slow"`, `npm test -- --grep install` and
+  `jest -t uninstall` are runs. Inspection flags (`--version`, `--help`, `--collect-only`,
+  `--list-tests` and the rest) and every other install and inspection case behave as before.
+
+- **Text sent to Claude masks e-mail addresses and home folders, with no opt-out
+  (`runledger.llm`, `runledger.review`, `runledger.summarize`):** every request body, from `--ai`
+  summaries as well as from `--review`, replaces e-mail addresses with `[EMAIL]` and the user name of
+  `C:\Users\<name>`, `/Users/<name>` and `/home/<name>` with `~`, on top of the secret patterns that
+  were already applied. Masking happens before the text is cut to its limit, so a home folder is
+  never sent in half, and it applies to the whole message at the API boundary. A session mentioning
+  `ana@example.com` or `C:\Users\ana\app\x.py` now sends `[EMAIL]` and `~\app\x.py`; commands keep
+  their shape. A review's data block also escapes `<` as `\u003c`, so a command containing
+  `</run_data>` cannot close it. `docs/analysis.md`, `docs/quickstart.md` and the README state what
+  is masked.
+- **A home folder whose user name contains spaces or punctuation is masked whole, and nested step
+  inputs are masked before `--ai` writes them as JSON (`runledger.llm`, `runledger.summarize`):** a
+  quoted path such as `"C:\Users\Jane Smith\app\x.py"` or `/Users/Jane Smith/app/x` was masked only
+  up to the first word, leaving ` Smith` in the text sent to Anthropic; the user name is now consumed
+  to the separator or quote, so both read `"~\app\x.py"` and `~/app/x`. Inside quotes the name runs
+  to the next path separator, so a folder named `Jane (Smith)` goes whole
+  (`"C:\Users\Jane (Smith)\app\x.py"` sends `"~\app\x.py"`), and the same name is masked when it
+  appears unquoted. A step input is masked at every level before serialization, so a `MultiEdit`'s
+  `edits` (and the doubled Windows separators that JSON produces) can no longer carry a complete
+  home path into an `--ai` request. The check at the API boundary also recognizes a path whose
+  separators were doubled, and command boundaries are kept: `cat ~/app/x && ls` still sends `&& ls`.
+- **The dashboard reads a second, read-only connection, and a backup no longer stops writes
+  (`runledger.server`):** reports, stats, insights, the run list and the exports read from their own
+  read-only connection (`file:...?mode=ro`), so a long report or a `runledger backup` running beside
+  the server cannot hold the write lock and block pushed runs. `runledger backup` copies through that
+  connection in pages with a short sleep, so it stays cheap on a busy store. Test databases that live
+  in memory keep their single connection. A read never sees uncommitted rows, which is what the
+  approval decision flow needs.
+- **Dashboard: unknown costs show `n/a`, partial costs show `≥$X`, and the unpriced hint names the
+  real cause (`runledger.server`):** a run with no recorded token usage or no known model price shows
+  `n/a` (never `$0.00`), with a tooltip saying token usage was not recorded when that is the reason,
+  and a figure that leaves unpriced tokens out is prefixed with `≥` in the run list, the KPI card and
+  the by-user, by-project, by-agent, by-model, insights and cost-per-run cells. The hint under the cost
+  KPI now splits the unpriced runs into those without recorded usage and those with an unknown model
+  price instead of always blaming the price.
+- **Dashboard filters: Max quality and AI verdict, kept in the URL (`runledger.server`):** the filter
+  bar next to Min quality has a Max quality number input and an AI verdict select
+  (`looks_safe`, `needs_review`, `dangerous`, or any), and the whole filter set (developer, project,
+  agent, min risk, min quality, max quality, verdict) is written to the URL hash and restored from it,
+  so a reload or a shared link shows the same runs. The filter bar belongs to the Runs view: switching
+  to Insights, Approvals, Keys, Audit or Settings leaves it untouched, and returning to Runs writes
+  the filters back into the hash, so a tab switch no longer loses what the developer typed (and a
+  filter edit landing after the switch cannot pull the page back to Runs).
+- **Dashboard polling pauses while the tab is hidden and backs off after a failure
+  (`runledger.server`):** the pending-approvals poll on the dashboard and the poll on the individual
+  approval page now stop while the page is hidden, refresh at once when it becomes visible again, and
+  grow the delay from 3 s to 6 s, 12 s and so on up to 30 s after a failed request (a 429 included)
+  instead of hammering a server that is down. The first success returns to the 3 s delay.
+- **Grade E is gone from the quality distribution (`runledger.server`):** `GET /api/insights` returns
+  the `quality.by_grade` buckets A, B, C, D and F, the dashboard shows five buckets and no E badge, and
+  a run stored earlier with grade E keeps its score but shows no grade badge.
+- **Dashboard comments and the run detail panel match the real page (`runledger.server`):** the header
+  comment no longer claims features hide on 404/403 because endpoints may not exist (only admin-only
+  panels hide, on 403), and a run row opens a detail dialog that names the developer, the key that
+  pushed the run ("Pushed by alice-laptop"), the cost, risk, quality, AI verdict, steps, tokens and
+  revision, with a link to the receipt.
+- **Project `.runledger.json` is tighten-only in receipts as well as the guard:** `ignore` and
+  lowering `severity_overrides` are read only from your user config (`~/.runledger/config.json` or
+  `RUNLEDGER_CONFIG`). A project `.runledger.json` may raise severities and add safe
+  `extra_secret_paths`; if it tries to ignore or lower risk kinds, the receipt keeps the findings
+  and adds a note.
+- **`runledger guard install` writes interpreter-bound hook commands by default:** `guard install`
+  writes `"<sys.executable>" -m runledger guard` and `"<sys.executable>" -m runledger checkpoint --hook`
+  so the hooks run without `runledger` on `PATH` and when the Python path contains spaces, upgrades
+  earlier bare `runledger ...` hook entries in place, and verifies the configured command exits `0`
+  on empty JSON input, run from the project folder with your environment unchanged (a command that
+  cannot start RunLedger there is reported as a warning, not as a success). Pass `--portable` to
+  write bare `runledger ...` commands for checked-in settings files.
+- **HTML receipts inside a Git work tree are safe by default, and default receipt filenames
+  auto-increment (`runledger.cli`):** `runledger receipt` now enables safe mode by default for HTML
+  files written inside a Git repository (matching Markdown and JSON; pass `--no-safe` for full
+  paths), and when `-o` is omitted it writes `runledger-<stem>-2.<ext>`, `runledger-<stem>-3.<ext>`,
+  and so on instead of overwriting an existing receipt file.
+- **The dashboard sign-in form replaces the key-in-URL instructions (`runledger.server`):** the `401`
+  sign-in page now shows a form (`method="post"`, action `/session`) instead of teaching
+  `/?key=YOUR_API_KEY`, and a wrong key answers the same page with an error message. Docs
+  (`docs/api.md`, `docs/enterprise.md`, `docs/self-hosting.md`, `docs/quickstart.md`) describe the
+  form, the Strict cookie, the confirmation step and the session cap; the `?key=` link is documented
+  as deprecated.
+- **The Docker image identifies itself, and the Compose stack is hardened (`Dockerfile`, `deploy/`):**
+  the image carries the full OCI label set, with `org.opencontainers.image.version` and
+  `org.opencontainers.image.revision` fed by the `RUNLEDGER_VERSION` and `RUNLEDGER_REVISION` build
+  arguments (the CI docker job passes the version from `pyproject.toml` and the commit it built, then
+  checks the labels on the built image); the base image stays on a tag, so Dependabot can bump it.
+  `deploy/docker-compose.yml` runs the server with a read-only root filesystem (only the data volume
+  and `/tmp` are writable), drops every Linux capability, forbids gaining new ones, pins its network
+  to `172.28.0.0/16` and uses that subnet as the default `RUNLEDGER_TRUSTED_PROXIES`, so every user
+  keeps their own failed-sign-in counter and audit address without any configuration; Caddy is pinned
+  to `caddy:2.8` and waits for the server's healthcheck before it starts. `deploy/backup.sh` uses
+  POSIX commands only, copies exactly the file the backup command wrote, and gives the host copy a
+  free name, so two runs within the same second neither overwrite nor miss each other. `deploy/.env.example`
+  documents the new trusted-proxies default.
+
+### Fixed
+
+- **The stored receipt of a run with no recorded usage no longer carries a `$0.00` cost
+  (`runledger.server`):** the run row, the list and the aggregates already read `n/a`, but
+  `GET /api/runs/{id}` still served the client's original `cost_usd` `0.0` inside the embedded
+  `receipt` (`receipt.totals` and every `receipt.models` bucket), which read as a free run. The
+  server now normalizes the receipt it stores and serves the same way it normalizes the flattened
+  run: a run whose `usage_source` is `missing` has `cost_usd` `null` in its receipt too, including
+  a row an older server stored with the zero. A run that reports its usage keeps its figure, so a
+  reported `$0.00` stays `0.0`, and a receipt from a client that reports no `usage_source` is
+  untouched.
+- **`GET /api/stats` reports `unpriced_runs` and `cost_is_lower_bound` on `by_model` rows
+  (`runledger.server`, `docs/api.md`):** the model rows were the only group rows without the two
+  fields the documentation's example already showed, so a consumer could not tell that a model's
+  figure leaves unpriced runs out. A model bucket with no price and a run that is only partly
+  priced both count as unpriced, exactly as they do in the developer, project and agent rows.
+- **Quality score: a bare pytest count line counts as a pass again (`runledger.quality`):** a
+  footer without the timing pytest adds (`3 passed`, `3 passed, 1 skipped`, `=== 3 passed ===`,
+  with or without a service-name or timestamp prefix) was read as unreadable, so the run lost the
+  15 `test_outcome` points that v0.6.0 awarded it. The timing (`in 0.20s`) is optional again;
+  unreadable output (`Done.`) and counts inside free-form log text (`retried after 3 errors in
+  0.10s`, `lint found 7 errors`) stay unknown.
+- **`docs/github.md` shows the workflow's `permissions:` block (`docs/github.md`):** the page
+  described the `pull-requests: write` grant in prose and linked the example workflow; the
+  workflow snippet now carries the block itself (`contents: read`, `pull-requests: write`).
+
+- **Safe mode masks an e-mail address that ends a sentence (`runledger.safe`):** an address
+  followed by a full stop was left as it was typed, so a prompt such as `contact me@example.com.`
+  reached the Markdown, JSON and HTML receipts, the body of `push --safe`, the stored run and the
+  served run page with the address in it, while the same address followed by a space was masked.
+  The address now ends at its last label, so the punctuation after it stays in the text
+  (`contact [EMAIL].`) and an address followed by a comma, semicolon, colon, question or
+  exclamation mark, or a closing bracket or quote, is masked in the same way. The same matcher at
+  the Claude API boundary already masked these addresses and is unchanged.
+
+- **The pull request comment keeps an SSH remote byte-for-byte (`runledger.github`):** every `@` in
+  session text was split with an invisible separator, which changed a remote such as
+  `git@github.com:org/repo.git` in the comment even though GitHub does not read an at-sign inside a
+  word as a mention. The separator is now used only where GitHub would read one (at the start of the
+  text or after a character that is not a letter, digit or underscore), so a remote and an address
+  in a session's text are shown exactly as they were written, while `@someone` after a space or an
+  opening bracket is still not a live mention.
+
+- **The README's safe-mode sentence matches the code (`README.md`):** it promised that "HTML
+  receipts keep full paths", while `runledger.cli.default_safe` writes every format safe by default
+  inside a Git repository, HTML included, and only Markdown and JSON to stdout are always safe. The
+  page now says the same as `docs/quickstart.md`: a receipt written outside a repository keeps full
+  paths unless `--safe` is passed.
+
+- **A test summary behind a log prefix is read again (`runledger.quality`):** a pytest footer
+  written by a container, a wrapper or a log stream keeps its counts when it carries a
+  docker-compose or container service name (`app  | 3 passed in 0.5s`, `web-1  | 1 failed, 2 passed
+  in 0.4s`) or a timestamp (`2026-10-18T12:00:00Z 3 passed in 0.5s`, `[12:00:01] 3 passed in
+  0.5s`), alone or together, so a passing suite behind a prefix is no longer unknown. Only those
+  prefixes are allowed, and only at the start of the line: a count in free-form text
+  (`retried after 3 errors in 0.10s`, `app  | done, 3 passed in 0.5s`) is still not a summary.
+
+- **A very long line of digits no longer stalls the quality score (`runledger.quality`):** the
+  count fallbacks tried a 20 KB run of digits from every digit before giving up, which took over a
+  second per line; each count is now anchored to its start, so the same line parses in about a
+  millisecond. A 20 KB line of any shape (digits, `=`, spaces or a near-match footer) stays well
+  under a tenth of a second.
+
+- **A bare URL in session text no longer becomes a live link in the pull request comment
+  (`runledger.github`):** GitHub links a bare `https://…` or `www.…` by itself, so escaping the
+  Markdown punctuation around it was not enough: a request such as `See https://evil.example/x`
+  rendered as a clickable address in a comment that everyone who can read the pull request can
+  see. The comment now carries an invisible separator inside the scheme and after `www.`, so the
+  address stays readable while the footer's link to `https://runledger.site` is the only live link
+  left in the comment.
+
+- **The tests line reports the session's final test invocation (`runledger.github`):** a final test
+  command whose captured output has no readable summary is reported as `last run unreadable (…) ·
+  verdict: unknown` instead of borrowing an earlier run's pass; a readable earlier run is named as
+  earlier (`An earlier readable run passed (3 passed, 0 failed).`) and never as the last run. A
+  final run that passed or failed reads as before.
+
+- **Test runs are read from PowerShell call-operator commands and from real summary lines only
+  (`runledger.quality`):** `& pytest -q` and `& "C:\Python312\python.exe" -m pytest -q` are runs
+  again, with their outcome at score level, and a quoted executable keeps its spaces, so
+  `& "C:\Program Files\Python312\python.exe" -m pytest -q` counts too, while a literal mention
+  (`echo pytest`, `& echo pytest`, `echo "C:\Program Files\Python312\python.exe" -m pytest`) still
+  earns nothing. A line counts as a runner summary only when it has a summary shape (counts and a
+  timing and nothing else), so `retried after 3 errors in 0.10s` no longer turns a following
+  `3 passed in 0.20s` into a failure, and free-text error counts stay ignored. Pytest's own elapsed
+  suffix is part of that shape: `==== 3 passed in 75.12s (0:01:15) ====` parses again. The v0.6.0
+  fallback for an explicit failed count is back: `2 failed, 3 passed` without a timing marks the run
+  failed even when the step reports no error, while unreadable output (`Done.`) stays unknown.
+
+- **A failed Opus escalation keeps the first review (`runledger.review`):** when
+  `RUNLEDGER_ESCALATE_OPUS=1` re-runs a `dangerous` verdict on Opus and that call fails, the receipt
+  keeps the Sonnet review instead of losing it and printing "AI risk review skipped".
+  `ai_review.notes` records one line starting with `escalation failed:` and `ai_review.escalated` is
+  `false` (`true` after an escalation that succeeded); both keys are new.
+
+- **`--ai` reads its summaries from a reply that is not pure JSON (`runledger.summarize`):** the
+  first JSON object in the reply is decoded on its own, so trailing prose (even with braces in it)
+  and a ```json fence no longer lose the summaries. Step entries that are not objects, that name no
+  usable step number (an int, `"2"` and `two` all work) or that carry no text are skipped instead of
+  raising, and a reply with no JSON at all still prints `AI summaries skipped: ...` and keeps the
+  rule-based receipt.
+
+- **No model-downgrade estimate without a Haiku price (`runledger.advisor`):** the
+  `model_downgrade` recommendation is built against the price of `claude-haiku-5-5`; a user price
+  table that has no Haiku row now yields no downgrade advice instead of relying on the estimate
+  silently collapsing to zero.
+
+- **HTTP error bodies are closed in every client (`runledger._http`, `runledger.llm`,
+  `runledger.client`, `runledger.github`):** a 4xx/5xx reply from the Claude API, the team server or
+  GitHub is read through one helper that closes the response, so `-W error::ResourceWarning` runs
+  clean and a long-lived process does not keep the socket. The error text the user sees is unchanged.
+
+- **Quality score: installing or inspecting a runner is no longer a test run, and an unreadable
+  result is unknown instead of a pass (`runledger.quality`, `runledger.risk`, `runledger.parser`):**
+  each `&&`/`;`/`|`/newline segment is judged by the command word it starts with, after `FOO=1`
+  assignments and wrappers (`uv run`, `poetry run`, `npx`, `python -m`) are stripped, so
+  `pip install pytest`, `npm install --save-dev jest` and `python -m pip install pytest` earn no
+  `tests_run` credit and no pass outcome, while `uv run pytest`, `cd app && pytest`, `pytest | tee`,
+  `npx jest`, `npm test`, `go test`, `cargo test` and `dotnet test` still count (a path such as
+  `tests/test_install.py` never disqualifies a real run). `pytest --version`, `--help`,
+  `--collect-only`, `--co` and `jest --list-tests` are inspections, not runs. Counts are read only
+  from a runner's summary lines (the pytest footer or quiet form, the jest/vitest `Tests:` line,
+  mocha's `N passing`/`N failing`, go's `ok`/`FAIL` lines, cargo's `test result:` line, unittest's
+  `Ran N tests` footer), so "retried after 3 errors" in log text is not a failure, `0 errors` is
+  not one either, and a run whose output has no readable summary is unknown: it earns neither the
+  +15 nor the -15 instead of counting as a pass. The test-file diff verdicts are computed once per
+  receipt and shared with the risk rules, and a file rewritten five or more times through the shell
+  (`echo x >> a.py`, `sed -i`, `Set-Content`) now counts toward `retry_loops`, as PowerShell writes
+  already count toward the changed-file list. Sessions that only installed a runner score up to 25
+  points lower than before.
+
+- **Secrets in assignments whose name only contains a keyword (`runledger.secrets`,
+  `runledger.guard`):** `MYTOKEN=abc123`, `TOKEN2=abc123` and `MY_ACCESS_TOKEN2=abc123` are masked
+  again in `guard.log`, receipts and the text sent to an LLM, as they were in v0.6.0. The redaction
+  patterns accept a bounded identifier prefix and suffix around the keyword
+  (`[A-Za-z0-9_.-]{0,40}` on each side), so a long name without a keyword cannot cause
+  backtracking; variable references, placeholders, all-caps names and digit-only values stay
+  readable. Detection (`find_secrets`, and the risk findings built on it) keeps its word-anchored
+  12-character threshold.
+
+- **Guard hook ownership with versioned or free-threaded interpreters (`runledger.guard`,
+  `runledger.rollback`):** `guard install` stores the literal `sys.executable`, so the recognizers
+  now accept every interpreter name it can write, including `python3.13t.exe`, `python3.14t`,
+  `pythonw.exe` and `pypy3`. Installing again updates the existing entry instead of adding a second
+  one, `guard uninstall` removes the guard and both lifecycle checkpoint hooks, and the install
+  self-test recognises the stored command instead of warning that it is not a RunLedger guard
+  command. Foreign hooks (`echo runledger guard`, `other.sh && runledger guard`, another
+  executable) are still left alone.
+
+- **Spaced drive paths are a label output shows, never an input to a decision
+  (`runledger.paths`, `runledger.risk`, `runledger.summarize`, `runledger.receipt`,
+  `runledger.safe`, `runledger.guard`, `runledger.labels`):** an unquoted path that contains
+  spaces (`echo hi > E:\Work\Client y\z.txt`) is two words to a shell, and findings, their
+  de-duplication, severities, user `ignore` rules, guard rules and decisions, file keys,
+  deletion state, counts and Git lookups are computed from exactly those words. Reading the
+  whole folder name (`E:\Work\Client X\secret.txt`) happens when a receipt, a push payload or a
+  guard message is rendered, so a finding shows the whole path and a safe receipt shows
+  `…/Client X/secret.txt` instead of the unmasked `E:\Work\Client`, while the files a receipt
+  lists stay the files the shell wrote (`touch C:/repo/My Folder/x.txt` writes `My` and
+  `Folder/x.txt`). A quoted path (`"E:\Work\Client X\secret.txt"`) is one word already and is
+  left as written. A label can therefore no longer merge two findings or hide one:
+  `cat E:/Work/Client y/z.txt; rm 'E:/Work/Client y/z.txt'` keeps the low read and the high
+  outside delete and the default guard asks again, a user `{"ignore": ["y/z.txt"]}` cannot hide
+  the delete of `E:/Work/Client`, and a guard `reason:` rule matches the raw reason
+  (`reason:(e:/work/client)` still denies it).
+
+- **Findings beside a spaced path are the shell's own reading again (`runledger.risk`):** the
+  joined/unjoined "union" this milestone added between the two readings is gone, which restores
+  three behaviours that join-based analysis had lost: with the working folder `C:/repo`,
+  `C:/repo/bin/rm sub/echo ../outside.txt` reports the high outside-the-working-folder finding for
+  `../outside.txt` and the default guard asks instead of allowing the outside delete;
+  `rm C:/elsewhere/tests/test_a.py other/file.txt` keeps the high `test_deleted` finding for
+  `test_a.py` and `rm C:/elsewhere/key.pem other/file.txt` keeps the high `secret_file` finding
+  for `key.pem`; and `echo hi > C:/repo/migrations/001_init.sql other/file.txt` reports the medium
+  `db_migration` for the real redirect target. `rm C:/repo/a.txt ../outside.txt`,
+  `rm C:\a b\x nested/../../outside.txt` and their `>` and `<` redirect forms still report the
+  high finding for the operand that climbs out of the project and still ask again.
+
+- **A queued heredoc starts at the newline that ends the command line (`runledger.shell_syntax`):**
+  a newline inside a multiline `$'...'` or `"..."` string is part of that word, so a pending
+  heredoc keeps waiting for the command's real terminator. In `echo <<EOF $'first` / `second'` /
+  `payload` / `EOF` / `rm -rf ./build` (five lines, as Bash runs them) the heredoc body is now
+  `payload` and the `rm -rf` after it is read again: the receipt keeps the high
+  recursive-force-delete command finding and the default guard denies it, instead of treating the
+  delete as quoted heredoc data.
+
+- **Hook ownership reads the whole command, and follows the interpreter that is running
+  (`runledger.paths`, `runledger.guard`, `runledger.rollback`):** the command is rejected as
+  foreign before any basename is read when it holds an unquoted shell operator, redirection,
+  command substitution, sub-shell or second line, so `true;/usr/bin/python3.13t -m runledger
+  checkpoint --hook` (and the `guard` form, with `&&`, `||`, `|`, `&`, `>` or a second line) is
+  preserved again: `guard install` appends beside it and `guard uninstall` leaves it, as v0.6.0
+  did. A `$` or a backtick in the executable word keeps the entry foreign as well, even inside
+  double quotes, because a POSIX shell executes those substitutions:
+  `"/usr/$(printf bin)/python3.13t" -m runledger checkpoint --hook` and its backtick form (and
+  the `guard` forms) compute their own path, so they are left untouched instead of being replaced
+  or removed. A single command is also ours when its executable word is the interpreter that runs
+  `install`, which writes that path literally: a copied or renamed interpreter
+  (`agent-python.exe`) now works through install, the no-op second install, the install self-test
+  and uninstall. Other interpreters still match the python/pypy name pattern
+  (`python3.13t.exe`, `pythonw.exe`, `pypy3`).
+
+- **A completed backup is never overwritten by a delayed run (`runledger.cli`):** the backup
+  sequence is read before the name marker exists, so a run that paused there could claim a number
+  another run had since used, finished and released, and the atomic rename then replaced that
+  finished copy. The marker claim now checks the final target as well and moves to the next suffix
+  when it is taken, so overlapping backups in the same second still leave one copy per run.
+
+- **CLI flag validation, non-colliding receipts, and atomic stem-scoped backups (`runledger.cli`,
+  `runledger.server.db`):** `--latest` on `receipt` and `push` is now mutually exclusive with an
+  explicit `session` argument (exits `2`); `--open` with `--format md` or `--format json` prints a
+  warning to `stderr` instead of being silently ignored; `list --limit` requires a positive integer
+  and `checkpoints prune --keep` requires a non-negative integer via `argparse` (exits `2`); and
+  `runledger backup` writes stem-qualified `runledger-<db-stem>-YYYYmmdd-HHMMSS[-N].db` files via a
+  temporary file and atomic rename (leaving no `.db` or `.tmp` file on failure) while pruning only
+  matching database stems.
+
+- **Session discovery, sub-agent merging, and fast `list` (`runledger.parser`, `runledger.session_cache`, `runledger.adapters`):**
+  Claude Code sub-agent transcripts (`<project>/<session>/subagents/**/*.jsonl` and legacy
+  `<project>/subagents/agent-*.jsonl`) are merged into the parent session's token usage and cost
+  with message-id deduplication and a receipt note (`includes N sub-agent transcript(s)`), without
+  being listed as separate sessions. Encoded Claude project folder names longer than 200 characters
+  resolve via the UTF-16 32-bit base36 hash suffix with a 200-character prefix fallback scan.
+  Codex and Droid session discovery and `runledger list` share a corruption-tolerant header and
+  summary cache in `~/.runledger/cache/sessions.json` keyed by file modification time and size,
+  Droid project discovery filters by encoded folder name before reading unrelated directories,
+  Aider discovery walks up from project subfolders to the Git top-level directory, and
+  `adapters()` reports a broken adapter import once per process on `stderr` (or re-raises when
+  `RUNLEDGER_DEBUG=1`).
+- **Guard project root resolution and subfolder support (`runledger.guard`, `runledger.guard_receipt`, `runledger.risk`):**
+  the guard resolves the project root from `CLAUDE_PROJECT_DIR` / `FACTORY_PROJECT_DIR` /
+  `DROID_PROJECT_DIR`, else the nearest ancestor of the event's `cwd` (including the `cwd` itself)
+  that contains `.runledger.json` or `.git`, else `cwd`. Policy
+  is read from `<project_root>/.runledger.json`, `.runledger/guard.log` is written only at the
+  project root, `write_outside` / `read_outside` / `shell_outside` use the project root as the
+  boundary while resolving relative paths against the event's `cwd`, and receipts load both root
+  and legacy subfolder guard logs with de-duplication. Running `runledger guard` interactively with
+  a TTY stdin now prints help and exits `2` instead of blocking.
+
+- **Guard roots, foreign hooks, and the install self-test (`runledger.guard`):** a project whose
+  root holds only `.runledger.json` (no Git) now enforces its policy and writes one
+  `.runledger/guard.log` at that root when the agent runs in a subfolder; `guard install` and
+  `guard uninstall` recognise only the complete RunLedger commands, so a foreign hook that merely
+  mentions the words (`echo runledger guard`, `other-check.sh && runledger guard`) is kept intact
+  instead of being replaced or removed; `guard install` without `--project` writes
+  `.claude/settings.json` at the project root (git top level or policy marker) instead of in the
+  subfolder it was run from; and the install self-test runs the stored command from the project
+  folder without adding the installer's checkout to `PYTHONPATH`, so a hook that cannot start
+  RunLedger there is reported as a warning rather than verified.
+
+- **Unified secret detection and redaction (`runledger.secrets`):** `risk`, `guard` and `llm` share
+  one leaf rule set for secret content and secret file paths, resolving `sk-proj-` and 30-character
+  GitHub token mismatches, covering `.tfstate`, `.tfvars`, `.jks`, `.keystore`, `.p8`, `.kdbx`,
+  `.htpasswd`, `.vault-token`, `.config/gh/hosts.yml`, `.config/gcloud/credentials.db` and
+  `.azure/accessTokens.json`, and excluding `id_*.pub` public keys from `secret_file` findings.
+- **ReDoS-safe `extra_secret_paths`:** user and project patterns are validated before compilation
+  (rejecting nested quantifiers, backreferences and patterns over 200 characters, capped at 20
+  patterns and 1,024-character path inputs) and support a `glob:` prefix. Unsafe patterns are
+  skipped and logged as warnings by the guard.
+- **Git plumbing hardening and faster checkpoint listing:** receipt Git calls strip inherited
+  `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE` and related environment overrides, disable optional
+  locks (`GIT_OPTIONAL_LOCKS=0`), treat pathspec magic characters (`[`, `*`, `:`) literally, and
+  cache repository context per run. `runledger checkpoints` reads checkpoint metadata in a single
+  `for-each-ref` call, and `runledger checkpoint --hook` stays silent outside a Git repository
+  while still warning on failures inside a repository.
+- **Repository failures are no longer reported as "not a repository" (`runledger.rollback`):**
+  `Repository` now distinguishes Git's "not a git repository" message (checked with the C locale)
+  from other discovery failures, so a repository Git cannot read (a malformed `.git/config`, a
+  permission or ownership error) warns from the checkpoint hook and prints Git's own reason from
+  `runledger checkpoint`, instead of being silently swallowed. Checkpoint listing frames each
+  `for-each-ref` record with its declared contents size, and any record whose body contains the
+  raw record separator is rejected whole, so a malformed foreign commit can no longer truncate
+  into a listed checkpoint.
+- **PowerShell file write and delete analysis (`runledger.ps_writes`):** `PowerShell` tool steps
+  and PowerShell cmdlets inside `Bash` steps (`Set-Content`, `Add-Content`, `Out-File`,
+  `Tee-Object`, `Export-Csv`, `New-Item`, `Copy-Item`, `Move-Item`, `Rename-Item`, `Remove-Item`,
+  `Invoke-WebRequest -OutFile`, their aliases, `>`/`>>` redirections and `[System.IO.File]` writes)
+  now populate `files` in receipts and trigger the same file-path risk rules (`secret_file`,
+  `git_internals`, `db_migration`, `shell_outside`, `temp_copy`, `test_deleted`) and guard
+  decisions as POSIX shell writes, while skipping variable, wildcard and `-WhatIf` targets.
+- **Quote- and comment-aware heredoc scanning (`runledger.shell_syntax`):** `<<` inside single or
+  double quotes, `#` comments, `<<<` here-strings and `$((...))` arithmetic expansions no longer
+  start a fake heredoc that hides later commands on subsequent lines from `shell_writes` and
+  `risk`.
+- **ANSI-C strings do not start a heredoc (`runledger.shell_syntax`, `runledger.shell_writes`,
+  `runledger.risk`):** `echo $'it\'s <<EOF'` is one word, because a backslash escapes the quote
+  inside `$'...'`, so the commands on the following lines are analysed again in the guard and in
+  receipts instead of being swallowed as a heredoc body. A literal newline is part of the string
+  until its closing quote, so `echo $'first` / `second'` followed by `rm -rf ./build` still
+  reports the recursive force delete (guard: deny).
+- **A `#` comment ends at the newline (`runledger.shell_writes`):** the shell tokenizer no
+  longer reads the line after a comment as arguments of the commented command, so
+  `echo ok # <<EOF` followed by `rm k.txt` still lists `k.txt` as deleted, and `echo a#b` is
+  one word.
+- **A project severity override is compared with the finding it matches (`runledger.risk`):** a
+  project `.runledger.json` still raises severities, but an override below the finding's actual
+  severity (a `shell_outside: medium` override on a delete outside the project, for example) no
+  longer lowers it, and the receipt counts the kind in its "not applied" note.
+- **Cmdlets are only sniffed in command position (`runledger.ps_writes`):** a `Bash` step whose
+  only cmdlet-looking text is quoted or commented (`echo 'Set-Content is a cmdlet'; touch t.txt;
+  rm r.txt`) stays POSIX, so its writes and deletes are listed instead of being lost to the
+  PowerShell extractor, while a real `Set-Content` command word is still analysed as PowerShell.
+  Quoted text is blanked through its closing quote even across newlines, so a multiline quoted
+  example (`echo "example:` / `Set-Content -Path demo.txt"` / `; touch t.txt`) cannot flip a
+  POSIX step to PowerShell either.
+- **Tightened `test_skipped` detection:** `sys.exit(`, `process.exit(`, `os._exit(`, `foo.xit(`,
+  `taxit(`, `@pytest.mark.xfail` and `.todo(` in test diffs or edits are no longer misclassified
+  as disabled tests, while `xit(`, `xdescribe(`, `xtest(`, `xcontext(`, `xspecify(`, `t.Skip(`,
+  `t.SkipNow(`, `self.skipTest(`, `it.only(`, `@Disabled` and `@Ignore` are flagged.
+- **UNC, `\\?\` long-path and symlink/junction path handling (`runledger.paths`, `runledger.risk`):**
+  UNC paths (`\\srv\share\...` and `//srv/share/...`) and Windows `\\?\` / `\\?\UNC\` long-path
+  prefixes are recognized as Windows-style absolute paths across `paths`, `risk` and `guard` while
+  keeping device paths (`\\.\...`, `\\?\GLOBALROOT...`) excluded. When a path and working directory
+  exist on the local host (non-UNC, matching the host OS style), `_outside` also resolves
+  `os.path.realpath` to flag symlink and Windows junction escapes outside the project without
+  hanging on unreachable UNC shares.
+- **Safe-mode path and Git remote masking (`runledger.safe`):** home folders with spaces in the
+  user name (`C:\Users\John Smith\...`, `/home/john smith/...`, `/Users/Mary Jane Doe/...`) are
+  masked in full to `~/...`; scp-style `git@host:org/repo` and `ssh://git@host/...` Git remotes are
+  preserved instead of being redacted as `[EMAIL]` or `[REDACTED]@`; and foreign non-system
+  absolute paths with more than two segments are trimmed to `…/<last two parts>` even when the
+  repository root is known.
+- **Safe mode fully masks spaced paths and unknown user names (`runledger.safe`, `runledger.risk`):**
+  a foreign drive path that contains spaces is masked as one path, quoted (`type "E:\Work\Client
+  X\secret.txt"`) or bare, instead of surviving in the step text, and a folder name with several
+  words (`E:\Work\Client X Corp\secret.txt`) is one path too, so it is trimmed to
+  `…/Client X Corp/secret.txt`; an unknown home user name with
+  spaces or non-ASCII characters (`/home/john smith`, `/Users/mary jane doe`,
+  `C:\Users\José Smith\Documents`, including runs of spaces such as
+  `C:\Users\John  Smith\Documents`) is consumed up to a separator, quote or end of line, so no
+  surname fragment reaches a receipt; and the scp-remote exemption now needs a non-empty path after
+  the colon, so a real address followed by a prose colon (`git@example.com: please respond`) is
+  masked as `[EMAIL]` while `git@github.com:org/repo.git` is still kept. A shell command's unquoted
+  drive path with spaces is read as one path, so the risk reason names the whole path (which safe
+  mode can then mask) instead of a fragment.
+- **Model normalization, verified OpenAI/Google prices, 1h cache writes and long-context tiers (`runledger.pricing`, `runledger/prices.json`):**
+  `normalize_model` strips trailing `[...]` context tags (`claude-opus-4-6[1m]`), `custom:` and
+  proxy suffixes (`custom:Claude-Opus-4.5-[Proxy]-0`), Bedrock/Vertex prefixes and `-latest` while
+  keeping `-fast`, unverified `-preview` and `-chat-latest` unpriced. `prices.json` adds verified
+  OpenAI (`gpt:6-astra`, `gpt:6.1-sol`, `gpt:6-luna`, `gpt:5.6-sol`, `gpt:5.6-cyber`,
+  `gpt:5.3-codex`) and Google Gemini (`gemini:4-argon`, `gemini:3.8-flash`, `gemini:3.6-flash`,
+  `gemini:3.5-flash-lite`, `gemini:3.1-flash-lite`, `gemini:3-flash-preview`, `gemini:2.5*`) list
+  prices alongside all 20 v0.6.0 Anthropic keys, with backward-compatible optional fields
+  (`cache_write_5m`, `cache_write_1h`, `long_context`, `valid_from`, `valid_until`, `windows`),
+  once-per-process invalid price file warnings, and a 120-day staleness note in receipts.
+  `parser._usage` reads `cache_creation.ephemeral_1h_input_tokens` and bills 1-hour cache writes at
+  `2x` input (or `cache_write_1h`), and `cost_of` applies `long_context` rates per request (noting
+  when Droid settings-only usage uses the base tier).
+- **Long-context tiers, price windows and cumulative usage are enforced honestly (`runledger.pricing`, `runledger/prices.json`, `runledger.adapters.native`, `runledger.adapters.droid`):**
+  the Haiku 5.5 row carries its documented `>100K` tier again (0.50/2.50/0.05, cache writes
+  0.625/1.00), so a 150K-token request costs $0.0775 and two 75K requests cost $0.0155. `valid_from`
+  /`valid_until` windows are evaluated against today's date in production lookups, and a user row
+  outside its window is skipped so the bundled row stays in effect (a row past every window is
+  `n/a`). Per-request tiering now follows the usage that carries request boundaries: native header
+  totals keep their per-step requests, aggregate-only totals and Droid settings remainders are
+  marked cumulative and stay on the base tier, and the receipt totals, `push` payload and advisor
+  all price those buckets the same way. `PRICING_HELP` names the 120-day re-verification policy,
+  and the bundled `checked` date is back to 2026-10-08 (its last recorded verification).
+- **Codex, Claude Code and Aider usage and prompt parsing (`runledger.adapters.codex`, `runledger.parser`, `runledger.adapters.aider`):**
+  Codex `token_count` events deduplicate repeated cumulative totals, fall back to
+  `total - _prev_total` when `last_token_usage` is omitted, and handle counter resets; Claude Code
+  `parse_session` streams in a single pass and retains user prompts starting with `<` (such as HTML
+  or JSX snippets) while still filtering wrapper tags (`<command-`, `<local-command-`,
+  `<system-reminder>`, etc.); and Aider parses `cache write` and `cache hit` token counts in either
+  order without double-counting `sent` and distributes per-step integer remainders so step tokens
+  sum to `totals.tokens`.
+- **Backup names are reserved exclusively and stems stay unique per database (`runledger.cli`):**
+  `runledger backup` reserves its `runledger-<stem>-YYYYmmdd-HHMMSS[-N].db` name with an exclusive
+  marker create before copying, so two backups started in the same second take different names
+  instead of one silently replacing the other, and a failed copy removes the reservation, still
+  leaving no `.db` or `.tmp` file behind. The stem percent-encodes every character outside
+  `A-Za-z0-9._-` instead of replacing it with `_`, so databases whose names differ only by such a
+  character (`team a.db` and `team_a.db`) keep separate backup namespaces and retention for one
+  never prunes the other database's copies.
+- **Backup retention ignores unfinished copies (`runledger.cli`):** an unfinished backup is a
+  `.lock` name reservation beside the target, never an empty `.db` placeholder, and retention
+  counts only non-empty `.db` files. Overlapping `runledger backup --keep 1` runs can therefore no
+  longer keep an unfinished copy while deleting the finished one (which also failed the run with
+  "cannot find the file specified" when it printed its own result), and a copy that fails removes
+  its own marker only, leaving every finished backup untouched. A zero-byte placeholder left by an
+  interrupted older version is never counted and never pruned.
+- **Droid sub-agent totals stay on the base tier (`runledger.adapters.droid`):** a child session's
+  cumulative `inclusiveTokenUsage` is marked as a cumulative estimate before it is aggregated, so
+  its usage cannot be billed at the long-context tier just because a genuinely long parent request
+  shares its model bucket. A known 300K-token parent request next to a cumulative-only 500K-token
+  child now costs $11 (tier 2 for the parent, base tier for the child) instead of $16, and the
+  receipt, the advisor figures and the `push` payload all show that value.
+- **A secret inside a spaced-path label is redacted everywhere the label is shown
+  (`runledger.labels`, `runledger.guard`, `runledger.receipt`, `runledger.safe`):** the label that
+  shows `E:/Work/Client TOKEN2=.../file.txt` as one path repeats text from the command, and
+  applying it after the redaction of a risk reason put the raw assignment back into the risks the
+  guard returns and posts to the approval server. Every render site now applies the label first
+  and the redaction, the truncation and the safe masking on the labelled copy, so that command
+  reads `(E:/Work/Client TOKEN2=[REDACTED])` in the guard's returned risks and reason, in the
+  approval request, in receipts (Markdown, JSON, HTML) and in the pull-request comment. Decisions
+  are unchanged - the shell's own words still decide - and the whole spaced path stays visible,
+  with the assignment inside it masked.
+
+- **An unknown cost is `null` (n/a), never `$0.00`, and a partly priced one is a lower bound
+  (`runledger.server`, `runledger.pricing`):** a run whose agent recorded no usage keeps an unknown
+  cost (`usage_source: "missing"`, `cost_usd: null`) instead of a free-looking `0`, and a Droid session
+  without usage gets no cost in the receipt at all. Runs whose cost is only partly priced are counted
+  as `partial_runs` and reported with a `≥` prefix: `GET /api/stats` totals and every breakdown carry
+  `cost_usd` (`null` when nothing in the group is priced), `priced_runs`, `unpriced_runs` (null or
+  partly priced) and `cost_is_lower_bound`, insights agents and models show `cost_usd: null` when no
+  run of theirs is priced, `GET /api/budgets/status` counts the runs behind the month's spend and says
+  when it is a lower bound, budget alerts name the unpriced runs ("lower bound: 2 of 30 runs
+  unpriced"), the runs CSV leaves an unknown cost cell empty, and the compliance report reads `n/a`
+  for a window with no priced run and `(lower bound)` with the counts otherwise. Markdown, HTML and
+  pull-request-comment receipts carry the same `≥` mark on a partly priced total. A reported zero
+  (`usage_source: "messages"` and `cost_usd: 0.0`) and a receipt from an older client keep their old
+  meaning and still show `$0.00`. JSON consumers that assumed a number must handle `null` (see
+  docs/api.md).
+
+- **Retention can no longer delete the runs behind a budget alert, and audit events do not follow the
+  runs' period (`runledger.server.maintenance`):** `RUNLEDGER_RETENTION_DAYS` below 35 is raised to 35
+  with a warning on startup, because a shorter period deleted the current month's runs, dropped the
+  month's spend and fired the same `budget.alert` threshold a second time. Budget alerts are purged by
+  the calendar month they belong to (`month < cutoff month`), never by when they fired, so an alert of
+  the current month survives any period. Audit events are deleted against
+  `RUNLEDGER_AUDIT_RETENTION_DAYS` only (default 365 days while runs are pruned, `0` keeps them for
+  ever), so a 35-day run period keeps a year of audit history instead of deleting it with the runs.
+  With neither variable set, nothing is deleted, whatever its age, as in v0.6.0.
+
+- **The pull request comment is only updated when it is RunLedger's own, and untrusted text can no
+  longer build links (`runledger.github`):** the sticky comment is looked up among the comments the
+  token itself wrote (`GET /user`; `GITHUB_TOKEN` cannot call it, so then only a bot's comment
+  counts), and a comment planted by somebody else with the marker is left alone: a new comment is
+  created instead of a `PATCH` to theirs. A refused `PATCH` (403 or 404, for example a comment from
+  an app that has since been removed) falls back to a fresh comment with a notice on stderr. Session
+  text (titles, risk reasons, models) is backslash-escaped for Markdown punctuation (`[`, `]`, `(`,
+  `)`, `!`, backticks, `*`, `_`, `~`, `|`) and for line-leading `#`, `>`, `-`, `+` and `1.`, `#12`
+  becomes `\#12`, HTML stays escaped and `@` is still neutralized with a zero-width space, so the only
+  live link in the comment is the footer. A file path or command containing a backtick is shown in a
+  code span whose fence is widened (`` `` dir/we`ird.py `` ``) instead of replacing the backtick with
+  `'`.
+
+- **The comment says which agent, what Guard decided and how the tests ended (`runledger.github`,
+  `runledger.guard_receipt`):** each run's block now carries a `Guard:` line with the blocked, asked,
+  approved and rejected counts plus the warnings (monitor-mode interventions and ignored loosening
+  settings) and a `Tests:` line (`N test command(s) ran · last run 3 passed, 0 failed · verdict:
+  passed`, or a distinct "no tests run"). The footer states that the comment was built in safe mode
+  with paths shortened and e-mails masked, and the run table names Factory Droid like every other
+  agent.
+
+- **One unreadable session no longer loses the whole comment, and an empty folder can be accepted
+  (`runledger.github`):** a session file that cannot be parsed is skipped with a
+  `::warning file=…::` annotation naming it, the comment is still posted for the readable sessions and
+  says "N session(s) could not be read"; when no file can be read at all, nothing is posted and the
+  exit code is `3`. `--allow-empty` (and the `allow-empty` action input) turns an empty session folder
+  into a notice, a one-line job summary and exit `0` instead of an error. A failed post now always
+  exits `3`, printing the posting error and the threshold message together, so a red job never hides
+  that the comment never went up. A fork pull request (read-only token: `Resource not accessible by
+  integration`, or a `pull_request` event whose head repository is a fork) writes the full receipt to
+  `GITHUB_STEP_SUMMARY`, prints a notice and exits `0` while still honouring `--fail-on`; every other
+  403, and a 401, stay errors.
+
+- **The Action covers every agent (`action.yml`):** the description and `sessions-dir` input name AI
+  coding agent sessions (`.jsonl` and `.runledger.json`, Claude Code, Codex and Factory Droid) and
+  the Droid `.settings.json` sidecar that carries usage, and two inputs are new: `allow-empty`
+  (default `false`) and `python-version` (default `3.11`), which the setup step now uses.
+
+- **A colon in a PowerShell target no longer hides a real file write (`runledger.ps_writes`):** the
+  skip for non-filesystem provider targets now matches the providers' own names (`HKLM:`, `HKCU:`,
+  `Cert:`, `Env:`, `Function:`, `Variable:`, `Alias:`, `WSMan:`), so a literal file such as
+  `notes:2026.txt` or the drive-relative `C:notes.txt` is listed in `file_changes` again when
+  written or deleted, and the literal path of a `[System.IO.File]` write is never read as a
+  provider target.
+
+- **The restore recipes in `docs/self-hosting.md` match what the backup script writes and the user
+  the server runs as (`docs/self-hosting.md`, `docs/analysis.md`):** the Docker database restore
+  reads `deploy/backups/<name>.db` (`/backup/backups/<name>.db` in the helper container), and both
+  it and the bare-metal recipe hand the restored file to the service user (`runledger:runledger`,
+  mode `0600`) with a writable `/data` (`0700`) before the server starts, because a backup is
+  owner-only and the helpers run as root. The volume archive is now described as the data volume
+  only: Caddy's certificates live in the separate `caddy-data` and `caddy-config` volumes, and no
+  restore recipe removes a volume (`docker compose down -v` would delete volumes the archive does
+  not hold). The whole-volume tar restore reads the archive the backup command writes
+  (`runledger-data-YYYY-MM-DD.tgz`, not a compact date) and does every check and every write in one
+  helper container running one `sh -c` with `set -e`: it checks the archive is readable, lists it
+  with `tar tzf`, extracts its data-directory-relative members into a `/restore` directory of their
+  own, checks that the database is there, and only then empties `/data` and copies the tree in
+  (`cp -a /restore/. /data/`), giving the volume back to the service user with the database at mode
+  `0600`. The service starts only when that container exited 0 (`&&`), so a missing, unreadable,
+  corrupt or unusable archive leaves the volume exactly as it was and the server stopped.
+  `docs/analysis.md` states which provider names are skipped,
+  that a colon elsewhere is part of a file name, and that a `[System.IO.File]` call counts anywhere
+  in a command.
+
+### Security
+
+- **A cross-site `GET /?key=` link cannot sign the browser in to another team (`runledger.server`):**
+  the legacy sign-in now applies the same origin check as `POST /session`. A request a browser marks
+  as coming from another origin (`Sec-Fetch-Site: cross-site` or `same-site`, or an `Origin` header
+  that is not this server's own origin) is refused with `403 cross_site` before the key is checked:
+  no cookie, no session row and a warning line on stderr that never contains the key. Plain links
+  (a click, a pasted URL, curl or any client that sends no `Sec-Fetch-Site`) are unchanged, so
+  `runledger serve` and `team create` links keep working.
+- **A cross-site form cannot sign the browser in to another team (`runledger.server`):** `POST /session`
+  now refuses a request that a browser marks as coming from another origin, before the body is read,
+  with `403 cross_site`, no cookie and no session row, and a warning line on the server's stderr that
+  never contains the key. `Sec-Fetch-Site: cross-site` and `same-site` are refused (another port,
+  scheme or subdomain is a different origin, which is what a page on a second loopback port sends),
+  and so is an `Origin` header that is not this server's own origin, `null` included, when compared at
+  the scheme the server believes the client used (so a reverse proxy it already trusts for
+  `X-Forwarded-Proto` matches). The two headers are checked independently: `Sec-Fetch-Site:
+  same-origin` still has to agree with a concrete `Origin`, so a request whose headers contradict
+  each other is refused; the fetch metadata only excuses an absent `Origin` and the opaque `null`
+  one, because every response carries `Referrer-Policy: no-referrer` and Chromium then serializes
+  the Origin of the dashboard's own form POST as `null` (measured with Chrome 155). Because
+  the session cookie is `SameSite=Strict`, a cross-site form arrives without the cookie the visitor
+  holds, so the confirmation page could not be shown and the cookie it set replaced the visitor's
+  session; that request is now refused instead. Same-origin sign-ins (the dashboard form) and clients
+  that send neither header (curl, `runledger` and other non-browser callers) are unchanged.
+- **Writes are authenticated before their body is read, and the failed-key limiter has a real memory
+  cap (`runledger.server`):** every endpoint that needs a role (`POST /api/runs`, `POST /api/approvals`,
+  `POST /api/approvals/<id>/decision`, `PUT /api/team/settings`, `POST /api/keys`, `PUT /api/budgets`)
+  now identifies the caller first, so an oversized unauthenticated body is answered `401` (`403` for a
+  role that is too low) without reading or draining it, and the connection closes; a body over the cap
+  sent by a valid member is still `413`. The in-memory failed-sign-in table evicts the least recently
+  failed address once it holds `max_tracked` (default 10 000) addresses, so distinct source addresses
+  can no longer grow it without bound. `runledger.server.auth` imports `Any`, so
+  `typing.get_type_hints()` resolves every function in the module.
+- **Dashboard sign-in posts the key, and `?key=` never overrides another team's session
+  (`runledger.server`):** the sign-in page has a form that posts the key to `POST /session`, so the
+  key stays out of the address bar, history and proxy logs, and the session cookie is now
+  `SameSite=Strict`. The legacy `GET /?key=` sign-in still works for a first visit (it redirects to
+  strip the key and logs one deprecation warning per process), but when the browser already holds a
+  session of a **different** team the server answers `200` with a confirmation page and switches only
+  after that form is submitted; a key of the same team signs in without confirmation. Each key keeps
+  at most 20 sessions (the oldest of that key is dropped), and other keys are unaffected.
+- **Receipt HTML is served with a `sandbox` CSP, and the team database and its backups are
+  owner-only (`runledger.server`, `runledger.cli`):** `GET /runs/<id>` keeps its `default-src 'none'`
+  policy (no scripts, no external resources, `nosniff`) and adds the `sandbox` directive, so a stored
+  receipt cannot navigate or submit forms even if its HTML is hostile. The team database file is
+  created with mode `0600`, and `runledger backup` sets the same mode on every copy; both are no-ops
+  where the OS has no POSIX modes, so Windows never fails on them.
+
+### Added
+
+- **A re-pushed session supersedes the run it replaces, and its history is kept (`runledger.server`):**
+  pushing the same `session_id` again with the same key (or an admin key) replaces the stored run and
+  answers `200 {"status": "updated", "id": ..., "revision": n}` instead of `409 run_conflict`. The
+  replaced version is kept in the new `run_revisions` table with its receipt JSON, HTML, risk score and
+  cost, the newest 20 versions per run; `runledger push` reports the revision it replaced. An identical
+  re-push is still an accepted retry (`200`, `"status": "duplicate"`, no new revision), a different
+  member key still gets `409` (a run stored before the server recorded pushing keys has none after
+  the migration, so only an admin key can replace it),
+  and a receipt older than the stored version (an earlier `ended`, or fewer steps) is still `409`. The
+  run keeps its URL, its `created_at` and its approvals; its risk, quality, AI review, insights,
+  dashboard counts, budget spend and audit log are recomputed from the new version, and the supersede
+  is recorded as the `run.supersede` audit event (revision, replaced_revision). The purge deletes a
+  run's history with the run.
+- **Runs store the client's `agent_id`, `usage_source` and `cost_partial`, and list by `sort_at`
+  (`runledger.server`):** the run list and the receipt carry the agent's id (`claude-code`), how the
+  client measured usage (`messages`, `settings` or `missing`) and whether its cost is a lower bound, so
+  a dashboard can label partial costs; an existing database gains the columns, the version history
+  table and a `(team_id, sort_at)` index in place, and its rows are backfilled from what they already
+  hold (no data is rewritten or dropped). Runs are listed, filtered by window and purged by `sort_at`
+  (the start time, or the push time when a receipt has none), so a run without a start time is no
+  longer sorted or counted by a different column than the one the list uses.
+- **Optional key attribution, and audit events on their own retention period (`runledger.server`):**
+  the new team setting `attribution` (`client`, the default, or `key`) decides whether a pushed run is
+  stored under the name the client sent or under the label of the key that pushed it. With `key` a
+  member cannot choose the displayed user (admin keys still push under the client's name for someone
+  else), the client's own value stays in the stored receipt, the run reports `pushed_by` in the API,
+  and per-user budgets and the dashboard follow the key label. Every change is a `team.settings` audit
+  event. The new `RUNLEDGER_AUDIT_RETENTION_DAYS` variable deletes audit events on their own schedule
+  (default 365 days while runs are pruned, `0` keeps them for ever), so audit history is no longer
+  deleted on the runs' period.
+- **`runledger push --safe` masks what the team server stores (`runledger.client`, `runledger.cli`):**
+  `--safe` (or `RUNLEDGER_PUSH_SAFE=1`, or `"push_safe": true` in `~/.runledger/config.json`; the flag
+  wins over the environment, which wins over the config) applies the same safe mode as `runledger
+  receipt` to the receipt before it is sent, so the stored JSON receipt, the HTML and the dashboard
+  show relative paths and `[EMAIL]` instead of local folders and e-mail addresses. The default is
+  unchanged: without any of the three, the server gets the full paths and the project folder it
+  groups runs by. `--safe` wins over `RUNLEDGER_PUSH_SAFE=0`. A push to a remote HTTPS server that is
+  not masked prints one line on stderr: `tip: --safe (or RUNLEDGER_PUSH_SAFE=1) masks local paths and
+  e-mail addresses before they are sent`; a loopback server and plain HTTP stay silent. The developer
+  name from `--user` is kept as given: it is the name the dashboard attributes the run to.
+- **Packaging and releases describe and check the whole product (`pyproject.toml`, `.github/`,
+  `tools/check_release.py`):** the package description and keywords now name every supported agent
+  (Claude Code, Codex CLI, Factory Droid, Aider), and the wheel discovers its packages instead of
+  listing them, so a new subpackage ships without a second edit. CI runs the test matrix on Python
+  3.9-3.13 on Ubuntu, Windows and macOS, caches pip, times every job out, builds the sdist and wheel
+  and runs `twine check` on them, and lints `deploy/docker-compose.yml`; it no longer runs twice for
+  a branch with an open pull request. Pushing a `v*` tag now refuses to publish unless the tag,
+  `pyproject.toml`, `runledger.__version__` and the CHANGELOG heading agree and the tagged commit is
+  on `main`, and after PyPI succeeds it creates the GitHub Release from that CHANGELOG section. The
+  publish action is pinned by commit and Dependabot watches the actions, the Docker base image and
+  the build tools.
+
 ## [0.6.0] - 2026-10-15
 
 ### Changed
@@ -322,3 +1038,15 @@ First working prototype (MVP).
 - Public Claude API list prices in `runledger/prices.json`, with `RUNLEDGER_PRICES` to
   override them.
 - No runtime dependencies; Python 3.9 and later.
+
+[Unreleased]: https://github.com/kodji7202-code/runledger/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/kodji7202-code/runledger/compare/v0.6.0...v0.6.1
+[0.6.0]: https://github.com/kodji7202-code/runledger/compare/v0.5.2...v0.6.0
+[0.5.2]: https://github.com/kodji7202-code/runledger/compare/v0.5.1...v0.5.2
+[0.5.1]: https://github.com/kodji7202-code/runledger/compare/v0.5.0...v0.5.1
+[0.5.0]: https://github.com/kodji7202-code/runledger/compare/v0.4.1...v0.5.0
+[0.4.1]: https://github.com/kodji7202-code/runledger/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/kodji7202-code/runledger/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/kodji7202-code/runledger/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/kodji7202-code/runledger/releases/tag/v0.2.0
+[0.1.0]: https://github.com/kodji7202-code/runledger/commit/b756b1ba48e37fa9aa4247857bf7bd24f7e5dc15

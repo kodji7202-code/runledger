@@ -8,7 +8,7 @@ By contributing, you agree that your contribution is licensed under the Apache L
 ## Set up
 
 ```bash
-git clone <repository URL> runledger
+git clone https://github.com/kodji7202-code/runledger.git runledger
 cd runledger
 python -m venv .venv
 . .venv/bin/activate              # Windows: .venv\Scripts\activate
@@ -24,6 +24,10 @@ python -m pytest -q
 `tests/test_packaging.py` builds a wheel with pip. The first build downloads the build
 backend from the package index. Offline, those tests are skipped with the reason.
 
+CI runs the same suite on Ubuntu, Windows and macOS with Python 3.9 to 3.13, builds the sdist
+and the wheel and runs `twine check` on them, lints `deploy/docker-compose.yml`, and builds the
+Docker image, starts it and checks its `/health` endpoint.
+
 ## Rules for the code
 
 - **Standard library only at runtime.** `dependencies` in `pyproject.toml` stays empty.
@@ -31,8 +35,8 @@ backend from the package index. Offline, those tests are skipped with the reason
 - **Python 3.9 must keep working.** Avoid `match` statements, `X | Y` union types outside
   annotations (inside annotations they are fine when the module starts with
   `from __future__ import annotations`), parenthesized context managers, `zip(strict=...)`,
-  `datetime.UTC`, and other names added after 3.9. CI byte-compiles the package with 3.9 and
-  runs the tests on 3.9.
+  `datetime.UTC`, and other names added after 3.9. CI byte-compiles the package and runs the
+  tests on Python 3.9, 3.10, 3.11, 3.12 and 3.13 on Ubuntu, Windows and macOS.
 - **Windows, macOS and Linux all work.** Build paths with `pathlib`, and do not depend on a
   particular shell in tests.
 - **No real data in fixtures.** Session files, API keys and customer data never go into
@@ -41,10 +45,11 @@ backend from the package index. Offline, those tests are skipped with the reason
 
 ## Agent adapters
 
-Each coding agent is read by an adapter in `runledger/adapters/`. The adapter contract (the
-`NAME`, `LABEL`, `detect`, `parse` and `find_sessions` members, and the canonical tool names)
-is described in the docstring at the top of `runledger/adapters/__init__.py`. Agents that
-should not need an adapter write the native format described in `docs/format.md`.
+Each coding agent is read by an adapter in `runledger/adapters/`: Claude Code, Codex CLI,
+Factory Droid and Aider today. The adapter contract (the `NAME`, `LABEL`, `detect`, `parse` and
+`find_sessions` members, and the canonical tool names) is described in the docstring at the top
+of `runledger/adapters/__init__.py`. Agents that should not need an adapter write the native
+format described in `docs/format.md`.
 
 To add an adapter, add the module, register its name in `ADAPTER_MODULES` in
 `runledger/adapters/__init__.py`, and add tests with a synthetic session file.

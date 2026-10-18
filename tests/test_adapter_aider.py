@@ -360,3 +360,85 @@ def test_risk_flags_rm_rf_and_costs_apply(last):
     # claude-sonnet-4-5 at $3 in / $15 out per million tokens
     assert last.cost == pytest.approx(23500 * 3 / 1e6 + 1700 * 15 / 1e6)
     assert last.steps[1].cost == pytest.approx(5500 * 3 / 1e6 + 700 * 15 / 1e6)
+
+
+def test_aider_tokens_parses_cache_write_and_cache_hit_without_double_counting():
+    res1 = aider._tokens("> Tokens: 12k sent, 1.2k cache write, 8.0k cache hit, 450 received. Cost: $0.05 message, $0.12 session.")
+    assert res1 is not None
+    u1, cost1 = res1
+    assert (u1.input_tokens, u1.cache_write_tokens, u1.cache_read_tokens, u1.output_tokens) == (2800, 1200, 8000, 450)
+    assert cost1 == pytest.approx(0.12)
+
+    # Reverse order: cache hit before cache write
+    res2 = aider._tokens("> Tokens: 12k sent, 8.0k cache hit, 1.2k cache write, 450 received. Cost: $0.05 message, $0.12 session.")
+    assert res2 is not None
+    u2, _ = res2
+    assert (u2.input_tokens, u2.cache_write_tokens, u2.cache_read_tokens, u2.output_tokens) == (2800, 1200, 8000, 450)
+
+
+def test_aider_per_step_usage_distributes_remainders_and_sums_to_total(tmp_path):
+    path = _write(tmp_path, (
+        "# aider chat started at 2026-09-30 10:00:00\n"
+        "> Main model: anthropic/claude-sonnet-4-5 with diff edit format\n"
+        "#### edit three files\n"
+        "\n"
+        "a.py\n"
+        "```python\n"
+        "<<<<<<< SEARCH\n"
+        "a = 1\n"
+        "=======\n"
+        "a = 2\n"
+        ">>>>>>> REPLACE\n"
+        "```\n"
+        "\n"
+        "b.py\n"
+        "```python\n"
+        "<<<<<<< SEARCH\n"
+        "b = 1\n"
+        "=======\n"
+        "b = 2\n"
+        ">>>>>>> REPLACE\n"
+        "```\n"
+        "\n"
+        "c.py\n"
+        "```python\n"
+        "<<<<<<< SEARCH\n"
+        "c = 1\n"
+        "=======\n"
+        "c = 2\n"
+        ">>>>>>> REPLACE\n"
+        "```\n"
+        "\n"
+        "> Tokens: 1,000 sent, 200 received. Cost: $0.01 message, $0.01 session.\n"
+    ))
+    run = aider.parse(path)
+    assert len(run.steps) == 3
+    assert run.usage.total == 1200
+    assert sum(s.usage.total for s in run.steps) == 1200
+
+
+def test_find_sessions_walks_up_to_git_root(tmp_path):
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    _write(outer, "#### outer history\n")
+
+    repo = outer / "aider-repo"
+    (repo / ".git").mkdir(parents=True)
+    repo_hist = _write(repo, "#### repo history\n")
+
+    deep = repo / "sub" / "deep"
+    deep.mkdir(parents=True)
+
+    # From sub/deep, walks up to git root and finds repo/.aider.chat.history.md
+    assert aider.find_sessions(str(deep)) == [repo_hist]
+
+    # Nearest directory wins when sub/ also has history
+    sub_hist = _write(repo / "sub", "#### sub history\n")
+    assert aider.find_sessions(str(deep)) == [sub_hist]
+
+    # Removing in-repo histories does NOT escape above git root to outer/
+    sub_hist.unlink()
+    repo_hist.unlink()
+    assert aider.find_sessions(str(deep)) == []
+
+

@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from runledger.labels import command_labels, show_reason
 from runledger.parser import Run, Step, Usage
 from runledger.risk import _outside, assess, assess_step, load_policy
 
@@ -28,6 +29,12 @@ def _risks(tool, cwd=WIN_CWD, **inp):
 
 def _reasons(risks):
     return [r.reason for r in risks]
+
+
+def _shown(tool, command, risks):
+    """The reasons a receipt shows: the whole spaced drive path, applied after the rules ran."""
+    labels = command_labels(tool, command)
+    return [show_reason(r.reason, labels) for r in risks]
 
 
 def _run(steps, cwd):
@@ -170,6 +177,175 @@ def test_bash_shell_outside_windows_path_is_high_when_deleting():
     risks = _risks("Bash", command=r"rm -rf C:\Users\bob\docs")
     outside = [r for r in risks if r.code == "shell_outside"]
     assert outside and outside[0].severity == "high"
+
+
+def test_unquoted_spaced_drive_path_is_read_as_one_path():
+    """CORE-SCR-013/R5-001: a folder name with spaces is two words to a shell, so the finding
+    names the word the shell reads; a receipt shows the whole path (`E:\\Work\\Client` ->
+    `E:\\Work\\Client X\\secret.txt`) so safe mode can mask the folder name (VAL-CORE-034)."""
+    command = r"type E:\Work\Client X\secret.txt"
+    risks = _risks("Bash", command=command)
+    assert _reasons(risks) == [
+        r"Shell command referenced a path outside the working folder (E:\Work\Client)"]
+    assert _shown("Bash", command, risks) == [
+        r"Shell command referenced a path outside the working folder (E:\Work\Client X\secret.txt)"]
+    quoted = r'type "E:\Work\Client X\secret.txt"'
+    assert _shown("Bash", quoted, _risks("Bash", command=quoted)) == _shown("Bash", command, risks)
+
+
+def test_spaced_drive_path_does_not_merge_two_paths():
+    assert _reasons(_risks("Bash", command=r"copy E:\a\b.txt F:\c\d.txt")) == [
+        r"Shell command referenced a path outside the working folder (E:\a\b.txt)",
+        r"Shell command referenced a path outside the working folder (F:\c\d.txt)"]
+
+
+def test_unquoted_spaced_drive_redirect_target_is_one_write_finding():
+    """The redirect target is the shell's own word, and the receipt shows the whole path that
+    word's folder name belongs to: one finding either way, no fragment and no second finding."""
+    command = r"echo hi > E:\Work\Client y\z.txt"
+    risks = _risks("Bash", command=command)
+    assert [(r.severity, r.code, r.reason) for r in risks] == [
+        ("low", "shell_outside", r"Shell command wrote outside the working folder (E:\Work\Client)")]
+    assert _shown("Bash", command, risks) == [
+        r"Shell command wrote outside the working folder (E:\Work\Client y\z.txt)"]
+
+
+def test_spaced_drive_redirect_target_with_forward_slashes_is_one_write_finding():
+    command = r"echo hi > E:/Work/Client y/z.txt"
+    risks = _risks("Bash", command=command)
+    outside = [r for r in risks if r.code == "shell_outside"]
+    assert len(outside) == 1
+    assert outside[0].reason.replace("\\", "/") == \
+        "Shell command wrote outside the working folder (E:/Work/Client)"
+    assert _shown("Bash", command, risks)[0].replace("\\", "/") == \
+        "Shell command wrote outside the working folder (E:/Work/Client y/z.txt)"
+
+
+def test_unquoted_spaced_drive_read_redirect_names_the_whole_path():
+    command = r"cat < E:\Work\Client y\z.txt"
+    assert _reasons(_risks("Bash", command=command)) == [
+        r"Shell command referenced a path outside the working folder (E:\Work\Client)"]
+    assert _shown("Bash", command, _risks("Bash", command=command)) == [
+        r"Shell command referenced a path outside the working folder (E:\Work\Client y\z.txt)"]
+
+
+@pytest.mark.parametrize("command", [
+    r"rm C:/repo/a.txt ../outside.txt",
+    r"rm C:/repo/a.txt > C:/repo/log ../outside.txt",
+    r"rm < C:/repo/input ../outside.txt",
+])
+def test_spaced_drive_path_does_not_absorb_a_relative_operand(command):
+    """CORE-SCR-R2-004: `../outside.txt` is its own argument, not the tail of the drive path
+    before it, so deleting it is still a high finding (and the guard asks again)."""
+    assert [(r.severity, r.code, r.reason) for r in _risks("Bash", cwd="C:/repo", command=command)] == [
+        ("high", "shell_outside",
+         r"Shell command referenced a path outside the working folder (../outside.txt)")]
+
+
+@pytest.mark.parametrize("command", [
+    r"rm C:/repo/sub/a.txt nested/../../outside.txt",
+    r"rm C:/repo/sub/a.txt > C:/repo/sub/log nested/../../outside.txt",
+    r"rm < C:/repo/sub/input nested/../../outside.txt",
+])
+def test_traversing_operand_after_a_spaced_drive_path_stays_a_high_delete(command):
+    """CORE-SCR-R3-001: `nested/../../outside.txt` is an argument of its own that climbs out of
+    the project, so the delete keeps a high finding naming it even when the display join reads
+    the words as one spaced path (both readings are analysed, most severe wins)."""
+    outside = [r for r in _risks("Bash", cwd="C:/repo", command=command)
+               if r.code == "shell_outside" and r.severity == "high"]
+    assert [r.reason for r in outside] == [
+        r"Shell command referenced a path outside the working folder (nested/../../outside.txt)"]
+
+
+@pytest.mark.parametrize("command", [
+    r"rm C:\a b\x nested/../../outside.txt",
+    r"rm C:\a b\x > C:\a b\log nested/../../outside.txt",
+    r"rm < C:\a b\input nested/../../outside.txt",
+])
+def test_traversing_operand_is_named_when_the_joined_path_is_itself_outside(command):
+    """CORE-SCR-R3-001: the shell reads `C:\\a b\\x` and `nested/../../outside.txt` as two
+    arguments, so the escaping operand keeps a finding naming it, next to the finding for the
+    fragment (`C:\\a`) that the display label shows as the whole path."""
+    reasons = [r.reason for r in _risks("Bash", cwd="C:/repo", command=command)
+               if r.code == "shell_outside" and r.severity == "high"]
+    assert any(reason.endswith("(nested/../../outside.txt)") for reason in reasons)
+
+
+def test_spaced_drive_path_with_several_words_is_still_one_path():
+    """CORE-SCR-R2-005: a folder name may hold more than one extra word; the label names the
+    whole path so safe mode can mask it, while the finding keeps the shell's own word."""
+    command = r"type E:\Work\Client X Corp\secret.txt"
+    risks = _risks("Bash", command=command)
+    assert _reasons(risks) == [
+        r"Shell command referenced a path outside the working folder (E:\Work\Client)"]
+    assert _shown("Bash", command, risks) == [
+        r"Shell command referenced a path outside the working folder (E:\Work\Client X Corp\secret.txt)"]
+
+
+def test_the_spaced_path_label_shows_what_the_shell_reads_as_two_words():
+    """The label step rewrites the path a receipt shows (`E:\\Work\\Client` ->
+    `E:\\Work\\Client y\\z.txt`); the findings themselves are the shell's own reading, so the
+    codes and severities match the same command with the path quoted (R5-001)."""
+    loose_command = r"echo hi > E:\Work\Client y\z.txt"
+    quoted_command = r"echo hi > 'E:\Work\Client y\z.txt'"
+    loose = _risks("Bash", command=loose_command)
+    quoted = _risks("Bash", command=quoted_command)
+    assert [(r.severity, r.code) for r in loose] == [(r.severity, r.code) for r in quoted]
+    assert _shown("Bash", loose_command, loose) == _reasons(quoted)
+
+
+def test_the_spaced_path_label_never_adds_a_finding():
+    """The label is a display step: the words the shell splits stay two operands, and the
+    second one is checked as itself (here it resolves inside the working folder)."""
+    command = r"type E:\Work\Client y\z.txt"
+    risks = _risks("Bash", command=command)
+    assert [(r.severity, r.code, r.reason) for r in risks] == [
+        ("low", "shell_outside",
+         r"Shell command referenced a path outside the working folder (E:\Work\Client)")]
+    assert _shown("Bash", command, risks) == [
+        r"Shell command referenced a path outside the working folder (E:\Work\Client y\z.txt)"]
+
+
+# ------------------------------------------------ round 4: the shell's own words decide
+
+def test_an_explicit_rm_executable_still_sees_the_escaping_operand():
+    """CORE-SCR-R4-001: `C:/repo/bin/rm` is the executable and `sub/echo` a plain argument, so
+    `../outside.txt` is a delete operand of its own: the outside delete is high again."""
+    assert [(r.severity, r.code, r.reason) for r in
+            _risks("Bash", cwd="C:/repo", command="C:/repo/bin/rm sub/echo ../outside.txt")] == [
+        ("high", "shell_outside",
+         "Shell command referenced a path outside the working folder (../outside.txt)")]
+
+
+@pytest.mark.parametrize("command, codes, named", [
+    ("rm C:/elsewhere/tests/test_a.py other/file.txt",
+     [("high", "test_deleted"), ("high", "shell_outside")], "tests/test_a.py"),
+    ("rm C:/elsewhere/key.pem other/file.txt",
+     [("high", "secret_file"), ("high", "shell_outside")], "key.pem"),
+])
+def test_a_delete_beside_a_spaced_path_keeps_its_own_finding(command, codes, named):
+    """CORE-SCR-R4-002: a finding is kept for the code and the target it names, never dropped
+    because another finding for the same command is equally severe. The path the finding shows
+    is the display label; the finding itself comes from the shell's own word."""
+    risks = _risks("Bash", cwd="C:/repo", command=command)
+    assert [(r.severity, r.code) for r in risks] == codes
+    assert any(named in r.reason for r in risks if r.code == "shell_outside")
+
+
+def test_a_redirect_beside_a_spaced_operand_is_still_a_migration():
+    """CORE-SCR-R4-003: the real redirect target gets the write-specific checks, so writing a
+    migration through the shell stays a medium db_migration."""
+    assert [(r.severity, r.code, r.reason) for r in _risks(
+        "Bash", cwd="C:/repo", command="echo hi > C:/repo/migrations/001_init.sql other/file.txt")] == [
+        ("medium", "db_migration", "Wrote a database migration (migrations/001_init.sql)")]
+
+
+def test_multiline_ansi_c_string_keeps_the_next_command_visible():
+    """CORE-SCR-R2-002: a `$'...'` string may contain literal newlines, so the `rm -rf` after
+    the closing quote is still a high command finding (the guard denies it)."""
+    risks = _risks("Bash", cwd="C:/repo", command="echo $'first\nsecond'\nrm -rf ./build")
+    assert [(r.severity, r.code, r.reason) for r in risks] == [
+        ("high", "command", "Recursive force delete (rm -rf)")]
 
 
 def test_git_dash_c_rm_resolves_delete_operand_against_git_working_folder():
@@ -393,25 +569,31 @@ def test_load_policy_invalid_or_non_object_gives_defaults(tmp_path, raw):
     assert load_policy(str(tmp_path)) == DEFAULTS
 
 
-def test_load_policy_drops_invalid_entries(tmp_path):
-    _write_policy(tmp_path, {
+def test_load_policy_drops_invalid_entries(tmp_path, monkeypatch):
+    user_cfg = tmp_path / "user_config.json"
+    user_cfg.write_text(json.dumps({
         "ignore": ["command", 5, "", "   "],
         "severity_overrides": {"command": "critical", "mcp": "LOW", "rm": 3},
         "extra_secret_paths": ["(", r"\.vault$"],
-    })
+    }), encoding="utf-8")
+    monkeypatch.setenv("RUNLEDGER_CONFIG", str(user_cfg))
     policy = load_policy(str(tmp_path))
     assert policy["ignore"] == ["command"]
     assert policy["severity_overrides"] == {"mcp": "low"}
     assert policy["extra_secret_paths"] == [r"\.vault$"]
 
 
-def test_load_policy_accepts_utf8_bom(tmp_path):
-    _write_policy(tmp_path, {"ignore": ["mcp"]}, bom=True)
+def test_load_policy_accepts_utf8_bom(tmp_path, monkeypatch):
+    user_cfg = tmp_path / "user_config.json"
+    user_cfg.write_bytes(json.dumps({"ignore": ["mcp"]}).encode("utf-8-sig"))
+    monkeypatch.setenv("RUNLEDGER_CONFIG", str(user_cfg))
     assert load_policy(str(tmp_path))["ignore"] == ["mcp"]
 
 
-def test_policy_ignore_removes_matching_risks(tmp_path):
-    _write_policy(tmp_path, {"ignore": ["mcp"]})
+def test_policy_ignore_removes_matching_risks(tmp_path, monkeypatch):
+    user_cfg = tmp_path / "user_config.json"
+    user_cfg.write_text(json.dumps({"ignore": ["mcp"]}), encoding="utf-8")
+    monkeypatch.setenv("RUNLEDGER_CONFIG", str(user_cfg))
     steps = [_step("mcp__github__create_issue", 1, title="x"), _step("Bash", 2, command="sudo ls")]
     _, _, risks = assess(_run(steps, str(tmp_path)))
     codes = {r.code for r in risks}
@@ -425,10 +607,12 @@ def test_policy_ignore_matches_reason_text_case_insensitively():
     assert "read_outside" not in {r.code for r in risks}
 
 
-def test_policy_severity_override_changes_level_and_score(tmp_path):
+def test_policy_severity_override_changes_level_and_score(tmp_path, monkeypatch):
     steps = [_step("Bash", 1, command="sudo ls")]
     base_score, _, _ = assess(_run(steps, str(tmp_path)))
-    _write_policy(tmp_path, {"severity_overrides": {"command": "low"}})
+    user_cfg = tmp_path / "user_config.json"
+    user_cfg.write_text(json.dumps({"severity_overrides": {"command": "low"}}), encoding="utf-8")
+    monkeypatch.setenv("RUNLEDGER_CONFIG", str(user_cfg))
     score, _, risks = assess(_run(steps, str(tmp_path)))
     assert [(r.severity, r.reason) for r in risks] == [("low", "Ran a command with sudo")]
     assert base_score == 30 and score == 5
@@ -732,3 +916,311 @@ def test_medium_findings_cap_at_forty_five_points(tmp_path):
 def test_high_findings_are_not_capped_below_one_hundred(tmp_path):
     score, _, _ = assess(_run(_steps("Bash", 4, command="sudo ls"), str(tmp_path)))
     assert score == 60  # 30 for the first sudo, then 10 for each repeat
+
+
+# ---------------------------------------------------------------- secret paths, ReDoS validator & trust model (VAL-CORE-014, 016..018, 024..026)
+
+@pytest.mark.parametrize("secret_path", [
+    "main.tfstate",
+    "terraform.tfstate.backup",
+    "prod.tfvars",
+    "keystore.jks",
+    "app.keystore",
+    "AuthKey_ABC1234567.p8",
+    "cert.p12",
+    "cert.pfx",
+    ".htpasswd",
+    ".vault-token",
+    ".config/gh/hosts.yml",
+    ".azure/accessTokens.json",
+    ".git/config",
+    ".netrc",
+    "id_rsa",
+    "id_ed25519",
+    ".envrc",
+    "/app/.envrc",
+    "~/.ssh/config",
+    "~/.ssh/authorized_keys",
+    "~/.ssh/deploy_ed25519",
+    "credentials",
+    "config/credentials",
+    "~/.aws/credentials",
+])
+def test_extended_secret_paths_are_detected(secret_path):
+    from runledger import secrets
+
+    assert secrets.is_secret_path(secret_path) is True
+    hits = assess_step(_step("Read", file_path=secret_path), POSIX_CWD)
+    assert any(r.code == "secret_file" and r.severity == "high" for r in hits)
+
+
+@pytest.mark.parametrize("public_path", [
+    "~/.ssh/id_rsa.pub",
+    "id_ed25519.pub",
+    "deploy_key.pub",
+    "src/public.py",
+    "src/credentials.py",
+    "src/credentials/utils.py",
+    "docs/secrets.md",
+    "README.md",
+    "package.json",
+])
+def test_public_key_and_normal_paths_are_not_secret(public_path):
+    from runledger import secrets
+
+    assert secrets.is_secret_path(public_path) is False
+    hits = assess_step(_step("Read", file_path=public_path), POSIX_CWD)
+    assert not any(r.code == "secret_file" for r in hits)
+
+
+@pytest.mark.parametrize("bad_pattern", [
+    "(a+)+$",
+    "(a|aa)+$",
+    "(?>(a+)+$)",
+    "(?>(a|aa)+$)",
+    "((?>a+))+$",
+    "((?>a|aa))+$",
+    "(a++)+",
+    "(a+)*+",
+    "(a*)*",
+    "(x+x+)+y",
+    r"(\w+\.)+com",
+    "(a+){2,}",
+    r"(a+)\1",
+    "a" * 201,
+])
+def test_safe_user_regex_rejects_redos_and_overlong(bad_pattern):
+    from runledger import secrets
+
+    assert secrets.safe_user_regex(bad_pattern) is None
+
+
+@pytest.mark.parametrize("good_pattern,matching_sample,non_matching_sample", [
+    (r"\.vault$", "config/app.vault", "config/app.txt"),
+    (r"(^|/)vault\.txt$", "dir/vault.txt", "dir/other.txt"),
+    (r"(^|/)config/prod\.ya?ml$", "config/prod.yaml", "config/dev.yaml"),
+    (r"^(?:src|lib)/secrets/.*$", "src/secrets/key.json", "test/secrets/key.json"),
+    (r"[a-z]+\d*\.pem$", "cert12.pem", "cert12.txt"),
+    ("glob:*.SecretConfig", "app.SecretConfig", "app.Config"),
+])
+def test_safe_user_regex_accepts_valid_and_glob_patterns(good_pattern, matching_sample, non_matching_sample):
+    from runledger import secrets
+
+    compiled = secrets.safe_user_regex(good_pattern)
+    assert compiled is not None
+    assert compiled.search(matching_sample) is not None
+    assert compiled.search(non_matching_sample) is None
+
+
+def test_extra_secret_paths_truncates_long_path_and_caps_count(tmp_path):
+    from runledger import secrets
+
+    long_path = "a/" * 5000 + "file.vault"
+    assert len(long_path) > 10000
+    assert secrets.is_secret_path(long_path, extra=[r"\.vault$"]) is False
+    short_path = "a/" * 40 + "file.vault"
+    assert len(short_path) < 200
+    assert secrets.is_secret_path(short_path, extra=[r"\.vault$"]) is True
+
+    _write_policy(tmp_path, {
+        "extra_secret_paths": [f"pat{i}\\.secret$" for i in range(30)],
+    })
+    policy = load_policy(str(tmp_path))
+    assert len(policy["extra_secret_paths"]) == 20
+
+
+def test_project_config_cannot_ignore_or_lower_risks_and_emits_note(tmp_path):
+    from runledger.receipt import render
+
+    _write_policy(tmp_path, {
+        "ignore": ["destructive_delete", "git_force_push", "secret_file"],
+        "severity_overrides": {"destructive_delete": "low", "secret_file": "low"},
+    })
+    steps = [
+        _step("Bash", 1, command="rm -rf dist"),
+        _step("Bash", 2, command="git push --force"),
+        _step("Read", 3, file_path=".env"),
+    ]
+    run = _run(steps, str(tmp_path))
+    score, level, risks = assess(run)
+    assert score == 100 and level == "High"
+    high_reasons = [r.reason for r in risks if r.severity == "high"]
+    assert len(high_reasons) == 3
+    assert any("rm" in r or "deletion" in r for r in high_reasons)
+    assert any("Force-pushed" in r for r in high_reasons)
+    assert any(".env" in r for r in high_reasons)
+
+    expected_note = "Project config tried to ignore/lower 3 risk kind(s) (not applied; set in user config to enable)."
+    assert expected_note in run.notes
+    for fmt in ("md", "html", "json"):
+        rendered = render(run, score, level, risks, fmt)
+        assert expected_note in rendered
+
+
+def test_project_config_can_raise_severities_and_add_extra_secret_paths(tmp_path):
+    _write_policy(tmp_path, {
+        "severity_overrides": {"git_push": "high", "mcp": "medium"},
+        "extra_secret_paths": [r"\.vault$"],
+    })
+    steps = [
+        _step("mcp__github__create_issue", 1, title="x"),
+        _step("Bash", 2, command="git push origin main"),
+        _step("Read", 3, file_path="secrets.vault"),
+    ]
+    run = _run(steps, str(tmp_path))
+    _, _, risks = assess(run)
+    by_step = {r.step: r for r in risks}
+    assert by_step[1].code == "mcp" and by_step[1].severity == "medium"
+    assert by_step[2].severity == "high"
+    assert by_step[3].code == "secret_file" and by_step[3].severity == "high"
+    assert run.notes == []
+
+
+def test_project_severity_override_cannot_lower_a_high_finding(tmp_path):
+    # `rm` of a path outside the folder is a high shell_outside; the project's medium is refused.
+    _write_policy(tmp_path, {"severity_overrides": {"shell_outside": "medium"}})
+    run = _run([_step("Bash", 1, command=r"rm C:\other\important.txt")], str(tmp_path))
+    _, _, risks = assess(run)
+    assert [(r.severity, r.code) for r in risks] == [("high", "shell_outside")]
+    assert run.notes == [
+        "Project config tried to ignore/lower 1 risk kind(s) (not applied; set in user config to enable)."
+    ]
+
+
+def test_project_severity_override_still_raises_low_findings(tmp_path):
+    _write_policy(tmp_path, {"severity_overrides": {"shell_outside": "high"}})
+    run = _run([_step("Bash", 1, command=r"echo x > C:\Windows\win.ini")], str(tmp_path))
+    _, _, risks = assess(run)
+    assert risks and {r.code for r in risks} == {"shell_outside"}
+    assert {r.severity for r in risks} == {"high"}
+    assert run.notes == []
+
+
+def test_user_severity_override_outranks_the_project(tmp_path, monkeypatch):
+    _write_policy(tmp_path, {"severity_overrides": {"shell_outside": "high"}})
+    user_cfg = tmp_path / "user_cfg.json"
+    user_cfg.write_text(json.dumps({"severity_overrides": {"shell_outside": "low"}}), encoding="utf-8")
+    monkeypatch.setenv("RUNLEDGER_CONFIG", str(user_cfg))
+    run = _run([_step("Bash", 1, command=r"rm C:\other\important.txt")], str(tmp_path))
+    _, _, risks = assess(run)
+    assert [(r.severity, r.code) for r in risks] == [("low", "shell_outside")]
+    assert run.notes == []
+
+
+def test_user_config_can_ignore_and_lower_severities(tmp_path, monkeypatch):
+    user_cfg = tmp_path / "user_cfg.json"
+    user_cfg.write_text(json.dumps({
+        "ignore": ["network"],
+        "severity_overrides": {"outside_repo": "low"},
+    }), encoding="utf-8")
+    monkeypatch.setenv("RUNLEDGER_CONFIG", str(user_cfg))
+    steps = [
+        _step("WebFetch", 1, url="https://example.com"),
+        _step("Bash", 2, command="curl https://example.com"),
+        _step("Write", 3, file_path="/etc/hosts", content="127.0.0.1 localhost"),
+    ]
+    run = _run(steps, str(tmp_path))
+    _, _, risks = assess(run)
+    assert not any(r.code == "network" or "Network call" in r.reason for r in risks)
+    outside = [r for r in risks if r.code in ("outside_workspace", "write_outside", "outside_repo")]
+    assert outside and all(r.severity == "low" for r in outside)
+    assert run.notes == []
+
+
+# ---------------------------------------------------------------- UNC, \\?\, symlinks/junctions (VAL-CORE-027..031)
+
+def test_unc_paths_in_risk_and_guard():
+    from runledger import guard
+
+    cwd = r"\\srv\share\proj"
+    for inside_path in (r"\\srv\share\proj\a.py", "//srv/share/proj/a.py", r"\\SRV\Share\Proj\b.py"):
+        risks = _risks("Write", cwd=cwd, file_path=inside_path, content="x")
+        assert "write_outside" not in {r.code for r in risks}
+        ev = {"session_id": "s1", "cwd": cwd, "hook_event_name": "PreToolUse",
+              "tool_name": "Write", "tool_input": {"file_path": inside_path, "content": "x"}}
+        assert guard.decide(ev, {})["decision"] == "allow"
+
+    for outside_path in (r"\\srv\share2\x.py", r"\\srv\share\other\x.py"):
+        risks = _risks("Write", cwd=cwd, file_path=outside_path, content="x")
+        assert any(r.code == "write_outside" and r.severity == "high" for r in risks)
+        ev = {"session_id": "s1", "cwd": cwd, "hook_event_name": "PreToolUse",
+              "tool_name": "Write", "tool_input": {"file_path": outside_path, "content": "x"}}
+        assert guard.decide(ev, {})["decision"] == "ask"
+
+
+def test_long_path_prefix_in_risk():
+    cwd = r"C:\proj"
+    assert any(r.code == "write_outside" for r in _risks("Write", cwd=cwd, file_path=r"\\?\C:\Windows\x.txt", content="x"))
+    assert not any(r.code == "write_outside" for r in _risks("Write", cwd=cwd, file_path=r"\\?\C:\proj\a.py", content="x"))
+    assert any(r.code == "write_outside" for r in _risks("Write", cwd=r"\\srv\share\proj", file_path=r"\\?\UNC\srv\share\x", content="x"))
+    assert any(r.code == "write_outside" for r in _risks("Write", cwd=cwd, file_path=r"C:\proj\..\Windows\x", content="x"))
+    assert not any(r.code == "write_outside" for r in _risks("Write", cwd=cwd, file_path=r"\\.\PhysicalDrive0", content="x"))
+    assert not any(r.code == "write_outside" for r in _risks("Write", cwd=cwd, file_path=r"\\?\GLOBALROOT\Device\HarddiskVolume1", content="x"))
+
+
+def test_symlink_and_junction_escapes_are_flagged(tmp_path):
+    import subprocess
+    from runledger import guard
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    sub = proj / "sub"
+    sub.mkdir()
+    outside_dir = Path(r"C:\Windows\Temp") if os.name == "nt" and Path(r"C:\Windows\Temp").exists() else (tmp_path / "outside")
+    if not outside_dir.exists():
+        outside_dir.mkdir()
+
+    escape_link = proj / "link"
+    in_link = proj / "inlink"
+    if os.name == "nt":
+        subprocess.run(["cmd", "/c", "mklink", "/J", str(escape_link), str(outside_dir)], check=True, capture_output=True)
+        subprocess.run(["cmd", "/c", "mklink", "/J", str(in_link), str(sub)], check=True, capture_output=True)
+    else:
+        os.symlink(str(outside_dir), str(escape_link))
+        os.symlink(str(sub), str(in_link))
+
+    try:
+        evil_file = str(escape_link / "evil.txt")
+        risks = _risks("Write", cwd=str(proj), file_path=evil_file, content="x")
+        assert any(r.code == "write_outside" and r.severity == "high" for r in risks)
+
+        ev = {"session_id": "s1", "cwd": str(proj), "hook_event_name": "PreToolUse",
+              "tool_name": "Write", "tool_input": {"file_path": evil_file, "content": "x"}}
+        assert guard.decide(ev, {})["decision"] == "ask"
+
+        bash_risks = _risks("Bash", cwd=str(proj), command="echo hi > link/evil.txt")
+        assert any(r.code in ("shell_outside", "write_outside") for r in bash_risks)
+
+        ok_file = str(in_link / "ok.txt")
+        ok_risks = _risks("Write", cwd=str(proj), file_path=ok_file, content="x")
+        assert not any(r.code in ("write_outside", "shell_outside") for r in ok_risks)
+    finally:
+        if os.name == "nt":
+            subprocess.run(["cmd", "/c", "rmdir", str(escape_link)], check=False, capture_output=True)
+            subprocess.run(["cmd", "/c", "rmdir", str(in_link)], check=False, capture_output=True)
+
+
+def test_foreign_host_paths_use_lexical_comparison():
+    cwd = "/home/dev/proj"
+    assert not any(r.code == "write_outside" for r in _risks("Write", cwd=cwd, file_path="/home/dev/proj/src/a.py", content="x"))
+    assert any(r.code == "write_outside" for r in _risks("Write", cwd=cwd, file_path="/etc/passwd", content="x"))
+
+
+def test_unreachable_unc_share_never_hangs_realpath():
+    import time
+    from runledger import guard
+
+    cwd = r"\\192.0.2.1\share\proj"
+    t0 = time.monotonic()
+    in_risks = assess_step(_step("Write", file_path=r"\\192.0.2.1\share\proj\a.py", content="x"), cwd=cwd)
+    out_risks = assess_step(_step("Write", file_path=r"\\192.0.2.1\share\other\a.py", content="x"), cwd=cwd)
+    dec = guard.decide({"session_id": "s1", "cwd": cwd, "hook_event_name": "PreToolUse",
+                        "tool_name": "Write", "tool_input": {"file_path": r"\\192.0.2.1\share\other\a.py", "content": "x"}})
+    elapsed = time.monotonic() - t0
+    assert elapsed < 1.0
+    assert not any(r.code == "write_outside" for r in in_risks)
+    assert any(r.code == "write_outside" for r in out_risks)
+    assert dec["decision"] == "ask"
+    assert "write_outside" in dec["codes"]
+
+

@@ -8,12 +8,13 @@ from dataclasses import asdict
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import __version__
+from . import labels
 from .adapters import label as agent_label
 from .guard import redact
 from .guard_receipt import guard_counts, guard_summary
 from .parser import Run, Step, Usage
-from .pricing import (PRICING_HELP, UNATTRIBUTED, UNATTRIBUTED_NOTE, friendly_model, partial_note,
-                      unknown_models, unpriced)
+from .pricing import (PRICING_HELP, UNATTRIBUTED, UNATTRIBUTED_NOTE, friendly_model, is_stale,
+                      partial_note, stale_note, unknown_models, unpriced)
 from .risk import Risk
 from .summarize import FileChange, file_changes
 
@@ -85,6 +86,8 @@ def _cost_card(run: Run) -> str:
                 if run.reported_cost is not None else "")
         if run.cost_partial:
             note = f"<small>at least · {_e(partial_note(run))}</small>" + note
+            return (f'<div class="card"><span>Cost</span><b>≥ {_money(run.cost)}</b>'
+                    f"{note}</div>")
         return f'<div class="card"><span>Cost</span><b>{_money(run.cost)}</b>{note}</div>'
     return (f'<div class="card"><span>Cost</span><b>{_money(run.reported_cost)}</b>'
             "<small>reported by agent</small></div>")
@@ -448,6 +451,11 @@ def redact_run(run: Run, risks: List[Risk]) -> None:
     """Mask secrets in every text a receipt, a push or a PR comment shows, in place.
     Call it after scoring and analysis: the risk rules need the raw text to find secrets.
     File contents and command output are not shown, so they are left as they are."""
+    # Read the whole-path labels of the raw commands now: masking them takes a spaced drive path
+    # apart, and the renderers put a label on the output copy before it is redacted
+    # (`labels.show_reason`), never after it.
+    if run.show_labels is None:
+        run.show_labels = labels.step_label_map(run)
     run.session_id = redact(run.session_id)
     run.agent = redact(run.agent)
     run.cwd = redact(run.cwd) if run.cwd is not None else None
@@ -476,6 +484,7 @@ def redact_run(run: Run, risks: List[Risk]) -> None:
     run.recommendations = _redact_value(run.recommendations)
     run.ai_review = _redact_value(run.ai_review)
     run.guard = _redact_value(run.guard)
+    run.notes = [redact(n) for n in (run.notes or []) if isinstance(n, str)]
 
 
 # ---------------------------------------------------------------- output formats
@@ -531,8 +540,18 @@ def md_trailer(run: Run) -> str:
     return f"<!-- runledger: safe={'true' if run.safe else 'false'} schema={SCHEMA_VERSION} -->\n"
 
 
+def _pricing_note(run: Run) -> Optional[str]:
+    notes: List[str] = []
+    if unknown_models(run):
+        notes.append(PRICING_HELP)
+    if is_stale():
+        notes.append(stale_note())
+    return " ".join(notes) if notes else None
+
+
 def to_dict(run: Run, score: int, level: str, risks: List[Risk]) -> Dict:
     changes = file_changes(run)
+    by_step = labels.step_label_map(run)
     data = {
         "schema_version": SCHEMA_VERSION,
         "runledger_version": __version__,
@@ -547,7 +566,7 @@ def to_dict(run: Run, score: int, level: str, risks: List[Risk]) -> Dict:
         "request": run.prompts[:3],
         "overview": run.overall_summary,
         "risk": {"score": score, "level": level,
-                 "reasons": [asdict(r) for r in risks]},
+                 "reasons": [asdict(r) for r in labels.show_risks(risks, by_step)]},
         "totals": {"steps": len(run.steps), "tokens": run.usage.total,
                    "input_tokens": run.usage.input_tokens, "output_tokens": run.usage.output_tokens,
                    "cache_write_tokens": run.usage.cache_write_tokens,
@@ -556,13 +575,14 @@ def to_dict(run: Run, score: int, level: str, risks: List[Risk]) -> Dict:
                    "cost_partial": run.cost_partial, "unknown_models": unknown_models(run),
                    "files_changed": len(changes), "usage_source": run.usage_source},
         "models": {m: {"tokens": u.total} for m, u in run.models.items()},
-        "pricing_note": PRICING_HELP if unknown_models(run) else None,
+        "pricing_note": _pricing_note(run),
         "files": [asdict(c) for c in changes.values()],
         "steps": [{"n": s.index, "tool": s.tool, "summary": s.summary, "model": s.model,
                    "tokens": s.usage.total, "tokens_known": _step_known(run, s),
                    "tokens_estimated": s.usage_estimated,
                    "cost_usd": s.cost, "error": s.is_error,
-                   "risks": [asdict(r) for r in s.risks]} for s in run.steps],
+                   "risks": [asdict(r) for r in labels.show_risks(s.risks, by_step)]}
+                  for s in run.steps],
         "quality": run.quality,
         "recommendations": _recs_list(run),
         "ai_review": run.ai_review if run.ai_review else None,
@@ -570,18 +590,25 @@ def to_dict(run: Run, score: int, level: str, risks: List[Risk]) -> Dict:
     if run.guard:
         data["guard"] = run.guard
         data["totals"]["guard"] = guard_counts(run.guard)
+    if run.notes:
+        data["notes"] = list(run.notes)
     return data
 
 
 def to_markdown(run: Run, score: int, level: str, risks: List[Risk]) -> str:
     changes = file_changes(run)
+    by_step = labels.step_label_map(run)
     out = [f"# Run receipt · {run.session_id[:8]}", ""]
     out.append(f"- **Agent:** {agent_label(run.agent)}  ·  **Folder:** {_md_code(run.cwd) if run.cwd else '-'}  ·  **Branch:** {_md_code(run.git_branch or '-')}  ·  **Duration:** {_dur(run.duration_seconds)}")
     out.append(f"- **Risk:** {score}/100 ({level})  ·  **Cost:** {_cost_text(run)}  ·  **Tokens:** {_run_tok(run, run.usage.total)}  ·  **Files changed:** {len(changes)}")
     if run.guard:
         out.append(f"- **Guard:** {guard_summary(run.guard)}")
+    for n in run.notes or []:
+        out.append(f"- **Note:** {_md_inline(n)}")
     if unknown_models(run):
         out.append(f"- **Unknown model price:** {PRICING_HELP}")
+    if is_stale():
+        out.append(f"- **Pricing note:** {stale_note()}")
     if UNATTRIBUTED in unpriced(run):
         out.append(f"- **Unattributed tokens:** {UNATTRIBUTED_NOTE}")
     rollback = _rollback(run)
@@ -593,7 +620,7 @@ def to_markdown(run: Run, score: int, level: str, risks: List[Risk]) -> str:
     ai_map = _ai_map(ai) if ai else {}
     if risks:
         out.append("## Why it was flagged")
-        for r in risks:
+        for r in labels.show_risks(risks, by_step):
             out.append(f"- **{r.severity.upper()}** · step {r.step}: {_md_inline(r.reason)}{_ai_md_suffix(r, ai_map)}")
         out.append("")
     out += _ai_md(ai, risks)
@@ -648,6 +675,7 @@ footer{margin-top:40px;color:var(--muted);font-size:12px}
 def to_html(run: Run, score: int, level: str, risks: List[Risk]) -> str:
     e = html.escape
     changes = file_changes(run)
+    by_step = labels.step_label_map(run)
     color = "var(--accent)" if level == "Low" else "var(--amber)" if level == "Medium" else "var(--red)"
 
     ai = _ai_dict(run)
@@ -655,7 +683,7 @@ def to_html(run: Run, score: int, level: str, risks: List[Risk]) -> str:
     risk_html = "".join(
         f'<div class="risk"><span class="sev {r.severity}">{r.severity.upper()}</span>'
         f'<div>{e(r.reason)} <span class="meta">· step {r.step}</span>{_ai_badge_html(r, ai_map)}</div></div>'
-        for r in risks
+        for r in labels.show_risks(risks, by_step)
     ) or '<div class="risk"><span class="sev low">OK</span><div>No risky actions detected by the rules.</div></div>'
     recs = _recs_list(run)
     has_analysis = run.quality is not None or bool(recs) or bool(ai)
@@ -673,6 +701,7 @@ def to_html(run: Run, score: int, level: str, risks: List[Risk]) -> str:
 
     rows = []
     for s in run.steps:
+        step_risks = labels.show_risks(s.risks, by_step)
         worst = "high" if any(r.severity == "high" for r in s.risks) else ("medium" if s.risks else "")
         cls = f' class="flag {worst}"' if s.risks else ""
         summary = e(s.summary)
@@ -681,7 +710,7 @@ def to_html(run: Run, score: int, level: str, risks: List[Risk]) -> str:
         summary = "".join(f"<code>{p}</code>" if i % 2 else p for i, p in enumerate(parts))
         rows.append(
             f"<tr{cls}><td class='num'>{s.index}</td><td>{summary}"
-            + ("".join(f" <span class='sev {r.severity}'>{e(r.reason)}</span>" for r in s.risks))
+            + ("".join(f" <span class='sev {r.severity}'>{e(r.reason)}</span>" for r in step_risks))
             + ("" if not s.is_error else " <span class='pill'>error</span>")
             + f"</td><td><span class='pill'>{e(friendly_model(s.model))}</span></td>"
             f"<td class='num'>{_step_tok(run, s)}</td><td class='num'>{_money(s.cost)}</td></tr>"
@@ -693,6 +722,8 @@ def to_html(run: Run, score: int, level: str, risks: List[Risk]) -> str:
     usage_note = f" {e(usage_note)}" if usage_note else ""
     pricing_note = (f'<div class="meta">Unknown model price. {e(PRICING_HELP)}</div>'
                     if unknown_models(run) else "")
+    if is_stale():
+        pricing_note += f'<div class="meta">{e(stale_note())}</div>'
     if UNATTRIBUTED in unpriced(run):
         pricing_note += f'<div class="meta">Unattributed tokens. {e(UNATTRIBUTED_NOTE)}</div>'
     rollback = _rollback(run)
@@ -702,6 +733,7 @@ def to_html(run: Run, score: int, level: str, risks: List[Risk]) -> str:
     ) if rollback else ""
     guard_note = (f'<div class="meta">Guard: {_e(guard_summary(run.guard))}</div>'
                   if run.guard else "")
+    notes_html = "".join(f'<div class="meta">Note: {_e(n)}</div>' for n in (run.notes or []))
 
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -720,6 +752,7 @@ def to_html(run: Run, score: int, level: str, risks: List[Risk]) -> str:
  <div class="card"><span>Duration</span><b>{_dur(run.duration_seconds)}</b></div>
 </div>
 {guard_note}
+{notes_html}
 {pricing_note}
 <h2>Overview</h2><div class="overview">{e(run.overall_summary)}</div>{quality_html}
 <h2>Risk · {level}</h2><div class="overview">{risk_html}</div>{ai_html}{recs_html}

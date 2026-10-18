@@ -130,7 +130,8 @@ target and details. Details never include a key secret or a webhook URL.
 | `key.create` | A key is created, including the team's first key | Key id | label, role, prefix |
 | `key.rotate` | A key's secret is replaced | Key id | label, role, prefix (of the new secret) |
 | `key.revoke` | A key is revoked | Key id | label, role, prefix |
-| `run.push` | A new immutable receipt is stored (identical retries are not new writes) | Run id | agent, project |
+| `run.push` | A new receipt is stored (identical retries are not new writes) | Run id | agent, project |
+| `run.supersede` | A session is pushed again and replaces the stored run | Run id | revision, replaced_revision, agent, project |
 | `approval.decide` | An approval is approved or denied | Approval id | status |
 | `team.settings` | Team settings change | `settings` | the names of the fields changed, and `approval_ttl_s` if it changed. Never the URLs. |
 | `auth.sign_in` | A dashboard sign-in with a key succeeds | Key id | role, and the client address (`ip`) |
@@ -168,12 +169,25 @@ runs or block the guard; they only alert.
 - **Spend.** The sum of the run cost estimates (list prices, see
   [agents.md](agents.md#costs-across-agents)) for runs that started in the current calendar month in
   UTC. A run with no start time counts in the month it was pushed.
+- **Unknown costs.** A run whose cost is unknown (the agent recorded no usage, or no model had a
+  price) adds nothing to the month's spend, and a run whose cost is only partly priced counts with the
+  part that is known. A month of unknown runs therefore reads `$0` in the API, never a made-up figure,
+  and the dashboard shows `n/a` for it; a month with partly priced runs reads `≥ $X` there, and the
+  note next to the figure names the runs it leaves out. The status and the alert carry the run counts
+  behind the number, and say the figure is a lower bound when some run is unpriced or only partly
+  priced.
 - **Limits.** `monthly_usd` for the team and `per_user_monthly_usd` for each developer. `null` or `0`
   means no limit.
+- **Attribution.** The developer a run counts against is the run's `user`, which follows the team's
+  `attribution` setting: `client` (default) uses the name the client sent, and `key` uses the pushing
+  key's label so a per-user budget cannot be dodged by editing the receipt. See
+  [api.md](api.md#get-apiteamsettings).
 - **Thresholds.** `alert_thresholds`: one to three whole percentages from 1 to 500, ascending. The
   default is `[50, 80, 100]`.
 - **When alerts fire.** After every push. Each threshold fires once per scope per month: once for the
-  team, and once for each developer, so a repeated push never repeats an alert.
+  team, and once for each developer, so a repeated push never repeats an alert. Alerts of earlier
+  months are deleted by retention; the alert of the current month is kept by its month, so pruning can
+  never make the same threshold fire twice in a month.
 - **Where alerts go.** The team's Slack and generic webhook URLs (the same settings as approvals). Each
   alert is recorded as a `budget.alert` audit event.
 
@@ -195,16 +209,28 @@ defaults. Unknown fields are rejected.
   "spend_usd": 412.37,
   "monthly_usd": 500.0,
   "pct": 82.5,
-  "per_user": [{"user": "ana@example.com", "spend_usd": 58.1, "pct": 96.8}]
+  "runs": 30,
+  "priced_runs": 28,
+  "unpriced_runs": 2,
+  "partial_runs": 1,
+  "cost_is_lower_bound": true,
+  "per_user": [{"user": "ana@example.com", "spend_usd": 58.1, "pct": 96.8,
+                "runs": 5, "priced_runs": 5, "unpriced_runs": 0, "partial_runs": 0}]
 }
 ```
 
-A budget alert sent to a generic webhook has this shape:
+A budget alert sent to a generic webhook has this shape. The lower-bound fields are added only when
+some of the month's runs have no complete price:
 
 ```json
 {"type": "budget_alert", "team": "myteam", "month": "2026-10", "scope": "team", "user": null,
- "threshold": 80, "spend_usd": 412.37, "limit_usd": 500.0, "pct": 82.47}
+ "threshold": 80, "spend_usd": 412.37, "limit_usd": 500.0, "pct": 82.47,
+ "cost_is_lower_bound": true, "runs": 30, "unpriced_runs": 2, "partial_runs": 1,
+ "note": "lower bound: 2 of 30 runs unpriced"}
 ```
+
+The Slack message says the same: `RunLedger budget: team spend $412.37 is 82% of $500.00 for 2026-10
+(lower bound: 2 of 30 runs unpriced)`.
 
 ## Exports and the compliance report
 
@@ -213,13 +239,19 @@ to 3650, counted back from now in UTC):
 
 | Endpoint | Format | Contents |
 | --- | --- | --- |
-| `GET /api/export/runs.csv?days=N` | CSV | One row per run that started (or was pushed) in the window, oldest first: id, started_at, user, project, agent, models, steps, tokens, files_changed, cost_usd, risk_score, risk_level, title. Never the receipt JSON or HTML. |
+| `GET /api/export/runs.csv?days=N` | CSV | One row per run that started (or was pushed) in the window, oldest first: id, started_at, user, project, agent, models, steps, tokens, files_changed, cost_usd, risk_score, risk_level, title, quality_score, quality_grade, ai_verdict, est_savings_usd. Never the receipt JSON or HTML. |
 | `GET /api/export/audit.csv?days=N` | CSV | Every audit event in the window, oldest first: id, at, actor, action, target, details_json. |
 | `GET /api/export/report.html?days=N` | HTML | A report for the window: totals, runs by risk level, top risk codes, high-risk runs, approvals decided, key lifecycle events, this month's budget status, and a note on the method. Each long table shows at most 200 rows. |
 
 The CSV files are UTF-8 with a byte-order mark, and a cell that a spreadsheet could read as a formula
 is written as text. The report contains no scripts and no outside resources. Each download is recorded in
 the audit log.
+
+A run whose cost is unknown leaves the `cost_usd` cell empty rather than writing `0`; `quality_score`
+and `est_savings_usd` are empty in the same way. The report states the window's cost as `n/a` when no
+run in it could be priced, and as a lower bound (`≥ $X`, with the number of runs it leaves out) when
+some runs are unpriced or only partly priced; the month's developer rows follow the same rule, so a
+developer whose runs are only partly priced reads `≥ $X` too.
 
 Each endpoint also answers `HEAD`, with the same headers and no body. Exports are admin-only.
 
@@ -232,18 +264,36 @@ exports as confidential.
 
 ## Sign-in and sessions
 
-- Open `https://your-server/?key=YOUR_KEY` once. The server checks the key, sets a session cookie, and
-  redirects, so the key leaves the address bar. Later visits need only the plain address.
-- The cookie is `rl_session`: HttpOnly, SameSite=Lax, and valid for 12 hours. It is Secure when the
+- Open `https://your-server/` and sign in with your team API key in the form. The key is sent in the
+  request body and never appears in the address bar, browser history or proxy logs.
+- The legacy link form `https://your-server/?key=YOUR_KEY` still works for links printed by
+  `runledger serve` and `team create`. It redirects so the key leaves the address bar, and it logs one
+  deprecation warning. If the browser already holds a session for a **different** team, the link shows
+  a confirmation page instead of switching: one click is always required, so a link cannot silently
+  sign you into someone else's team.
+- The cookie is `rl_session`: HttpOnly, SameSite=Strict, and valid for 12 hours. It is Secure when the
   server is behind HTTPS (see below).
 - A session carries the role of its key. It ends after 12 hours, or at once when its key is revoked or
-  rotated.
+  rotated. Each key keeps at most 20 sessions; signing in past that cap drops that key's oldest
+  session and leaves other keys alone.
 - *This release:* the server keeps sessions in the team database as hashes of their tokens, so a
   server restart does not sign anyone out. Until this release, sessions were held in memory.
 - There is no sign-out endpoint. To end a session, rotate or revoke its key.
 - Changes made from the dashboard must send the header `X-Requested-With: runledger`. A cross-site form
   cannot set it, so a forged request is refused with `csrf_required`. Requests that use an API key in
   the `Authorization` header do not need it.
+- The sign-in POST itself is checked too: a request a browser marks as coming from another origin
+  (`Sec-Fetch-Site: cross-site` or `same-site`, which covers another port or a subdomain; or an
+  `Origin` header that is not this server's own origin, `null` included) is refused with
+  `403 cross_site` before the key is read. No cookie is set, so a page that auto-submits a form to
+  `POST /session` with someone else's key cannot replace the session you are signed in with, and the
+  server writes a warning line that never contains the key. This matters because the cookie is
+  `SameSite=Strict`: a cross-site form arrives without your session, so the server could not show the
+  switch confirmation below. The two headers are checked independently, so `Sec-Fetch-Site:
+  same-origin` never excuses a concrete `Origin` that names another site. The fetch metadata only
+  excuses an absent `Origin` and the opaque `null` one, which is what Chromium sends for the
+  dashboard's own form because every response carries `Referrer-Policy: no-referrer`. A request with
+  neither header (curl, a script) is not a browser and signs in as usual.
 
 ## HTTPS, proxies and cookies
 
@@ -316,16 +366,33 @@ The team database (one SQLite file) holds:
 
 - **Runs.** Each pushed receipt: the receipt JSON (prompts, step summaries, file paths and line counts,
   command text, models, cost and risk reasons) and the HTML receipt.
+- **Run history.** When a session is pushed again and replaces the stored run, the replaced version
+  (its receipt JSON and HTML, risk score and cost) is kept, at most the newest 20 versions per run.
+  The purge deletes a run's history with the run.
 - **Approvals.** Their summary, findings, folder, session id, decision, reason and who decided.
 - **Keys.** Hashes and prefixes, labels, roles and timestamps. Never the secrets.
-- **Settings.** Team webhook URLs and the approval timeout.
+- **Settings.** Team webhook URLs, the approval timeout, and the attribution mode.
 - **The audit log.**
 - **In this release:** budgets and budget alerts, and dashboard sessions as hashes.
 
-**Retention.** By default RunLedger keeps everything until you delete it. Set
-`RUNLEDGER_RETENTION_DAYS` (for example `90`) and the server deletes runs, approvals, audit events and
-budget alerts older than that, at start and every hour. The period applies to every team on the
-server. To erase all data, stop the server, keep any backup you need, and delete the database file
+**Retention.** By default RunLedger keeps everything until you delete it: with neither retention
+variable set, no run, approval, budget alert or audit event is deleted automatically, whatever its
+age. Set `RUNLEDGER_RETENTION_DAYS` (for example `90`) and the server deletes runs, their history,
+approvals and budget alerts older than that, at start and every hour. The period applies to every
+team on the server.
+
+The shortest useful period is 35 days: a value from 1 to 34 is raised to 35 with a warning on
+startup. A shorter period could delete the runs of the month a budget alert belongs to, which would
+drop the month's spend and fire the same alert again. Budget alerts are kept by the calendar month
+they belong to, never by when they fired, so an alert of the current month survives any retention
+period.
+
+Audit events have their own period. `RUNLEDGER_AUDIT_RETENTION_DAYS` defaults to 365 days while
+runs are being pruned, and `0` keeps them forever; they are never deleted on the runs' schedule, so
+`RUNLEDGER_RETENTION_DAYS=35` still keeps a year of audit history. Set the audit variable to keep
+audit events for a shorter or longer time independently, or to keep them forever.
+
+To erase all data, stop the server, keep any backup you need, and delete the database file
 along with its `-wal` and `-shm` files. That removes every team in the database. See
 [self-hosting.md](self-hosting.md) for backups and restores. Retention removes history only;
 teams and API keys remain available.
@@ -334,8 +401,8 @@ teams and API keys remain available.
 
 - It has no single sign-on (SAML or OIDC), no per-person accounts and no multi-factor authentication.
 - Keys do not expire, and there is no IP allow-list.
-- Without `RUNLEDGER_RETENTION_DAYS`, runs and audit events are never deleted automatically. There is
-  no per-team retention period.
+- Without `RUNLEDGER_RETENTION_DAYS`, runs, approvals, budget alerts and audit events are never
+  deleted automatically. There is no per-team retention period.
 - One server process uses one SQLite file. It is not a cluster.
 - Receipts and the guard's log mask secrets by pattern, as described in [guard.md](guard.md#the-guard-log).
   A secret in an unknown format, or a short one, is not masked. Receipts pushed by clients older

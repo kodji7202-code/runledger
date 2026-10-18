@@ -1,5 +1,4 @@
 # Copy this file to .github/workflows/runledger.yml in the repository you want to review.
-# Replace OWNER with the account that hosts RunLedger (or use `uses: ./` inside the RunLedger repo).
 name: RunLedger receipt
 
 on:
@@ -16,7 +15,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Post the RunLedger receipt
-        uses: kodji7202-code/runledger@v0.4.0
+        uses: kodji7202-code/runledger@v0.6.1
         with:
           sessions-dir: .runledger/sessions
           fail-on: "60"

@@ -29,9 +29,9 @@ import math
 import secrets
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass
-from typing import Callable, Deque, Dict, Mapping, Optional
+from typing import Any, Callable, Deque, Dict, Mapping, Optional
 
 ROLES = ("admin", "member", "viewer")
 _RANK = {"viewer": 0, "member": 1, "admin": 2}
@@ -46,6 +46,7 @@ FAILURE_WINDOW_S = 300.0
 MAX_TRACKED_ADDRESSES = 10000
 
 SESSION_TTL_SECONDS = 12 * 3600
+SESSION_CAP_PER_KEY = 20
 
 
 class InvalidKey(ValueError):
@@ -135,19 +136,25 @@ def identity_from_row(row: Mapping[str, Any], via: str) -> Identity:
 
 class FailureLimiter:
     """Counts failed credentials per client address. Once an address has more than
-    max_failures inside the window, its requests get 429 until enough failures age out."""
+    max_failures inside the window, its requests get 429 until enough failures age out.
+
+    At most max_tracked addresses are remembered: when the table is full, the address
+    that failed least recently makes room for the new one. Evicting an attacker's
+    entry lets it start over, so the default cap is far above any honest team's size."""
 
     def __init__(
         self,
         max_failures: int = MAX_FAILURES,
         window_s: float = FAILURE_WINDOW_S,
         clock: Callable[[], float] = time.monotonic,
+        max_tracked: int = MAX_TRACKED_ADDRESSES,
     ) -> None:
         self.max_failures = max_failures
         self.window_s = window_s
+        self.max_tracked = max(1, max_tracked)
         self._clock = clock
         self._lock = threading.Lock()
-        self._failures: Dict[str, Deque[float]] = {}
+        self._failures: OrderedDict[str, Deque[float]] = OrderedDict()
 
     def _recent(self, address: str, now: float) -> Optional[Deque[float]]:
         """The failures of `address` still inside the window (caller holds the lock)."""
@@ -177,8 +184,8 @@ class FailureLimiter:
             now = self._clock()
             times = self._recent(address, now)
             if times is None:
-                if len(self._failures) >= MAX_TRACKED_ADDRESSES:
-                    for other in list(self._failures):
-                        self._recent(other, now)
+                while len(self._failures) >= self.max_tracked:
+                    self._failures.popitem(last=False)  # the least recently failed address
                 times = self._failures.setdefault(address, deque())
+            self._failures.move_to_end(address)
             times.append(now)
