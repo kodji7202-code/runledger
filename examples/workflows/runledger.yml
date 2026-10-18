@@ -1,5 +1,4 @@
 # Copy this file to .github/workflows/runledger.yml in the repository you want to review.
-# Replace OWNER with the account that hosts RunLedger (or use `uses: ./` inside the RunLedger repo).
 name: RunLedger receipt
 
 on:

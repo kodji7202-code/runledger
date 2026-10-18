@@ -30,8 +30,8 @@ changelog if you want that.
 In scope: the `runledger` package (the CLI, the team server, the dashboard, the approval API
 and the guard hook), the Docker image and the files in `deploy/`, and the GitHub action.
 
-Out of scope: the agents RunLedger reads (Claude Code, Codex CLI, Aider) and third-party
-services.
+Out of scope: the agents RunLedger reads (Claude Code, Codex CLI, Factory Droid, Aider) and
+third-party services.
 
 ## Known limits
 

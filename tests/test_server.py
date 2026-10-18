@@ -254,7 +254,9 @@ def test_receipt_equality_is_type_sensitive_and_a_duplicate_reply_uses_the_store
     status, _, raw = _http(base, "POST", "/api/runs", body=payload, headers=_auth(key))
     assert status == 200
     reply = _json(raw)
+    assert reply["status"] == "duplicate"
     assert reply["risk_score"] == 77 and reply["risk_level"] == "high" and reply["revision"] == 1
+    assert reply["id"] == SESSION_ID and reply["url"] == "/runs/" + SESSION_ID
     assert _revisions(srv.db.path, SESSION_ID) == []
 
     # Receipt equality is type-sensitive: True is not 1, so this is a new version, not a retry.

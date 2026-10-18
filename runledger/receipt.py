@@ -86,6 +86,8 @@ def _cost_card(run: Run) -> str:
                 if run.reported_cost is not None else "")
         if run.cost_partial:
             note = f"<small>at least · {_e(partial_note(run))}</small>" + note
+            return (f'<div class="card"><span>Cost</span><b>≥ {_money(run.cost)}</b>'
+                    f"{note}</div>")
         return f'<div class="card"><span>Cost</span><b>{_money(run.cost)}</b>{note}</div>'
     return (f'<div class="card"><span>Cost</span><b>{_money(run.reported_cost)}</b>'
             "<small>reported by agent</small></div>")

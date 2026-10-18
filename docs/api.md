@@ -139,7 +139,8 @@ steps), returns `409 run_conflict`.
 }
 ```
 
-Response `201` (a new run) and `200` (an identical retry: `revision` stays as stored):
+Response `201` (a new run) and `200` (an identical retry: `revision` stays as stored). An identical
+retry adds `"status": "duplicate"` to the same fields, so a client can tell a retry from a first push:
 
 ```json
 {

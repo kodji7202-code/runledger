@@ -2,9 +2,10 @@
 
 **Receipts and safe rollback for AI coding agents.**
 
-RunLedger reads the session logs of your coding agents and turns each run into a receipt: what
-changed, what ran, which model did each step, what it cost, and what looked risky. A Claude Code hook
-can stop risky calls before they run, and a small team server collects receipts from the whole team.
+RunLedger reads the session logs of your coding agents (Claude Code, Codex CLI, Factory Droid and
+Aider) and turns each run into a receipt: what changed, what ran, which model did each step, what it
+cost, and what looked risky. A Claude Code hook can stop risky calls before they run, and a small team
+server collects receipts from the whole team.
 Local Git checkpoints let you restore files from before a run, with a safety checkpoint for undo.
 
 RunLedger is fully free and open source, including the self-hosted team server.
@@ -108,7 +109,9 @@ project's `.runledger.json` may only make the guard stricter. See [docs/guard.md
 ## GitHub Action
 
 Post a receipt on every pull request. Commit the session files you want reviewed to
-`.runledger/sessions/`, then add this workflow:
+`.runledger/sessions/`: Claude Code `.jsonl` transcripts, Codex rollouts, Factory Droid transcripts
+(with their `.settings.json` sidecar, which carries the token usage), or `.runledger.json` written by
+any agent. Then add this workflow:
 
 ```yaml
 name: RunLedger receipt

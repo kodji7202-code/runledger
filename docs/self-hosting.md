@@ -355,9 +355,49 @@ docker compose up -d
 Store backups off the host, encrypted. They contain the same data as the live database,
 including keys' hashes, prompts, file paths and webhook URLs. Test a restore before you need one.
 
-**Restore.** Stop the server. Replace `runledger.db` with the backup file, and delete any
-`runledger.db-wal` and `runledger.db-shm` files that belong to the old database. Start the
-server again.
+**Restore.** Stop the server first, so nothing writes to the database while you replace it, and
+delete the `runledger.db-wal` and `runledger.db-shm` files that belong to the old database.
+
+**Bare metal:**
+
+```bash
+sudo systemctl stop runledger
+sudo cp /var/backups/runledger/runledger-runledger-20261018-030000.db /var/lib/runledger/runledger.db
+sudo rm -f /var/lib/runledger/runledger.db-wal /var/lib/runledger/runledger.db-shm
+sudo systemctl start runledger
+```
+
+**Docker.** The data lives in the `runledger-data` volume of the Compose project, so copy the
+backup into the volume with a throwaway container instead of the host filesystem. The volume is
+named `<compose project>_runledger-data`; the project name is the folder the compose file is run
+from (`deploy`), or the `-p` name you pass:
+
+```bash
+cd deploy
+docker compose down
+docker run --rm -v deploy_runledger-data:/data -v "$PWD":/backup alpine \
+  sh -c "cp /backup/runledger-runledger-20261018-030000.db /data/runledger.db"
+docker run --rm -v deploy_runledger-data:/data alpine \
+  sh -c "rm -f /data/runledger.db-wal /data/runledger.db-shm"
+docker compose up -d
+```
+
+With `docker compose -p myproject ...` the volume is `myproject_runledger-data`; use that name in
+the two `docker run` commands.
+
+**Whole volume (tar).** Restore the archive from the "Whole volume" backup into the volume, again
+with the stack stopped:
+
+```bash
+docker compose down
+docker run --rm -v deploy_runledger-data:/data -v "$PWD":/backup alpine \
+  sh -c "cd /data && tar xzf /backup/runledger-data-20261018.tgz"
+docker compose up -d
+```
+
+The archive holds the certificates as well as the database, and extracting it overwrites the files
+in the volume with the archived ones. For a clean restore of an old archive, remove the volume
+first (`docker compose down -v`) if you no longer need what it holds.
 
 ## Upgrades
 
@@ -419,7 +459,7 @@ roll back, install the older version and restore the backup from before the upgr
       and cannot gain new privileges (`deploy/docker-compose.yml`).
 - [ ] **Back up regularly, and test the restore.**
 
-## Known limits in 0.4.0
+## Known limits
 
 - No single sign-on, no per-person accounts, no multi-factor authentication, and no key expiry.
 - Retention is one run period for the whole server (`RUNLEDGER_RETENTION_DAYS`), not per team, with

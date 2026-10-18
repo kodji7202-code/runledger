@@ -133,3 +133,46 @@ receives it.
 
 **Stored result:** `ai_review` on the run, with keys `model`, `verdict`, `summary`,
 `risk_assessments`, `diff_explanations`, `cost_usd`, `tokens`, `escalated` and `notes`.
+
+## Shell and PowerShell analysis
+
+A command is read the way the shell reads it, without running it: `runledger/shell_syntax.py`
+finds POSIX heredocs, `runledger/shell_writes.py` reads POSIX writes and deletes, and
+`runledger/ps_writes.py` reads PowerShell ones. The files they report are the files the receipt
+lists and the paths the risk rules check.
+
+**Heredocs.** A heredoc body is data, so the commands after it are analysed and the body is not.
+The scanner is quote- and comment-aware: `<<` inside `'...'` or `"..."`, in a `#` comment
+(`# <<EOF`), in `$((...))` arithmetic (`echo $((1<<2))`) or as the `<<<` here-string operator
+does not start a heredoc. Inside an ANSI-C string (`$'...'`) a backslash escapes the quote
+(`$'it\'s <<EOF'` is one word) and a literal newline is part of the string, so a queued heredoc
+takes its body from the newline that really ends the command line: in `echo <<EOF $'first` /
+`second'` / `payload` / `EOF` / `rm -rf ./build`, the body is `payload` and the `rm -rf` after it
+is analysed again. A `#` comment ends at the newline, so the line after it is a command of its own
+(`echo ok # <<EOF` followed by `rm k.txt` still lists `k.txt` as deleted).
+
+**When a step is read as PowerShell.** A `PowerShell` tool step always is. A `Bash` step is read
+as PowerShell only when a cmdlet or a `[System.IO.File]` call is the command word of a statement,
+after statement separators (`;`, `|`, newline, parentheses), prefixes such as `sudo`, `env`,
+`time` and `xargs`, and `VAR=` assignments. Quoted strings, `$'...'` strings, `@'...'@`
+here-strings, `<# ... #>` block comments and `#` comments are blanked first, so
+`echo 'Set-Content is a cmdlet'; touch t.txt; rm r.txt` stays POSIX and keeps its writes and
+deletes.
+
+**PowerShell writes and deletes.** `Set-Content`/`sc`, `Add-Content`/`ac`, `Out-File`,
+`Tee-Object`/`tee`, `Export-Csv`/`epcsv`, `New-Item`/`ni` (files, not `-ItemType Directory`),
+`Copy-Item`/`cp`, `Move-Item`/`mv`, `Rename-Item`/`ren`, `Remove-Item`/`ri`/`rm`/`del`/`rd`,
+`Invoke-WebRequest`/`iwr` and `Invoke-RestMethod`/`irm` with `-OutFile`, the `>`/`>>`/`n>`
+redirections, and `[System.IO.File]` write calls (`WriteAllText`, `WriteAllLines`,
+`AppendAllText`, `AppendAllLines`, `WriteAllBytes`). Named and positional
+`-Path`/`-LiteralPath`/`-Destination`/`-NewName`/`-Name` arguments are read, an earlier
+`Set-Location`/`cd` resolves later relative targets, and `Move-Item` and `Rename-Item` count as a
+delete of the old path plus a write of the new one.
+
+**What is skipped.** Targets that are not one literal file: `$variable` and `$(...)` targets,
+wildcards (`*.log`, `?`), backtick interpolation, paths that end in a separator (a directory),
+device names (`nul`, `con`, `com1`), non-FileSystem provider paths (`HKLM:\Software\...`,
+`Cert:\...`, `Env:\...`), which change registry keys, certificates or environment variables
+rather than files, and `-WhatIf`, which skips the whole statement. A `Copy-Item`, `Move-Item` or
+`Rename-Item` whose source has a variable or a wildcard is skipped entirely, because the
+destination cannot be known.
