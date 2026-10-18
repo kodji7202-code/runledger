@@ -85,13 +85,30 @@ _INSPECT_FLAGS_LOWER = {"--version", "--help", "--collect-only", "--co", "--list
                         "--listtests", "--dry-run", "--dryrun"}
 _TESTS_LINE = re.compile(r"^\s*Tests:?\s+(.+)$", re.M)  # jest and vitest summary line
 # A line a runner writes its counts on: counts and a timing and nothing else, as in
-# `3 passed in 0.20s` or `=== 2 failed, 3 passed in 0.50s ===`. A timed log line
-# (`retried after 3 errors in 0.10s`) has no such shape and is not a summary.
+# `3 passed in 0.20s` or `=== 2 failed, 3 passed in 0.50s ===`. Such a footer can carry a
+# short log prefix: a docker-compose or container service name (`app  | 3 passed in 0.5s`)
+# or a timestamp (`2026-10-18T12:00:00Z 3 passed in 0.5s`, `[12:00:01] 3 passed in 0.5s`),
+# alone or together (`web-1  | 2026-10-18T12:00:00Z ...`). Only those three shapes are
+# allowed, only at the start of the line, and each is bounded: a count in free-form log
+# text (`retried after 3 errors in 0.10s`) is still not a summary.
 _COUNT_PHRASE = r"\d+\s+(?:passed|failed|errors?|skipped|xfailed|xpassed|deselected|warnings?)"
+_SERVICE_PREFIX = r"[A-Za-z0-9][A-Za-z0-9_.-]{0,31}\s*\|\s?"
+_TIMESTAMP_PREFIX = (
+    r"(?:\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:?\d{2})?"
+    r"|\[\d{1,2}:\d{2}(?::\d{2})?\])\s+")
+# Either prefix may lead; a timestamp may follow a service name. Every alternative matches
+# something, so the lead never holds two adjacent empty-capable runs (a 20 KB line of `=`
+# or spaces then stays linear instead of backtracking quadratically).
+_LOG_PREFIX = (r"(?:(?:" + _SERVICE_PREFIX + r")?" + _TIMESTAMP_PREFIX
+               + r"|" + _SERVICE_PREFIX + r")")
 _PYTEST_SUMMARY = re.compile(
-    r"^[\s=]*(?:" + _COUNT_PHRASE + r")(?:[\s,|]+" + _COUNT_PHRASE + r")*"
+    r"^[\s=]*(?:(?:" + _LOG_PREFIX + r")[\s=]*)?(?:" + _COUNT_PHRASE + r")"
+    r"(?:[\s,|]+" + _COUNT_PHRASE + r")*"
     r"\s+in\s+\d+(?:\.\d+)?s[\s=]*$")
 _MOCHA_SUMMARY = re.compile(r"^\s*\d+\s+(?:passing|failing|pending)\b")
+# A count read out of a line fragment. The `(?<!\d)` keeps a long digit run from being
+# rescanned from every digit: without it a 20 KB line of digits backtracks for seconds.
+_COUNT_NUMBER = r"(?<!\d)(\d+) "
 
 _UNFINISHED = [
     ("couldn't or could not finish", re.compile(r"couldn['’]t|could not", re.I)),
@@ -171,17 +188,18 @@ def _failed_counts(text: str) -> Optional[Tuple[int, int]]:
     """The v0.6.0 fallback, kept for failed counts only: an explicit `N failed` says the suite
     failed even when the runner wrote no summary line. Error counts are not read here, so free
     text (`retried after 3 errors`) and unreadable output stay unknown."""
-    failed = [int(n) for n in re.findall(r"(\d+) (?:failed|failing)\b", text)]
+    failed = [int(n) for n in re.findall(_COUNT_NUMBER + r"(?:failed|failing)\b", text)]
     if not failed:
         return None
-    passed = [int(n) for n in re.findall(r"(\d+) (?:passed|passing)\b", text)]
+    passed = [int(n) for n in re.findall(_COUNT_NUMBER + r"(?:passed|passing)\b", text)]
     return sum(passed), sum(failed)
 
 
 def _summary_segments(text: str) -> List[str]:
-    """The lines a runner writes its counts on: a pytest-style counts-and-timing footer or a
-    mocha `N passing` line. A count in free-form log text (`retried after 3 errors in 0.10s`)
-    is not a summary, however it is timed."""
+    """The lines a runner writes its counts on: a pytest-style counts-and-timing footer (a
+    container service name or a timestamp may precede it) or a mocha `N passing` line. A count
+    in free-form log text (`retried after 3 errors in 0.10s`) is not a summary, however it is
+    timed."""
     out = []
     for line in text.splitlines():
         if _PYTEST_SUMMARY.match(line) or _MOCHA_SUMMARY.match(line):
@@ -190,9 +208,9 @@ def _summary_segments(text: str) -> List[str]:
 
 
 def _count(segment: str) -> Optional[Tuple[int, int]]:
-    passed = [int(n) for n in re.findall(r"(\d+) (?:passed|passing)\b", segment)]
-    failed = [int(n) for n in re.findall(r"(\d+) (?:failed|failing)\b", segment)]
-    failed += [int(n) for n in re.findall(r"(\d+) errors?\b", segment) if int(n)]
+    passed = [int(n) for n in re.findall(_COUNT_NUMBER + r"(?:passed|passing)\b", segment)]
+    failed = [int(n) for n in re.findall(_COUNT_NUMBER + r"(?:failed|failing)\b", segment)]
+    failed += [int(n) for n in re.findall(_COUNT_NUMBER + r"errors?\b", segment) if int(n)]
     if not passed and not failed:
         return None
     return sum(passed), sum(failed)

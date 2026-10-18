@@ -3,6 +3,7 @@ grades, missing data and the sample fixture."""
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -113,6 +114,57 @@ def test_parse_zero_errors_is_not_a_failure():
 def test_timed_log_errors_are_not_a_summary_line():
     assert parse_test_output("retried after 3 errors in 0.10s", "pytest") is None
     assert parse_test_output("retried after 3 errors in 0.10s\n3 passed in 0.20s", "pytest") == (3, 0)
+
+
+@pytest.mark.parametrize("text, counts", [
+    ("app  | 3 passed in 0.5s", (3, 0)),
+    ("web-1  | 1 failed, 2 passed in 0.4s", (2, 1)),
+    ("2026-10-18T12:00:00Z 3 passed in 0.5s", (3, 0)),
+    ("[12:00:01] 3 passed in 0.5s", (3, 0)),
+    ("api-1  | ============ 12 passed in 0.31s ============", (12, 0)),
+    ("web-1  | 2026-10-18T12:00:00.123456789Z 1 failed, 2 passed in 0.4s", (2, 1)),
+    ("2026-10-18 12:00:00+02:00 1 error, 3 passed in 0.9s", (3, 1)),
+])
+def test_a_prefixed_runner_footer_is_read(text, counts):
+    assert parse_test_output(text, "pytest") == counts
+
+
+@pytest.mark.parametrize("text", [
+    "app  | retried after 3 errors in 0.10s",
+    "2026-10-18T12:00:00Z retried after 3 errors in 0.10s",
+    "[12:00:01] retried after 3 errors in 0.10s",
+    "app  | done, 3 passed in 0.5s",
+    "build  | compiled in 0.10s, 3 errors",
+    "app  | the retry failed twice",
+])
+def test_a_prefixed_log_line_is_not_a_summary(text):
+    assert parse_test_output(text, "pytest") is None
+
+
+def test_noise_lines_parse_fast():
+    # 20 KB lines: the prefix alternatives, the count phrases and the count fallbacks must
+    # stay linear, so one long line of output cannot stall the score.
+    noise = [
+        "x" * 20_000,
+        "retried after 3 errors in 0.10s " * 625,
+        "app  | " + "1 passed, " * 2_000 + "in",
+        ("1 passed, " * 1_500) + " " * 5_000,
+        "app  | " * 3_000,
+        "2026-10-18T12:00:00Z " * 1_000,
+        "=" * 20_000,
+        "1" * 20_000,
+        "2026-10-18T" + "1" * 19_991,
+    ]
+    assert min(len(line) for line in noise) >= 20_000
+    start = time.perf_counter()
+    for line in noise:
+        assert parse_test_output(line, "pytest") is None
+    # Near-matches that end in a real timing are summaries, and must parse fast too.
+    footer = "app  | " + ", ".join(["1 passed"] * 2_000) + " in 0.5s"
+    assert len(footer) >= 20_000
+    assert parse_test_output(footer, "pytest") == (2_000, 0)
+    assert parse_test_output("1 passed in " + "9" * 20_000 + "s", "pytest") == (1, 0)
+    assert time.perf_counter() - start < 0.1
 
 
 def test_parse_keeps_the_failed_count_fallback():

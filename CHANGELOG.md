@@ -129,6 +129,20 @@ change behavior, so read the entry before you upgrade.
 
 ### Fixed
 
+- **A test summary behind a log prefix is read again (`runledger.quality`):** a pytest footer
+  written by a container, a wrapper or a log stream keeps its counts when it carries a
+  docker-compose or container service name (`app  | 3 passed in 0.5s`, `web-1  | 1 failed, 2 passed
+  in 0.4s`) or a timestamp (`2026-10-18T12:00:00Z 3 passed in 0.5s`, `[12:00:01] 3 passed in
+  0.5s`), alone or together, so a passing suite behind a prefix is no longer unknown. Only those
+  prefixes are allowed, and only at the start of the line: a count in free-form text
+  (`retried after 3 errors in 0.10s`, `app  | done, 3 passed in 0.5s`) is still not a summary.
+
+- **A very long line of digits no longer stalls the quality score (`runledger.quality`):** the
+  count fallbacks tried a 20 KB run of digits from every digit before giving up, which took over a
+  second per line; each count is now anchored to its start, so the same line parses in about a
+  millisecond. A 20 KB line of any shape (digits, `=`, spaces or a near-match footer) stays well
+  under a tenth of a second.
+
 - **A bare URL in session text no longer becomes a live link in the pull request comment
   (`runledger.github`):** GitHub links a bare `https://…` or `www.…` by itself, so escaping the
   Markdown punctuation around it was not enough: a request such as `See https://evil.example/x`
