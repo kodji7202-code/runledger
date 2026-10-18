@@ -74,9 +74,11 @@ Run these commands on the host, from the repository's `deploy` folder.
    The team's first key is an admin key labelled `initial`. It is printed once. Save it in a password
    manager. The server stores only a hash of it, so it cannot show the key again.
 
-6. Open the dashboard once with the key: `https://runledger.example.com/?key=YOUR_KEY`. The
-   server sets a session cookie and redirects, so the key leaves the address bar. After that,
-   open the plain address.
+6. Open the dashboard at `https://runledger.example.com/` and sign in with the key in the form. The
+   key travels in the request body, so it never enters the address bar. Links with
+   `?key=YOUR_KEY` still work for a first sign-in (they redirect to strip the key) but are
+   deprecated, and they never replace an existing session of another team without a confirming
+   click.
 
 7. Push a run from a developer's machine, with a member or admin key:
 
@@ -444,8 +446,9 @@ roll back, install the older version and restore the backup from before the upgr
 - **Everyone gets `429 rate_limited`**: one address sent more than 20 failed credentials in five
   minutes. Wait for the `Retry-After` time. If the server is behind a proxy, set the proxy as a trusted
   proxy (see above) so that the limit counts each client.
-- **The dashboard asks you to sign in**: open `https://YOUR_DOMAIN/?key=YOUR_KEY` once, as in
-  step 6 of the quickstart. Sessions last 12 hours.
+- **The dashboard asks you to sign in**: open `https://YOUR_DOMAIN/` and sign in with the key in the
+  form (or the deprecated `/?key=YOUR_KEY` link), as in step 6 of the quickstart. Sessions last 12
+  hours.
 - **`runledger push` says there is no server or key**: set `RUNLEDGER_SERVER` and
   `RUNLEDGER_API_KEY`, or pass `--server` and `--key`.
 - **`runledger push` answers `403`**: the key has the viewer role. Use a member or admin key.

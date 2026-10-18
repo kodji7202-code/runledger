@@ -21,12 +21,14 @@ Contents:
 ## Conventions
 
 **Authentication.** Send an API key as `Authorization: Bearer <key>`. The dashboard uses a session
-cookie instead: `rl_session`, set by `GET /?key=<key>`.
+cookie instead: `rl_session`, set by the sign-in form (`POST /session`).
 
 - A request with an API key needs no extra header.
 - A `POST` or `PUT` that uses the session cookie must also send `X-Requested-With: runledger`. Without
   it, the response is `403 csrf_required`.
 - A valid API key is checked first. The session cookie is used when the request carries no valid key.
+- Endpoints that require a role authenticate before they read the request body, so a large body sent
+  with a bad key gets `401` (or `403` for a role that is too low) instead of `413`.
 
 **Roles.** Each key has one role: `viewer` (read only), `member` (also pushes runs and requests
 approvals) or `admin` (also decides approvals, manages settings, keys, the audit log, budgets and exports).
@@ -43,14 +45,17 @@ server's log.
 {"error": {"code": "forbidden", "message": "The viewer role cannot push runs. This needs the member role or higher."}}
 ```
 
-**Body size and length.** Every request with a body must send `Content-Length` (otherwise `411`). The
-size is checked before authentication, so an oversized request gets `413` even without a key:
+**Body size and length.** Every request with a body must send `Content-Length` (otherwise `411`).
+Writes are authenticated before the body is read, so a bad key or a role that is too low is answered
+`401` or `403` at once, whatever the declared length; the size is checked next, so an oversized
+request from a caller that may write gets `413`:
 
 | Endpoint | Limit |
 | --- | --- |
 | `POST /api/runs` | 10 MB |
 | `POST /api/approvals` | 128 KB |
 | `POST /api/approvals/{id}/decision`, `PUT /api/team/settings`, `PUT /api/budgets`, `POST /api/keys` | 16 KB |
+| `POST /session` | 4 KB |
 
 **Rate limit.** An address with more than 20 failed credentials in five minutes gets `429` with a
 `Retry-After` header in seconds. `/health` is never limited. Behind a reverse proxy, the address is the
@@ -666,14 +671,32 @@ Errors: `400` `bad_request` (`days` outside 1 to 3650); `401`; `403` (not admin)
 
 ### `GET /`
 
-Role: any. The dashboard. Without a valid session it returns a sign-in page with status `401`.
+Role: any. The dashboard. Without a valid session it returns a sign-in page with status `401`. The
+form on that page posts the key to `POST /session`, so the key never enters the address bar.
+
+### `POST /session`
+
+The sign-in form. Body: `application/x-www-form-urlencoded` with one field, `key`. On success the
+response is `302` to `/`, with `Set-Cookie: rl_session=...; Path=/; HttpOnly; SameSite=Strict;
+Max-Age=43200` (plus `Secure` over HTTPS). On failure it returns the sign-in page with status `401`,
+and the failure counts toward the rate limit. A successful sign-in is recorded in the audit log as
+`auth.sign_in`, with the role and the client address.
 
 ### `GET /?key=<key>`
 
-Signs in with an API key. On success the response is `302` to `/`, with `Set-Cookie: rl_session=...;
-Path=/; HttpOnly; SameSite=Lax; Max-Age=43200` (plus `Secure` over HTTPS). On failure it returns the
-sign-in page with status `401`, and the failure counts toward the rate limit. A successful sign-in is
-recorded in the audit log as `auth.sign_in`, with the role and the client address.
+Legacy sign-in, kept for links printed by `runledger serve` and `team create`. It is deprecated (the
+server logs one warning per process) and strips the key from the address bar by redirecting.
+
+- With no session, or with a session of the same team: `302` to `/` with the same `Strict` cookie as
+  `POST /session`.
+- With a valid session of a **different** team: `200` with a confirmation page naming both teams and
+  a form that posts the key to `POST /session`. Nothing changes until that form is submitted, so a
+  link cannot silently sign you into someone else's team.
+- An unknown key returns the sign-in page with status `401`, and the failure counts toward the rate
+  limit.
+
+At most 20 sessions are kept per key; signing in again past that cap drops the oldest session of that
+key, and other keys are unaffected.
 
 There is no sign-out endpoint. Revoke or rotate the key to end a session.
 

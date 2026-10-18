@@ -240,3 +240,23 @@ def test_a_superseded_run_keeps_its_replaced_versions_and_purge_removes_them(tmp
     assert removed["run_revisions"] == 2
     assert _rows(path, "SELECT run_id FROM run_revisions ORDER BY run_id") == [("young",), ("young",)]
     assert _rows(path, "SELECT id FROM runs") == [("young",)]
+
+
+def test_session_cap_per_key(tmp_path):
+    """Signing in 25 times leaves the 20 newest sessions of that key and no more."""
+    path = tmp_path / "sessions.db"
+    with closing(Database(str(path))) as db:
+        team_id, admin = db.create_team("alpha")
+        other_team_id, other_admin = db.create_team("beta")
+        key_id = db.key_for_token(admin)["id"]
+        other_key_id = db.key_for_token(other_admin)["id"]
+        other_token = db.issue_session(other_team_id, other_key_id, "admin")
+
+        tokens = [db.issue_session(team_id, key_id, "admin") for _ in range(25)]
+        assert len(_rows(path, "SELECT token_hash FROM sessions WHERE key_id = ?", (key_id,))) == 20
+        assert len(_rows(path, "SELECT token_hash FROM sessions WHERE key_id = ?", (other_key_id,))) == 1
+        for token in tokens[:5]:
+            assert db.session_key(token) is None
+        for token in tokens[5:]:
+            assert db.session_key(token) is not None
+        assert db.session_key(other_token) is not None

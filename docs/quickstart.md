@@ -184,8 +184,9 @@ runledger team create myteam --db runledger.db     # prints the team's API key o
 runledger serve --db runledger.db                  # listens on http://127.0.0.1:8787
 ```
 
-Keep the key and open the dashboard once with it: `http://127.0.0.1:8787/?key=YOUR_KEY`. The
-server sets a session cookie and redirects, so the key leaves the address bar.
+Keep the key and open `http://127.0.0.1:8787/`, then sign in with the key in the form. The key is
+sent in the request body, so it never appears in the address bar. The `?key=YOUR_KEY` link form still
+works for a first sign-in but is deprecated.
 
 Push a run from a developer's machine:
 

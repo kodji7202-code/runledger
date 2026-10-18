@@ -25,12 +25,18 @@
   GET  /api/export/runs.csv[?days=30]         runs as CSV (admin); HEAD returns headers only
   GET  /api/export/audit.csv[?days=30]        audit log as CSV (admin)
   GET  /api/export/report.html[?days=30]      printable compliance report (admin)
-  GET  /                                      dashboard; sign in once with /?key=API_KEY
+  GET  /                                      dashboard; sign in with the form, which posts the key
+  POST /session                               sign in: form field "key" -> session cookie (302)
+  GET  /?key=API_KEY                          legacy sign-in: redirects to strip the key; never
+                                              replaces a session of another team without confirmation
   GET  /health                                liveness, no auth
 
 Credentials are "Authorization: Bearer KEY", or the dashboard session cookie. A cookie
 session has the role of the key it was signed in with, and survives a restart. A POST or
 PUT that uses a cookie must also send the header "X-Requested-With: runledger".
+
+A request that needs a role is authenticated before its body is read, so an oversized
+unauthenticated body gets 401, not 413, and the connection is closed without reading it.
 
 Behind a reverse proxy, pass --trusted-proxy CIDR (or RUNLEDGER_TRUSTED_PROXIES). A peer in
 a trusted range may report the client in X-Forwarded-For: the server then uses the right-most
@@ -55,7 +61,8 @@ import sys
 import threading
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from html import escape as _escape
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from .. import __version__
@@ -73,6 +80,7 @@ from .dashboard import APPROVAL_HTML, DASHBOARD_HTML
 from .db import TIME_FORMAT, Database
 
 MAX_BODY_BYTES = 10 * 1024 * 1024
+SIGN_IN_BODY_LIMIT = 4096
 COOKIE_NAME = "rl_session"
 LEVELS = ("low", "medium", "high")
 SEVERITIES = ("low", "medium", "high")
@@ -96,19 +104,45 @@ _KEY_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 RECEIPT_CSP = (
     "default-src 'none'; style-src 'unsafe-inline'; img-src data:; "
-    "base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+    "base-uri 'none'; form-action 'none'; frame-ancestors 'none'; sandbox"
 )
+SIGN_IN_CSP = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'"
 SIGN_IN_HTML = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>RunLedger sign in</title>
 <style>body{font:15px/1.5 system-ui,sans-serif;margin:0;padding:48px 16px;background:#0a0b0d;color:#eef0f2}
 @media (prefers-color-scheme: light){body{background:#f7f8f9;color:#121417}}
-main{max-width:560px;margin:0 auto}code{font-family:ui-monospace,monospace;background:rgba(127,127,127,.18);padding:2px 6px;border-radius:6px}</style>
+main{max-width:560px;margin:0 auto}code{font-family:ui-monospace,monospace;background:rgba(127,127,127,.18);padding:2px 6px;border-radius:6px}
+form{display:flex;gap:8px;margin:18px 0}input{flex:1;padding:9px 11px;border:1px solid rgba(127,127,127,.4);border-radius:8px;background:transparent;color:inherit;font:inherit}
+button{padding:9px 16px;border:0;border-radius:8px;background:#3b82f6;color:#fff;font:inherit;font-weight:600;cursor:pointer}
+.error{color:#e5484d;font-weight:600}</style>
 </head><body><main>
 <h1 style="font-size:20px">RunLedger team dashboard</h1>
-<p>Open the dashboard once with your team API key. The server then sets a session cookie and the key leaves the address bar.</p>
-<p><code>/?key=YOUR_API_KEY</code></p>
+__ERROR__
+<p>Sign in with a team API key. The server then sets a session cookie, and the key is never put in the address bar.</p>
+<form method="post" action="/session">
+<label for="key" style="position:absolute;left:-9999px">API key</label>
+<input id="key" name="key" type="password" autocomplete="off" required>
+<button type="submit">Sign in</button>
+</form>
 <p>Create a team and its key with <code>runledger team create NAME</code>. Make more keys with <code>runledger key create</code>.</p>
+</main></body></html>
+"""
+SWITCH_TEAM_HTML = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Switch team · RunLedger</title>
+<style>body{font:15px/1.5 system-ui,sans-serif;margin:0;padding:48px 16px;background:#0a0b0d;color:#eef0f2}
+@media (prefers-color-scheme: light){body{background:#f7f8f9;color:#121417}}
+main{max-width:560px;margin:0 auto}a{color:#3b82f6}
+button{padding:9px 16px;border:0;border-radius:8px;background:#3b82f6;color:#fff;font:inherit;font-weight:600;cursor:pointer;margin:18px 0}</style>
+</head><body><main>
+<h1 style="font-size:20px">Switch to team __TO__?</h1>
+<p>This browser is already signed in to team <b>__FROM__</b>. The link you opened carries a key for team <b>__TO__</b>.</p>
+<form method="post" action="/session">
+<input type="hidden" name="key" value="__KEY__">
+<button type="submit">Switch to __TO__</button>
+</form>
+<p><a href="/">Stay signed in to __FROM__</a></p>
 </main></body></html>
 """
 
@@ -179,6 +213,8 @@ class RunLedgerServer(ThreadingHTTPServer):
         self.limiter = FailureLimiter()
         self.retention_days = retention_days
         self.audit_retention_days = audit_retention_days
+        self._query_key_warned = False
+        self._query_key_lock = threading.Lock()
         self._maintenance_stop = threading.Event()
         super().__init__(address, _Handler)
         # The base URL people see in approval links. The default is the bound address,
@@ -280,6 +316,17 @@ class RunLedgerServer(ThreadingHTTPServer):
         survives a restart, and it ends when its key is revoked or rotated (see db.session_key)."""
         row = self.db.session_key(token)
         return identity_from_row(row, "session") if row else None
+
+    def warn_query_key_once(self) -> None:
+        """Write the ?key= deprecation warning once per server process. Never the key."""
+        with self._query_key_lock:
+            if self._query_key_warned:
+                return
+            self._query_key_warned = True
+        sys.stderr.write(
+            "warning: signing in with '?key=' in the URL is deprecated; "
+            "use the sign-in form (POST /session) instead.\n"
+        )
 
 
 class _IPv6Server(RunLedgerServer):
@@ -423,6 +470,9 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/":
             self._only(method, ("GET",))
             self._dashboard(query)
+        elif path == "/session":
+            self._only(method, ("POST",))
+            self._session_post()
         elif path == "/api/me":
             self._only(method, ("GET",))
             self._me()
@@ -536,8 +586,9 @@ class _Handler(BaseHTTPRequestHandler):
     def _send_html(self, status: int, html: str, headers: Optional[Dict[str, str]] = None) -> None:
         self._send(status, html.encode("utf-8"), "text/html; charset=utf-8", headers)
 
-    def _sign_in_page(self) -> None:
-        self._send_html(401, SIGN_IN_HTML, {"Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'"})
+    def _sign_in_page(self, error: Optional[str] = None) -> None:
+        message = f'<p class="error" role="alert">{_escape(error)}</p>' if error else ""
+        self._send_html(401, SIGN_IN_HTML.replace("__ERROR__", message), {"Content-Security-Policy": SIGN_IN_CSP})
 
     # Auth
 
@@ -614,6 +665,17 @@ class _Handler(BaseHTTPRequestHandler):
                 f"Dashboard changes must send the header '{CSRF_HEADER}: {CSRF_VALUE}'.",
             )
 
+    def _authed(self, minimum: str, what: str, write: bool = False) -> Identity:
+        """Identify and authorize before the request body is read, so a huge unauthenticated
+        body is answered 401/403 at once, and the connection closes without draining it."""
+        try:
+            ident = self._identify()
+            self._require(ident, minimum, what, write=write)
+        except _HttpError as exc:
+            exc.headers.setdefault("Connection", "close")
+            raise
+        return ident
+
     # Endpoints
 
     def _content_length(self, limit: int = MAX_BODY_BYTES, what: str = "Receipts") -> int:
@@ -640,10 +702,9 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_json(200, me)
 
     def _create_run(self) -> None:
+        ident = self._authed("member", "push runs", write=True)
         length = self._content_length()
         raw = self.rfile.read(length) if length else b""
-        ident = self._identify()
-        self._require(ident, "member", "push runs", write=True)
         if not raw:
             raise _HttpError(400, "empty_body", "Send the receipt as a JSON object in the request body.")
         try:
@@ -734,21 +795,21 @@ class _Handler(BaseHTTPRequestHandler):
         self._send(200, html.encode("utf-8"), "text/html; charset=utf-8", {"Content-Security-Policy": RECEIPT_CSP})
 
     def _dashboard(self, query: Dict[str, List[str]]) -> None:
-        if "key" in query:
-            # Sign-in: trade the key for an opaque cookie and redirect so the key leaves the URL.
-            row = self.server.db.key_for_token((query["key"][0] or "").strip())
+        key = (query.get("key") or [""])[0].strip()
+        if key:
+            # Legacy sign-in: trade the key for an opaque cookie and redirect so the key leaves
+            # the URL. A session of another team is never replaced without a confirming click.
+            self.server.warn_query_key_once()
+            row = self.server.db.key_for_token(key)
             if row is None:
                 self.server.limiter.record_failure(self._client_ip())
-                self._sign_in_page()
+                self._sign_in_page("That key was not recognized. Check the key and try again.")
                 return
-            token = self.server.db.issue_session(row["team_id"], row["id"], row["role"])
-            session = identity_from_row(row, "session")
-            self.server.db.record_audit(row["team_id"], session.actor(), "auth.sign_in", row["id"],
-                                        {"role": row["role"], "ip": self._client_ip()})
-            cookie = f"{COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_TTL_SECONDS}"
-            if self._secure():
-                cookie += "; Secure"
-            self._send(302, b"", "text/plain; charset=utf-8", {"Location": "/", "Set-Cookie": cookie})
+            current = self._try_identify()
+            if current is not None and current.team_id != row["team_id"]:
+                self._switch_team_page(row, current, key)
+                return
+            self._sign_in(row)
             return
         if self._try_identify() is None:
             self._sign_in_page()
@@ -756,13 +817,46 @@ class _Handler(BaseHTTPRequestHandler):
         nonce = secrets.token_urlsafe(16)
         self._send_html(200, DASHBOARD_HTML.replace("__CSP_NONCE__", nonce), {"Content-Security-Policy": _page_csp(nonce)})
 
+    def _session_post(self) -> None:
+        """The sign-in form: the key travels in the body, never in the URL."""
+        length = self._content_length(SIGN_IN_BODY_LIMIT, "Sign-in forms")
+        raw = self.rfile.read(length) if length else b""
+        fields = parse_qs(raw.decode("utf-8", "replace"), keep_blank_values=True)
+        key = (fields.get("key") or [""])[0].strip()
+        row = self.server.db.key_for_token(key) if key else None
+        if row is None:
+            if key:
+                self.server.limiter.record_failure(self._client_ip())
+            self._sign_in_page("That key was not recognized. Check the key and try again.")
+            return
+        self._sign_in(row)
+
+    def _sign_in(self, row: Mapping[str, Any]) -> None:
+        token = self.server.db.issue_session(row["team_id"], row["id"], row["role"])
+        session = identity_from_row(row, "session")
+        self.server.db.record_audit(row["team_id"], session.actor(), "auth.sign_in", row["id"],
+                                    {"role": row["role"], "ip": self._client_ip()})
+        cookie = f"{COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_TTL_SECONDS}"
+        if self._secure():
+            cookie += "; Secure"
+        self._send(302, b"", "text/plain; charset=utf-8", {"Location": "/", "Set-Cookie": cookie})
+
+    def _switch_team_page(self, row: Mapping[str, Any], current: Identity, key: str) -> None:
+        """A ?key= link for another team is a switch, not a sign-in: ask for one click first."""
+        page = (
+            SWITCH_TEAM_HTML
+            .replace("__FROM__", _escape(current.team_name))
+            .replace("__TO__", _escape(row["team_name"]))
+            .replace("__KEY__", _escape(key))
+        )
+        self._send_html(200, page, {"Content-Security-Policy": SIGN_IN_CSP})
+
     # Approvals
 
     def _create_approval(self) -> None:
+        ident = self._authed("member", "request approvals", write=True)
         length = self._content_length(approvals.CREATE_BODY_LIMIT, "Approval requests")
         raw = self.rfile.read(length) if length else b""
-        ident = self._identify()
-        self._require(ident, "member", "request approvals", write=True)
         try:
             fields = approvals.validate_new_approval(_json_object(raw))
         except approvals.InvalidInput as exc:
@@ -803,10 +897,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _decide_approval(self, raw_id: str) -> None:
         approval_id = _approval_id(raw_id)
+        ident = self._authed("admin", "decide approvals", write=True)
         length = self._content_length(approvals.SMALL_BODY_LIMIT, "Decisions")
         raw = self.rfile.read(length) if length else b""
-        ident = self._identify()
-        self._require(ident, "admin", "decide approvals", write=True)
         try:
             decision, reason, _name = approvals.validate_decision(_json_object(raw))
         except approvals.InvalidInput as exc:
@@ -842,10 +935,9 @@ class _Handler(BaseHTTPRequestHandler):
     def _team_settings(self, method: str) -> None:
         db = self.server.db
         if method == "PUT":
+            ident = self._authed("admin", "change team settings", write=True)
             length = self._content_length(approvals.SMALL_BODY_LIMIT, "Settings")
             raw = self.rfile.read(length) if length else b""
-            ident = self._identify()
-            self._require(ident, "admin", "change team settings", write=True)
             try:
                 changes = approvals.validate_settings(_json_object(raw))
             except approvals.InvalidInput as exc:
@@ -883,10 +975,9 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_json(200, {"keys": self.server.db.list_keys(ident.team_id)})
 
     def _create_key(self) -> None:
+        ident = self._authed("admin", "create keys", write=True)
         length = self._content_length(approvals.SMALL_BODY_LIMIT, "Key requests")
         raw = self.rfile.read(length) if length else b""
-        ident = self._identify()
-        self._require(ident, "admin", "create keys", write=True)
         body = _json_object(raw)
         try:
             view = self.server.db.create_key(ident.team_id, body.get("label"), body.get("role"), ident.actor())
@@ -948,10 +1039,9 @@ class _Handler(BaseHTTPRequestHandler):
     def _budgets(self, method: str) -> None:
         db = self.server.db
         if method == "PUT":
+            ident = self._authed("admin", "change the team budget", write=True)
             length = self._content_length(approvals.SMALL_BODY_LIMIT, "Budgets")
             raw = self.rfile.read(length) if length else b""
-            ident = self._identify()
-            self._require(ident, "admin", "change the team budget", write=True)
             try:
                 values = budgets.validate_budget(_json_object(raw))
             except _HttpError as exc:  # no body, or not a JSON object

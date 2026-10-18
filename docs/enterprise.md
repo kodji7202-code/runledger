@@ -261,12 +261,18 @@ exports as confidential.
 
 ## Sign-in and sessions
 
-- Open `https://your-server/?key=YOUR_KEY` once. The server checks the key, sets a session cookie, and
-  redirects, so the key leaves the address bar. Later visits need only the plain address.
-- The cookie is `rl_session`: HttpOnly, SameSite=Lax, and valid for 12 hours. It is Secure when the
+- Open `https://your-server/` and sign in with your team API key in the form. The key is sent in the
+  request body and never appears in the address bar, browser history or proxy logs.
+- The legacy link form `https://your-server/?key=YOUR_KEY` still works for links printed by
+  `runledger serve` and `team create`. It redirects so the key leaves the address bar, and it logs one
+  deprecation warning. If the browser already holds a session for a **different** team, the link shows
+  a confirmation page instead of switching: one click is always required, so a link cannot silently
+  sign you into someone else's team.
+- The cookie is `rl_session`: HttpOnly, SameSite=Strict, and valid for 12 hours. It is Secure when the
   server is behind HTTPS (see below).
 - A session carries the role of its key. It ends after 12 hours, or at once when its key is revoked or
-  rotated.
+  rotated. Each key keeps at most 20 sessions; signing in past that cap drops that key's oldest
+  session and leaves other keys alone.
 - *This release:* the server keeps sessions in the team database as hashes of their tokens, so a
   server restart does not sign anyone out. Until this release, sessions were held in memory.
 - There is no sign-out endpoint. To end a session, rotate or revoke its key.

@@ -26,6 +26,12 @@ change behavior, so read the entry before you upgrade.
   files written inside a Git repository (matching Markdown and JSON; pass `--no-safe` for full
   paths), and when `-o` is omitted it writes `runledger-<stem>-2.<ext>`, `runledger-<stem>-3.<ext>`,
   and so on instead of overwriting an existing receipt file.
+- **The dashboard sign-in form replaces the key-in-URL instructions (`runledger.server`):** the `401`
+  sign-in page now shows a form (`method="post"`, action `/session`) instead of teaching
+  `/?key=YOUR_API_KEY`, and a wrong key answers the same page with an error message. Docs
+  (`docs/api.md`, `docs/enterprise.md`, `docs/self-hosting.md`, `docs/quickstart.md`) describe the
+  form, the Strict cookie, the confirmation step and the session cap; the `?key=` link is documented
+  as deprecated.
 
 ### Fixed
 
@@ -320,6 +326,32 @@ change behavior, so read the entry before you upgrade.
   `RUNLEDGER_AUDIT_RETENTION_DAYS` only (default 365 days while runs are pruned, `0` keeps them for
   ever), so a 35-day run period keeps a year of audit history instead of deleting it with the runs.
   With neither variable set, nothing is deleted, whatever its age, as in v0.6.0.
+
+### Security
+
+- **Writes are authenticated before their body is read, and the failed-key limiter has a real memory
+  cap (`runledger.server`):** every endpoint that needs a role (`POST /api/runs`, `POST /api/approvals`,
+  `POST /api/approvals/<id>/decision`, `PUT /api/team/settings`, `POST /api/keys`, `PUT /api/budgets`)
+  now identifies the caller first, so an oversized unauthenticated body is answered `401` (`403` for a
+  role that is too low) without reading or draining it, and the connection closes; a body over the cap
+  sent by a valid member is still `413`. The in-memory failed-sign-in table evicts the least recently
+  failed address once it holds `max_tracked` (default 10 000) addresses, so distinct source addresses
+  can no longer grow it without bound. `runledger.server.auth` imports `Any`, so
+  `typing.get_type_hints()` resolves every function in the module.
+- **Dashboard sign-in posts the key, and `?key=` never overrides another team's session
+  (`runledger.server`):** the sign-in page has a form that posts the key to `POST /session`, so the
+  key stays out of the address bar, history and proxy logs, and the session cookie is now
+  `SameSite=Strict`. The legacy `GET /?key=` sign-in still works for a first visit (it redirects to
+  strip the key and logs one deprecation warning per process), but when the browser already holds a
+  session of a **different** team the server answers `200` with a confirmation page and switches only
+  after that form is submitted; a key of the same team signs in without confirmation. Each key keeps
+  at most 20 sessions (the oldest of that key is dropped), and other keys are unaffected.
+- **Receipt HTML is served with a `sandbox` CSP, and the team database and its backups are
+  owner-only (`runledger.server`, `runledger.cli`):** `GET /runs/<id>` keeps its `default-src 'none'`
+  policy (no scripts, no external resources, `nosniff`) and adds the `sandbox` directive, so a stored
+  receipt cannot navigate or submit forms even if its HTML is hostile. The team database file is
+  created with mode `0600`, and `runledger backup` sets the same mode on every copy; both are no-ops
+  where the OS has no POSIX modes, so Windows never fails on them.
 
 ### Added
 

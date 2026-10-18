@@ -1011,3 +1011,43 @@ def test_existing_team_data_remains_writable_after_upgrade(tmp_path):
         assert maintenance.run_maintenance(srv.db, 90)["runs"] == 0
         assert srv.db.team_name(team_id) == "existing"
         assert _http(base, "GET", "/api/me", headers=_auth(admin))[0] == 200
+
+
+def test_failure_limiter_is_bounded():
+    """Fifty recent distinct addresses with a cap of five leave at most five tracked."""
+    limiter = FailureLimiter(max_tracked=5)
+    for index in range(50):
+        limiter.record_failure(f"10.0.0.{index}")
+    assert len(limiter._failures) <= 5
+
+    for _ in range(MAX_FAILURES + 1):
+        limiter.record_failure("10.9.9.9")
+    assert limiter.blocked_for("10.9.9.9") > 0
+    assert len(limiter._failures) <= 5
+    assert limiter.blocked_for("10.0.0.0") == 0  # the oldest address was evicted
+
+
+def test_failure_limiter_still_blocks_after_threshold():
+    clock = [500.0]
+    limiter = FailureLimiter(max_failures=3, max_tracked=100, clock=lambda: clock[0])
+    for index in range(20):  # many addresses, none of them over the threshold
+        limiter.record_failure(f"192.0.2.{index}")
+    assert limiter.blocked_for("192.0.2.0") == 0
+
+    for _ in range(4):
+        limiter.record_failure("192.0.2.0")
+    assert limiter.blocked_for("192.0.2.0") > 0
+
+    clock[0] += 301
+    assert limiter.blocked_for("192.0.2.0") == 0
+
+
+def test_type_hints_resolve():
+    import typing
+
+    import runledger.server.auth as auth
+
+    for value in vars(auth).values():
+        if callable(value) and getattr(value, "__module__", "") == auth.__name__:
+            typing.get_type_hints(value)
+    assert typing.get_type_hints(auth.validate_label)["value"] is typing.Any
