@@ -76,7 +76,15 @@ def check(tag, root=ROOT):
     return problems
 
 
+def use_utf8_output():
+    """Write UTF-8 even on a Windows console whose code page cannot encode the changelog."""
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
+
+
 def main(argv=None):
+    use_utf8_output()
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--tag", default=os.environ.get("GITHUB_REF_NAME", ""),
                         help="release tag, e.g. v0.6.1 (default: $GITHUB_REF_NAME)")

@@ -36,6 +36,7 @@ CHANGELOG = """# Changelog
 ### Fixed
 
 - the 0.6.0 fix
+- a partial cost renders as "\u2265 $1", like the real changelog
 
 ## [0.5.2] - 2026-10-15
 
@@ -130,3 +131,21 @@ def test_notes_for_the_current_version_of_this_repository():
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.startswith("## [%s]" % __version__)
+
+
+def test_notes_survive_a_legacy_console_encoding(tmp_path):
+    # Windows consoles default to a legacy code page, and a changelog holds characters such as
+    # U+2265 that it cannot encode; the notes must still be written, in full.
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "cp1252"
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "--root", str(_repo(tmp_path)), "--tag", "v0.6.0", "--notes"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True,
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("## [0.6.0]")
+    assert "the 0.6.0 fix" in result.stdout
+    assert "\u2265" in result.stdout
