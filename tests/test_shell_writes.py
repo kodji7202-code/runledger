@@ -89,14 +89,12 @@ def test_an_unquoted_spaced_drive_path_is_the_shells_own_words(command, expected
     assert _paths(command) == expected
 
 
-def test_a_spaced_drive_write_inside_the_project_is_labelled_whole(tmp_path):
-    """The shell writes `My` and `Folder/x.txt`; the file entry whose path is the leading
-    fragment of the spaced drive path is shown as the whole path, so the receipt names the file
-    the command's folder name belongs to."""
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    root = str(repo).replace(chr(92), "/")
-    run = _run(repo, [f"touch {root}/My Folder/x.txt"])
+def test_a_spaced_drive_write_inside_the_project_is_labelled_whole():
+    """The shell writes `My` and `Folder/x.txt` inside the project; the file entry whose path is
+    the leading fragment of the spaced drive path is shown as the whole path, so a receipt names
+    the file the command's folder name belongs to. The drive path is spelled out so the check
+    reads the same on every host."""
+    run = _run("C:/repo", ["touch C:/repo/My Folder/x.txt"])
     assert sorted(file_changes(run)) == ["Folder/x.txt", "My Folder/x.txt"]
 
 
