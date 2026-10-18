@@ -246,6 +246,19 @@ def test_changelog_links_cover_headings():
         assert links[version] == f"{base}/compare/v{previous}...v{version}", links[version]
 
 
+def test_github_doc_shows_the_workflow_permissions_block():
+    """VAL-DOCS-006: docs/github.md shows the workflow's `permissions:` block with the two
+    grants the job needs, not only a sentence saying it needs pull request write access."""
+    text = (ROOT / "docs" / "github.md").read_text(encoding="utf-8")
+    blocks = re.findall(r"```yaml\n(.*?)```", text, re.S)
+    with_permissions = [block for block in blocks if re.search(r"^permissions:", block, re.M)]
+    assert with_permissions, "docs/github.md has no YAML block with a permissions: section"
+    block = with_permissions[0]
+    assert re.search(r"^permissions:\s*$", block, re.M)
+    assert re.search(r"^\s+pull-requests:\s*write\s*$", block, re.M)
+    assert re.search(r"^\s+contents:\s*read\s*$", block, re.M)
+
+
 def test_action_yml_not_claude_only():
     """P9: the Action describes every agent it reads, not Claude Code only."""
     action = (ROOT / "action.yml").read_text(encoding="utf-8")

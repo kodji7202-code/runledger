@@ -254,6 +254,11 @@ With the team setting `attribution: "key"`, `user` is the pushing key's label an
 still holds the client's own `user` value. With the default `attribution: "client"`, `user` is what the
 client sent and `pushed_by` is the key's label.
 
+The embedded `receipt` follows the same cost rule as the flattened fields: a run whose
+`usage_source` is `missing` stores `cost_usd` `null` in `receipt.totals` and in every
+`receipt.models` bucket, even when an older client sent `0.0`, while a run that reports its usage
+keeps its figure (including a reported `0.0`).
+
 Errors: `401`; `404` `not_found` ("Run not found.").
 
 ### `GET /runs/{id}`

@@ -84,13 +84,15 @@ _INSPECT_FLAGS = {"-V", "-h"}
 _INSPECT_FLAGS_LOWER = {"--version", "--help", "--collect-only", "--co", "--list", "--list-tests",
                         "--listtests", "--dry-run", "--dryrun"}
 _TESTS_LINE = re.compile(r"^\s*Tests:?\s+(.+)$", re.M)  # jest and vitest summary line
-# A line a runner writes its counts on: counts and a timing and nothing else, as in
-# `3 passed in 0.20s` or `=== 2 failed, 3 passed in 0.50s ===`. Such a footer can carry a
-# short log prefix: a docker-compose or container service name (`app  | 3 passed in 0.5s`)
-# or a timestamp (`2026-10-18T12:00:00Z 3 passed in 0.5s`, `[12:00:01] 3 passed in 0.5s`),
-# alone or together (`web-1  | 2026-10-18T12:00:00Z ...`). Only those three shapes are
-# allowed, only at the start of the line, and each is bounded: a count in free-form log
-# text (`retried after 3 errors in 0.10s`) is still not a summary.
+# A line a runner writes its counts on: counts and nothing else, as in `3 passed` or
+# `3 passed in 0.20s`, `=== 2 failed, 3 passed in 0.50s ===`. The timing pytest appends is
+# optional, because a runner that prints a bare footer (`3 passed`, `3 passed, 1 skipped`)
+# reports the same result. Such a footer can carry a short log prefix: a docker-compose or
+# container service name (`app  | 3 passed in 0.5s`) or a timestamp
+# (`2026-10-18T12:00:00Z 3 passed`, `[12:00:01] 3 passed`), alone or together
+# (`web-1  | 2026-10-18T12:00:00Z ...`). Only those three shapes are allowed, only at the
+# start of the line, and each is bounded: a count in free-form log text
+# (`retried after 3 errors in 0.10s`) is still not a summary.
 _COUNT_PHRASE = r"\d+\s+(?:passed|failed|errors?|skipped|xfailed|xpassed|deselected|warnings?)"
 _SERVICE_PREFIX = r"[A-Za-z0-9][A-Za-z0-9_.-]{0,31}\s*\|\s?"
 _TIMESTAMP_PREFIX = (
@@ -104,10 +106,12 @@ _LOG_PREFIX = (r"(?:(?:" + _SERVICE_PREFIX + r")?" + _TIMESTAMP_PREFIX
 # pytest appends its own elapsed time, `(H:MM:SS)`, to the summary of a session that ran for
 # at least a minute. Only that bounded shape is accepted after the seconds.
 _ELAPSED_SUFFIX = r"(?:[ \t]*\(\d{1,4}:\d{2}:\d{2}\))?"
+# The timing itself (`in 0.20s`) is optional: a bare count line is the same footer.
 _PYTEST_SUMMARY = re.compile(
     r"^[\s=]*(?:(?:" + _LOG_PREFIX + r")[\s=]*)?(?:" + _COUNT_PHRASE + r")"
     r"(?:[\s,|]+" + _COUNT_PHRASE + r")*"
-    r"\s+in\s+\d+(?:\.\d+)?s" + _ELAPSED_SUFFIX + r"[\s=]*$")
+    r"(?:\s+in\s+\d+(?:\.\d+)?s" + _ELAPSED_SUFFIX + r")?"
+    r"[\s=]*$")
 _MOCHA_SUMMARY = re.compile(r"^\s*\d+\s+(?:passing|failing|pending)\b")
 # A count read out of a line fragment. The `(?<!\d)` keeps a long digit run from being
 # rescanned from every digit: without it a 20 KB line of digits backtracks for seconds.

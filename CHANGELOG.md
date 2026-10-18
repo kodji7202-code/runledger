@@ -131,6 +131,30 @@ change behavior, so read the entry before you upgrade.
 
 ### Fixed
 
+- **The stored receipt of a run with no recorded usage no longer carries a `$0.00` cost
+  (`runledger.server`):** the run row, the list and the aggregates already read `n/a`, but
+  `GET /api/runs/{id}` still served the client's original `cost_usd` `0.0` inside the embedded
+  `receipt` (`receipt.totals` and every `receipt.models` bucket), which read as a free run. The
+  server now normalizes the receipt it stores and serves the same way it normalizes the flattened
+  run: a run whose `usage_source` is `missing` has `cost_usd` `null` in its receipt too, including
+  a row an older server stored with the zero. A run that reports its usage keeps its figure, so a
+  reported `$0.00` stays `0.0`, and a receipt from a client that reports no `usage_source` is
+  untouched.
+- **`GET /api/stats` reports `unpriced_runs` and `cost_is_lower_bound` on `by_model` rows
+  (`runledger.server`, `docs/api.md`):** the model rows were the only group rows without the two
+  fields the documentation's example already showed, so a consumer could not tell that a model's
+  figure leaves unpriced runs out. A model bucket with no price and a run that is only partly
+  priced both count as unpriced, exactly as they do in the developer, project and agent rows.
+- **Quality score: a bare pytest count line counts as a pass again (`runledger.quality`):** a
+  footer without the timing pytest adds (`3 passed`, `3 passed, 1 skipped`, `=== 3 passed ===`,
+  with or without a service-name or timestamp prefix) was read as unreadable, so the run lost the
+  15 `test_outcome` points that v0.6.0 awarded it. The timing (`in 0.20s`) is optional again;
+  unreadable output (`Done.`) and counts inside free-form log text (`retried after 3 errors in
+  0.10s`, `lint found 7 errors`) stay unknown.
+- **`docs/github.md` shows the workflow's `permissions:` block (`docs/github.md`):** the page
+  described the `pull-requests: write` grant in prose and linked the example workflow; the
+  workflow snippet now carries the block itself (`contents: read`, `pull-requests: write`).
+
 - **Safe mode masks an e-mail address that ends a sentence (`runledger.safe`):** an address
   followed by a full stop was left as it was typed, so a prompt such as `contact me@example.com.`
   reached the Markdown, JSON and HTML receipts, the body of `push --safe`, the stored run and the
