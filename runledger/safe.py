@@ -9,7 +9,8 @@ Path rules, applied to path fields and to every absolute path found in free text
   - other non-system paths with more than two segments keep their last two parts: `…/a/b`
 Free text then gets the usual secret masking, e-mail addresses become [EMAIL] (except
 scp-style `git@host:org/repo` remotes) and the `user:pass@` part of URLs becomes
-[REDACTED]@ (except `ssh://git@host/...`). Session id, branch and models are kept.
+[REDACTED]@ (except `ssh://git@host/...`). Sentence punctuation that follows an address
+(`contact me@example.com.`) stays in the text. Session id, branch and models are kept.
 Every function is idempotent: applying it to its own output changes nothing.
 """
 from __future__ import annotations
@@ -32,11 +33,14 @@ ELLIPSIS = "…"
 EMAIL = "[EMAIL]"
 # An scp-style remote (`git@host:org/repo`) is kept, but only with a non-empty remote path,
 # so a real address followed by a prose colon (`git@host: reply`) is still masked.
+# The address ends at the last label: sentence punctuation and closing brackets or quotes that
+# follow it are left in the text, so `contact me@example.com.` masks the address and keeps the
+# full stop. Only a letter or digit would have been part of the address itself.
 _EMAIL_RE = re.compile(
     r"(?<![A-Za-z0-9._%+-])(?<!://)"
     r"(?!git@[A-Za-z0-9.-]+\.[A-Za-z]{2,}:(?!//)[\w./~-])"
     r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
-    r"(?![A-Za-z0-9.-])"
+    r"(?![A-Za-z0-9])"
 )
 _URL_CREDS_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9+.-]*://)(?!git@)[^\s/@]+@")
 # More of a path separated by spaces: a name followed by a separator, then the rest of the

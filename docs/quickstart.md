@@ -62,9 +62,12 @@ folder) or when Markdown or JSON is written to stdout (`-o -`):
   fragment, and a folder name with several words (`E:\Work\Client X Corp\secret.txt`) is one path
   in the same way;
 - temp paths such as `/tmp/...` and standard system paths such as `/usr/bin/...` stay as they are;
-- e-mail addresses become `[EMAIL]` (a prose colon does not exempt one) and `user:pass@` in URLs
-  becomes `[REDACTED]@`, while scp-style `git@host:org/repo` remotes (with a non-empty path after
-  the colon) and `ssh://git@host/...` Git remotes are kept verbatim.
+- e-mail addresses become `[EMAIL]`, an address that ends a sentence included: the punctuation
+  after it stays, so `contact me@example.com.` reads `contact [EMAIL].` (a prose colon does not
+  exempt one, and a comma, semicolon, question or exclamation mark, bracket or quote after an
+  address behaves the same way); `user:pass@` in URLs becomes `[REDACTED]@`, while scp-style
+  `git@host:org/repo` remotes (with a non-empty path after the colon) and `ssh://git@host/...`
+  Git remotes are kept verbatim.
 
 RunLedger reads a command the way the shell does, word by word. An unquoted path that contains
 spaces is several words to the shell, so `touch C:/repo/My Folder/x.txt` is listed as the separate

@@ -273,6 +273,28 @@ def test_home_user_names_with_repeated_spaces_are_fully_masked():
         assert leaked not in win + posix + mac
 
 
+def test_sentence_final_emails_are_masked_without_eating_the_punctuation():
+    """VAL-PUSH-001 / VAL-CROSS-009: an address that ends a sentence is still an address.
+    A full stop, comma, semicolon, colon, question or exclamation mark, or a closing
+    bracket or quote, ends the address but stays in the text."""
+    ctx = SafeContext(root="D:/repo")
+    assert safe_text("contact me@example.com.", ctx) == "contact [EMAIL]."
+    assert safe_text("mail me@example.com, bob@example.org.", ctx) == "mail [EMAIL], [EMAIL]."
+    assert safe_text("ask me@example.com?", ctx) == "ask [EMAIL]?"
+    assert safe_text("ask me@example.com!", ctx) == "ask [EMAIL]!"
+    assert safe_text("ask me@example.com;", ctx) == "ask [EMAIL];"
+    assert safe_text("ask me@example.com:", ctx) == "ask [EMAIL]:"
+    assert safe_text("see (me@example.com), [me@example.com] and 'me@example.com'", ctx) == (
+        "see ([EMAIL]), [[EMAIL]] and '[EMAIL]'")
+    assert safe_text('asked "me@example.com".', ctx) == 'asked "[EMAIL]".'
+    assert safe_text("ends with me@example.com...", ctx) == "ends with [EMAIL]..."
+    assert safe_text("ends with me@example.com.", ctx) == "ends with [EMAIL]."
+    for text in ("me@example.com.", "Contact me@example.com.", "me@example.com, please",
+                 "List: me@example.com, bob@example.org."):
+        masked = safe_text(text, ctx)
+        assert "example.com" not in masked and "example.org" not in masked
+
+
 def test_git_scp_exemption_needs_a_remote_path():
     """CORE-SCR-015: only `git@host:path` with a non-empty path is an scp remote; a real
     address followed by a prose colon, a bare colon or a slash is still masked."""

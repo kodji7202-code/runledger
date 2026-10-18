@@ -508,11 +508,44 @@ def test_text_neutralizes_bare_urls_github_would_autolink():
     assert "\n" not in text
 
 
+def test_text_neutralizes_only_where_github_reads_a_mention():
+    """VAL-CROSS-009: a mention starts at the beginning of a text or after a character that
+    is not a letter, digit or underscore. An at-sign inside a word (`git@github.com:acme/app.git`)
+    is not one, so the remote stays byte-for-byte while `@someone` is still neutralized."""
+    remote = "git@github.com:acme/app.git"
+    assert _text(remote) == remote
+    assert _text("push to " + remote) == "push to " + remote
+    assert _text("git@gitlab.internal.corp:team/service.git") == (
+        "git@gitlab.internal.corp:team/service.git")
+    assert _text("ssh://git@github.com/acme/app.git") == "ssh://git@github.com/acme/app.git"
+    assert "\u200b" not in _text(f"{remote} and {remote} then")
+    assert _text("git config user.email me@example.com") == "git config user.email me@example.com"
+    assert "user\\_@octocat" == _text("user_@octocat")     # an underscore is a word character
+    for text in ("@octocat", "ping @octocat", "cc: @octocat.", "(@octocat)", "**@octocat**"):
+        out = _text(text)
+        assert "@\u200boctocat" in out and "@octocat" not in out, text
+
+
 def test_code_keeps_backticks_in_a_wider_fence():
     assert _code("src/app.py") == "`src/app.py`"
     assert _code("dir/we`ird.py") == "`` dir/we`ird.py ``"
     assert _code("a``b") == "``` a``b ```"
     assert "`" in _code("trailing`")
+
+
+def test_comment_keeps_an_ssh_remote_verbatim(tmp_path, capsys):
+    """VAL-CROSS-009: the remote a session's text names survives the comment byte-for-byte,
+    the address next to it is masked, and a real mention is still neutralized."""
+    remote = "git@github.com:acme/app.git"
+    prompt = f"Ping @someone, push to {remote} and mail dev@example.com."
+    path = _native_session(tmp_path, "remote.runledger.json", prompts=[prompt],
+                           steps=[_shell_step(f"git push {remote} main")])
+    rc, out, err = run_cli(capsys, "comment", "--session", str(path), "--dry-run")
+    assert rc == 0
+    assert remote in out
+    assert "git@\u200bgithub.com" not in out
+    assert "dev@example.com" not in out and "\\[EMAIL\\]." in out   # brackets are escaped
+    assert "@someone" not in out and "@\u200bsomeone" in out
 
 
 def test_comment_has_no_live_links_from_session_text(tmp_path, capsys):

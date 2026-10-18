@@ -68,6 +68,9 @@ _ESCAPE_RE = re.compile(r"([\\`*_~\[\]()!|])")
 _BACKTICKS_RE = re.compile(r"`+")
 _ISSUE_REF_RE = re.compile(r"#(?=\d)")
 _LINE_START_RE = re.compile(r"^(?:#|>|-|\+|\d+\.)")
+# GitHub reads a mention only at the beginning of a text or after a character that is not a
+# letter, digit or underscore, so `git@github.com:acme/app.git` is not one and is kept as it is.
+_MENTION_RE = re.compile(r"(?<![A-Za-z0-9_])@")
 # GitHub links a bare URL on its own: the scheme and the `www.` prefix are the triggers,
 # and escaping the surrounding punctuation does not stop them.
 _BARE_URL_RE = re.compile(r"(?i)https?://|www\.")
@@ -126,7 +129,7 @@ def _text(value: Any, limit: Optional[int] = None) -> str:
     s = _ISSUE_REF_RE.sub(r"\\#", s)
     s = _LINE_START_RE.sub(lambda m: "\\" + m.group(0), s)
     s = _BARE_URL_RE.sub(_no_autolink, s)
-    return s.replace("@", "@" + _ZWSP)
+    return _MENTION_RE.sub("@" + _ZWSP, s)
 
 
 def _code(value: Any) -> str:
