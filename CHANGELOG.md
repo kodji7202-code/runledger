@@ -563,13 +563,16 @@ change behavior, so read the entry before you upgrade.
   it and the bare-metal recipe hand the restored file to the service user (`runledger:runledger`,
   mode `0600`) with a writable `/data` (`0700`) before the server starts, because a backup is
   owner-only and the helpers run as root. The volume archive is now described as the data volume
-  only: Caddy's certificates live in the separate `caddy-data` and `caddy-config` volumes, and the
-  clean restore removes that one volume instead of `docker compose down -v`, which would delete
-  volumes the archive does not hold. The whole-volume tar restore reads the archive the backup
-  command writes (`runledger-data-YYYY-MM-DD.tgz`, not a compact date), lists it with `tar tzf`
-  before the volume is removed, and runs the removal, extraction, ownership and restart in one
-  `sh -c` with `set -e`, so a missing or unreadable archive stops the recipe before anything is
-  deleted and a failed extraction stops it before the server starts on an empty volume.
+  only: Caddy's certificates live in the separate `caddy-data` and `caddy-config` volumes, and no
+  restore recipe removes a volume (`docker compose down -v` would delete volumes the archive does
+  not hold). The whole-volume tar restore reads the archive the backup command writes
+  (`runledger-data-YYYY-MM-DD.tgz`, not a compact date) and does every check and every write in one
+  helper container running one `sh -c` with `set -e`: it checks the archive is readable, lists it
+  with `tar tzf`, extracts its data-directory-relative members into a `/restore` directory of their
+  own, checks that the database is there, and only then empties `/data` and copies the tree in
+  (`cp -a /restore/. /data/`), giving the volume back to the service user with the database at mode
+  `0600`. The service starts only when that container exited 0 (`&&`), so a missing, unreadable,
+  corrupt or unusable archive leaves the volume exactly as it was and the server stopped.
   `docs/analysis.md` states which provider names are skipped,
   that a colon elsewhere is part of a file name, and that a `[System.IO.File]` call counts anywhere
   in a command.

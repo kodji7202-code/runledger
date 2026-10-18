@@ -5,8 +5,10 @@ The wheel is built with pip. When pip cannot reach the package index (offline, s
 build backend cannot be downloaded), the wheel tests are skipped with the reason. Any
 other build failure fails the test. Standard library only, so it runs on Python 3.9.
 """
+import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import zipfile
@@ -418,7 +420,7 @@ def test_backup_script_uses_portable_commands():
 
 def test_self_hosting_restore_recipes_match_the_backup_script():
     """The documented restore reads the folder deploy/backup.sh writes, hands the restored files
-    to the unprivileged service user, and deletes only the volume the archive holds."""
+    to the unprivileged service user, and never deletes a volume."""
     text = (ROOT / "docs" / "self-hosting.md").read_text(encoding="utf-8")
     script = (ROOT / "deploy" / "backup.sh").read_text(encoding="utf-8")
     restore = text[text.index("**Restore.**"):]
@@ -434,14 +436,22 @@ def test_self_hosting_restore_recipes_match_the_backup_script():
     # The data-volume archive does not hold Caddy's certificates, and no recipe deletes them.
     assert "including the certificates in the Caddy volume" not in text
     assert "caddy-data" in text and "caddy-config" in text
-    assert "docker volume rm deploy_runledger-data" in restore
+    assert "docker volume rm" not in restore, "no restore recipe deletes a volume"
     assert not re.search(r"^docker compose down -v", restore, re.M)
 
 
+def _tar_restore_script(text):
+    """The inner `sh -c` script of the whole-data-volume restore recipe."""
+    restore = text[text.index("**Whole data volume (tar).**"):text.index("## Upgrades")]
+    start = restore.index("-c '") + len("-c '")
+    return restore[start:restore.index("\n' sh \"$archive\"", start)]
+
+
 def test_self_hosting_tar_restore_reads_the_archive_the_backup_writes():
-    """SGD-022: the whole-volume restore names the archive the backup command writes
-    (runledger-data-YYYY-MM-DD.tgz), checks it before the volume is removed, and stops before
-    the restart when the extraction fails."""
+    """SGD-022/SGD-023/SGD-024: the whole-volume restore names the archive the backup command
+    writes (runledger-data-YYYY-MM-DD.tgz), extracts its /data-relative members into a directory
+    of their own, copies them into the volume, and does every check and destructive step inside
+    the one fail-fast shell that gates the restart."""
     text = (ROOT / "docs" / "self-hosting.md").read_text(encoding="utf-8")
     backup = text[text.index("**Whole data volume.**"):text.index("**Restore.**")]
     restore = text[text.index("**Whole data volume (tar).**"):text.index("## Upgrades")]
@@ -449,17 +459,103 @@ def test_self_hosting_tar_restore_reads_the_archive_the_backup_writes():
     # The same YYYY-MM-DD name in the restore, never the compact YYYYMMDD one.
     assert re.search(r"runledger-data-\d{4}-\d{2}-\d{2}\.tgz", restore)
     assert not re.search(r"runledger-data-\d{8}\.tgz", restore)
-    # The archive is listed before the volume is removed, so a missing one stops the recipe.
-    listing = restore.index("tar tzf")
-    removal = restore.index("docker volume rm deploy_runledger-data")
-    assert listing < removal, "check the archive before deleting the volume"
-    # One shell with `set -e`: a failed extraction ends the script before the stack starts again.
-    start = restore.index("sh -c '") + len("sh -c '")
-    script = restore[start:restore.index("'", start)]
-    assert "set -e" in script
-    assert script.index("docker volume rm") < script.index("tar xzf")
-    assert script.index("tar xzf") < script.index("docker compose up -d")
-    assert "chown -R runledger:runledger /data" in script
+    # The data volume is never removed, so a failed restore cannot lose the live data.
+    assert "docker volume rm" not in restore, "the data volume must survive a failed restore"
+    assert not re.search(r"^docker compose down( -v)?\b", restore, re.M)
+    script = _tar_restore_script(text)
+    # The recipe wraps the script in `-c '...'`, so a single quote inside it would end the
+    # wrapper early and leave the rest of the recipe to the reader's shell.
+    assert "'" not in script
+    # The archive's members are relative to /data, so they are extracted with -C into a directory
+    # of their own and copied into the volume only once the database is there.
+    assert 'tar xzf "$archive" -C /restore' in script
+    assert 'test -f /restore/runledger.db' in script
+    assert 'cp -a /restore/. /data/' in script
+    # One `set -e` shell: a missing, unreadable or corrupt archive stops before /data is touched.
+    assert script.index("set -e") < script.index('test -r "$archive"')
+    assert script.index('test -r "$archive"') < script.index("tar tzf")
+    assert script.index("tar tzf") < script.index('tar xzf "$archive" -C /restore')
+    assert script.index('test -f /restore/runledger.db') < script.index("find /data -mindepth 1 -delete")
+    assert script.index("find /data -mindepth 1 -delete") < script.index('cp -a /restore/. /data/')
+    assert script.index('cp -a /restore/. /data/') < script.index("chown -R runledger:runledger /data")
+    assert "chmod 700 /data" in script
+    assert "chmod 600 /data/runledger.db" in script
+    # The service starts only when the helper container exited 0.
+    helper = restore.index("' sh \"$archive\"") + len("' sh \"$archive\"")
+    restart = restore.index("&& docker compose start runledger")
+    assert restore[helper:restart].replace("\\", "").strip() == "", "the restart is chained with &&"
+    assert not re.search(r"^docker compose (up -d|start)\b", restore, re.M)
+
+
+def test_self_hosting_tar_restore_script_restores_a_backup_and_keeps_a_bad_one_out(tmp_path):
+    """SGD-023/SGD-024: the documented inner script, with its container paths pointed at
+    stand-ins, puts a real backup's database into the data stand-in, while a corrupt or missing
+    archive exits non-zero and leaves the existing contents alone."""
+    if os.name == "nt":
+        pytest.skip("the recipe is a POSIX script; on Windows it runs in the container")
+    tar = shutil.which("tar")
+    if tar is None:
+        pytest.skip("no tar on this runner")
+    text = (ROOT / "docs" / "self-hosting.md").read_text(encoding="utf-8")
+    data = tmp_path / "data"
+    backup = tmp_path / "backup"
+    restore_dir = tmp_path / "restore"
+    for folder in (data, backup, restore_dir):
+        folder.mkdir()
+    script = _tar_restore_script(text)
+    for container, sandbox in (("/data", str(data)), ("/backup", str(backup)),
+                               ("/restore", str(restore_dir))):
+        assert container in script, "the recipe is expected to use %s" % container
+        script = script.replace(container, sandbox)
+    # The script names the stand-ins only, so a test run cannot touch a real /data, /backup or
+    # /restore, and the ownership line still asks for the service user the image defines.
+    for container, sandbox in (("/data", str(data)), ("/backup", str(backup)),
+                               ("/restore", str(restore_dir))):
+        assert container not in script.replace(sandbox, ""), "a real %s would be touched" % container
+    assert "runledger:runledger" in script
+    script = script.replace("runledger:runledger", "%d:%d" % (os.getuid(), os.getgid()))
+    script_path = tmp_path / "restore.sh"
+    with open(script_path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(script)
+
+    def run(name):
+        return subprocess.run(["/bin/sh", str(script_path), name], capture_output=True, text=True)
+
+    volume = tmp_path / "volume"
+    (volume / "backups").mkdir(parents=True)
+    (volume / "runledger.db").write_bytes(b"the backed up database\n")
+    (volume / "backups" / "runledger-old.db").write_bytes(b"an older backup\n")
+    archive = backup / "runledger-data-2026-10-18.tgz"
+    # The shape of the documented backup command: tar czf <archive> -C /data .
+    subprocess.run([tar, "czf", str(archive), "-C", str(volume), "."], check=True)
+
+    (data / "runledger.db").write_bytes(b"the live database\n")
+    (data / "runledger.db-wal").write_bytes(b"the live wal\n")
+    (data / "leftover.txt").write_bytes(b"not in the archive\n")
+
+    restored = run(archive.name)
+    assert restored.returncode == 0, restored.stderr
+    assert (data / "runledger.db").read_bytes() == b"the backed up database\n"
+    assert (data / "backups" / "runledger-old.db").read_bytes() == b"an older backup\n"
+    assert not (data / "runledger.db-wal").exists(), "the old database's wal is replaced"
+    assert not (data / "leftover.txt").exists(), "the volume holds the archive, not the old mix"
+    assert stat.S_IMODE((data / "runledger.db").stat().st_mode) == 0o600
+    assert stat.S_IMODE(data.stat().st_mode) == 0o700
+
+    def snapshot():
+        return sorted(
+            (str(path.relative_to(data)), path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
+            for path in data.rglob("*") if path.is_file()
+        )
+
+    before = snapshot()
+    (backup / "runledger-data-2026-10-17.tgz").write_bytes(b"this is not a tar archive\n")
+    corrupt = run("runledger-data-2026-10-17.tgz")
+    assert corrupt.returncode != 0, "a corrupt archive must stop the recipe"
+    assert snapshot() == before, "a corrupt archive must leave the volume untouched"
+    missing = run("runledger-data-2026-10-16.tgz")
+    assert missing.returncode != 0, "a missing archive must stop the recipe"
+    assert snapshot() == before, "a missing archive must leave the volume untouched"
 
 
 def test_license_file_is_apache_2_0():
