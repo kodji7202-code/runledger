@@ -50,7 +50,9 @@ mentioning a runner (`grep pytest`, `echo npm test`) is not a run. An install ve
 subcommand (`pip install pytest`, `uv add pytest`, `npm i jest`), so a run whose arguments contain
 one of those words (`pytest -k add`, `npm test -- --grep install`) still counts. Results are read
 from the runner's summary lines: the pytest footer or quiet form (counts and a timing and nothing
-else, as in `3 passed in 0.20s` or `=== 2 failed, 3 passed in 0.50s ===`), the jest/vitest `Tests:`
+else, as in `3 passed in 0.20s` or `=== 2 failed, 3 passed in 0.50s ===`, optionally behind a
+container service name or a timestamp, as in `app  | 3 passed in 0.5s`,
+`2026-10-18T12:00:00Z 3 passed in 0.5s` or `[12:00:01] 3 passed in 0.5s`), the jest/vitest `Tests:`
 line, mocha's `N passing`/`N failing`, go's `ok`/`FAIL` lines, cargo's `test result:` line and
 unittest's `Ran N tests` footer. A count in free-form text (`retried after 3 errors in 0.10s`) is
 not a summary, and `0 errors` is not a failure. An explicit `N failed` still marks the run failed
