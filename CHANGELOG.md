@@ -421,6 +421,44 @@ change behavior, so read the entry before you upgrade.
   ever), so a 35-day run period keeps a year of audit history instead of deleting it with the runs.
   With neither variable set, nothing is deleted, whatever its age, as in v0.6.0.
 
+- **The pull request comment is only updated when it is RunLedger's own, and untrusted text can no
+  longer build links (`runledger.github`):** the sticky comment is looked up among the comments the
+  token itself wrote (`GET /user`; `GITHUB_TOKEN` cannot call it, so then only a bot's comment
+  counts), and a comment planted by somebody else with the marker is left alone: a new comment is
+  created instead of a `PATCH` to theirs. A refused `PATCH` (403 or 404, for example a comment from
+  an app that has since been removed) falls back to a fresh comment with a notice on stderr. Session
+  text (titles, risk reasons, models) is backslash-escaped for Markdown punctuation (`[`, `]`, `(`,
+  `)`, `!`, backticks, `*`, `_`, `~`, `|`) and for line-leading `#`, `>`, `-`, `+` and `1.`, `#12`
+  becomes `\#12`, HTML stays escaped and `@` is still neutralized with a zero-width space, so the only
+  live link in the comment is the footer. A file path or command containing a backtick is shown in a
+  code span whose fence is widened (`` `` dir/we`ird.py `` ``) instead of replacing the backtick with
+  `'`.
+
+- **The comment says which agent, what Guard decided and how the tests ended (`runledger.github`,
+  `runledger.guard_receipt`):** each run's block now carries a `Guard:` line with the blocked, asked,
+  approved and rejected counts plus the warnings (monitor-mode interventions and ignored loosening
+  settings) and a `Tests:` line (`N test command(s) ran · last run 3 passed, 0 failed · verdict:
+  passed`, or a distinct "no tests run"). The footer states that the comment was built in safe mode
+  with paths shortened and e-mails masked, and the run table names Factory Droid like every other
+  agent.
+
+- **One unreadable session no longer loses the whole comment, and an empty folder can be accepted
+  (`runledger.github`):** a session file that cannot be parsed is skipped with a
+  `::warning file=…::` annotation naming it, the comment is still posted for the readable sessions and
+  says "N session(s) could not be read"; when no file can be read at all, nothing is posted and the
+  exit code is `3`. `--allow-empty` (and the `allow-empty` action input) turns an empty session folder
+  into a notice, a one-line job summary and exit `0` instead of an error. A failed post now always
+  exits `3`, printing the posting error and the threshold message together, so a red job never hides
+  that the comment never went up. A fork pull request (read-only token: `Resource not accessible by
+  integration`, or a `pull_request` event whose head repository is a fork) writes the full receipt to
+  `GITHUB_STEP_SUMMARY`, prints a notice and exits `0` while still honouring `--fail-on`; every other
+  403, and a 401, stay errors.
+
+- **The Action covers every agent (`action.yml`):** the description and `sessions-dir` input name AI
+  coding agent sessions (`.jsonl` and `.runledger.json`, Claude Code, Codex and Factory Droid) and
+  the Droid `.settings.json` sidecar that carries usage, and two inputs are new: `allow-empty`
+  (default `false`) and `python-version` (default `3.11`), which the setup step now uses.
+
 ### Security
 
 - **A cross-site `GET /?key=` link cannot sign the browser in to another team (`runledger.server`):**

@@ -371,4 +371,9 @@ def test_the_pull_request_comment_redacts_a_secret_inside_a_label(tmp_path, caps
     out = capsys.readouterr().out
     assert rc == 0
     assert "reviewdummy123" not in out
-    assert SHOWN_REASON in out
+    # The comment escapes Markdown punctuation, brackets and parentheses included, so the
+    # label is read back after removing the backslashes it adds.
+    shown = out
+    for char in "[]()":
+        shown = shown.replace("\\" + char, char)
+    assert SHOWN_REASON in shown

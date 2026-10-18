@@ -155,6 +155,37 @@ def load_guard_decisions(run: Run) -> List[Dict[str, Any]]:
     return decisions
 
 
+def guard_warning_count(run: Run) -> int:
+    """Rows the Guard logged as a plain warning for this run (an ignored loosening setting).
+    Monitor-mode rows are decisions, which `guard_counts` already reports, so they are not
+    counted here. Missing, unreadable and unknown-CWD logs count zero."""
+    if not run.cwd or is_unc(run.cwd):
+        return 0
+    total = 0
+    seen_files = set()
+    seen = set()
+    for path in _log_paths(run.cwd):
+        try:
+            key = os.path.normcase(os.path.abspath(str(path)))
+        except OSError:
+            key = str(path)
+        if key in seen_files:
+            continue
+        seen_files.add(key)
+        for record in _records(path):
+            if record.get("session_id") != run.session_id:
+                continue
+            if record.get("decision") != "warning" or record.get("mode") == "monitor":
+                continue  # monitor-mode rows are decisions, and guard_counts() counts them
+            dup = (record.get("ts"), record.get("reason"))
+            if record.get("ts") is not None:
+                if dup in seen:
+                    continue
+                seen.add(dup)
+            total += 1
+    return total
+
+
 def guard_counts(decisions: List[Dict[str, Any]]) -> Dict[str, int]:
     outcomes = [d["outcome"] for d in decisions]
     approved = sum(o in ("Approved by user", "Approved by approval server") for o in outcomes)
