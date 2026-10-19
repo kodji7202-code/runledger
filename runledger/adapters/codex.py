@@ -482,13 +482,18 @@ def _code_mode_calls(source: str) -> List[Tuple[str, Dict[str, Any]]]:
     and the risk engine both see the plain command, so the step carries that command under the
     tool name of the shell that ran it. Only real calls count: the same text in a comment or a
     string is an example, not a call. A call whose arguments are not static is left out, so a
-    script with no readable call keeps its single opaque step."""
+    script with no readable call keeps its single opaque step. A source the scanner cannot read
+    to the end is searched as raw text instead: over-reporting a call is safer than hiding one."""
     calls: List[Tuple[str, Dict[str, Any]]] = []
-    for start, end in _code_spans(source):
+    spans, clean = _code_spans(source)
+    regions = spans if clean else [(0, len(source))]
+    for start, end in regions:
         for match in CODE_CALL_RE.finditer(source, start, end):
             if match.group(1) not in SHELL_FUNCTIONS:
                 continue
             body = _object_body(source, match.end() - 1)
+            if body is None and not clean:
+                body = source[match.end():]
             if body is None:
                 continue
             args = _js_object(body)
@@ -503,36 +508,78 @@ def _code_mode_calls(source: str) -> List[Tuple[str, Dict[str, Any]]]:
     return calls
 
 
-def _code_spans(source: str) -> List[Tuple[int, int]]:
-    """The code regions of a JavaScript source, comments and literal text left out.
+def _code_spans(source: str) -> Tuple[List[Tuple[int, int]], bool]:
+    """The code regions of a JavaScript source, comments and literal text left out, and
+    whether the scan finished cleanly. An unterminated literal leaves the rest of the source
+    unreadable, and then the caller searches the raw text instead.
 
     A call written in a comment or inside a string is text, never a call. The `${...}` body of
-    a template literal is code again. Unterminated input simply runs to the end."""
+    a template literal is code again."""
     spans: List[Tuple[int, int]] = []
-    _js_code_end(source, 0, "", spans)
-    return spans
+    state = {"clean": True}
+    _js_code_end(source, 0, "", spans, state)
+    return spans, bool(state["clean"])
+
+
+# A `/` after one of these words starts a regular expression: they expect an expression next.
+_REGEX_PREV_WORDS = frozenset((
+    "await", "case", "delete", "do", "else", "in", "instanceof", "new", "of", "return",
+    "throw", "typeof", "void", "yield",
+))
+# A token that ends a value: after it a `/` divides. Identifiers and numbers are checked
+# separately, and `}` is deliberately not here, so a pattern after a block is read as one.
+_REGEX_VALUE_END = ")]\"'`/"
+
+
+def _js_regex_starts(prev: str, prev_word: str) -> bool:
+    """The standard JavaScript rule: a `/` starts a regular expression when the previous
+    significant token is not an identifier, a number, `)` or `]`. A string, a template or
+    another regular expression ends a value too, and a keyword that expects an expression
+    after it (`return /re/`) starts one."""
+    if not prev:
+        return True
+    if prev.isalnum() or prev in "_$":
+        return prev_word in _REGEX_PREV_WORDS
+    return prev not in _REGEX_VALUE_END
 
 
 def _js_code_end(source: str, start: int, stop: str,
-                 spans: Optional[List[Tuple[int, int]]] = None) -> int:
+                 spans: Optional[List[Tuple[int, int]]] = None,
+                 state: Optional[Dict[str, bool]] = None) -> int:
     """Scan code from `start` until the `stop` char at brace depth 0, or the end of `source`.
 
-    Literals and comments are stepped over; with `spans`, every code region is collected."""
+    Literals and comments are stepped over; with `spans`, every code region is collected. A
+    quote inside a `/.../ ` pattern belongs to the pattern, so a regular expression is stepped
+    over as one literal. `state["clean"]` is set False when a literal or comment never ends."""
     i, seg, depth = start, start, 0
+    prev, prev_word = "", ""
     n = len(source)
     while i < n:
         ch = source[i]
         if ch in "\"'`":
             if spans is not None and i > seg:
                 spans.append((seg, i))
-            i = _js_literal_end(source, i, spans)
-            seg = i
+            i = _js_literal_end(source, i, spans, state)
+            seg, prev, prev_word = i, ch, ""
             continue
         if ch == "/" and (source.startswith("//", i) or source.startswith("/*", i)):
             if spans is not None and i > seg:
                 spans.append((seg, i))
-            i = _js_comment_end(source, i)
+            i = _js_comment_end(source, i, state)
             seg = i
+            continue
+        if ch == "/" and _js_regex_starts(prev, prev_word):
+            if spans is not None and i > seg:
+                spans.append((seg, i))
+            i = _js_regex_end(source, i, state)
+            seg, prev, prev_word = i, "/", ""
+            continue
+        if ch.isalnum() or ch in "_$":
+            j = i
+            while j < n and (source[j].isalnum() or source[j] in "_$"):
+                j += 1
+            prev_word, prev = source[i:j], source[j - 1]
+            i = j
             continue
         if stop == "}":
             if ch == "{":
@@ -541,17 +588,47 @@ def _js_code_end(source: str, start: int, stop: str,
                 if depth == 0:
                     break
                 depth -= 1
+        if not ch.isspace():
+            prev, prev_word = ch, ""
         i += 1
     if spans is not None and i > seg:
         spans.append((seg, i))
     return i + 1 if stop and i < n else i
 
 
+def _js_regex_end(source: str, start: int, state: Optional[Dict[str, bool]] = None) -> int:
+    """The index after the regular-expression literal at `source[start]`: its first unescaped
+    `/` outside a `[...]` character class. A pattern never spans a line, and one that never
+    closes runs to the end of the source and leaves the scan unclean."""
+    i, n = start + 1, len(source)
+    in_class = False
+    while i < n:
+        ch = source[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == "\n":
+            break
+        if ch == "[":
+            in_class = True
+        elif ch == "]":
+            in_class = False
+        elif ch == "/" and not in_class:
+            return i + 1
+        i += 1
+    if state is not None:
+        state["clean"] = False
+    return n
+
+
 def _js_literal_end(source: str, start: int,
-                    spans: Optional[List[Tuple[int, int]]] = None) -> int:
+                    spans: Optional[List[Tuple[int, int]]] = None,
+                    state: Optional[Dict[str, bool]] = None) -> int:
     """The index after the string or template literal at `source[start]`.
 
-    With `spans`, the code inside a template's `${...}` interpolation is collected too."""
+    With `spans`, the code inside a template's `${...}` interpolation is collected too. A
+    single- or double-quoted string cannot cross a line, so one that does is unterminated:
+    the rest of the source is unreadable and the scan is left unclean."""
     if start >= len(source) or source[start] not in "\"'`":
         return start + 1
     quote = source[start]
@@ -564,18 +641,27 @@ def _js_literal_end(source: str, start: int,
             continue
         if ch == quote:
             return i + 1
+        if ch == "\n" and quote != "`":
+            break
         if quote == "`" and ch == "$" and source.startswith("{", i + 1):
-            i = _js_code_end(source, i + 2, "}", spans)
+            i = _js_code_end(source, i + 2, "}", spans, state)
             continue
         i += 1
+    if state is not None:
+        state["clean"] = False
     return n
 
 
-def _js_comment_end(source: str, start: int) -> int:
+def _js_comment_end(source: str, start: int,
+                    state: Optional[Dict[str, bool]] = None) -> int:
     """The index after the `//` or `/*` comment at `source[start]`."""
     if source.startswith("/*", start):
         close = source.find("*/", start + 2)
-        return len(source) if close < 0 else close + 2
+        if close < 0:
+            if state is not None:
+                state["clean"] = False
+            return len(source)
+        return close + 2
     newline = source.find("\n", start)
     return len(source) if newline < 0 else newline
 
@@ -595,19 +681,35 @@ def _js_skip_blanks(source: str, start: int) -> int:
 
 
 def _object_body(source: str, start: int) -> Optional[str]:
-    """The text between the braces of the object literal at `source[start]`, else None."""
+    """The text between the braces of the object literal at `source[start]`, else None.
+
+    String, comment and regular-expression literals are stepped over, so a brace or a quote
+    inside one of them cannot end the object early."""
     if start >= len(source) or source[start] != "{":
         return None
     depth = 0
     i = start
+    prev, prev_word = "(", ""
     n = len(source)
     while i < n:
         ch = source[i]
         if ch in "\"'`":
             i = _js_literal_end(source, i)
+            prev, prev_word = ch, ""
             continue
         if ch == "/" and (source.startswith("//", i) or source.startswith("/*", i)):
             i = _js_comment_end(source, i)
+            continue
+        if ch == "/" and _js_regex_starts(prev, prev_word):
+            i = _js_regex_end(source, i)
+            prev, prev_word = "/", ""
+            continue
+        if ch.isalnum() or ch in "_$":
+            j = i
+            while j < n and (source[j].isalnum() or source[j] in "_$"):
+                j += 1
+            prev_word, prev = source[i:j], source[j - 1]
+            i = j
             continue
         if ch == "{":
             depth += 1
@@ -615,6 +717,8 @@ def _object_body(source: str, start: int) -> Optional[str]:
             depth -= 1
             if depth == 0:
                 return source[start + 1:i]
+        if not ch.isspace():
+            prev, prev_word = ch, ""
         i += 1
     return None
 

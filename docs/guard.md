@@ -271,6 +271,10 @@ the command being run, and a `DELETE FROM` inside a heredoc body is not scanned 
 limitation quoted text always had). A flag right before a separator still counts, so
 `git push origin feature --delete; echo done` is the delete it looks like, and a `find -name`
 pattern is text rather than a command: `find . -name 'helm uninstall web' -print` is a search.
+Only the literal text of such an argument is blanked, though: the shell runs a `$(...)` or a
+backtick the word carries before the command starts, so `find . -name "$(rm -rf ./victim)"` and
+``find . -name `helm uninstall web` `` stay denied. Single-quoted text is literal and an escaped
+`\$` computes nothing, so `find . -name '$(rm -rf ./victim)' -print` stays a search.
 The rule families, by severity:
 
 - **medium:** force-deleting a git branch (`git branch -D`, `git branch -fD`,
@@ -380,9 +384,14 @@ the pattern) and `raw`. The expression is searched case-insensitively:
 - with `"raw": true` it reads the whole command, so a pattern can also match text the command only
   prints. Use it only for words that cannot appear in an unrelated message.
 
-A pattern that is not a safe regular expression (unbalanced brackets, or one that can backtrack
-catastrophically) is dropped, and the warning names it and the file it came from. `deny` entries
-deny, `ask` entries ask, and a command that matches both is denied.
+A pattern that is not a safe regular expression is dropped, and the warning names it and the file
+it came from. That covers unbalanced brackets, a backreference, more than two unbounded repeats,
+and the patterns that backtrack catastrophically: a repeat of any kind inside a repeat
+(`(a+)+`, `(?:a{1,32}){1,32}b`, `(?:a?){40}b`) and an alternation inside one (`(aa|a)+b`). A
+dropped pattern never runs, so an entry from a file you did not write cannot stall the hook. A
+rule reads at most the first 20 000 characters of a command (the same bound the SQL inspection
+uses) and each pattern is at most 200 characters. `deny` entries deny, `ask` entries ask, and a
+command that matches both is denied.
 
 `tool_rules` matches the tool name with `fnmatch` globs (`*` and `?`), case-sensitively, against
 the whole name. Rules apply to any tool, not only MCP ones: `Edit` can be denied, and

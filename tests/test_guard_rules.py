@@ -233,6 +233,50 @@ def test_oddly_typed_rules_do_not_break_the_hook_process(tmp_path, isolated_sett
     assert allowed.returncode == 0 and allowed.stdout == b"" and b"Traceback" not in allowed.stderr
 
 
+# A repeat of any kind inside a repeat backtracks exponentially: `(?:a?){40}b` needs an input
+# with forty optional branches, `(a|a)*b` and `(a|aa)+b` split the same text several ways.
+CATASTROPHIC_RULES = [
+    r"(?:a{1,32}){1,32}b",
+    r"(?:a?){40}b",
+    r"(?:a?){12}b",
+    r"(a|a)*b",
+    r"(a|aa)+b",
+    r"(\d{1,3}\.){3}",
+]
+
+
+@pytest.mark.parametrize("pattern", CATASTROPHIC_RULES)
+def test_the_hook_finishes_quickly_for_every_catastrophic_rule(tmp_path, isolated_settings,
+                                                               pattern):
+    """Every nested-repeat shape is dropped, so the probe that would take hours never runs:
+    the real hook answers in well under its own timeout (GE-005)."""
+    write_user_config(isolated_settings, {
+        "command_rules": {"deny": [{"pattern": pattern, "raw": True, "reason": "nested"}]}})
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(PROJECT_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+    start = time.monotonic()
+    proc = subprocess.run([sys.executable, "-m", "runledger", "guard"],
+                          input=json.dumps(bash_event(tmp_path, "echo " + "a" * 40 + "!")).encode("utf-8"),
+                          capture_output=True, cwd=str(tmp_path), env=env, timeout=15)
+    spent = time.monotonic() - start
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == b"" and b"Traceback" not in proc.stderr
+    assert spent < 10.0, f"{pattern} stalled the hook for {spent:.1f}s"
+
+
+def test_a_command_rule_reads_only_the_first_20000_characters(tmp_path):
+    """A `command_rules` regex reads a bounded prefix of the command, like the SQL inspection:
+    a project file cannot make the guard work on an arbitrarily long command (GE-005)."""
+    write_project(tmp_path, {"command_rules": {"deny": [r"\bforbidden\b",
+                                                        {"pattern": r"\brawword\b",
+                                                         "raw": True,
+                                                         "reason": "raw bounded"}]}})
+    assert permission(handle(tmp_path, "myfancytool forbidden")) == "deny"
+    assert permission(handle(tmp_path, "myfancytool rawword")) == "deny"
+    assert handle(tmp_path, "myfancytool " + "x" * 20000 + " forbidden") is None
+    assert handle(tmp_path, "myfancytool " + "x" * 20000 + " rawword") is None
+
+
 # ---------------------------------------------------------------- VAL-RULES-021
 
 def test_a_rule_hit_survives_a_user_replaced_deny_list(tmp_path, isolated_settings):

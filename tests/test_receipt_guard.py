@@ -365,6 +365,47 @@ def test_codex_row_links_by_the_recorded_tool_use_id(tmp_path):
     assert decision["step"] == 1 and decision["outcome"] == "Approved by approval server"
 
 
+def _codex_code_mode_run(tmp_path, command="rm -rf victim", call_id="ctc-1"):
+    """A Codex code-mode `exec` call whose script scans a regular expression holding a quote
+    before it really calls `tools.exec_command`."""
+    from runledger.adapters import codex as codex_adapter
+
+    project = tmp_path / "codex-code-proj"
+    project.mkdir()
+    script = ('const stripQuotes = /\\"/g;\n'
+              'const r = await tools.exec_command({cmd:"' + command + '",shell:"bash"});\n'
+              'text(r.output);')
+    lines = [
+        {"timestamp": "2026-10-19T13:00:00.000Z", "type": "session_meta",
+         "payload": {"id": CODEX_SESSION_ID, "cwd": str(project), "model": "gpt-6-luna"}},
+        {"timestamp": "2026-10-19T13:00:01.000Z", "type": "response_item",
+         "payload": {"type": "custom_tool_call", "name": "exec", "call_id": call_id,
+                     "id": "ctc_" + call_id, "status": "completed", "input": script}},
+        {"timestamp": "2026-10-19T13:00:02.000Z", "type": "response_item",
+         "payload": {"type": "custom_tool_call_output", "call_id": call_id,
+                     "output": [{"type": "input_text", "text": "blocked by RunLedger guard"}]}},
+    ]
+    session = project / ("rollout-2026-10-19T13-00-00-" + CODEX_SESSION_ID + ".jsonl")
+    session.write_text("\n".join(json.dumps(x) for x in lines) + "\n", encoding="utf-8")
+    return codex_adapter.parse(session), project
+
+
+def test_codex_code_mode_row_links_the_step_behind_a_regex_literal(tmp_path):
+    """GE-018: a quote inside a regex literal before the real call cannot hide the shell step,
+    so the guard decision that blocked it still links to that step."""
+    run, project = _codex_code_mode_run(tmp_path)
+    assert [(s.tool, s.input) for s in run.steps] == [("Bash", {"command": "rm -rf victim"})]
+    _write_log(project, [{
+        "ts": "2026-10-19T13:00:01Z", "session_id": CODEX_SESSION_ID,
+        "tool_use_id": "ctc-1", "tool": "Bash", "agent": "codex", "canonical_tool": "Bash",
+        "decision": "deny", "policy_decision": "deny", "codes": ["command"],
+        "summary": "rm -rf victim",
+        "reason": "Blocked by RunLedger guard: Recursive force delete (rm -rf)",
+    }])
+    decision, = load_guard_decisions(run)
+    assert decision["step"] == 1 and decision["outcome"] == "Blocked by Guard"
+
+
 def _codex_shell_switch_run(tmp_path, command="Get-Content .env"):
     """A Codex rollout where the same command ran twice, first through PowerShell, then Bash:
     a code-mode retry after a block. The hook sees `Bash` for both calls."""

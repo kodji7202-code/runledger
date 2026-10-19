@@ -136,6 +136,10 @@ SHELL_TOOLS = ("Bash", "PowerShell")
 RULE_ASK_CODE = "rule_ask"
 RULE_DENY_CODE = "rule_deny"
 RULE_CODES = (("deny", RULE_DENY_CODE, "high"), ("ask", RULE_ASK_CODE, "medium"))
+# A user or project rule reads at most this many characters of a command, like the SQL
+# inspection (`mcp_risk.SQL_MAX_CHARS`): even a bounded repeat cannot make the synchronous
+# guard path walk an arbitrarily long command.
+RULE_MATCH_MAX_CHARS = 20000
 
 # Shell rules shared by Bash and PowerShell steps, matched against the command text
 # with heredoc bodies, comments and text arguments removed (see _code_view).
@@ -964,14 +968,103 @@ def _check_shell_word(w: _Word, name: str, cwd: Optional[str], workdir: Optional
         risks.append(Risk("low", "shell_outside", f"Shell command referenced a path outside the working folder ({shown})", step.index))
 
 
-def _code_view(text: str, comments: List[Tuple[int, int]], text_words: List[_Word]) -> str:
+def _substitution_spans(raw: str, ps: bool = False) -> List[Tuple[int, int]]:
+    """The offsets of the commands a shell runs inside `raw` before the command itself starts:
+    `$(...)` everywhere, and a backtick for a POSIX shell. Single-quoted text is literal, so
+    `'$(rm -rf x)'` is a file name; an escaped `$` or backtick computes nothing either."""
+    spans: List[Tuple[int, int]] = []
+    i, n = 0, len(raw)
+    while i < n:
+        ch = raw[i]
+        if ch == "'" and raw[i - 1:i] != "$":
+            close = raw.find("'", i + 1)
+            i = n if close < 0 else close + 1
+            continue
+        if ch == '"':
+            i += 1
+            while i < n and raw[i] != '"':
+                if raw[i] == "\\" and i + 1 < n and (ps or raw[i + 1] in '"\\$`'):
+                    i += 2
+                    continue
+                if raw[i] == "$" and raw[i + 1:i + 2] == "(":
+                    end = _substitution_end(raw, i)
+                elif raw[i] == "`" and not ps:
+                    close = raw.find("`", i + 1)
+                    end = n if close < 0 else close + 1
+                else:
+                    i += 1
+                    continue
+                spans.append((i, end))
+                i = end
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if ch == "$" and raw[i + 1:i + 2] == "(":
+            end = _substitution_end(raw, i)
+        elif ch == "`" and not ps:
+            close = raw.find("`", i + 1)
+            end = n if close < 0 else close + 1
+        else:
+            i += 1
+            continue
+        spans.append((i, end))
+        i = end
+    return spans
+
+
+def _substitution_end(raw: str, start: int) -> int:
+    """The index after the `)` closing the `$(` at `start`; the end of `raw` when it never
+    closes, so an unreadable substitution stays visible rather than blanked."""
+    depth = 0
+    i, n = start + 1, len(raw)
+    while i < n:
+        ch = raw[i]
+        if ch == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if ch == "'":
+            close = raw.find("'", i + 1)
+            i = n if close < 0 else close + 1
+            continue
+        if ch == '"':
+            i += 1
+            while i < n and raw[i] != '"':
+                i += 2 if raw[i] == "\\" else 1
+            i += 1
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return n
+
+
+def _code_view(text: str, comments: List[Tuple[int, int]], text_words: List[_Word],
+               ps: bool = False) -> str:
     """The command text the dangerous-command rules read: comments removed, and text
-    arguments (echo, git commit -m, python -c, a `find -name` pattern) blanked. Unquoted
-    $VAR words are kept."""
+    arguments (echo, git commit -m, python -c, a `find -name` pattern) blanked. A command
+    substitution inside a text argument stays: the shell runs it before the command does, so
+    only the literal text around it is blanked (GE-017). Unquoted $VAR words are kept."""
     spans = [(s, e, "") for s, e in comments]
     for w in text_words:
-        if w.quoted or not w.value.startswith("$") or "$(" in w.value:
-            spans.append((w.start, w.end, '""'))
+        raw = text[w.start:w.end]
+        subs = _substitution_spans(raw, ps)
+        if not subs:
+            if w.quoted or not w.value.startswith("$") or "$(" in w.value:
+                spans.append((w.start, w.end, '""'))
+            continue
+        pos = 0
+        for s, e in subs:
+            if s > pos:
+                spans.append((w.start + pos, w.start + s, '""'))
+            pos = e
+        if pos < len(raw):
+            spans.append((w.start + pos, w.end, '""'))
     out = text
     for s, e, rep in sorted(spans, key=lambda x: x[0], reverse=True):
         out = out[:s] + rep + out[e:]
@@ -1002,7 +1095,7 @@ def _shell_risks(step: Step, cwd: Optional[str], extra: List["re.Pattern"], risk
     cmds = _simple_commands(items)
     names = [_plan(words, ps) for words in cmds]
     text_words = [w for words in cmds for w in words if w.role == "text"]
-    code = _code_view(prepared, comments, text_words)
+    code = _code_view(prepared, comments, text_words, ps)
 
     rules = list(_DANGEROUS)
     if ps:
@@ -1302,13 +1395,16 @@ def command_rule_risks(command: str, view: str, policy: Optional[Dict[str, Any]]
     """Risks for the `command_rules` of the user's file and the project's file.
 
     `view` is the quote/heredoc-blanked command the built-in rules read; an entry with
-    `raw: true` reads `command` itself, so a rule can also match quoted text."""
+    `raw: true` reads `command` itself, so a rule can also match quoted text. Either way only
+    the first `RULE_MATCH_MAX_CHARS` characters are read."""
     rules = policy.get("command_rules") if isinstance(policy, dict) else None
     risks: List[Risk] = []
     if not isinstance(rules, dict):
         return risks
+    text = view[:RULE_MATCH_MAX_CHARS]
+    raw = command[:RULE_MATCH_MAX_CHARS]
     for kind, code, severity in RULE_CODES:
-        hits = [r["label"] for r in rules.get(kind) or [] if r["rx"].search(command if r["raw"] else view)]
+        hits = [r["label"] for r in rules.get(kind) or [] if r["rx"].search(raw if r["raw"] else text)]
         risks.extend(_rule_matched_risks(kind, code, severity, hits, index))
     return risks
 

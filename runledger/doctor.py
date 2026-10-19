@@ -211,7 +211,13 @@ def _hook_check(root: str, agent: str, scope: str, user: Dict[str, Any],
 
     issues: List[Tuple[str, str, str]] = []
     if not guard_hooks:
-        issues.append((WARN, f"the guard hook is missing from {path}", REINSTALL_FIX))
+        foreign = _first_unowned_command_text(agent, path)
+        if foreign:
+            issues.append((WARN, f"the PreToolUse command {foreign!r} in {path} is not a "
+                                 f"RunLedger guard hook: the guard does not run for this file",
+                           REINSTALL_FIX))
+        else:
+            issues.append((WARN, f"the guard hook is missing from {path}", REINSTALL_FIX))
     if len(guard_hooks) > 1:
         issues.append((WARN, f"{len(guard_hooks)} guard entries in {path}: the guard would run "
                              f"once per entry", REINSTALL_FIX))
@@ -231,6 +237,17 @@ def _hook_check(root: str, agent: str, scope: str, user: Dict[str, Any],
     detail = f"{who}: " + "; ".join(text for _, text, _ in issues)
     fix = _first_fix(issues) or REINSTALL_FIX
     return [check(status, detail[len(who) + 2:], fix)]
+
+
+def _first_unowned_command_text(agent: str, path: Path) -> str:
+    """The first stored PreToolUse command of that file that RunLedger does not own, else ""."""
+    for entry, _ in _pre_tool_use_entries(path, agent):
+        if _guard._is_guard_hook(entry):
+            continue
+        text = _hook_command_text(agent, entry)
+        if text:
+            return text
+    return ""
 
 
 def _first_fix(issues: Sequence[Tuple[str, str, str]]) -> str:
@@ -417,6 +434,17 @@ def _skip_selftest() -> List[Check]:
 
 # ---------------------------------------------------------------- the self-test
 
+@dataclass
+class _StoredHook:
+    """The PreToolUse command doctor may run for one agent's self-test.
+
+    `command` is None when the agent does run a stored command that RunLedger does not own:
+    `blocked` names it, and doctor reports it instead of running it."""
+    command: Optional[str]
+    scope: str
+    blocked: str
+
+
 def _selftest_checks(root: str, agents: Sequence[str], user: Dict[str, Any]) -> List[Check]:
     """Run the stored hook command of every installed agent once, in a temp folder."""
     out: List[Check] = []
@@ -427,40 +455,77 @@ def _selftest_checks(root: str, agents: Sequence[str], user: Dict[str, Any]) -> 
             found = _stored_command(root, agent)
             if found is None:
                 continue
-            command, scope = found
             if folder is None:
                 folder = Path(tempfile.mkdtemp(prefix="runledger-doctor-"))
                 env = _selftest_env(folder, user)
-            out.append(_selftest_check(agent, scope, command, env, str(folder)))
+            if found.command is None:
+                out.append(Check("guard.selftest", FAIL, "hook self-test",
+                                 f"{hook_targets.LABEL[agent]} {found.scope}: {found.blocked}",
+                                 fix=SELFTEST_FIX, agent=agent))
+                continue
+            out.append(_selftest_check(agent, found.scope, found.command, env, str(folder)))
     finally:
         if folder is not None:
             shutil.rmtree(str(folder), ignore_errors=True)
     return out
 
 
-def _stored_command(root: str, agent: str) -> Optional[Tuple[str, str]]:
-    """`(command, scope)` of the PreToolUse hook the agent would run for a tool call.
+def _stored_command(root: str, agent: str) -> Optional[_StoredHook]:
+    """The command doctor may run through the shell for that agent, and where it comes from.
 
     RunLedger's own guard entry comes first, and for Codex the `commandWindows` copy is the
-    command that agent runs on Windows. A file whose guard entry was hand-edited no longer
-    matches the installed shape, so any entry the agent would run for every tool is used
-    instead - but only in a file that still stores RunLedger's own hooks: a foreign PreToolUse
-    hook is never run as the guard's self-test, and it never hides a RunLedger entry that is
-    installed in another scope."""
+    command that agent runs on Windows. Only a command RunLedger owns is selected: a foreign
+    PreToolUse command in a file that still stores RunLedger hooks (a checkpoint beside a
+    deleted guard entry, for example) is reported instead of run, and it never hides a
+    RunLedger entry installed in another scope."""
+    blocked, blocked_scope = "", ""
     for scope in SCOPES:
         path = Path(hook_targets.target_for(agent, root, global_scope=(scope == "global")).path)
         entries = _pre_tool_use_entries(path, agent)
         if not entries:
             continue
-        chosen = [e for e, _ in entries if _guard._is_guard_hook(e)]
-        if not chosen and _holds_runledger_hooks(path, agent):
-            chosen = [e for e, matcher in entries if matcher in ("", "*", ".*")]
-            if not chosen:
-                chosen = [e for e, _ in entries]
-        for entry in chosen:
-            command = entry.get("command")
-            if isinstance(command, str) and command.strip():
-                return _windows_override(agent, entry) or command, scope
+        for entry in [e for e, _ in entries if _guard._is_guard_hook(e)]:
+            command = _effective_hook_command(agent, entry)
+            if command is not None:
+                return _StoredHook(command, scope, "")
+            if not blocked:
+                blocked, blocked_scope = (
+                    f"the stored command {_hook_command_text(agent, entry)!r} the agent would "
+                    f"run is not a RunLedger guard command", scope)
+        if not blocked and _holds_runledger_hooks(path, agent):
+            for entry, _ in entries:
+                text = _hook_command_text(agent, entry)
+                if text:
+                    blocked, blocked_scope = (
+                        f"the stored PreToolUse command {text!r} is not a RunLedger guard "
+                        f"command", scope)
+                    break
+    if blocked:
+        return _StoredHook(None, blocked_scope, blocked)
+    return None
+
+
+def _hook_command_text(agent: str, entry: Dict[str, Any]) -> Optional[str]:
+    """The command string the agent runs for this entry, whether RunLedger owns it or not."""
+    windows = _windows_override(agent, entry)
+    if windows is not None:
+        return windows
+    command = entry.get("command")
+    return command if isinstance(command, str) and command.strip() else None
+
+
+def _effective_hook_command(agent: str, entry: Dict[str, Any]) -> Optional[str]:
+    """The command that agent really runs for this entry, when RunLedger owns it.
+
+    Codex runs its stored `commandWindows` copy on Windows instead of `command`, so an
+    override RunLedger does not own blocks the self-test even though `command` looks like
+    ours: doctor only ever runs the guard command it installed."""
+    windows = _windows_override(agent, entry)
+    if windows is not None:
+        return windows if _windows_command_parts(windows) is not None else None
+    command = entry.get("command")
+    if isinstance(command, str) and command.strip():
+        return command if _guard._is_guard_hook(entry) else None
     return None
 
 

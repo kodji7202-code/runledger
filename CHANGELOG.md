@@ -159,14 +159,18 @@ change behavior, so read the entry before you upgrade.
   no longer executes a foreign PreToolUse hook. A project that stores its own hook (an `echo hi`
   preflight, say) but nothing of RunLedger's is neither run nor reported as a RunLedger failure,
   and that hook no longer hides a genuine global install: doctor keeps looking through the scopes
-  and self-tests the RunLedger entry it finds. A hand-edited entry inside a file that still holds
-  RunLedger's own guard or checkpoint hooks is still run, as before. For Codex, the
-  `commandWindows` copy - the command Codex runs on Windows - is now the value doctor inspects and
-  self-tests, so a stale or broken override is a `fail` even when the plain `command` is healthy
-  (on the other platforms `command` stays the one that counts). The hook-timeout comparison uses
-  the project's `guard.approval.timeout_s` for a global hook as well, because that hook reads the
-  project policy when it runs: a 135 s global hook in a project that sets `timeout_s: 300` is now
-  a `warn` (exit 1) instead of `ok`.
+  and self-tests the RunLedger entry it finds. Ownership is decided per command, not per file: a
+  foreign PreToolUse command stored beside a RunLedger checkpoint (a project guard entry that was
+  deleted or replaced) is reported - the `guard.hooks` entry warns and names it - and never run,
+  and it cannot shadow the real global guard. A guard command that was hand-edited into something
+  else is reported as the `fail` (exit 2) it is, with the reason the command was not run, instead
+  of being executed to observe it. For Codex, the `commandWindows` copy - the command Codex runs on
+  Windows - is the value doctor inspects and self-tests, so a stale or broken override is a `fail`
+  even when the plain `command` is healthy (on the other platforms `command` stays the one that
+  counts); an override RunLedger does not own is likewise reported, never run. The hook-timeout
+  comparison uses the project's `guard.approval.timeout_s` for a global hook as well, because that
+  hook reads the project policy when it runs: a 135 s global hook in a project that sets
+  `timeout_s: 300` is now a `warn` (exit 1) instead of `ok`.
 - **`doctor` fails cleanly on a broken config or approval URL (`runledger.doctor`):** a config file
   that is empty or holds only whitespace is a `config` failure (exit 2) instead of a silently valid
   empty file, and a config that is not UTF-8 JSON - a UTF-16 `~/.runledger/config.json` written by
@@ -218,10 +222,14 @@ change behavior, so read the entry before you upgrade.
   nameless `exec` step, so the command was invisible to the risk rules and the guard's decision on
   it had no step to link to. Each call inside the script is now one `Bash` or `PowerShell` step
   carrying its `cmd`, and a code-mode result's text blocks are shown as their text instead of raw
-  JSON. Calls are located in the JavaScript itself, so the same text in a comment or in a string is
-  an example, never a step; `cmd`, `command` and `shell`/`program` values are read from
+  JSON. Calls are located in the JavaScript itself, so the same text in a comment, in a string or
+  in a regular-expression literal is an example, never a step: a `/.../ ` pattern is read as one
+  literal, so the quote in `const r = /\"/;` cannot hide the call that follows, and a `/` that
+  divides is not mistaken for one. `cmd`, `command` and `shell`/`program` values are read from
   double-quoted, single-quoted and static template literals, while a template that interpolates a
-  variable leaves the script as its single step under `exec`.
+  variable leaves the script as its single step under `exec`. A script the reader cannot finish
+  (an unterminated string, template, comment or pattern) is searched as raw text instead, so a
+  call that is there is reported rather than hidden.
 - **A quoted SQL name is an identifier (`runledger.mcp_risk`):** single-quoted string literals are
   still blanked before the statement is matched, but a double-quoted or backtick name keeps an
   identifier placeholder. `DELETE FROM "users"` and `UPDATE "users" SET admin = true` are high
@@ -238,12 +246,19 @@ change behavior, so read the entry before you upgrade.
   as text in the blanked view, so `find . -name 'helm uninstall web' -print` no longer produces the
   high `Uninstalled a Helm release` finding - the same for any other destructive name in a `-name`,
   `-path`, `-iname` or related pattern. A real command in the expression, such as
-  `find . -name x -exec helm uninstall web \;`, still matches.
+  `find . -name x -exec helm uninstall web \;`, still matches. Only literal text is blanked: the
+  shell runs a `$(...)` or backtick the pattern carries before `find` starts, and those stay
+  visible, so `find . -name "$(rm -rf ./victim)"` and
+  ``find . -name `helm uninstall web` `` are still denied. Single-quoted text is literal - the
+  shell substitutes nothing there - and an escaped `\$` computes nothing either.
 - **A command rule that can backtrack catastrophically is dropped (`runledger.secrets`):** the
-  safe-regex check now rejects a quantifier inside a quantifier, the shape of
-  `(?:a{1,32}){1,32}b`, so a user or project `command_rules` entry (or an `extra_secret_paths`
-  pattern) with one is dropped with the existing `Dropped invalid command_rules.deny pattern ...`
-  warning instead of stalling the guard hook or a receipt on a long command.
+  safe-regex check rejects a repeat of any kind inside a repeat (`(?:a{1,32}){1,32}b`,
+  `(?:a?){40}b`, `(a+)+`) and an alternation inside one (`(a|a)*b`, `(a|aa)+b`), so a user or
+  project `command_rules` entry (or an `extra_secret_paths` pattern) with one is dropped with the
+  existing `Dropped invalid command_rules.deny pattern ...` warning instead of stalling the guard
+  hook or a receipt. A user or project rule also reads at most the first 20 000 characters of a
+  command, like the SQL inspection, so no rule can make the synchronous guard path walk an
+  arbitrarily long command.
 
 ## [0.6.1] - 2026-10-18
 

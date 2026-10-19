@@ -120,6 +120,7 @@ that agent's hook file and reports:
 | No file, or no RunLedger hook in it | `info` | `not installed` and the file path |
 | Guard hook, `SessionStart` and `UserPromptSubmit` checkpoint hooks present | `ok` | the file and the entries found |
 | A hook is missing (for example a hand-deleted `SessionStart` entry) | `warn` | what is missing and how to rewrite it |
+| A `PreToolUse` command in a file that still holds RunLedger hooks is not a RunLedger guard command | `warn` | that command, which doctor never runs, and how to rewrite the entry |
 | The same file runs the guard twice | `warn` | the duplicate entries |
 | Hook `timeout` smaller than the approval wait needs | `warn` | the agent would run the tool before the approval answers; re-run `guard install`. The wait is the project's `guard.approval.timeout_s` when it sets one, for a global hook too: the hook reads the project's file when it runs |
 | A `--portable` command (`runledger guard`) and `runledger` is not on `PATH` | `warn` | the hook depends on `PATH`; reinstall without `--portable` or add it to `PATH` |
@@ -146,16 +147,19 @@ shell, exactly as the agent would, with a synthetic `PreToolUse` payload in that
 shape: `rm -rf /` must produce deny JSON, `ls` must produce empty output (nothing to report means
 allow). The result line is `ok` with the elapsed time. It is a `fail` when the command does not
 start, exits non-zero, prints something else, or fails to deny the destructive call, and the
-detail then carries what was observed: exit code, stdout and stderr (truncated). A hook edited to
-exit `1`, to print garbage or to allow everything is caught here.
+detail then carries what was observed: exit code, stdout and stderr (truncated).
 
-What is run belongs to RunLedger: the installed guard entry, or - when that entry was hand-edited
-out of the installed shape - another entry the agent runs for every tool, but only in a file that
-still holds RunLedger's own guard or checkpoint hooks. A foreign project hook (someone else's
-`echo` preflight) is never executed here and never reported as a RunLedger failure, and it does
-not hide a RunLedger entry installed in another scope: doctor keeps looking and self-tests that
-one. For Codex, the `commandWindows` copy is the command Codex runs on Windows, so that is the
-one doctor runs there; on macOS and Linux Codex runs `command`, and so does doctor.
+What is run belongs to RunLedger, and ownership is decided on the command that would run, never on
+another entry in the same file. The installed guard entry is the normal case. A file that still
+holds RunLedger hooks - a checkpoint entry, say - but whose `PreToolUse` command is no longer a
+RunLedger guard command is reported and **not** run: the `guard.hooks` entry warns and names the
+command, and when no scope holds an owned command at all the self-test itself is the `fail` (exit
+2) that says why it declined, instead of executing a command anyone could have written. A foreign
+project hook (someone else's `echo` preflight) in a file RunLedger never touched is neither run
+nor reported as a RunLedger failure, and it does not hide a RunLedger entry installed in another
+scope: doctor keeps looking and self-tests that one. For Codex, the `commandWindows` copy is the
+command Codex runs on Windows, so that is the one doctor checks there - and runs there only when
+RunLedger owns it; on macOS and Linux Codex runs `command`, and so does doctor.
 
 The run is isolated: a temporary working directory, temporary `HOME`/`USERPROFILE`, temporary
 agent config folders, no `RUNLEDGER_SERVER` and no API key variables, so a `monitor` mode or an
