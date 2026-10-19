@@ -11,10 +11,10 @@ import sys
 import tempfile
 import uuid
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 from .paths import is_abs, owned_hook_command
 from .userconfig import load_user_config
@@ -25,6 +25,7 @@ HOOK_COMMAND = "runledger checkpoint --hook"
 HOOK_EVENTS = ("SessionStart", "UserPromptSubmit")
 DURATION_RE = re.compile(r"(\d+)([dwh])\Z", re.I)
 DURATION_UNITS = {"d": "days", "w": "weeks", "h": "hours"}
+TZ_RE = re.compile(r"[+-][0-9]{4}\Z")
 
 
 def parse_duration(text: Any) -> Optional[timedelta]:
@@ -62,6 +63,55 @@ def _size_mb(value: Any) -> Optional[float]:
     if number != number or number < 0 or number == float("inf"):
         return None
     return number
+
+
+WARN_MARKER = Path(".runledger") / ".size-warned"
+WARN_WINDOW = timedelta(hours=24)
+SIZE_SCAN_LIMIT = 200000
+
+
+def _human_bytes(size: int) -> str:
+    """A size a person reads: `512 bytes`, `4.2 MB`, `1.2 GB`."""
+    for unit, scale in (("GB", 1024 ** 3), ("MB", 1024 ** 2), ("KB", 1024)):
+        if size >= scale:
+            return f"{size / scale:.1f} {unit}"
+    return f"{size} bytes"
+
+
+def size_warning_text(files: int, total: int, largest: Tuple[str, int],
+                      settings: Settings) -> str:
+    """The warning one checkpoint tree deserves, or "" while it is under the thresholds.
+    A threshold of 0 switches that half of the check off."""
+    largest_path, largest_size = largest
+    over_total = settings.warn_mb > 0 and total > settings.warn_mb * 1024 * 1024
+    over_file = settings.warn_file_mb > 0 and largest_size > settings.warn_file_mb * 1024 * 1024
+    if not (over_total or over_file):
+        return ""
+    return (f"warning: this checkpoint holds {_human_bytes(total)} in {files:,} files "
+            f"(largest: {largest_path} {_human_bytes(largest_size)}). "
+            "Add big or generated folders to .gitignore.")
+
+
+def checkpoint_age(checkpoint: "Checkpoint") -> Optional[datetime]:
+    """When a checkpoint was made, read from Git's own commit date. The metadata copy is the
+    fallback for a checkpoint built in a test or written by an older RunLedger."""
+    if checkpoint.committed_at is not None:
+        return checkpoint.committed_at
+    try:
+        parsed = datetime.fromisoformat(checkpoint.created_at)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _parsed_time(value: str) -> Optional[datetime]:
+    """An ISO timestamp that carries its own timezone, or None: a naive one has no instant to
+    compare against."""
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo is not None else None
 
 
 def load_settings(user: Optional[Dict[str, Any]] = None) -> Settings:
@@ -147,10 +197,11 @@ def _repo_discovery_error(result: subprocess.CompletedProcess) -> CheckpointErro
 def _split_ref_records(data: bytes) -> Optional[List[Tuple[bytes, ...]]]:
     """Split a for-each-ref stream that carries the declared size of every ref's contents.
 
-    Each record is refname, objectname, objecttype, symref, tree, contents size and the
-    contents, NUL-separated and terminated by the record separator. Reading the contents by
-    their declared size keeps a separator inside a commit message inside its own record.
-    Returns None when the stream is not framed as expected, so callers can read refs one by one.
+    Each record is refname, objectname, objecttype, symref, tree, committer date, contents
+    size and the contents, NUL-separated and terminated by the record separator. Reading the
+    contents by their declared size keeps a separator inside a commit message inside its own
+    record. Returns None when the stream is not framed as expected, so callers can read refs
+    one by one.
     """
     records: List[Tuple[bytes, ...]] = []
     pos, end = 0, len(data)
@@ -160,25 +211,37 @@ def _split_ref_records(data: bytes) -> Optional[List[Tuple[bytes, ...]]]:
         if pos >= end:
             break
         fields = []
-        for _ in range(6):
+        for _ in range(7):
             stop = data.find(b"\x00", pos)
             if stop < 0:
                 return None
             fields.append(data[pos:stop])
             pos = stop + 1
         body = b""
-        if fields[5]:
-            if not fields[5].isdigit():
+        if fields[6]:
+            if not fields[6].isdigit():
                 return None
-            size = int(fields[5])
+            size = int(fields[6])
             body = data[pos:pos + size]
             if len(body) != size:
                 return None
         if data[pos + len(body):pos + len(body) + 1] != b"\x1e":
             return None
         pos += len(body) + 1
-        records.append(tuple(fields[:5]) + (body,))
+        records.append(tuple(fields[:6]) + (body,))
     return records
+
+
+def _commit_date(raw: bytes) -> Optional[datetime]:
+    """`%(committerdate:raw)`, or a `committer` header from `cat-file commit`: the time is the
+    second-to-last field, right before the timezone offset."""
+    parts = raw.decode("ascii", "replace").split()
+    if len(parts) < 2 or not parts[-2].isdigit() or not TZ_RE.fullmatch(parts[-1]):
+        return None
+    try:
+        return datetime.fromtimestamp(int(parts[-2]), timezone.utc)
+    except (OSError, OverflowError, ValueError):
+        return None
 
 
 @dataclass
@@ -190,6 +253,10 @@ class Checkpoint:
     label: str
     run_id: Optional[str]
     kind: str = "checkpoint"
+    committed_at: Optional[datetime] = field(default=None, compare=False)
+    """When Git recorded the commit. It is the age a stale checkpoint is pruned by, because
+    that is the date `git log` and `%(committerdate)` show for the ref. Read from the ref, so
+    it never takes part in identifying a checkpoint."""
 
     @property
     def ref(self) -> str:
@@ -398,7 +465,8 @@ class Repository:
         return checkpoint
 
     @staticmethod
-    def _parse_checkpoint_body(checkpoint_id: str, oid: str, tree: str, body: bytes) -> Optional[Checkpoint]:
+    def _parse_checkpoint_body(checkpoint_id: str, oid: str, tree: str, body: bytes,
+                               committed_at: Optional[datetime] = None) -> Optional[Checkpoint]:
         if b"\x1e" in body:
             # The record separator frames the bulk listing, so a body may never contain it.
             return None
@@ -414,18 +482,19 @@ class Repository:
                     or meta["kind"] not in ("checkpoint", "safety")):
                 return None
             return Checkpoint(checkpoint_id, oid, tree, meta["created_at"],
-                              meta["label"], meta["run_id"], meta["kind"])
+                              meta["label"], meta["run_id"], meta["kind"], committed_at)
         except (ValueError, KeyError, TypeError, UnicodeError):
             return None
 
     @staticmethod
-    def _checkpoint_from_ref(ref: str, oid: str, tree: str, body: bytes) -> Optional[Checkpoint]:
+    def _checkpoint_from_ref(ref: str, oid: str, tree: str, body: bytes,
+                             committed_at: Optional[datetime] = None) -> Optional[Checkpoint]:
         if not ref.startswith(PREFIX) or not oid or not tree:
             return None
         checkpoint_id = ref[len(PREFIX):]
         if not ID_RE.fullmatch(checkpoint_id):
             return None
-        return Repository._parse_checkpoint_body(checkpoint_id, oid, tree, body)
+        return Repository._parse_checkpoint_body(checkpoint_id, oid, tree, body, committed_at)
 
     def snapshot_stats(self, tree: str) -> Tuple[int, int, Tuple[str, int]]:
         """`(files, bytes, (largest path, its bytes))` of one tree, from a single
@@ -456,11 +525,11 @@ class Repository:
     def checkpoints(self) -> List[Checkpoint]:
         result = []
         fmt = ("%(refname)%00%(objectname)%00%(objecttype)%00%(symref)%00%(tree)"
-               "%00%(contents:size)%00%(contents)%1e")
+               "%00%(committerdate:raw)%00%(contents:size)%00%(contents)%1e")
         probe = self._git("for-each-ref", f"--format={fmt}", PREFIX, check=False)
         records = _split_ref_records(probe.stdout) if probe.returncode == 0 else None
         if records is not None:
-            for ref_b, oid_b, obj_type_b, symref_b, tree_b, contents_b in records:
+            for ref_b, oid_b, obj_type_b, symref_b, tree_b, date_b, contents_b in records:
                 if obj_type_b != b"commit" or symref_b:
                     continue  # symbolic refs must never redirect a rollback/prune to a branch
                 try:
@@ -469,7 +538,7 @@ class Repository:
                     tree = tree_b.decode("ascii").strip()
                 except UnicodeError:
                     continue
-                cp = self._checkpoint_from_ref(ref, oid, tree, contents_b)
+                cp = self._checkpoint_from_ref(ref, oid, tree, contents_b, _commit_date(date_b))
                 if cp is not None:
                     result.append(cp)
             return sorted(result, key=lambda cp: cp.id, reverse=True)
@@ -484,9 +553,11 @@ class Repository:
             try:
                 header, body = raw.split(b"\n\n", 1)
                 tree = header.splitlines()[0].decode("ascii").removeprefix("tree ")
+                line_date = next((ln for ln in header.splitlines()
+                                  if ln.startswith(b"committer ")), b"")
             except (ValueError, IndexError, UnicodeError):
                 continue
-            cp = self._checkpoint_from_ref(ref, oid, tree, body)
+            cp = self._checkpoint_from_ref(ref, oid, tree, body, _commit_date(line_date))
             if cp is not None:
                 result.append(cp)
         return sorted(result, key=lambda cp: cp.id, reverse=True)
@@ -684,13 +755,94 @@ class Repository:
                                   f"Undo: runledger rollback {safety.id}") from None
         return safety
 
-    def prune(self, keep: int) -> List[Checkpoint]:
-        if keep < 0:
-            raise CheckpointError("--keep must be zero or greater.")
-        removed = self.checkpoints()[keep:]
-        for checkpoint in removed:
-            self._git("update-ref", "--no-deref", "-d", checkpoint.ref, checkpoint.oid)
+    def prune(self, keep: Optional[int] = None, older_than: Optional[timedelta] = None,
+              now: Optional[datetime] = None) -> List[Checkpoint]:
+        """Delete checkpoint refs, newest first in the returned list. `keep` protects the newest
+        N and `older_than` the checkpoints younger than the limit; giving both deletes only what
+        is beyond the window *and* older, so the two rules can never add up to a wider deletion.
+        Only refs are removed: the commits stay until Git reclaims them."""
+        removed = self._prune_candidates(keep, older_than, now)
+        self._delete_refs(removed)
         return removed
+
+    def auto_prune(self, settings: Settings, *, run_id: Optional[str] = None,
+                   protect: Iterable[str] = ()) -> List[Checkpoint]:
+        """Retention for the checkpoint hook, under the user's own settings. The checkpoints
+        named in `protect` (the one just created) and every checkpoint of the session in
+        progress are never removed, so the run the agent is in can always be rolled back."""
+        if not settings.auto_prune:
+            return []
+        protected = set(protect)
+        removed = [cp for cp in self._prune_candidates(settings.auto_prune_keep,
+                                                       settings.auto_prune_older_than, None)
+                   if cp.id not in protected and not (run_id and cp.run_id == run_id)]
+        self._delete_refs(removed)
+        return removed
+
+    def _prune_candidates(self, keep: Optional[int], older_than: Optional[timedelta],
+                          now: Optional[datetime]) -> List[Checkpoint]:
+        if keep is None and older_than is None:
+            raise CheckpointError("--keep or --older-than is required for prune.")
+        if keep is not None and keep < 0:
+            raise CheckpointError("--keep must be zero or greater.")
+        listed = self.checkpoints()
+        beyond = listed[keep:] if keep is not None else listed
+        if older_than is None:
+            return list(beyond)
+        cutoff = (now or datetime.now(timezone.utc)) - older_than
+        window = {cp.id for cp in beyond}
+        removed = []
+        for checkpoint in listed:
+            if keep is not None and checkpoint.id not in window:
+                continue
+            age = checkpoint_age(checkpoint)
+            if age is not None and age < cutoff:
+                removed.append(checkpoint)
+        return removed
+
+    def _delete_refs(self, checkpoints: List[Checkpoint]) -> None:
+        for checkpoint in checkpoints:
+            self._git("update-ref", "--no-deref", "-d", checkpoint.ref, checkpoint.oid)
+
+    def size_warning(self, tree: str, settings: Settings) -> str:
+        """The size warning one tree deserves, or "" when it is small enough. One
+        `git ls-tree -r -l`; skipped entirely when both thresholds are off, and when the tree
+        holds more entries than the scan is worth (`SIZE_SCAN_LIMIT`)."""
+        if settings.warn_mb <= 0 and settings.warn_file_mb <= 0:
+            return ""
+        if len(self.entries(tree)) > SIZE_SCAN_LIMIT:
+            return ""
+        files, total, largest = self.snapshot_stats(tree)
+        return size_warning_text(files, total, largest, settings)
+
+    def warn_size_once(self, message: str, session_id: str,
+                       now: Optional[datetime] = None) -> bool:
+        """Print a size warning to stderr at most once per session per day. The marker file is
+        best effort: a checkpoint hook must never fail because it could not be written."""
+        when = now or datetime.now(timezone.utc)
+        marker = self.root / WARN_MARKER
+        try:
+            seen = json.loads(marker.read_text(encoding="utf-8-sig"))
+            seen = seen if isinstance(seen, dict) else {}
+        except (OSError, ValueError, TypeError, RecursionError):
+            seen = {}
+        recorded = seen.get(session_id)
+        if isinstance(recorded, str):
+            last = _parsed_time(recorded)
+            if last is not None and when - last < WARN_WINDOW:
+                return False
+        print(message, file=sys.stderr)
+        # Keep the marker small: sessions that have not been warned for a week are forgotten.
+        remembered = {key: value for key, value in seen.items()
+                      if isinstance(value, str) and (parsed := _parsed_time(value)) is not None
+                      and when - parsed < WARN_WINDOW * 7}
+        remembered[session_id] = when.isoformat()
+        try:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(json.dumps(remembered), encoding="utf-8")
+        except OSError:
+            pass
+        return True
 
 
 _DEFAULT_SELECT = Repository.select
@@ -741,10 +893,36 @@ def hook_main() -> int:
         cwd, run_id = event.get("cwd"), event.get("session_id")
         if not isinstance(cwd, str) or not cwd or not isinstance(run_id, str) or not run_id:
             return 0
-        Repository(cwd).create(label=event["hook_event_name"], run_id=run_id)
+        repo = Repository(cwd)
+        checkpoint = repo.create(label=event["hook_event_name"], run_id=run_id)
+        settings = load_settings()
+        _hook_auto_prune(repo, settings, run_id, checkpoint)
+        _hook_size_warning(repo, settings, run_id, checkpoint)
     except NotAGitRepository:
         return 0
     except (CheckpointError, OSError, ValueError):
         print("RunLedger checkpoint unavailable. Run 'runledger checkpoint' manually for details.",
               file=sys.stderr)
     return 0
+
+
+def _hook_auto_prune(repo: Repository, settings: Settings, run_id: str,
+                     checkpoint: Checkpoint) -> None:
+    """Retention after the checkpoint exists. A failure here is swallowed: it must never cost
+    the user the checkpoint the hook just made, or the agent its turn."""
+    try:
+        repo.auto_prune(settings, run_id=run_id, protect=(checkpoint.id,))
+    except Exception:
+        pass
+
+
+def _hook_size_warning(repo: Repository, settings: Settings, run_id: str,
+                       checkpoint: Checkpoint) -> None:
+    """The size warning reaches stderr (never stdout: a lifecycle hook's stdout becomes agent
+    context) and at most once per session per day, so a huge tree does not nag on every prompt."""
+    try:
+        message = repo.size_warning(checkpoint.tree, settings)
+        if message:
+            repo.warn_size_once(message, run_id)
+    except Exception:
+        pass

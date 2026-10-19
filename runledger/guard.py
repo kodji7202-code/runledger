@@ -329,6 +329,14 @@ def _project_key_warnings(project: Dict[str, Any]) -> List[str]:
     if isinstance(read_words, list) and any(isinstance(w, str) and w.strip() for w in read_words):
         warnings.append(f"Ignored mcp_verbs.read in {POLICY_FILE}: a read word in this list would lower a "
                         f"destructive MCP tool, so a project may add destructive and write words only.")
+    retention = [key for key in ("auto_prune", "warn_mb", "warn_file_mb")
+                 if key in _section(project, "rollback")]
+    if retention:
+        warnings.append("Ignored " + ", ".join(f"rollback.{key}" for key in retention)
+                        + f" in {POLICY_FILE}: a project file cannot change checkpoint retention "
+                          f"or the size warning, because a cloned repository must not be able to "
+                          f"delete the user's checkpoints. Use "
+                          f"{USER_CONFIG_DIR}/{USER_CONFIG_FILE} in your home folder.")
     return warnings
 
 

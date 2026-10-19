@@ -152,6 +152,45 @@ change behavior, so read the entry before you upgrade.
   invalidated by a change to the user config or the project's `.runledger.json`. The cache holds no
   prompts, commands or file contents, and a corrupt session file is listed in `skipped` instead of
   stopping the run (`docs/stats.md`).
+- **`runledger checkpoints prune` takes `--older-than DUR` and needs only one of the two options
+  (`runledger.rollback`, `runledger.cli`):** `--keep N` still protects the newest N checkpoints and
+  `--older-than 30d` (`2w`, `12h`) removes the checkpoints older than that; neither is required on
+  its own, but giving neither is an error (`--keep or --older-than is required for prune.`, exit 1),
+  and a duration that is not a number followed by `d`, `w` or `h` is refused by the parser before
+  anything is deleted (exit 2). Giving both is conservative - a checkpoint goes only when it is
+  **both** beyond the newest N **and** older than the limit, and one exactly at the limit age is
+  kept - so the rules can never add up to a wider deletion than each one alone. The age comes from
+  the ref's own Git commit date (the date `GIT_COMMITTER_DATE` writes), so a repository with old
+  checkpoints prunes them by how old Git says they are. Safety checkpoints are pruned like any
+  other, the report names the count and how many of them were safety checkpoints, and only refs are
+  deleted: the commits stay readable until Git reclaims them, and `git gc --prune=now` is mentioned
+  as text only, never run (`docs/rollback.md`).
+- **The checkpoint hooks prune automatically (`runledger.rollback`):** after the checkpoint of a
+  `SessionStart` or `UserPromptSubmit` hook exists, retention runs under the user's own
+  `~/.runledger/config.json` settings - on by default, keeping the newest 50 checkpoints with no age
+  limit, tunable with `{"rollback": {"auto_prune": {"keep": N, "older_than": "30d"}}}` and
+  switchable off with `"auto_prune": false`. The checkpoint just created and every checkpoint of the
+  session in progress are never removed, so `rollback` and `rollback --run` always reach the run the
+  agent is in; an unusable config keeps the documented default instead of guessing, and a failure
+  inside auto-prune is swallowed - a hook never blocks the agent or loses the checkpoint it just
+  made. Only refs are deleted, and nothing is written to stdout, where Droid and Codex turn hook
+  output into agent context.
+- **A size warning for large checkpoints (`runledger.rollback`, `runledger.cli`):** `runledger
+  checkpoint` and the checkpoint hooks measure the snapshot (`git ls-tree -r -l`, one call) and
+  print one `warning:` line to stderr when it exceeds `rollback.warn_mb` (default 500 MB of content)
+  or `rollback.warn_file_mb` (default 50 MB for a single file, `0` switches a threshold off), naming
+  the total, the file count, the largest file and its size, and pointing at `.gitignore`, which is
+  the real fix because a checkpoint takes the whole non-ignored tree. The manual command warns every
+  time and never puts the text on stdout; the hooks warn on stderr only, at most once per session
+  per 24 hours (marker file `<repo>/.runledger/.size-warned`), so a huge tree does not repeat the
+  message on every prompt. A tree above 200,000 entries skips the scan instead of costing every
+  hook, and both thresholds at `0` skip it entirely.
+- **A project `.runledger.json` cannot change checkpoint retention (`runledger.guard`):**
+  `rollback.auto_prune`, `rollback.warn_mb` and `rollback.warn_file_mb` are read from the user's own
+  config file only, and a project file that sets them is ignored with a warning from the guard and
+  from `runledger guard test` (`Ignored rollback.auto_prune in .runledger.json: a project file
+  cannot change checkpoint retention or the size warning, ...`), so a cloned repository can neither
+  delete the user's checkpoints nor silence the size warning.
 
 ### Changed
 
