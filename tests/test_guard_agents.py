@@ -16,7 +16,7 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import pytest
 
@@ -123,8 +123,6 @@ def hook_process(agent, stdin_text, cwd, extra_env=None):
     """Run the real hook command in a subprocess, as an agent would."""
     env = dict(os.environ)
     env["PYTHONPATH"] = str(PROJECT_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
-    if agent is not None:
-        env["_RL_AGENT"] = agent
     env.update(extra_env or {})
     argv = [sys.executable, "-m", "runledger", "guard"]
     if agent is not None:
@@ -749,7 +747,9 @@ def test_the_recorded_session_id_is_the_transcript_stem_and_reaches_the_log(tmp_
     `session_id` and the log row."""
     for agent in AGENTS:
         ev = payload(agent, cwd=tmp_path)
-        stem = Path(ev["transcript_path"]).stem
+        # The recorded payloads carry Windows transcript paths, so parse them as such: on
+        # POSIX `Path` would treat the backslashes as part of the file name.
+        stem = PureWindowsPath(ev["transcript_path"]).stem
         assert stem == ev["session_id"] if agent != "codex" else stem.endswith(ev["session_id"]), agent
         handle(agent, "Bash" if agent != "droid" else "Execute", {"command": "echo hi"}, tmp_path)
         assert last_log(tmp_path)["session_id"] == ev["session_id"], agent
