@@ -84,9 +84,12 @@ which has no envelope on each line.
 - **Shell calls.** Recent Codex versions send shell calls through code mode: a `custom_tool_call`
   named `exec` whose input is JavaScript around `tools.exec_command({cmd: ..., shell: ...})`.
   RunLedger reads each of those calls as one `Bash` or `PowerShell` step carrying the `cmd` it
-  runs, so the command is scored and the guard's decision on it links to that step. A script
-  without such a call stays one step under its own name, and the result's text blocks are shown as
-  their text.
+  runs, so the command is scored and the guard's decision on it links to that step. Only the calls
+  in the JavaScript itself count: the same text in a comment or inside a string is an example, not
+  a step. `cmd`, `command` and `shell`/`program` values may be double-quoted, single-quoted or a
+  template literal without interpolation; a value that interpolates a variable (`${...}`) cannot be
+  read, and a script with no readable call stays one step under its own name, with the result's
+  text blocks shown as their text.
 - **Usage.** The run total is the last cumulative token count in the session. Each model call's
   usage is split evenly across the steps issued since the previous count.
 - **Cost.** Estimated from list prices. Codex does not report its own cost.

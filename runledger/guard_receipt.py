@@ -95,14 +95,25 @@ def _log_paths(cwd: str) -> List[Path]:
 
 def _take_step(by_summary: Dict[Any, "deque"], tools: List[str], text: str,
                used: set) -> Optional[Step]:
-    """The oldest unconsumed step carrying `text` among `tools`, in the order given."""
+    """The oldest unconsumed step carrying `text` among `tools`, in transcript order.
+
+    The Bash and PowerShell queues are compared by step index, not by the order of `tools`:
+    a repeated command that switched shells keeps the order it ran in."""
+    best: Optional[Step] = None
     for tool in tools:
         queue = by_summary.get((tool, text))
         while queue and queue[0].index in used:
             queue.popleft()
-        if queue:
-            return queue.popleft()
-    return None
+        if queue and (best is None or queue[0].index < best.index):
+            best = queue[0]
+    if best is None:
+        return None
+    queue = by_summary[(best.tool, text)]
+    while queue and queue[0].index in used:
+        queue.popleft()
+    if queue:
+        queue.popleft()
+    return best
 
 
 def load_guard_decisions(run: Run) -> List[Dict[str, Any]]:

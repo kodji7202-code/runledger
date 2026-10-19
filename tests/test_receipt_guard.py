@@ -365,6 +365,50 @@ def test_codex_row_links_by_the_recorded_tool_use_id(tmp_path):
     assert decision["step"] == 1 and decision["outcome"] == "Approved by approval server"
 
 
+def _codex_shell_switch_run(tmp_path, command="Get-Content .env"):
+    """A Codex rollout where the same command ran twice, first through PowerShell, then Bash:
+    a code-mode retry after a block. The hook sees `Bash` for both calls."""
+    from runledger.adapters import codex as codex_adapter
+
+    project = tmp_path / "codex-switch-proj"
+    project.mkdir()
+    lines = [
+        {"timestamp": "2026-10-19T12:00:00.000Z", "type": "session_meta",
+         "payload": {"id": CODEX_SESSION_ID, "cwd": str(project), "model": "gpt-6-luna"}},
+        {"timestamp": "2026-10-19T12:00:01.000Z", "type": "response_item",
+         "payload": {"type": "function_call", "name": "shell", "call_id": "call-1",
+                     "arguments": json.dumps({"command": ["powershell.exe", "-Command", command]})}},
+        {"timestamp": "2026-10-19T12:00:02.000Z", "type": "response_item",
+         "payload": {"type": "function_call", "name": "shell", "call_id": "call-2",
+                     "arguments": json.dumps({"command": command})}},
+    ]
+    session = project / ("rollout-2026-10-19T12-00-00-" + CODEX_SESSION_ID + ".jsonl")
+    session.write_text("\n".join(json.dumps(x) for x in lines) + "\n", encoding="utf-8")
+    return codex_adapter.parse(session), project
+
+
+def test_repeated_command_across_shells_keeps_block_and_approval_in_order(tmp_path):
+    """The cross-shell fallback takes the oldest matching step, not the first nonempty shell
+    queue: the blocked first call keeps step 1 (PowerShell) and its later retry step 2 (Bash),
+    even though both hook rows name Bash (GE-007)."""
+    run, project = _codex_shell_switch_run(tmp_path)
+    assert [(s.index, s.tool) for s in run.steps] == [(1, "PowerShell"), (2, "Bash")]
+    _write_log(project, [
+        {"ts": "2026-10-19T12:00:01Z", "session_id": CODEX_SESSION_ID,
+         "tool_use_id": "exec-hook-1", "tool": "Bash", "agent": "codex", "canonical_tool": "Bash",
+         "decision": "deny", "policy_decision": "deny", "codes": ["command"],
+         "summary": "Get-Content .env", "reason": "Blocked by RunLedger guard: secret file (.env)"},
+        {"ts": "2026-10-19T12:00:02Z", "session_id": CODEX_SESSION_ID,
+         "tool_use_id": "exec-hook-2", "tool": "Bash", "agent": "codex", "canonical_tool": "Bash",
+         "decision": "allow", "policy_decision": "ask", "approval": "approved",
+         "summary": "Get-Content .env", "reason": "Approved for this once"},
+    ])
+    assert [(d["step"], d["outcome"]) for d in load_guard_decisions(run)] == [
+        (1, "Blocked by Guard"),
+        (2, "Approved by approval server"),
+    ]
+
+
 def test_rows_without_an_agent_keep_the_strict_tool_match(session):
     """v0.6.0 rows keep matching exactly; only rows that name their agent may cross the
     shell tool names the adapters use."""
