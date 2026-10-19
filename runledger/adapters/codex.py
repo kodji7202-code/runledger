@@ -476,24 +476,118 @@ def _code_mode_calls(source: str) -> List[Tuple[str, Dict[str, Any]]]:
 
     Codex's `exec` tool runs JavaScript that calls `tools.exec_command({...})`; the hook payload
     and the risk engine both see the plain command, so the step carries that command under the
-    tool name of the shell that ran it."""
+    tool name of the shell that ran it. Only real calls count: the same text in a comment or a
+    string is an example, not a call. A call whose arguments are not static is left out, so a
+    script with no readable call keeps its single opaque step."""
     calls: List[Tuple[str, Dict[str, Any]]] = []
-    for match in CODE_CALL_RE.finditer(source):
-        if match.group(1) not in SHELL_FUNCTIONS:
-            continue
-        body = _object_body(source, match.end() - 1)
-        if body is None:
-            continue
-        args = _js_object(body)
-        value = args.get("cmd", args.get("command", args.get("arguments")))
-        if value is None or value == "":
-            continue
-        tool, command = _shell_call(value)
-        shell = args.get("shell") or args.get("program")
-        if isinstance(shell, str) and shell:
-            tool = "PowerShell" if _program(shell) in ("powershell", "pwsh") else "Bash"
-        calls.append((tool, {"command": command}))
+    for start, end in _code_spans(source):
+        for match in CODE_CALL_RE.finditer(source, start, end):
+            if match.group(1) not in SHELL_FUNCTIONS:
+                continue
+            body = _object_body(source, match.end() - 1)
+            if body is None:
+                continue
+            args = _js_object(body)
+            value = args.get("cmd", args.get("command", args.get("arguments")))
+            if value is None or value == "":
+                continue
+            tool, command = _shell_call(value)
+            shell = args.get("shell") or args.get("program")
+            if isinstance(shell, str) and shell:
+                tool = "PowerShell" if _program(shell) in ("powershell", "pwsh") else "Bash"
+            calls.append((tool, {"command": command}))
     return calls
+
+
+def _code_spans(source: str) -> List[Tuple[int, int]]:
+    """The code regions of a JavaScript source, comments and literal text left out.
+
+    A call written in a comment or inside a string is text, never a call. The `${...}` body of
+    a template literal is code again. Unterminated input simply runs to the end."""
+    spans: List[Tuple[int, int]] = []
+    _js_code_end(source, 0, "", spans)
+    return spans
+
+
+def _js_code_end(source: str, start: int, stop: str,
+                 spans: Optional[List[Tuple[int, int]]] = None) -> int:
+    """Scan code from `start` until the `stop` char at brace depth 0, or the end of `source`.
+
+    Literals and comments are stepped over; with `spans`, every code region is collected."""
+    i, seg, depth = start, start, 0
+    n = len(source)
+    while i < n:
+        ch = source[i]
+        if ch in "\"'`":
+            if spans is not None and i > seg:
+                spans.append((seg, i))
+            i = _js_literal_end(source, i, spans)
+            seg = i
+            continue
+        if ch == "/" and (source.startswith("//", i) or source.startswith("/*", i)):
+            if spans is not None and i > seg:
+                spans.append((seg, i))
+            i = _js_comment_end(source, i)
+            seg = i
+            continue
+        if stop == "}":
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                if depth == 0:
+                    break
+                depth -= 1
+        i += 1
+    if spans is not None and i > seg:
+        spans.append((seg, i))
+    return i + 1 if stop and i < n else i
+
+
+def _js_literal_end(source: str, start: int,
+                    spans: Optional[List[Tuple[int, int]]] = None) -> int:
+    """The index after the string or template literal at `source[start]`.
+
+    With `spans`, the code inside a template's `${...}` interpolation is collected too."""
+    if start >= len(source) or source[start] not in "\"'`":
+        return start + 1
+    quote = source[start]
+    i = start + 1
+    n = len(source)
+    while i < n:
+        ch = source[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == quote:
+            return i + 1
+        if quote == "`" and ch == "$" and source.startswith("{", i + 1):
+            i = _js_code_end(source, i + 2, "}", spans)
+            continue
+        i += 1
+    return n
+
+
+def _js_comment_end(source: str, start: int) -> int:
+    """The index after the `//` or `/*` comment at `source[start]`."""
+    if source.startswith("/*", start):
+        close = source.find("*/", start + 2)
+        return len(source) if close < 0 else close + 2
+    newline = source.find("\n", start)
+    return len(source) if newline < 0 else newline
+
+
+def _js_skip_blanks(source: str, start: int) -> int:
+    """Whitespace and comments separate tokens; the first index that is neither."""
+    i = start
+    n = len(source)
+    while i < n:
+        if source[i] in " \t\r\n":
+            i += 1
+        elif source[i] == "/" and (source.startswith("//", i) or source.startswith("/*", i)):
+            i = _js_comment_end(source, i)
+        else:
+            break
+    return i
 
 
 def _object_body(source: str, start: int) -> Optional[str]:
@@ -502,11 +596,14 @@ def _object_body(source: str, start: int) -> Optional[str]:
         return None
     depth = 0
     i = start
-    while i < len(source):
+    n = len(source)
+    while i < n:
         ch = source[i]
-        if ch == '"':
-            _, after = _js_string(source, i)
-            i = after if after > i else i + 1
+        if ch in "\"'`":
+            i = _js_literal_end(source, i)
+            continue
+        if ch == "/" and (source.startswith("//", i) or source.startswith("/*", i)):
+            i = _js_comment_end(source, i)
             continue
         if ch == "{":
             depth += 1
@@ -518,16 +615,21 @@ def _object_body(source: str, start: int) -> Optional[str]:
     return None
 
 
-def _js_string(source: str, start: int) -> Tuple[Optional[str], int]:
-    """The JavaScript string literal at `source[start] == '"'` and the index after it."""
-    if start >= len(source) or source[start] != '"':
+def _js_literal(source: str, start: int) -> Tuple[Optional[str], int]:
+    """The string or template literal at `source[start]` and the index after it, with escapes
+    decoded. A template that interpolates (`${...}`) has no static text, so it gives None while
+    the index still moves past the whole literal."""
+    if start >= len(source) or source[start] not in "\"'`":
         return None, start + 1
+    quote = source[start]
     out: List[str] = []
     i = start + 1
     while i < len(source):
         ch = source[i]
-        if ch == '"':
+        if ch == quote:
             return "".join(out), i + 1
+        if quote == "`" and ch == "$" and source.startswith("{", i + 1):
+            return None, _js_literal_end(source, start)
         if ch != "\\":
             out.append(ch)
             i += 1
@@ -544,6 +646,8 @@ def _js_string(source: str, start: int) -> Tuple[Optional[str], int]:
             try:
                 if source[i + 2:i + 3] == "{":
                     end = source.find("}", i + 3)
+                    if end < 0:
+                        raise ValueError(nxt)
                     out.append(chr(int(source[i + 3:end], 16)))
                     i = end + 1
                     continue
@@ -559,15 +663,14 @@ def _js_string(source: str, start: int) -> Tuple[Optional[str], int]:
 
 def _js_value(source: str, start: int) -> Tuple[Any, int]:
     """A JavaScript string, string array, number, boolean or null at `start`, and the index
-    after it. Anything else (a nested object, a call) gives None and `start` unchanged."""
-    i = start
-    while i < len(source) and source[i] in " \t\r\n":
-        i += 1
+    after it. A template with an interpolation and anything else (a nested object, a call)
+    gives None and `start` unchanged."""
+    i = _js_skip_blanks(source, start)
     if i >= len(source):
         return None, start
     ch = source[i]
-    if ch == '"':
-        text, after = _js_string(source, i)
+    if ch in "\"'`":
+        text, after = _js_literal(source, i)
         return (text, after) if text is not None else (None, start)
     if ch == "[":
         items: List[str] = []
@@ -576,10 +679,10 @@ def _js_value(source: str, start: int) -> Tuple[Any, int]:
             if source[j] in " \t\r\n,":
                 j += 1
                 continue
-            if source[j] == '"':
-                text, after = _js_string(source, j)
+            if source[j] in "\"'`":
+                text, after = _js_literal(source, j)
                 if text is None:
-                    break
+                    return None, start
                 items.append(text)
                 j = after
                 continue
@@ -595,13 +698,16 @@ def _js_object(body: str) -> Dict[str, Any]:
     """The top-level keys of a JavaScript object literal body, with the values `_js_value` reads."""
     out: Dict[str, Any] = {}
     i = 0
-    while i < len(body):
-        ch = body[i]
-        if ch in " \t\r\n,":
+    n = len(body)
+    while i < n:
+        i = _js_skip_blanks(body, i)
+        if i < n and body[i] == ",":
             i += 1
             continue
-        if ch == '"':
-            key, after = _js_string(body, i)
+        if i >= n:
+            break
+        if body[i] in "\"'`":
+            key, after = _js_literal(body, i)
             if key is None:
                 break
             i = after
@@ -611,9 +717,8 @@ def _js_object(body: str) -> Dict[str, Any]:
                 i += 1
                 continue
             key, i = match.group(0), match.end()
-        while i < len(body) and body[i] in " \t\r\n":
-            i += 1
-        if i >= len(body) or body[i] != ":":
+        i = _js_skip_blanks(body, i)
+        if i >= n or body[i] != ":":
             continue
         value, after = _js_value(body, i + 1)
         if after > i + 1:

@@ -176,7 +176,10 @@ change behavior, so read the entry before you upgrade.
   what links a Droid call (its payload carries no id, and the log tool `Execute` faces a `Bash`
   step), a Codex call (the hook's `exec-...` id is not the rollout's `call_id`) and a legacy
   no-id row, using the canonical tool name and the `Bash`/`PowerShell` pair the adapters choose
-  between. Rows without an `agent` (v0.6.0) keep matching their tool name exactly, and a decision
+  between. The equivalent shell queues are compared by transcript position, not by tool name, so a
+  command repeated across a shell switch (the same `Get-Content .env` run through PowerShell, then
+  Bash) keeps its blocked call on the first step and its approved retry on the second. Rows without
+  an `agent` (v0.6.0) keep matching their tool name exactly, and a decision
   that fits no step stays visible in the receipt as unmatched.
 - **A Codex code-mode `exec` script becomes the shell step it ran (`runledger.adapters.codex`):**
   current Codex versions send shell calls as a `custom_tool_call` named `exec` whose input is
@@ -184,7 +187,10 @@ change behavior, so read the entry before you upgrade.
   nameless `exec` step, so the command was invisible to the risk rules and the guard's decision on
   it had no step to link to. Each call inside the script is now one `Bash` or `PowerShell` step
   carrying its `cmd`, and a code-mode result's text blocks are shown as their text instead of raw
-  JSON.
+  JSON. Calls are located in the JavaScript itself, so the same text in a comment or in a string is
+  an example, never a step; `cmd`, `command` and `shell`/`program` values are read from
+  double-quoted, single-quoted and static template literals, while a template that interpolates a
+  variable leaves the script as its single step under `exec`.
 - **A quoted SQL name is an identifier (`runledger.mcp_risk`):** single-quoted string literals are
   still blanked before the statement is matched, but a double-quoted or backtick name keeps an
   identifier placeholder. `DELETE FROM "users"` and `UPDATE "users" SET admin = true` are high

@@ -241,6 +241,51 @@ def test_code_mode_exec_output_text_blocks_are_joined(tmp_path):
     assert run.steps[0].result_text == "hi\nexit code: 0"
 
 
+def test_code_mode_exec_decodes_single_quotes_and_static_templates(tmp_path):
+    """Code-mode input is JavaScript, not JSON: single-quoted and backtick values are ordinary
+    string literals, so the call is read like its double-quoted form (GE-008)."""
+    script = ("const a = await tools.exec_command({cmd:'rm -rf victim',shell:'bash'});\n"
+              "const b = await tools.exec_command({cmd:`make test`, shell:`powershell`});\n"
+              "text(a.output); text(b.output);")
+    run = _parse_items(tmp_path, [_meta_line(), _exec_call(script)])
+    assert [(s.tool, s.input) for s in run.steps] == [
+        ("Bash", {"command": "rm -rf victim"}),
+        ("PowerShell", {"command": "make test"}),
+    ]
+
+
+def test_code_mode_exec_dynamic_template_call_stays_opaque(tmp_path):
+    """A template that interpolates a variable is not a static value: the call is left out and
+    the script keeps its single opaque `exec` step."""
+    script = "const r = await tools.exec_command({cmd:`rm -rf ${target}`,shell:'bash'});"
+    run = _parse_items(tmp_path, [_meta_line(), _exec_call(script)])
+    assert run.steps[0].tool == "exec"
+    assert run.steps[0].input == {"input": script}
+
+
+def test_code_mode_exec_ignores_calls_in_comments_and_strings(tmp_path):
+    """A shell call written in a comment or in a string literal is text: a receipt must not
+    report a shell operation the script never ran (GE-009)."""
+    script = ("// tools.exec_command({cmd:\"rm -rf victim\"})\n"
+              "/* text(); tools.exec_command({cmd:\"rm -rf victim\"}) */\n"
+              "text('Example: tools.exec_command({cmd:\"rm -rf victim\"})');")
+    run = _parse_items(tmp_path, [_meta_line(), _exec_call(script)])
+    assert len(run.steps) == 1
+    assert run.steps[0].tool == "exec"
+    assert run.steps[0].input == {"input": script}
+
+
+def test_code_mode_exec_reads_the_real_call_after_quoted_text(tmp_path):
+    """Only the text is skipped: a real call next to comments and string examples is still read."""
+    script = ("// tools.exec_command({cmd:\"echo fake\"})\n"
+              "text('run tools.exec_command({cmd:\"echo fake\"})');\n"
+              "const r = await tools.exec_command({cmd:'rm -rf victim',shell:'bash'});\n")
+    run = _parse_items(tmp_path, [_meta_line(), _exec_call(script)])
+    assert [(s.tool, s.input) for s in run.steps] == [("Bash", {"command": "rm -rf victim"})]
+    _, _, risks = assess(run)
+    assert any(r.step == 1 and r.severity == "high" for r in risks)
+
+
 def test_mcp_and_unknown_tool_names(tmp_path):
     run = _parse_items(tmp_path, [
         _meta_line(),
