@@ -12,16 +12,84 @@ import tempfile
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from .paths import owned_hook_command
+from .userconfig import load_user_config
 
 PREFIX = "refs/runledger/checkpoints/"
 ID_RE = re.compile(r"[0-9]{8}T[0-9]{12}Z-[0-9a-f]{8}\Z")
 HOOK_COMMAND = "runledger checkpoint --hook"
 HOOK_EVENTS = ("SessionStart", "UserPromptSubmit")
+DURATION_RE = re.compile(r"(\d+)([dwh])\Z", re.I)
+DURATION_UNITS = {"d": "days", "w": "weeks", "h": "hours"}
+
+
+def parse_duration(text: Any) -> Optional[timedelta]:
+    """`30d`, `2w` or `6h` as a timedelta; None for anything else (never raises)."""
+    if not isinstance(text, str):
+        return None
+    m = DURATION_RE.match(text.strip())
+    if not m:
+        return None
+    return timedelta(**{DURATION_UNITS[m.group(2).lower()]: int(m.group(1))})
+
+
+@dataclass
+class Settings:
+    """The `rollback` section of the user's config, with the documented defaults:
+    auto-prune on, keeping the newest 50 checkpoints and no age limit, and size warnings
+    at 500 MB in total or 50 MB for a single file (a threshold of 0 switches it off)."""
+    auto_prune: bool = True
+    auto_prune_keep: int = 50
+    auto_prune_older_than: Optional[timedelta] = None
+    warn_mb: float = 500.0
+    warn_file_mb: float = 50.0
+
+
+def _positive_int(value: Any) -> Optional[int]:
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 1:
+        return value
+    return None
+
+
+def _size_mb(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    if number != number or number < 0 or number == float("inf"):
+        return None
+    return number
+
+
+def load_settings(user: Optional[Dict[str, Any]] = None) -> Settings:
+    """The `rollback` user settings. Only the user's own file counts: a project
+    `.runledger.json` must never be able to trigger deletions. A value that is not exactly
+    the documented shape keeps the default instead of being guessed. `user` is an
+    already-read user config, or None to read `~/.runledger/config.json` once."""
+    if user is None:
+        user = load_user_config()
+    settings = Settings()
+    raw = user.get("rollback")
+    if not isinstance(raw, dict):
+        return settings
+    auto = raw.get("auto_prune")
+    if auto is False:
+        settings.auto_prune = False
+    elif isinstance(auto, dict):
+        keep = _positive_int(auto.get("keep"))
+        if keep is not None:
+            settings.auto_prune_keep = keep
+        settings.auto_prune_older_than = parse_duration(auto.get("older_than"))
+    warn_mb = _size_mb(raw.get("warn_mb"))
+    if warn_mb is not None:
+        settings.warn_mb = warn_mb
+    warn_file_mb = _size_mb(raw.get("warn_file_mb"))
+    if warn_file_mb is not None:
+        settings.warn_file_mb = warn_file_mb
+    return settings
 
 
 class CheckpointError(RuntimeError):

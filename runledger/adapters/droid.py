@@ -1,7 +1,8 @@
 """Factory Droid JSONL sessions and their sibling .settings.json metadata.
 
-FACTORY_HOME defaults to ~/.factory. Project folders under sessions replace
-path separators with dashes. Messages carry modelId and tool_use/tool_result
+FACTORY_HOME names the Factory config dir; FACTORY_HOME_OVERRIDE names a home whose config
+dir is `<override>/.factory`; the default is ~/.factory. Project folders under sessions
+replace path separators with dashes. Messages carry modelId and tool_use/tool_result
 blocks; settings.tokenUsage holds cumulative counts, not per-call usage.
 """
 from __future__ import annotations
@@ -37,8 +38,17 @@ _MAX_DECODE_PROBES = 2000
 
 
 def factory_home() -> Path:
+    """The Factory config directory, in the order the droid binary itself resolves it:
+    `FACTORY_HOME` names that directory directly (the long-standing RunLedger meaning),
+    `FACTORY_HOME_OVERRIDE` names a HOME whose config dir is `<override>/.factory`, and
+    without either one it is `~/.factory`."""
     base = os.environ.get("FACTORY_HOME")
-    return Path(base).expanduser() if base else Path.home() / ".factory"
+    if base:
+        return Path(base).expanduser()
+    override = os.environ.get("FACTORY_HOME_OVERRIDE")
+    if override:
+        return Path(override).expanduser() / ".factory"
+    return Path.home() / ".factory"
 
 
 def _header(path: Path) -> Dict[str, Any]:

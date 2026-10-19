@@ -1,6 +1,7 @@
 import json
 import os
 import re
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -163,6 +164,29 @@ def test_defaults_load_from_prices_json(monkeypatch):
     assert len(table) == len(raw) - 1  # minus the "checked" date
     assert table[("opus", "5.5")] == (4.0, 20.0, 0.2)
     assert table == pricing.PRICES
+
+
+def test_prices_checked_reports_the_packaged_date():
+    raw = json.loads(Path(pricing.__file__).with_name("prices.json").read_text(encoding="utf-8"))
+    assert pricing.prices_checked() == date.fromisoformat(raw["checked"])
+
+
+@pytest.mark.parametrize("value", [None, "", "not-a-date", "2026-13-01", 123])
+def test_prices_checked_is_none_when_the_packaged_key_is_unusable(monkeypatch, value):
+    monkeypatch.setitem(pricing._DEFAULT_RAW, "checked", value)
+    assert pricing.prices_checked() is None
+
+
+def test_prices_checked_ignores_a_user_files_own_checked_date(tmp_path, monkeypatch):
+    """The 120-day staleness note and the doctor check read the bundled table: a `checked`
+    key in a user prices file is informational only (docs/agents.md)."""
+    override = tmp_path / "prices.json"
+    override.write_text(json.dumps({
+        "checked": "2020-01-01",
+        "newfam:1": {"input": 1.0, "output": 2.0, "cache_read": 0.1},
+    }), encoding="utf-8")
+    monkeypatch.setenv(pricing.PRICES_ENV, str(override))
+    assert pricing.prices_checked() == date.fromisoformat(pricing.CHECKED)
 
 
 def test_env_override_merges_over_defaults(tmp_path, monkeypatch):

@@ -52,6 +52,8 @@ from . import paths as _paths
 from . import risk as _risk
 from .parser import Step
 from .risk import POLICY_FILE, SEVERITY_POINTS, Risk, assess_step
+# The user's own file has one reader for every consumer (guard, risk, rollback, doctor).
+from .userconfig import USER_CONFIG_DIR, USER_CONFIG_FILE, load_user_config, user_config_path
 
 try:
     from . import secrets as _secrets
@@ -71,8 +73,6 @@ LOG_DIR = ".runledger"
 LOG_FILE = "guard.log"
 KEY_ENV_DEFAULT = "RUNLEDGER_API_KEY"
 SERVER_ENV = "RUNLEDGER_SERVER"
-USER_CONFIG_DIR = ".runledger"
-USER_CONFIG_FILE = "config.json"
 PROJECT_APPROVAL_KEYS = ("server", "api_key_env")  # a project file may never set these
 TIMEOUT_DEFAULT_S = 120.0
 TIMEOUT_MAX_S = 3600.0
@@ -258,24 +258,6 @@ def read_policy(cwd: str, *, _resolved: bool = False) -> Dict[str, Any]:
     try:
         data = json.loads((Path(root) / POLICY_FILE).read_text(encoding="utf-8-sig"))
     except (OSError, ValueError, TypeError, RecursionError):
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def user_config_path() -> Path:
-    """`RUNLEDGER_CONFIG` when set, else `~/.runledger/config.json`."""
-    override = os.environ.get("RUNLEDGER_CONFIG", "").strip()
-    if override:
-        return Path(override)
-    base = os.environ.get("HOME") or os.environ.get("USERPROFILE")
-    return (Path(base) if base else Path.home()) / USER_CONFIG_DIR / USER_CONFIG_FILE
-
-
-def load_user_config() -> Dict[str, Any]:
-    """The user's config file as a dict, or {} when missing or invalid. Never raises."""
-    try:
-        data = json.loads(user_config_path().read_text(encoding="utf-8-sig"))
-    except Exception:
         return {}
     return data if isinstance(data, dict) else {}
 

@@ -5,6 +5,7 @@ import os
 import stat
 import subprocess
 import sys
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1207,3 +1208,73 @@ def test_actual_receipt_resolves_session_checkpoint(committed_repo, tmp_path):
     run, score, level, risks, _ = build(str(session))
     assert run.checkpoint_id == cp.id
     assert json.loads(render(run, score, level, risks, "json"))["rollback"]["checkpoint_id"] == cp.id
+
+
+# ---------------------------------------------------------------- user settings (rollback.*)
+
+def test_settings_defaults_when_the_user_file_is_missing(tmp_path, monkeypatch):
+    monkeypatch.setenv("RUNLEDGER_CONFIG", str(tmp_path / "missing.json"))
+    settings = rollback.load_settings()
+    assert settings.auto_prune is True
+    assert (settings.auto_prune_keep, settings.auto_prune_older_than) == (50, None)
+    assert (settings.warn_mb, settings.warn_file_mb) == (500.0, 50.0)
+
+
+def test_settings_read_the_documented_user_keys():
+    settings = rollback.load_settings({"rollback": {
+        "auto_prune": {"keep": 3, "older_than": "30d"}, "warn_mb": 12.5, "warn_file_mb": 1}})
+    assert settings.auto_prune is True
+    assert settings.auto_prune_keep == 3
+    assert settings.auto_prune_older_than == timedelta(days=30)
+    assert (settings.warn_mb, settings.warn_file_mb) == (12.5, 1.0)
+
+
+def test_auto_prune_can_be_switched_off():
+    assert rollback.load_settings({"rollback": {"auto_prune": False}}).auto_prune is False
+    assert rollback.load_settings({"rollback": {"auto_prune": True}}).auto_prune is True
+
+
+@pytest.mark.parametrize("value", ["yes", 0, 1, None, [], {"keep": "many"}, {"keep": 0},
+                                   {"older_than": "soon"}, {"keep": 2.5}])
+def test_unusable_rollback_values_keep_the_documented_defaults(value):
+    """A hook deletes refs from this config, so anything that is not exactly the documented
+    shape (or `false`) keeps the default instead of guessing."""
+    settings = rollback.load_settings({"rollback": {"auto_prune": value, "warn_mb": "big",
+                                                    "warn_file_mb": -1}})
+    assert settings.auto_prune is True
+    assert (settings.auto_prune_keep, settings.auto_prune_older_than) == (50, None)
+    assert (settings.warn_mb, settings.warn_file_mb) == (500.0, 50.0)
+
+
+def test_a_zero_size_threshold_switches_the_warning_off():
+    settings = rollback.load_settings({"rollback": {"warn_mb": 0, "warn_file_mb": 0}})
+    assert (settings.warn_mb, settings.warn_file_mb) == (0.0, 0.0)
+
+
+def test_rollback_settings_are_read_from_the_user_file_only(tmp_path, monkeypatch):
+    """A project `.runledger.json` must not be able to trigger deletions."""
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({"rollback": {"auto_prune": False}}), encoding="utf-8")
+    monkeypatch.setenv("RUNLEDGER_CONFIG", str(config))
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / ".runledger.json").write_text(
+        json.dumps({"rollback": {"auto_prune": {"keep": 1}}}), encoding="utf-8")
+    monkeypatch.chdir(project)
+    assert rollback.load_settings().auto_prune is False
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("30d", timedelta(days=30)),
+    ("2w", timedelta(weeks=2)),
+    ("6h", timedelta(hours=6)),
+    ("1D", timedelta(days=1)),
+    ("0d", timedelta(0)),
+])
+def test_parse_duration_accepts_days_weeks_and_hours(text, expected):
+    assert rollback.parse_duration(text) == expected
+
+
+@pytest.mark.parametrize("text", ["", "30", "d30", "-1d", "1.5d", "30dd", "1 day", None, 30])
+def test_parse_duration_rejects_anything_else(text):
+    assert rollback.parse_duration(text) is None

@@ -240,6 +240,20 @@ def load_prices(override: Optional[Union[str, os.PathLike]] = None
 PRICES: Dict[Tuple[str, str], Tuple[float, float, float]] = load_prices()
 
 
+def prices_checked() -> Optional[_date]:
+    """The date the bundled prices.json was last verified, or None when the packaged table
+    carries no usable `checked` value. `_parse_table` skips that key, so it is read here.
+    A `checked` key in a user prices file is informational only: the staleness policy is
+    about the bundled table."""
+    value = _DEFAULT_RAW.get("checked")
+    if not isinstance(value, str):
+        return None
+    try:
+        return _date.fromisoformat(value.strip()[:10])
+    except ValueError:
+        return None
+
+
 def is_stale(today: Optional[Union[str, _date]] = None) -> bool:
     """Return True when today is > STALE_DAYS (120) days past CHECKED."""
     try:

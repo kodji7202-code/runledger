@@ -8,7 +8,7 @@ way for every agent.
 | --- | --- | --- | --- |
 | Claude Code | `claude-code` | Stable | `~/.claude/projects/<encoded project folder>/<session>.jsonl` |
 | Codex CLI | `codex` | Beta | `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl` (default `~/.codex`) |
-| Factory Droid | `droid` | Beta | `$FACTORY_HOME/sessions/<encoded project folder>/<session>.jsonl` (default `~/.factory`) |
+| Factory Droid | `droid` | Beta | `$FACTORY_HOME/sessions/<encoded project folder>/<session>.jsonl` (default `~/.factory`; `FACTORY_HOME_OVERRIDE` names the home instead) |
 | Aider | `aider` | Beta | `.aider.chat.history.md` in the project folder |
 | Any other agent | `native` | Open format | `<project>/.runledger/runs/*.runledger.json` or `*.runledger.jsonl` |
 
@@ -88,7 +88,10 @@ Droid writes a JSONL transcript and a sibling settings file:
 ~/.factory/sessions/<cwd-with-path-separators-replaced-by-dashes>/<session-id>.settings.json
 ```
 
-- **Config directory.** `FACTORY_HOME` overrides `~/.factory`.
+- **Config directory.** `FACTORY_HOME` names the Factory config directory, overriding the default
+  `~/.factory`. `FACTORY_HOME_OVERRIDE` names a *home* directory instead: the config directory
+  becomes `<FACTORY_HOME_OVERRIDE>/.factory`, which is how the droid binary itself reads it.
+  When both are set, `FACTORY_HOME` wins.
 - **Relative `cwd`.** `droid exec --cwd .` records `cwd` as `.`. RunLedger recovers the real folder
   from, in order: the session's own `% pwd` context, a folder field in the settings file, the Git
   work tree that a majority of the absolute tool paths lie in, and the encoded session folder name.
@@ -120,7 +123,7 @@ Droid writes a JSONL transcript and a sibling settings file:
   than the session's own usage is ignored.
 - **Settings file lookup.** RunLedger reads the sibling `<name>.settings.json` first. If the
   transcript was copied or renamed without it, RunLedger looks for `<session-id>.settings.json`
-  under `$FACTORY_HOME/sessions/`, preferring the folder for the session's `cwd`.
+  under the config directory's `sessions/` folder, preferring the folder for the session's `cwd`.
 - **Where usage came from.** JSON receipts include `totals.usage_source`: `messages` (per-message
   usage), `settings` (the settings file's total) or `missing`, and `tokens_estimated` on each step
   that received an even split. Markdown and HTML receipts add a footer note for estimated
