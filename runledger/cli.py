@@ -14,10 +14,10 @@
   runledger key rotate ID [--db runledger.db]
   runledger push [SESSION | --latest] [--project PATH] [--agent AGENT] [--server URL] [--key KEY] [--user NAME]
                  [--review] [--review-model MODEL] [--safe | --no-safe]
-  runledger guard                       Claude Code PreToolUse hook (reads the event on stdin)
+  runledger guard [--agent claude-code|droid|codex]   PreToolUse hook (reads the event on stdin)
   runledger guard install [--project PATH | --global]
   runledger guard uninstall [--project PATH | --global]
-  runledger guard test 'EVENT_JSON'
+  runledger guard test [--agent claude-code|droid|codex] 'EVENT_JSON'
   runledger checkpoint [--label TEXT] [--run RUN_ID] [--cwd DIR]
   runledger checkpoints [--cwd DIR]
   runledger checkpoints prune --keep N [--cwd DIR]
@@ -55,6 +55,7 @@ from .review import DEFAULT_REVIEW_MODEL, ai_review
 from .summarize import DEFAULT_AI_MODEL, ai_summaries, apply_templates, file_changes
 
 AGENTS = ("claude-code", "codex", "droid", "aider", "native")
+GUARD_AGENTS = ("claude-code", "droid", "codex")   # the agents the guard can hook
 
 
 def build(session_path: str, use_ai: bool = False, ai_model: str = DEFAULT_AI_MODEL,
@@ -776,7 +777,10 @@ def cmd_push(args) -> int:
 def print_guard_help() -> None:
     """Print the `runledger guard` help text (used when stdin is an interactive TTY)."""
     p = argparse.ArgumentParser(prog="runledger guard",
-                                description="Real-time policy guard and checkpoint hooks for Claude Code.")
+                                description="Real-time policy guard and checkpoint hooks for Claude Code, "
+                                            "Factory Droid and Codex CLI.")
+    p.add_argument("--agent", metavar="AGENT", default=None,
+                   help="the agent this hook belongs to: claude-code (default), droid or codex")
     gsub = p.add_subparsers(dest="guard_cmd", metavar="{install,uninstall,test}")
     gsub.add_parser("install", help="add guard and automatic checkpoint hooks to Claude Code")
     gsub.add_parser("uninstall", help="remove the guard hook from Claude Code settings.json")
@@ -787,20 +791,21 @@ def print_guard_help() -> None:
 def cmd_guard(args) -> int:
     from . import guard
 
+    agent = getattr(args, "agent", None)
     if args.guard_cmd == "install":
         return guard.cmd_install(args.project, args.global_scope,
                                  portable=getattr(args, "portable", False))
     if args.guard_cmd == "uninstall":
         return guard.cmd_uninstall(args.project, args.global_scope)
     if args.guard_cmd == "test":
-        return guard.cmd_test(args.event)
+        return guard.cmd_test(args.event, agent)
     if sys.stdin is not None and sys.stdin.isatty():
         if hasattr(args, "_guard_parser"):
             args._guard_parser.print_help()
         else:
             print_guard_help()
         return 2
-    return guard.main()
+    return guard.main(agent)
 
 
 def _positive_int(raw: str) -> int:
@@ -961,7 +966,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     prb.add_argument("--cwd", help="Git working tree folder (default: current folder)")
     prb.set_defaults(func=cmd_rollback)
 
-    pg = sub.add_parser("guard", help="real-time policy guard and checkpoint hooks for Claude Code")
+    pg = sub.add_parser("guard", help="real-time policy guard and checkpoint hooks for Claude Code, "
+                                      "Factory Droid and Codex CLI")
+    pg.add_argument("--agent", metavar="AGENT", default=None,
+                    help="the agent this hook belongs to: claude-code (default), droid or codex; "
+                         "an unknown value is reported on stderr and never blocks the call")
     gsub = pg.add_subparsers(dest="guard_cmd", metavar="{install,uninstall,test}")
     pgi = gsub.add_parser("install", help="add guard and automatic checkpoint hooks to Claude Code")
     scope = pgi.add_mutually_exclusive_group()
@@ -975,6 +984,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     uscope.add_argument("--global", dest="global_scope", action="store_true", help="edits ~/.claude/settings.json")
     pgt = gsub.add_parser("test", help="print the decision for one PreToolUse event (JSON)")
     pgt.add_argument("event", help="the event as a JSON object")
+    pgt.add_argument("--agent", metavar="AGENT", choices=GUARD_AGENTS,
+                     help="read the event as that agent's payload (default: inferred from the payload)")
     pg.set_defaults(func=cmd_guard, _guard_parser=pg)
 
     args = p.parse_args(argv)

@@ -1,9 +1,16 @@
-"""Real-time policy guard: a Claude Code PreToolUse hook.
+"""Real-time policy guard: the PreToolUse hook of Claude Code, Factory Droid and Codex CLI.
 
-Claude Code runs `runledger guard` before each tool call and writes the call to
+The agent runs `runledger guard` before each tool call and writes the call to
 stdin as JSON. The guard scores the call with the rules in risk.py, decides
 allow / ask / deny, can ask a team approval server, and appends each decision to
 <cwd>/.runledger/guard.log.
+
+The installed hook carries its agent in `--agent claude-code|droid|codex`, so the call is
+read with the right tool vocabulary (Droid `Execute`/`Create`/`Edit`/`ApplyPatch`, Codex
+`apply_patch`, the MCP names of both) and answered in the shape the agent understands.
+Without the flag the agent is inferred from the payload's own fields. Codex cannot prompt
+from a hook, so an ask becomes a deny there with the reason why (the user's own file may
+opt out with `"codex_ask": "allow"`).
 
 Two settings files, not equal:
   ~/.runledger/config.json  the user's own file. It may set everything.
@@ -50,6 +57,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from . import labels
 from . import paths as _paths
 from . import risk as _risk
+from .mcp_risk import mcp_parts
 from .parser import Step
 from .risk import POLICY_FILE, RULE_ASK_CODE, RULE_DENY_CODE, SEVERITY_POINTS, Risk, assess_step
 # The user's own file has one reader for every consumer (guard, risk, rollback, doctor).
@@ -68,6 +76,29 @@ except Exception:  # pragma: no cover - standalone fallback when runledger.secre
 HOOK_COMMAND = "runledger guard"
 HOOK_MARGIN_S = 15             # the hook entry allows the approval wait plus this many seconds
 PROJECT_DIR_ENV_VARS = ("CLAUDE_PROJECT_DIR", "FACTORY_PROJECT_DIR", "DROID_PROJECT_DIR")
+
+AGENT_CLAUDE = "claude-code"
+AGENT_DROID = "droid"
+AGENT_CODEX = "codex"
+AGENTS = (AGENT_CLAUDE, AGENT_DROID, AGENT_CODEX)
+
+# The agent's own tool name -> the canonical name every risk rule keys on. A native tool
+# that is not in the table keeps its own name (it is logged with `canonical_tool: null`).
+_DROID_TOOLS = {
+    "Execute": "Bash",
+    "Create": "Write",
+    "Edit": "Edit",
+    "Read": "Read",
+    "LS": "Search",
+    "Glob": "Search",
+    "Grep": "Search",
+    "Task": "Task",
+    "FetchUrl": "WebFetch",
+    "WebSearch": "WebSearch",
+    "ApplyPatch": "ApplyPatch",
+}
+_CODEX_TOOLS = {"Bash": "Bash", "apply_patch": "ApplyPatch"}
+_PATCH_TOOLS = ("ApplyPatch", "apply_patch")
 
 LOG_DIR = ".runledger"
 LOG_FILE = "guard.log"
@@ -423,6 +454,13 @@ def _effective_guard(project: Dict[str, Any], user: Dict[str, Any], trusted: Dic
         warnings.append(f"Ignored on_timeout ask in {POLICY_FILE}: it would loosen deny. "
                         f"Only {USER_CONFIG_DIR}/{USER_CONFIG_FILE} can set it.")
 
+    # Codex has no way to prompt from a hook, so an ask is denied there unless the user's own
+    # file chooses to allow it. A project file may not make that choice.
+    codex_ask = "allow" if u.get("codex_ask") == "allow" else "deny"
+    if "codex_ask" in p:
+        warnings.append(f"Ignored codex_ask in {POLICY_FILE}: Codex cannot prompt from a hook, so only "
+                        f"{USER_CONFIG_DIR}/{USER_CONFIG_FILE} can decide what an ask means there.")
+
     cfg = {
         "mode": mode,
         "fail_closed": u.get("fail_closed") is True or p.get("fail_closed") is True,
@@ -432,6 +470,7 @@ def _effective_guard(project: Dict[str, Any], user: Dict[str, Any], trusted: Dic
         "project_deny": project_deny,
         "user_ask": user_ask,
         "project_ask": project_ask,
+        "codex_ask": codex_ask,
         "approval": {"server": trusted["server"], "api_key_env": trusted["api_key_env"],
                      "timeout_s": timeout, "on_timeout": on_timeout},
     }
@@ -576,6 +615,104 @@ def _exclusion_warnings(user_rules: List[Dict[str, Any]], project_rules: List[Di
     return warnings
 
 
+# ---------------------------------------------------------------- agents
+
+def normalize_agent(value: Any) -> Optional[str]:
+    """The canonical name of the agent a `--agent` value names, or None for anything else."""
+    if not isinstance(value, str):
+        return None
+    name = value.strip().lower()
+    return name if name in AGENTS else None
+
+
+def infer_agent(event: Any) -> str:
+    """The agent a payload came from, read from the payload's own shape. Used only when the
+    hook command has no (or an unknown) `--agent`: Codex sends `turn_id`, Droid a
+    `permission_mode` of off/spec/auto-*, and everything else is Claude Code."""
+    if not isinstance(event, dict):
+        return AGENT_CLAUDE
+    if "turn_id" in event:
+        return AGENT_CODEX
+    mode = event.get("permission_mode")
+    if isinstance(mode, str) and (mode in ("off", "spec") or mode.startswith("auto-")):
+        return AGENT_DROID
+    return AGENT_CLAUDE
+
+
+def canonical_tool(agent: str, tool: str) -> Optional[str]:
+    """The canonical name a tool is assessed and logged under, or None for a name this
+    agent's vocabulary does not know. Claude Code names are canonical already; a Droid
+    connector name gets the `mcp__` prefix the receipts use (the classifier reads both)."""
+    if agent == AGENT_CLAUDE:
+        return tool
+    mapped = (_DROID_TOOLS if agent == AGENT_DROID else _CODEX_TOOLS).get(tool)
+    if mapped is not None:
+        return mapped
+    if mcp_parts(tool) is not None:
+        return tool if tool.startswith("mcp__") else "mcp__" + tool
+    return None
+
+
+def _patch_text(tool_input: Any) -> str:
+    """The body of an ApplyPatch/apply_patch call. Codex sends it as `command`, Droid as
+    `input` or `patch`; a client that sends the text itself is accepted too."""
+    if isinstance(tool_input, str):
+        return tool_input
+    if isinstance(tool_input, dict):
+        for key in ("command", "input", "patch"):
+            value = tool_input.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+    return ""
+
+
+def _patch_steps(text: str) -> List[Tuple[str, Dict[str, Any]]]:
+    """One canonical step per file the patch touches (the same parser the Codex and Droid
+    adapters use). A body that cannot be parsed becomes one Edit with no path, so its text
+    is still scanned for secret content."""
+    from .adapters.codex import patch_to_steps
+    try:
+        steps = patch_to_steps(text)
+    except Exception:
+        steps = []
+    return steps or [("Edit", {"old_string": "", "new_string": text})]
+
+
+def _droid_steps(tool: str, raw_input: Any) -> List[Tuple[str, Dict[str, Any]]]:
+    if tool in _PATCH_TOOLS:
+        return _patch_steps(_patch_text(raw_input))
+    tool_input = raw_input if isinstance(raw_input, dict) else {}
+    if tool == "Edit":
+        # Droid names the Edit fields old_str/new_str; the rules read old_string/new_string.
+        mapped = dict(tool_input)
+        if "old_string" not in mapped and isinstance(mapped.get("old_str"), str):
+            mapped["old_string"] = mapped["old_str"]
+        if "new_string" not in mapped and isinstance(mapped.get("new_str"), str):
+            mapped["new_string"] = mapped["new_str"]
+        return [("Edit", mapped)]
+    return [(_DROID_TOOLS.get(tool, tool), tool_input)]
+
+
+def normalize_event(event: dict, agent: str) -> Tuple[str, Dict[str, Any], List[Tuple[str, Dict[str, Any]]]]:
+    """(the agent's own tool name, its tool_input, the canonical steps to assess).
+
+    Claude Code names are canonical, so its event is one step unchanged. Droid's `Execute`
+    becomes a `Bash`, `Create` a `Write`, `Edit` an `Edit` with `old_string`/`new_string`,
+    its searches a `Search`, `FetchUrl` a `WebFetch`, and `ApplyPatch` one step per file.
+    Codex's `apply_patch` likewise becomes one step per file. MCP tool names are passed
+    through unchanged: the classifier understands `mcp__server__tool` and Droid's bare
+    `server__tool` alike. Any other name keeps its own, so the guard never decides on a
+    tool it does not understand."""
+    tool = str(event.get("tool_name") or "?")
+    raw_input = event.get("tool_input")
+    tool_input = raw_input if isinstance(raw_input, dict) else {}
+    if agent == AGENT_DROID:
+        return tool, tool_input, _droid_steps(tool, raw_input)
+    if agent == AGENT_CODEX and tool == "apply_patch":
+        return tool, tool_input, _patch_steps(_patch_text(raw_input))
+    return tool, tool_input, [(tool, tool_input)]
+
+
 # ---------------------------------------------------------------- decision
 
 def _event_cwd(event: Any) -> str:
@@ -588,11 +725,19 @@ def _summary(tool: str, tool_input: Dict[str, Any]) -> str:
     file tools. Write/Edit bodies and MCP arguments are never included."""
     if tool in ("Bash", "PowerShell"):
         text = tool_input.get("command")
-    elif tool in ("Write", "Edit", "MultiEdit", "Read", "NotebookEdit"):
+    elif tool in ("Write", "Edit", "MultiEdit", "Read", "Delete", "NotebookEdit"):
         text = tool_input.get("file_path") or tool_input.get("path") or tool_input.get("notebook_path")
     else:
         text = None
     return clean(text, 200) if isinstance(text, str) else ""
+
+
+def _steps_summary(steps: List[Tuple[str, Dict[str, Any]]]) -> str:
+    """The summary of a call: the single step's own summary, or the comma list of the paths
+    a patch touches. File bodies never appear."""
+    if len(steps) == 1:
+        return _summary(steps[0][0], steps[0][1])
+    return clean(", ".join(s for s in (_summary(t, i) for t, i in steps) if s), 200)
 
 
 def _reasons_text(risks: List[Risk], limit: int = 300) -> str:
@@ -653,8 +798,12 @@ class _DecisionDict(dict):
         return str(self.get("policy_decision") or self.get("decision") or "allow")
 
 
-def decide(event: dict, policy: Optional[dict] = None, approver: Optional[ApproverFn] = None) -> _DecisionDict:
+def decide(event: dict, policy: Optional[dict] = None, approver: Optional[ApproverFn] = None,
+           agent: Optional[str] = None) -> _DecisionDict:
     """Decide one PreToolUse event.
+
+    `agent` is the installed hook's agent (`claude-code`, `droid` or `codex`). Without it,
+    or with a name the guard does not know, the agent comes from the payload's own shape.
 
     `policy` is the project's .runledger.json dict. The user's ~/.runledger/config.json
     is loaded here. The effective settings are the user's, tightened by the project's
@@ -663,12 +812,13 @@ def decide(event: dict, policy: Optional[dict] = None, approver: Optional[Approv
     (`http_approver`). It is used only when the decision is "ask" and an approval server
     is configured, or when an approver is passed in.
 
-    Returns a dict with: decision (allow|deny|ask, after monitor mode and approval),
-    policy_decision (before them), mode, tool, tool_use_id, session_id, cwd, reason, codes,
-    risks [{severity, code, reason}], approval (None or the server status), summary,
-    and warnings (project settings that were ignored). Nothing here touches the log
-    or stdout."""
+    Returns a dict with: decision (allow|deny|ask, after monitor mode, the approval and the
+    agent's own rules), policy_decision (before them), mode, agent, tool, canonical_tool,
+    tool_use_id, session_id, cwd, reason, codes, risks [{severity, code, reason}], approval
+    (None or the server status), summary, and warnings (project settings that were ignored).
+    Nothing here touches the log or stdout."""
     event = event if isinstance(event, dict) else {}
+    agent = normalize_agent(agent) or infer_agent(event)
     event_cwd = _event_cwd(event)
     cwd = project_root(event)
     project = policy if isinstance(policy, dict) else read_policy(cwd, _resolved=True)
@@ -676,23 +826,24 @@ def decide(event: dict, policy: Optional[dict] = None, approver: Optional[Approv
     cfg, warnings = _effective_guard(project, user, trusted_approval_settings(user))
     warnings = _project_key_warnings(project) + warnings
 
-    tool = str(event.get("tool_name") or "?")
-    raw_input = event.get("tool_input")
-    tool_input = raw_input if isinstance(raw_input, dict) else {}
+    tool, tool_input, steps = normalize_event(event, agent)
     session_id = str(event.get("session_id") or "")
+    tool_use_id = str(event.get("tool_use_id") or "")
 
     rs = _risk_settings(project, user)
     warnings += rs.get("extra_warnings", [])
-    step = Step(index=1, tool=tool, input=tool_input,
-                tool_use_id=str(event.get("tool_use_id") or ""), model=None, timestamp=None)
-    risks = assess_step(step, cwd, rs["assess"], workdir=event_cwd)
+    risks: List[Risk] = []
+    for index, (step_tool, step_input) in enumerate(steps, start=1):
+        step = Step(index=index, tool=step_tool, input=step_input,
+                    tool_use_id=tool_use_id, model=None, timestamp=None)
+        risks.extend(assess_step(step, cwd, rs["assess"], workdir=event_cwd))
     warnings += _apply_project_severity(risks, rs["project_severity"])
     warnings += _ignore_warnings(risks, rs["project_ignore"])
     warnings += _exclusion_warnings(cfg["user_deny"], cfg["project_deny"], risks, "deny")
     warnings += _exclusion_warnings(cfg["user_ask"], cfg["project_ask"], risks, "ask")
 
     policy_decision, drivers = _evaluate(risks, cfg)
-    summary = _summary(tool, tool_input)
+    summary = _steps_summary(steps)
     # Everything decided above used the shell's own words; the label is the whole spaced drive
     # path in the reason text this decision shows. The label names what the command said, so it
     # goes on before the redaction and the truncation of that output copy, never after them: a
@@ -718,13 +869,17 @@ def decide(event: dict, policy: Optional[dict] = None, approver: Optional[Approv
         request = {"session_id": session_id, "tool": tool, "summary": summary,
                    "risks": risks_out, "cwd": cwd}
         final, approval, reason = _ask_approver(request, cfg, approver, drivers, reason)
+    if agent == AGENT_CODEX and policy_decision == "ask" and final != "allow":
+        final, reason = _codex_ask_outcome(cfg, drivers, approval, reason)
 
     return _DecisionDict({
         "decision": final,
         "policy_decision": policy_decision,
         "mode": cfg["mode"],
+        "agent": agent,
         "tool": tool,
-        "tool_use_id": step.tool_use_id,
+        "canonical_tool": canonical_tool(agent, tool),
+        "tool_use_id": tool_use_id,
         "session_id": session_id,
         "cwd": cwd,
         "reason": clean(labels.show_reason(reason, shown), 500),
@@ -736,18 +891,49 @@ def decide(event: dict, policy: Optional[dict] = None, approver: Optional[Approv
     })
 
 
-def evaluate(event: dict, policy: Optional[dict] = None, approver: Optional[ApproverFn] = None) -> _DecisionDict:
+def _codex_ask_outcome(cfg: Dict[str, Any], drivers: List[Risk], approval: Optional[str],
+                       reason: str) -> Tuple[str, str]:
+    """Codex cannot prompt from a hook and would silently continue on an ask, so an ask
+    becomes a deny there that names the rule and the way forward. The user's own file can
+    choose to allow it instead (`"codex_ask": "allow"`); an approval answer from the server
+    always wins over that, and its own wording is kept in the reason."""
+    text = _reasons_text(drivers)
+    if cfg.get("codex_ask") == "allow" and approval is None:
+        return "allow", (f"RunLedger guard needs confirmation ({text}) but Codex cannot prompt from a hook; "
+                         f"allowed because guard.codex_ask is allow in {USER_CONFIG_DIR}/{USER_CONFIG_FILE}.")
+    if approval is not None:
+        # The approval server's own answer is the story; add what Codex can and cannot do about it.
+        return "deny", (f"{reason} Codex cannot prompt from a hook, so the call is denied: approve it in the "
+                        f"RunLedger approval server or adjust the rules, then re-run.")
+    return "deny", (f"RunLedger guard needs confirmation but Codex cannot prompt from a hook, so this call is "
+                    f"denied: {text}. Approve it in the RunLedger approval server or adjust the rules, "
+                    f"then re-run.")
+
+
+def evaluate(event: dict, policy: Optional[dict] = None, approver: Optional[ApproverFn] = None,
+             agent: Optional[str] = None) -> _DecisionDict:
     """Evaluate a PreToolUse event and write warnings + the decision record to `.runledger/guard.log`."""
-    decision = decide(event, policy=policy, approver=approver)
+    decision = decide(event, policy=policy, approver=approver, agent=agent)
     _log_quietly(lambda: _log_warnings_and_decision(decision))
     return decision
 
 
-def hook_output(decision: dict) -> Optional[dict]:
-    """The JSON Claude Code expects on stdout, or None for "print nothing"."""
+def hook_output(decision: dict, agent: Optional[str] = None) -> Optional[dict]:
+    """The JSON the agent expects on stdout, or None for "print nothing".
+
+    Claude Code and Droid read the same `hookSpecificOutput.permissionDecision` object and
+    both support "ask". Codex only blocks on "deny" (an ask would let the call run), so it
+    never gets an ask here: a deny prints the same JSON object. A plain allow prints
+    nothing for every agent, so the agent's own permission rules still apply: the guard is
+    meant to restrict, not to grant."""
+    if agent is None:
+        agent = decision.get("agent")
+    agent = normalize_agent(agent) or AGENT_CLAUDE
     final = decision.get("decision")
+    if agent == AGENT_CODEX:
+        return _deny_output(str(decision.get("reason") or "")) if final == "deny" else None
     if final == "allow" and decision.get("approval") != "approved":
-        return None  # no opinion: Claude Code's own permission rules decide
+        return None  # no opinion: the agent's own permission rules decide
     if final not in ("allow", "deny", "ask"):
         return None
     return {"hookSpecificOutput": {
@@ -855,7 +1041,9 @@ def _append_log(cwd: str, fields: Dict[str, Any]) -> None:
 
 def _decision_record(decision: dict) -> Dict[str, Any]:
     return {
-        "session_id": decision["session_id"], "tool": decision["tool"], "mode": decision["mode"],
+        "session_id": decision["session_id"], "tool": decision["tool"],
+        "agent": decision.get("agent"), "canonical_tool": decision.get("canonical_tool"),
+        "mode": decision["mode"],
         "tool_use_id": decision.get("tool_use_id", ""),
         "decision": decision["decision"], "policy_decision": decision["policy_decision"],
         "codes": decision["codes"], "approval": decision["approval"],
@@ -891,26 +1079,31 @@ def _log_quietly(fn: Callable[[], None]) -> None:
 
 # ---------------------------------------------------------------- hook entry point
 
-def handle(raw: str) -> Optional[dict]:
+def handle(raw: str, agent: Optional[str] = None) -> Optional[dict]:
     """Hook input (JSON text) to hook output dict, or None to print nothing.
-    Never raises."""
+    Never raises. `agent` is the installed hook's `--agent` value; without it, or with a
+    value the guard does not know, the agent comes from the payload's own shape."""
     event: Any = None
     policy: Dict[str, Any] = {}
+    resolved = normalize_agent(agent)
     try:
         event = json.loads(raw)
         if not isinstance(event, dict):
             raise ValueError("hook input is not a JSON object")
         if not event:
             return None
+        if resolved is None:
+            resolved = infer_agent(event)
         policy = read_policy(project_root(event), _resolved=True)
-        decision = decide(event, policy)
+        decision = decide(event, policy, agent=resolved)
     except Exception as exc:
-        return _on_error(event, policy, exc)
+        return _on_error(event, policy, exc, agent=resolved)
     _log_quietly(lambda: _log_warnings_and_decision(decision))
-    return hook_output(decision)
+    return hook_output(decision, resolved)
 
 
-def _on_error(event: Any, policy: Dict[str, Any], exc: BaseException) -> Optional[dict]:
+def _on_error(event: Any, policy: Dict[str, Any], exc: BaseException,
+              agent: Optional[str] = None) -> Optional[dict]:
     try:
         cwd = project_root(event)
         if not policy:
@@ -923,9 +1116,10 @@ def _on_error(event: Any, policy: Dict[str, Any], exc: BaseException) -> Optiona
     if isinstance(event, dict):
         tool = str(event.get("tool_name") or "?")
         session = str(event.get("session_id") or "")
+        resolved = agent or normalize_agent(infer_agent(event))
         _log_quietly(lambda: _append_log(cwd, {
-            "session_id": session, "tool": tool, "mode": cfg["mode"], "decision": "error",
-            "tool_use_id": str(event.get("tool_use_id") or ""),
+            "session_id": session, "tool": tool, "agent": resolved, "mode": cfg["mode"],
+            "decision": "error", "tool_use_id": str(event.get("tool_use_id") or ""),
             "codes": [], "reason": msg}))
     if cfg["mode"] == "monitor":
         return None
@@ -934,9 +1128,11 @@ def _on_error(event: Any, policy: Dict[str, Any], exc: BaseException) -> Optiona
     return None
 
 
-def main() -> int:
+def main(agent: Optional[str] = None) -> int:
     """Entry point for `runledger guard` as a hook: stdin JSON in, stdout JSON out.
-    When stdin is an interactive terminal (TTY), print the guard help and exit 2."""
+    `agent` is the installed hook's `--agent` value; an unknown one is reported on stderr
+    and never blocks, because a blocking argument error would stop every tool call. When
+    stdin is an interactive terminal (TTY), print the guard help and exit 2."""
     try:
         if sys.stdin is not None and sys.stdin.isatty():
             from .cli import print_guard_help
@@ -944,12 +1140,16 @@ def main() -> int:
             return 2
     except Exception:
         pass
+    resolved = normalize_agent(agent)
+    if agent and resolved is None:
+        _warn(f"unknown --agent {agent!r}: reading the agent from the payload instead. "
+              f"Known agents: {', '.join(AGENTS)}.")
     try:
         raw = sys.stdin.buffer.read().decode("utf-8", errors="replace")
     except Exception:
         raw = ""
     try:
-        out = handle(raw)
+        out = handle(raw, resolved)
     except Exception:
         out = None
     if out is not None:
@@ -961,10 +1161,20 @@ def main() -> int:
     return 0
 
 
+def _warn(message: str) -> None:
+    """A note for the human reading the hook's stderr. Never raises."""
+    try:
+        sys.stderr.write(f"runledger guard: {message}\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------- CLI helpers
 
-def cmd_test(event_json: str) -> int:
-    """`runledger guard test '<json event>'`: print the decision. Writes no log."""
+def cmd_test(event_json: str, agent: Optional[str] = None) -> int:
+    """`runledger guard test '<json event>' [--agent X]`: print the decision and the hook
+    output for that agent. Writes no log."""
     try:
         event = json.loads(event_json)
     except ValueError as exc:
@@ -973,12 +1183,13 @@ def cmd_test(event_json: str) -> int:
     if not isinstance(event, dict):
         print("error: event must be a JSON object", file=sys.stderr)
         return 1
+    resolved = normalize_agent(agent)
     try:
-        decision = decide(event, read_policy(project_root(event)))
+        decision = decide(event, read_policy(project_root(event)), agent=resolved)
     except Exception as exc:
         print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
-    print(json.dumps({"decision": decision, "hook_output": hook_output(decision)}, indent=2))
+    print(json.dumps({"decision": decision, "hook_output": hook_output(decision, resolved)}, indent=2))
     return 0
 
 
@@ -1021,13 +1232,19 @@ def hook_entry(hook_seconds: int, portable: bool = False) -> Dict[str, Any]:
 def _owned_command_parts(command: Any) -> Optional[List[str]]:
     """The words of a complete RunLedger guard hook command, else None.
 
-    Only the two forms the installer writes count: bare `runledger guard` (optionally with a
+    Only the forms the installer writes count: bare `runledger guard` (optionally with a
     path or `.exe`) and `"<interpreter>" -m runledger guard`, for every interpreter it can write
     (`sys.executable` itself, whatever the file is called, plus `python3.13t.exe` and the other
-    interpreter names). A foreign hook that merely mentions the words (`echo runledger guard`,
-    `other.sh && runledger guard`, a pipeline, a redirection, a command with an attached shell
-    operator) is not ours and must never be replaced or removed."""
-    return _paths.owned_hook_command(command, ("guard",))
+    interpreter names), each optionally followed by `--agent <agent>`. A foreign hook that
+    merely mentions the words (`echo runledger guard`, `other.sh && runledger guard`, a
+    pipeline, a redirection, a command with an attached shell operator) is not ours and must
+    never be replaced or removed."""
+    tails = [("guard",)] + [("guard", "--agent", agent) for agent in AGENTS]
+    for tail in tails:
+        parts = _paths.owned_hook_command(command, tail)
+        if parts is not None:
+            return parts
+    return None
 
 
 def _is_guard_hook(h: Any) -> bool:
