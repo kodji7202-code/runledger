@@ -12,6 +12,11 @@ Without the flag the agent is inferred from the payload's own fields. Codex cann
 from a hook, so an ask becomes a deny there with the reason why (the user's own file may
 opt out with `"codex_ask": "allow"`).
 
+`runledger guard install|uninstall --agent claude-code|droid|codex|all` writes one file per
+agent (hook_targets.py: `.claude/settings.json`, `.factory/hooks.json` with its events at the
+top level, `.codex/hooks.json` with them under `hooks`), project-scoped by default and under
+the agent's own config directory with `--global`.
+
 Two settings files, not equal:
   ~/.runledger/config.json  the user's own file. It may set everything.
   <cwd>/.runledger.json     the project's file. It may only TIGHTEN the guard.
@@ -54,9 +59,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from . import hook_targets
 from . import labels
 from . import paths as _paths
 from . import risk as _risk
+from .hook_targets import (
+    AGENT_ALL,
+    AGENT_CLAUDE,
+    AGENT_CODEX,
+    AGENT_DROID,
+    AGENTS,
+    HookTarget,
+    InstallError,
+)
 from .mcp_risk import mcp_parts
 from .parser import Step
 from .risk import POLICY_FILE, RULE_ASK_CODE, RULE_DENY_CODE, SEVERITY_POINTS, Risk, assess_step
@@ -76,11 +91,6 @@ except Exception:  # pragma: no cover - standalone fallback when runledger.secre
 HOOK_COMMAND = "runledger guard"
 HOOK_MARGIN_S = 15             # the hook entry allows the approval wait plus this many seconds
 PROJECT_DIR_ENV_VARS = ("CLAUDE_PROJECT_DIR", "FACTORY_PROJECT_DIR", "DROID_PROJECT_DIR")
-
-AGENT_CLAUDE = "claude-code"
-AGENT_DROID = "droid"
-AGENT_CODEX = "codex"
-AGENTS = (AGENT_CLAUDE, AGENT_DROID, AGENT_CODEX)
 
 # The agent's own tool name -> the canonical name every risk rule keys on. A native tool
 # that is not in the table keeps its own name (it is logged with `canonical_tool: null`).
@@ -165,8 +175,9 @@ class ApprovalError(Exception):
     """The approval server gave no usable answer. The guard then asks locally."""
 
 
-class InstallError(Exception):
-    """settings.json cannot be merged safely. The file is left untouched."""
+# InstallError (a hook file that cannot be merged safely, left untouched) is defined in
+# hook_targets, next to the readers and writers that raise it; `guard.InstallError` is the
+# same class.
 
 
 # ---------------------------------------------------------------- redaction
@@ -1197,9 +1208,10 @@ def settings_path(project: Optional[str] = None, global_scope: bool = False,
                   home: Optional[Path] = None) -> Path:
     """The Claude Code settings file this install writes: `~/.claude/settings.json` for a
     global install, else `<project>/.claude/settings.json`. Without `--project` the folder
-    is the project root (nearest ancestor with `.runledger.json` or `.git`), not the cwd."""
+    is the project root (nearest ancestor with `.runledger.json` or `.git`), not the cwd.
+    `CLAUDE_CONFIG_DIR` moves the global file, as it does for Claude Code itself."""
     if global_scope:
-        return (Path(home) if home is not None else Path.home()) / ".claude" / "settings.json"
+        return hook_targets.claude_dir(home) / "settings.json"
     base = Path(project) if project else Path(project_root())
     return base / ".claude" / "settings.json"
 
@@ -1212,10 +1224,15 @@ def hook_timeout_for(approval_timeout_s: Optional[float] = None) -> int:
     return int(math.ceil(base)) + HOOK_MARGIN_S
 
 
-def guard_hook_command(portable: bool = False) -> str:
-    """The hook command written to settings.json: `"<sys.executable>" -m runledger guard`
-    by default, or bare `runledger guard` when `portable=True`."""
-    return HOOK_COMMAND if portable else f'"{sys.executable}" -m runledger guard'
+def guard_hook_command(portable: bool = False, agent: Optional[str] = None) -> str:
+    """The hook command the installer writes: `"<sys.executable>" -m runledger guard` by
+    default, or bare `runledger guard` when `portable=True`. Droid and Codex append the
+    explicit `--agent`, so the hook never has to guess the payload shape; Claude Code keeps
+    the command it has always had."""
+    base = HOOK_COMMAND if portable else f'"{sys.executable}" -m runledger guard'
+    if agent in (AGENT_DROID, AGENT_CODEX):
+        return f"{base} --agent {agent}"
+    return base
 
 
 def checkpoint_hook_command(portable: bool = False) -> str:
@@ -1225,8 +1242,11 @@ def checkpoint_hook_command(portable: bool = False) -> str:
     return checkpoint_command if portable else f'"{sys.executable}" -m runledger checkpoint --hook'
 
 
-def hook_entry(hook_seconds: int, portable: bool = False) -> Dict[str, Any]:
-    return {"matcher": "*", "hooks": [{"type": "command", "command": guard_hook_command(portable=portable), "timeout": hook_seconds}]}
+def hook_entry(hook_seconds: int, portable: bool = False, agent: Optional[str] = None,
+               matcher: str = "*") -> Dict[str, Any]:
+    return {"matcher": matcher,
+            "hooks": [{"type": "command", "command": guard_hook_command(portable=portable, agent=agent),
+                       "timeout": hook_seconds}]}
 
 
 def _owned_command_parts(command: Any) -> Optional[List[str]]:
@@ -1258,30 +1278,30 @@ def _group_has_guard(group: Any) -> bool:
     return any(_is_guard_hook(h) for h in (hooks if isinstance(hooks, list) else []))
 
 
-def install_hook(path: Path, approval_timeout_s: Optional[float] = None,
+def install_into(target: HookTarget, approval_timeout_s: Optional[float] = None,
                  portable: bool = False) -> Tuple[bool, Optional[Path]]:
-    """Add the guard and lifecycle checkpoint entries, keeping everything else.
+    """Add the guard and lifecycle checkpoint entries to one agent's hook file, keeping
+    everything else.
 
-    The entry's "timeout" is hook_timeout_for(approval_timeout_s). An existing guard
-    hook (any matcher) gets its command and timeout updated in place; a second entry is
-    never added.
+    The guard entry's "timeout" is hook_timeout_for(approval_timeout_s) and its command
+    carries the agent. An existing guard hook (any matcher) gets its command and timeout
+    updated in place; a second entry is never added. A wrapped file keeps its events under
+    `hooks`; Droid's file keeps them at the top level.
 
-    Returns (changed, backup). The original is copied to `settings.json.bak` before
-    any change; a file that is already up to date is not written. Raises InstallError
-    (and writes nothing) if the file is not a JSON object."""
-    path = Path(path)
+    Returns (changed, backup). The original is copied to `<file>.bak` before any change;
+    a file that is already up to date is not written. Raises InstallError (and writes
+    nothing) if the file is not a JSON object or an event it must touch is not a list."""
+    path = Path(target.path)
     want = hook_timeout_for(approval_timeout_s)
-    want_cmd = guard_hook_command(portable=portable)
+    want_cmd = guard_hook_command(portable=portable, agent=target.agent)
     want_cp_cmd = checkpoint_hook_command(portable=portable)
+    prefix = f"{target.wrap_key}." if target.wrap_key else ""
     existed, settings = _read_settings(path)
-    hooks = settings.get("hooks")
-    hooks = {} if hooks is None else hooks
-    if not isinstance(hooks, dict):
-        raise InstallError(f"'hooks' in {path} must be an object. Nothing was changed.")
+    hooks = _events_of(settings, target, path)
     pre = hooks.get("PreToolUse")
     pre = [] if pre is None else pre
     if not isinstance(pre, list):
-        raise InstallError(f"'hooks.PreToolUse' in {path} must be a list. Nothing was changed.")
+        raise InstallError(f"'{prefix}PreToolUse' in {path} must be a list. Nothing was changed.")
 
     changed = False
     found = False
@@ -1298,14 +1318,14 @@ def install_hook(path: Path, approval_timeout_s: Optional[float] = None,
                     h["timeout"] = want
                     changed = True
     if not found:
-        pre.append(hook_entry(want, portable=portable))
+        pre.append(hook_entry(want, portable=portable, agent=target.agent, matcher=target.matcher))
         changed = True
     from .rollback import HOOK_EVENTS, is_checkpoint_hook
     for event in HOOK_EVENTS:
         groups = hooks.get(event)
         groups = [] if groups is None else groups
         if not isinstance(groups, list):
-            raise InstallError(f"'hooks.{event}' in {path} must be a list. Nothing was changed.")
+            raise InstallError(f"'{prefix}{event}' in {path} must be a list. Nothing was changed.")
         found_checkpoint = False
         for group in groups:
             entries = group.get("hooks") if isinstance(group, dict) else None
@@ -1327,25 +1347,34 @@ def install_hook(path: Path, approval_timeout_s: Optional[float] = None,
         return False, None
 
     hooks["PreToolUse"] = pre
-    settings["hooks"] = hooks
+    if target.wrap_key:
+        settings[target.wrap_key] = hooks
     return True, _write_settings(path, settings, existed)
 
 
-def uninstall_hook(path: Path) -> Tuple[bool, Optional[Path]]:
-    """Remove guard and checkpoint hooks from settings.json, keeping everything else.
+def uninstall_into(target: HookTarget) -> Tuple[bool, Optional[Path]]:
+    """Remove the RunLedger guard and checkpoint hooks from one agent's hook file, keeping
+    everything else.
 
     Other hooks in the same PreToolUse group stay. A group left with no hooks is removed,
-    then an empty PreToolUse list and an empty hooks object. Returns (changed, backup);
-    the original is copied to `settings.json.bak` first, and a file without the hook is
-    not written. Raises InstallError (and writes nothing) if the file is not a JSON object."""
-    path = Path(path)
+    then an empty PreToolUse list, an empty event and an empty `hooks` object. Returns
+    (changed, backup); the original is copied to `<file>.bak` first, and a file without
+    our hooks is not written. Raises InstallError (and writes nothing) if the file is not a
+    JSON object or an event it must touch is not a list."""
+    path = Path(target.path)
+    prefix = f"{target.wrap_key}." if target.wrap_key else ""
     existed, settings = _read_settings(path)
-    hooks = settings.get("hooks")
-    if not isinstance(hooks, dict):
+    if target.wrap_key is not None and target.wrap_key not in settings:
         return False, None
+    hooks = _events_of(settings, target, path)
     from .rollback import HOOK_EVENTS, is_checkpoint_hook
+    events = ("PreToolUse", *HOOK_EVENTS)
+    for event in events:
+        groups = hooks.get(event)
+        if groups is not None and not isinstance(groups, list):
+            raise InstallError(f"'{prefix}{event}' in {path} must be a list. Nothing was changed.")
     removed = False
-    for event in ("PreToolUse", *HOOK_EVENTS):
+    for event in events:
         groups = hooks.get(event)
         if not isinstance(groups, list):
             continue
@@ -1369,39 +1398,48 @@ def uninstall_hook(path: Path) -> Tuple[bool, Optional[Path]]:
             del hooks[event]
     if not removed:
         return False, None
-    if not hooks:
-        del settings["hooks"]
+    if target.wrap_key and not hooks:
+        del settings[target.wrap_key]
     return True, _write_settings(path, settings, existed)
+
+
+def _events_of(settings: Dict[str, Any], target: HookTarget, path: Path) -> Dict[str, Any]:
+    """The mapping the events live in: the file itself for Droid, its `hooks` object for
+    Claude Code and Codex. A wrapper of the wrong type is refused, not overwritten."""
+    if target.wrap_key is None:
+        return settings
+    events = settings.get(target.wrap_key)
+    if events is None:
+        events = {}
+        settings[target.wrap_key] = events
+    if not isinstance(events, dict):
+        raise InstallError(f"'{target.wrap_key}' in {path} must be an object. Nothing was changed.")
+    return events
+
+
+def install_hook(path: Path, approval_timeout_s: Optional[float] = None,
+                 portable: bool = False) -> Tuple[bool, Optional[Path]]:
+    """The Claude Code path, kept for callers that know the settings file: add the guard and
+    lifecycle checkpoint entries to it, keeping everything else."""
+    return install_into(hook_targets.target_at(AGENT_CLAUDE, path), approval_timeout_s,
+                        portable=portable)
+
+
+def uninstall_hook(path: Path) -> Tuple[bool, Optional[Path]]:
+    """The Claude Code path, kept for callers that know the settings file: remove the guard
+    and checkpoint hooks from it, keeping everything else."""
+    return uninstall_into(hook_targets.target_at(AGENT_CLAUDE, path))
 
 
 def _read_settings(path: Path) -> Tuple[bool, Dict[str, Any]]:
     """(existed, settings). A missing or empty file gives {}. Raises InstallError if the
     file is not a JSON object."""
-    if not path.exists():
-        return False, {}
-    text = path.read_text(encoding="utf-8-sig")
-    if not text.strip():
-        return True, {}
-    try:
-        settings = json.loads(text)
-    except ValueError as exc:
-        raise InstallError(f"{path} is not valid JSON ({exc}); fix or move it. Nothing was changed.") from None
-    if not isinstance(settings, dict):
-        raise InstallError(f"{path} must contain a JSON object. Nothing was changed.")
-    return True, settings
+    return hook_targets.read_settings(path)
 
 
 def _write_settings(path: Path, settings: Dict[str, Any], existed: bool) -> Optional[Path]:
-    """Write atomically, after copying an existing file to `settings.json.bak`. Returns the backup."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    backup = None
-    if existed:
-        backup = path.with_name(path.name + ".bak")
-        shutil.copy2(path, backup)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(settings, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
-    return backup
+    """Write atomically, after copying an existing file to `<name>.bak`. Returns the backup."""
+    return hook_targets.write_settings(path, settings, existed)
 
 
 def verify_hook_command(command: str, cwd: Optional[str] = None) -> Tuple[bool, str]:
@@ -1441,56 +1479,102 @@ def verify_hook_command(command: str, cwd: Optional[str] = None) -> Tuple[bool, 
     return True, f"Verified hook command: {command} (exit 0)"
 
 
+def _agent_value(agent: Optional[str]) -> str:
+    """The `--agent` value of `guard install|uninstall`: a known agent, `all`, or the default
+    (claude-code) when the flag is absent or names nothing the guard knows."""
+    if isinstance(agent, str) and agent.strip().lower() == AGENT_ALL:
+        return AGENT_ALL
+    return normalize_agent(agent) or AGENT_CLAUDE
+
+
 def cmd_install(project: Optional[str] = None, global_scope: bool = False,
-                home: Optional[Path] = None, portable: bool = False) -> int:
-    """Install or update the hook. The hook timeout follows the approval wait: the project's
-    timeout_s for a project install, the user's or the default for a global install. Without
-    `--project` the settings file is written at the project root, so installing from a
-    subfolder configures the whole project."""
+                home: Optional[Path] = None, portable: bool = False,
+                agent: Optional[str] = None) -> int:
+    """Install or update the hook for one agent, or for every agent that has one (`all`).
+
+    The hook timeout follows the approval wait: the project's timeout_s for a project
+    install, the user's or the default for a global install. Without `--project` the hook
+    file is written at the project root, so installing from a subfolder configures the whole
+    project. `all` never creates an agent's global config directory from nothing: an agent
+    whose directory is missing is reported and skipped. Exit 0 when every target was written
+    or already up to date, 1 on an error."""
+    value = _agent_value(agent)
     project_dir = None if global_scope else (Path(project) if project else Path(project_root()))
-    target = settings_path(project, global_scope, home)
+    targets, skipped = hook_targets.plan_targets(value, project_dir, global_scope, home)
     project_policy = {} if global_scope else read_policy(str(project_dir))
     timeout_s = approval_timeout(project_policy)
+    failed = False
+    for target in targets:
+        failed = _install_target(target, timeout_s, portable, project_dir, home, global_scope) or failed
+    for skipped_agent, reason in skipped:
+        print(f"Skipped {hook_targets.LABEL[skipped_agent]}: {reason}")
+    return 1 if failed else 0
+
+
+def _install_target(target: HookTarget, timeout_s: float, portable: bool, project_dir: Any,
+                    home: Optional[Path], global_scope: bool) -> bool:
+    """Write one agent's hook file, report it, and run the stored command once. True on error."""
+    path = Path(target.path)
     try:
-        changed, backup = install_hook(target, timeout_s, portable=portable)
+        changed, backup = install_into(target, timeout_s, portable=portable)
     except InstallError as exc:
         print(f"error: {exc}", file=sys.stderr)
-        return 1
+        return True
     except OSError as exc:
-        print(f"error: cannot update {target}: {exc}", file=sys.stderr)
-        return 1
+        print(f"error: cannot update {path}: {exc}", file=sys.stderr)
+        return True
     hook_s = hook_timeout_for(timeout_s)
-    cmd = guard_hook_command(portable=portable)
     if changed:
-        print(f"Installed or updated the RunLedger guard hook and checkpoint hooks in {target} (hook timeout {hook_s} s)")
+        print(f"Installed or updated the RunLedger guard hook and checkpoint hooks in {path} (hook timeout {hook_s} s)")
         if backup is not None:
             print(f"Backup of the previous file: {backup}")
     else:
-        print(f"The RunLedger guard hook and checkpoint hooks in {target} are already up to date (hook timeout {hook_s} s). Nothing changed.")
-    verify_cwd = str(Path(home) if home is not None else Path.home()) if global_scope else str(project_dir)
+        print(f"The RunLedger guard hook and checkpoint hooks in {path} are already up to date (hook timeout {hook_s} s). Nothing changed.")
+    if target.agent == AGENT_DROID:
+        print("Restart droid, or review the hooks in /hooks: Droid snapshots its hooks at startup.")
+    elif target.agent == AGENT_CODEX:
+        print("Codex runs only hooks you trust: open `codex`, run /hooks and trust the RunLedger entries.")
+        print("Note: Codex cannot prompt from a hook, so an action the guard would ask about becomes "
+              'a deny instead (set guard.codex_ask to "allow" in the user config to change that).')
+    verify_cwd = str(home if home is not None else Path.home()) if global_scope else str(project_dir)
+    cmd = guard_hook_command(portable=portable, agent=target.agent)
     ok, verify_msg = verify_hook_command(cmd, cwd=verify_cwd)
-    print(verify_msg)
-    return 0
+    if ok and target.agent != AGENT_CLAUDE:
+        print(f"Hook command self-test: {cmd} exited 0 (this shows the command runs; the agent "
+              "still has to load it).")
+    else:
+        print(verify_msg)
+    return False
 
 
 def cmd_uninstall(project: Optional[str] = None, global_scope: bool = False,
-                  home: Optional[Path] = None) -> int:
-    """Remove the hook from the project's or the user's Claude Code settings. Without
-    `--project` the settings file is the project root's, exactly as for `install`."""
-    target = settings_path(project, global_scope, home)
-    try:
-        changed, backup = uninstall_hook(target)
-    except InstallError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
-    except OSError as exc:
-        print(f"error: cannot update {target}: {exc}", file=sys.stderr)
-        return 1
-    if not changed:
-        print(f"No RunLedger guard or checkpoint hooks in {target}. Nothing changed.")
-        return 0
-    print(f"Removed the RunLedger guard hook and checkpoint hooks from {target}")
-    if backup is not None:
-        print(f"Backup of the previous file: {backup}")
-    print("Policy files (.runledger.json, ~/.runledger/config.json) and .runledger/guard.log were left as they are.")
-    return 0
+                  home: Optional[Path] = None, agent: Optional[str] = None) -> int:
+    """Remove the RunLedger hooks from one agent's file, or from every agent's (`all`).
+    Without `--project` the file is the project root's, exactly as for `install`. An agent
+    without a hook file is reported and skipped; nothing is created. Exit 0 when every file
+    is clean, 1 on an error."""
+    value = _agent_value(agent)
+    agents = AGENTS if value == AGENT_ALL else (value,)
+    project_dir = None if global_scope else (Path(project) if project else Path(project_root()))
+    failed = False
+    for name in agents:
+        target = hook_targets.target_for(name, project_dir, global_scope, home)
+        path = Path(target.path)
+        try:
+            changed, backup = uninstall_into(target)
+        except InstallError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            failed = True
+            continue
+        except OSError as exc:
+            print(f"error: cannot update {path}: {exc}", file=sys.stderr)
+            failed = True
+            continue
+        if not changed:
+            print(f"No RunLedger guard or checkpoint hooks in {path}. Nothing changed.")
+            continue
+        print(f"Removed the RunLedger guard hook and checkpoint hooks from {path}")
+        if backup is not None:
+            print(f"Backup of the previous file: {backup}")
+        print("Policy files (.runledger.json, ~/.runledger/config.json) and .runledger/guard.log were left as they are.")
+    return 1 if failed else 0
