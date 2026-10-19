@@ -19,8 +19,9 @@ MCP_READ_VERBS = frozenset(
     "get list read search describe show fetch find query view check diff validate count lookup "
     "inspect status health stat preview export download watch tail".split())
 MCP_DESTRUCTIVE_VERBS = frozenset(
+    # "nuke" is deliberately not built in: a user adds it through `mcp_verbs.destructive`.
     "delete remove destroy drop purge wipe truncate terminate kill revoke uninstall erase "
-    "reset unpublish deprovision decommission nuke force".split())
+    "reset unpublish deprovision decommission force".split())
 MCP_WRITE_VERBS = frozenset(
     "create update add set put patch push merge deploy publish send post invite follow "
     "unfollow like unlike retweet mute unmute pause unpause restore apply write edit insert "

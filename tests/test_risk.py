@@ -552,7 +552,11 @@ def _write_policy(tmp_path, data, raw=None, bom=False):
     (tmp_path / ".runledger.json").write_bytes(payload)
 
 
-DEFAULTS = {"ignore": [], "severity_overrides": {}, "extra_secret_paths": []}
+DEFAULTS = {"ignore": [], "severity_overrides": {}, "extra_secret_paths": [],
+            # v0.7.0: the rule keys a receipt reads, from the project file only.
+            "mcp_verbs": {"destructive": [], "write": [], "read": []},
+            "tool_rules": {"deny": [], "ask": []},
+            "command_rules": {"deny": [], "ask": []}}
 
 
 def test_load_policy_missing_file_gives_defaults(tmp_path):
