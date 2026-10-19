@@ -307,6 +307,90 @@ def test_the_installed_command_survives_a_spaced_interpreter_path(tmp_path, caps
     assert guard._owned_command_parts(stored) is not None
 
 
+# ---------------------------------------------------------------- VAL-AGENT-035 (Codex)
+
+def test_codex_entries_carry_the_windows_command_it_can_actually_run(tmp_path, capsys):
+    """Codex runs hook commands itself, and on Windows the `"C:\\...\\python.exe" -m runledger
+    guard` form never starts: the quotes are read as part of the program name (measured with
+    codex 0.163.0 by pointing the hook at a recorder script - the same path unquoted fires, the
+    quoted one is silent). Every Codex entry therefore also stores the `cmd /c` copy of the same
+    command, in the `commandWindows` field Codex reads on Windows."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    assert install(proj, "codex") == 0
+    capsys.readouterr()
+
+    data = read_json(project_file(proj, "codex"))
+    guard_hook = hook_of(data, "codex")
+    assert guard_hook["commandWindows"] == f'cmd /c "{guard_hook["command"]}"'
+    assert sys.executable in guard_hook["commandWindows"]
+    for event in CHECKPOINTS:
+        hook = hook_of(data, "codex", event)
+        assert hook["commandWindows"] == f'cmd /c "{hook["command"]}"'
+
+
+def test_portable_codex_entries_carry_the_windows_command_too(tmp_path, capsys):
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    assert install(proj, "codex", "--portable") == 0
+    capsys.readouterr()
+
+    data = read_json(project_file(proj, "codex"))
+    assert hook_of(data, "codex")["commandWindows"] == 'cmd /c "runledger guard --agent codex"'
+    for event in CHECKPOINTS:
+        assert hook_of(data, "codex", event)["commandWindows"] == 'cmd /c "runledger checkpoint --hook"'
+
+
+@pytest.mark.parametrize("agent", ("claude-code", "droid"))
+def test_other_agents_keep_the_single_command(tmp_path, agent, capsys):
+    """Droid's and Claude Code's own hook runners start the quoted interpreter path as written,
+    so their files stay as they were."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    assert install(proj, agent) == 0
+    capsys.readouterr()
+
+    data = read_json(project_file(proj, agent))
+    assert "commandWindows" not in hook_of(data, agent)
+    for event in CHECKPOINTS:
+        assert "commandWindows" not in hook_of(data, agent, event)
+
+
+def test_a_codex_entry_without_the_windows_command_is_repaired_in_place(tmp_path, capsys):
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    assert install(proj, "codex") == 0
+    capsys.readouterr()
+    target = project_file(proj, "codex")
+    data = read_json(target)
+    del hook_of(data, "codex")["commandWindows"]
+    target.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    assert install(proj, "codex") == 0
+    capsys.readouterr()
+    data = read_json(target)
+    assert hook_of(data, "codex")["commandWindows"] == f'cmd /c "{hook_of(data, "codex")["command"]}"'
+
+    before = sha(target)
+    assert install(proj, "codex") == 0
+    out = capsys.readouterr().out
+    assert "already up to date" in out and "Nothing changed" in out
+    assert sha(target) == before
+
+
+def test_uninstall_removes_a_codex_entry_with_the_windows_command(tmp_path, capsys):
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    assert install(proj, "codex") == 0
+    capsys.readouterr()
+
+    assert uninstall(proj, "codex") == 0
+    capsys.readouterr()
+    text = project_file(proj, "codex").read_text(encoding="utf-8")
+    assert "commandWindows" not in text and "runledger" not in text
+    assert read_json(project_file(proj, "codex")) == {}
+
+
 # ---------------------------------------------------------------- VAL-AGENT-005
 
 @pytest.mark.parametrize("agent", AGENTS)

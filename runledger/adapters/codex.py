@@ -37,6 +37,12 @@ CONTEXT_PREFIXES = ("<environment_context>", "<user_instructions>")
 SHELL_FUNCTIONS = {"shell", "container.exec", "shell_command", "exec_command"}
 SHELL_PROGRAMS = {"bash", "sh", "zsh", "powershell", "pwsh"}
 SCRIPT_FLAGS = {"-lc", "-c", "-command"}
+# Codex 0.163 runs shell calls through code mode: an `exec` tool whose input is JavaScript
+# calling tools.exec_command({...}). The shell call inside it is what the hook saw.
+CODE_CALL_RE = re.compile(r"\btools\.([A-Za-z_][A-Za-z0-9_.]*)\s*\(\s*\{")
+JS_KEY_RE = re.compile(r"[A-Za-z_$][\w$]*")
+JS_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "b": "\b", "f": "\f", "v": "\v",
+              "0": "\0", "\\": "\\", '"': '"', "'": "'", "/": "/", "\n": ""}
 LEGACY_ITEM_TYPES = {"message", "reasoning", "function_call", "function_call_output",
                      "local_shell_call", "custom_tool_call", "custom_tool_call_output"}
 USAGE_FIELDS = ("input_tokens", "output_tokens", "cache_write_tokens", "cache_read_tokens")
@@ -391,10 +397,15 @@ class _Rollout:
         elif ptype == "function_call":
             self._function_call(p, ts)
         elif ptype == "custom_tool_call":
-            if p.get("name") == "apply_patch":
-                self._patch(_str(p.get("input")) or "", p.get("call_id"), ts)
+            name = str(p.get("name") or "?")
+            source = _str(p.get("input")) or ""
+            calls = _code_mode_calls(source) if name == "exec" else []
+            if name == "apply_patch":
+                self._patch(source, p.get("call_id"), ts)
+            elif calls:
+                for tool, inp in calls:
+                    self._add_step(tool, inp, p.get("call_id"), ts)
             else:
-                name = str(p.get("name") or "?")
                 self._add_step(_tool_name(name), {"input": p.get("input")}, p.get("call_id"), ts)
         elif ptype == "local_shell_call":
             action = p.get("action") if isinstance(p.get("action"), dict) else {}
@@ -458,6 +469,159 @@ def _wrapped_script(argv: List[str]) -> Optional[str]:
         if argv[i].lower() in SCRIPT_FLAGS:
             return argv[i + 1]
     return None
+
+
+def _code_mode_calls(source: str) -> List[Tuple[str, Dict[str, Any]]]:
+    """(tool, input) for every shell call inside a Codex code-mode script, in order.
+
+    Codex's `exec` tool runs JavaScript that calls `tools.exec_command({...})`; the hook payload
+    and the risk engine both see the plain command, so the step carries that command under the
+    tool name of the shell that ran it."""
+    calls: List[Tuple[str, Dict[str, Any]]] = []
+    for match in CODE_CALL_RE.finditer(source):
+        if match.group(1) not in SHELL_FUNCTIONS:
+            continue
+        body = _object_body(source, match.end() - 1)
+        if body is None:
+            continue
+        args = _js_object(body)
+        value = args.get("cmd", args.get("command", args.get("arguments")))
+        if value is None or value == "":
+            continue
+        tool, command = _shell_call(value)
+        shell = args.get("shell") or args.get("program")
+        if isinstance(shell, str) and shell:
+            tool = "PowerShell" if _program(shell) in ("powershell", "pwsh") else "Bash"
+        calls.append((tool, {"command": command}))
+    return calls
+
+
+def _object_body(source: str, start: int) -> Optional[str]:
+    """The text between the braces of the object literal at `source[start]`, else None."""
+    if start >= len(source) or source[start] != "{":
+        return None
+    depth = 0
+    i = start
+    while i < len(source):
+        ch = source[i]
+        if ch == '"':
+            _, after = _js_string(source, i)
+            i = after if after > i else i + 1
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return source[start + 1:i]
+        i += 1
+    return None
+
+
+def _js_string(source: str, start: int) -> Tuple[Optional[str], int]:
+    """The JavaScript string literal at `source[start] == '"'` and the index after it."""
+    if start >= len(source) or source[start] != '"':
+        return None, start + 1
+    out: List[str] = []
+    i = start + 1
+    while i < len(source):
+        ch = source[i]
+        if ch == '"':
+            return "".join(out), i + 1
+        if ch != "\\":
+            out.append(ch)
+            i += 1
+            continue
+        nxt = source[i + 1:i + 2]
+        if nxt == "x":
+            try:
+                out.append(chr(int(source[i + 2:i + 4], 16)))
+            except ValueError:
+                out.append(nxt)
+            i += 4
+            continue
+        if nxt == "u":
+            try:
+                if source[i + 2:i + 3] == "{":
+                    end = source.find("}", i + 3)
+                    out.append(chr(int(source[i + 3:end], 16)))
+                    i = end + 1
+                    continue
+                out.append(chr(int(source[i + 2:i + 6], 16)))
+            except ValueError:
+                out.append(nxt)
+            i += 6
+            continue
+        out.append(JS_ESCAPES.get(nxt, nxt))
+        i += 2
+    return None, i
+
+
+def _js_value(source: str, start: int) -> Tuple[Any, int]:
+    """A JavaScript string, string array, number, boolean or null at `start`, and the index
+    after it. Anything else (a nested object, a call) gives None and `start` unchanged."""
+    i = start
+    while i < len(source) and source[i] in " \t\r\n":
+        i += 1
+    if i >= len(source):
+        return None, start
+    ch = source[i]
+    if ch == '"':
+        text, after = _js_string(source, i)
+        return (text, after) if text is not None else (None, start)
+    if ch == "[":
+        items: List[str] = []
+        j = i + 1
+        while j < len(source) and source[j] != "]":
+            if source[j] in " \t\r\n,":
+                j += 1
+                continue
+            if source[j] == '"':
+                text, after = _js_string(source, j)
+                if text is None:
+                    break
+                items.append(text)
+                j = after
+                continue
+            j += 1
+        return items, j + 1
+    for word, value in (("true", True), ("false", False), ("null", None)):
+        if source.startswith(word, i):
+            return value, i + len(word)
+    return None, start
+
+
+def _js_object(body: str) -> Dict[str, Any]:
+    """The top-level keys of a JavaScript object literal body, with the values `_js_value` reads."""
+    out: Dict[str, Any] = {}
+    i = 0
+    while i < len(body):
+        ch = body[i]
+        if ch in " \t\r\n,":
+            i += 1
+            continue
+        if ch == '"':
+            key, after = _js_string(body, i)
+            if key is None:
+                break
+            i = after
+        else:
+            match = JS_KEY_RE.match(body, i)
+            if not match:
+                i += 1
+                continue
+            key, i = match.group(0), match.end()
+        while i < len(body) and body[i] in " \t\r\n":
+            i += 1
+        if i >= len(body) or body[i] != ":":
+            continue
+        value, after = _js_value(body, i + 1)
+        if after > i + 1:
+            out[key] = value
+            i = after
+        else:
+            i += 1
+    return out
 
 
 def _patch_in_shell(value: Any) -> Optional[str]:
@@ -613,7 +777,8 @@ def _args(raw: Any) -> Dict[str, Any]:
 
 
 def _output_of(raw: Any) -> Tuple[str, Optional[int]]:
-    """(text, exit_code) from a call output: plain text, or a JSON string/object
+    """(text, exit_code) from a call output: plain text, a list of text blocks (the code-mode
+    `custom_tool_call_output` form), or a JSON string/object
     {"output": ..., "metadata": {"exit_code": ...}}."""
     obj = raw
     if isinstance(raw, str):
@@ -621,6 +786,9 @@ def _output_of(raw: Any) -> Tuple[str, Optional[int]]:
             obj = json.loads(raw)
         except (ValueError, RecursionError):
             return raw, None
+    if isinstance(obj, list) and obj and all(isinstance(block, dict) and isinstance(block.get("text"), str)
+                                             for block in obj):
+        return "\n".join(block["text"] for block in obj), None
     if isinstance(obj, dict) and "output" in obj:
         text = obj.get("output")
         if text is None:

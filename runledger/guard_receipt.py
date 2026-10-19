@@ -6,7 +6,7 @@ import os
 import re
 from collections import defaultdict, deque
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from . import gitinfo
 from .guard import LOG_DIR, LOG_FILE, _summary, project_root, redact
@@ -25,6 +25,9 @@ _USER_REJECTION = re.compile(
     r"request interrupted by user\b)",
     re.IGNORECASE,
 )
+# One shell call, two names: the adapters build a `PowerShell` step when the recorded
+# command runs powershell, while Droid and Codex report the tool as `Execute` or `Bash`.
+_SHELL_TOOLS = ("Bash", "PowerShell")
 
 
 def _records(path: Path) -> Iterator[Dict[str, Any]]:
@@ -90,13 +93,30 @@ def _log_paths(cwd: str) -> List[Path]:
     return paths
 
 
-def load_guard_decisions(run: Run) -> List[Dict[str, Any]]:
-    """Match by tool id, or by the Guard's own tool + summary for legacy records.
+def _take_step(by_summary: Dict[Any, "deque"], tools: List[str], text: str,
+               used: set) -> Optional[Step]:
+    """The oldest unconsumed step carrying `text` among `tools`, in the order given."""
+    for tool in tools:
+        queue = by_summary.get((tool, text))
+        while queue and queue[0].index in used:
+            queue.popleft()
+        if queue:
+            return queue.popleft()
+    return None
 
-    Only legacy records use the fallback. A present but unknown id remains unmatched.
-    Repeated legacy calls consume steps in transcript order, including blocked calls.
-    Reads from project root, git top-level, and `run.cwd` (legacy subfolder location),
-    de-duplicating identical entries across files.
+
+def load_guard_decisions(run: Run) -> List[Dict[str, Any]]:
+    """Match by tool id, then by the Guard's own tool + summary for the rows ids cannot explain.
+
+    A row whose recorded id the transcript knows takes that step first, whatever its summary;
+    every other row - a legacy record without an id, a Droid row (whose log never keeps the
+    id), or a Codex id the rollout does not carry - is matched on the tool name and summary the
+    Guard logged. Repeated calls consume steps in transcript order, including blocked calls.
+    A record whose tool name the agent's vocabulary translated matches the step under the
+    canonical name (Droid logs `Execute`, the receipt step is `Bash`); a row that names its
+    agent may also cross `Bash`/`PowerShell`, which the adapters choose by the recorded
+    program. Reads from project root, git top-level, and `run.cwd` (legacy subfolder
+    location), de-duplicating identical entries across files.
     """
     if not run.cwd or is_unc(run.cwd):
         return []
@@ -104,9 +124,9 @@ def load_guard_decisions(run: Run) -> List[Dict[str, Any]]:
     by_summary = defaultdict(deque)
     for step in run.steps:
         by_summary[(step.tool, _summary(step.tool, step.input))].append(step)
-    used = set()
+    used: set = set()
     seen_keys = set()
-    decisions: List[Dict[str, Any]] = []
+    rows: List[Tuple[int, Dict[str, Any]]] = []
     for log_idx, log_path in enumerate(_log_paths(run.cwd)):
         seen_in_file = set()
         for record in _records(log_path):
@@ -126,23 +146,36 @@ def load_guard_decisions(run: Run) -> List[Dict[str, Any]]:
                 if log_idx > 0 and dedup_key in seen_keys:
                     continue
                 seen_in_file.add(dedup_key)
-            # Filter non-interventions before consuming a potential legacy match.
+            # Filter non-interventions before consuming a potential step.
             if _outcome(record, None) is None:
                 continue
-            tool_id = record.get("tool_use_id")
-            step = None
-            if isinstance(tool_id, str) and tool_id:
-                step = by_id.get(tool_id)
-            elif not tool_id:
-                candidates = by_summary[(tool, redact(summary))]
-                while candidates and candidates[0].index in used:
-                    candidates.popleft()
-                if candidates:
-                    step = candidates.popleft()
-            if step is not None:
-                used.add(step.index)
-            codes = record.get("codes")
-            decisions.append({
+            rows.append((len(rows), record))
+        seen_keys.update(seen_in_file)
+    matched: Dict[int, Optional[Step]] = {}
+    for index, record in rows:
+        tool_id = record.get("tool_use_id")
+        step = by_id.get(tool_id) if isinstance(tool_id, str) and tool_id else None
+        if step is not None and step.index not in used:
+            used.add(step.index)
+            matched[index] = step
+    for index, record in rows:
+        if index in matched:
+            continue
+        canonical = record.get("canonical_tool")
+        match_tool = canonical if isinstance(canonical, str) and canonical else record["tool"]
+        tools = [match_tool]
+        if isinstance(record.get("agent"), str) and match_tool in _SHELL_TOOLS:
+            tools += [t for t in _SHELL_TOOLS if t != match_tool]
+        step = _take_step(by_summary, tools, redact(record["summary"]), used)
+        if step is not None:
+            used.add(step.index)
+        matched[index] = step
+    decisions: List[Dict[str, Any]] = []
+    for index, record in rows:
+        tool, summary = record["tool"], record.get("summary", "")
+        step = matched.get(index)
+        codes = record.get("codes")
+        decisions.append({
                 "step": step.index if step is not None else None,
                 "tool": redact(tool), "summary": redact(summary),
                 "decision": record["decision"], "outcome": _outcome(record, step),
@@ -151,7 +184,6 @@ def load_guard_decisions(run: Run) -> List[Dict[str, Any]]:
                 if isinstance(codes, list) else [],
                 "ts": redact(record["ts"]) if isinstance(record.get("ts"), str) else None,
             })
-        seen_keys.update(seen_in_file)
     return decisions
 
 
