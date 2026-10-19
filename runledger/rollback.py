@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
-from .paths import owned_hook_command
+from .paths import is_abs, owned_hook_command
 from .userconfig import load_user_config
 
 PREFIX = "refs/runledger/checkpoints/"
@@ -100,6 +100,28 @@ class NotAGitRepository(CheckpointError):
     """Raised when the target directory is not inside a Git working tree."""
 
 
+def _unsafe_path(name: str) -> bool:
+    """The same names the checkpoint reader refuses, checked on a repo-relative POSIX path."""
+    parts = name.split("/")
+    if not name or "\\" in name or any(
+            p in ("", ".", "..") or p.rstrip(". ").casefold() in (".git", "git~1", ".git~1")
+            for p in parts):
+        return True
+    if os.name != "nt":
+        return False
+    reserved = {"con", "prn", "aux", "nul"}
+    reserved.update(f"{prefix}{n}" for prefix in ("com", "lpt") for n in range(1, 10))
+    return any(any(c in '<>:"|?*' or ord(c) < 32 for c in p) or p != p.rstrip(". ") or
+               p.split(".")[0].casefold() in reserved for p in parts)
+
+
+def _within(name: str, prefixes: Tuple[str, ...]) -> bool:
+    """A path is selected by itself, or by a folder above it. Literal (no globs), prefix-safe:
+    `src` never selects `src2`. An empty prefix (the repository root, `--path .`) selects all."""
+    return any(name == prefix or name.startswith(prefix + "/") or not prefix
+               for prefix in prefixes)
+
+
 def _unsupported_reparse_point(path: Path, info: os.stat_result) -> bool:
     """Detect directory junctions without following them, on old and new Python versions."""
     if stat.S_ISLNK(info.st_mode):
@@ -181,6 +203,7 @@ class Plan:
     restore: List[str]
     remove: List[str]
     keep_ignored: List[str]
+    paths: Tuple[str, ...] = ()
 
 
 class Repository:
@@ -490,13 +513,90 @@ class Repository:
             raise CheckpointError("Could not check ignored paths; nothing was restored.")
         return {os.fsdecode(p) for p in out.stdout.split(b"\0") if p}
 
-    def plan(self, checkpoint: Checkpoint, current_tree: Optional[str] = None) -> Plan:
+    def tree_sizes(self, tree: str) -> Dict[str, int]:
+        """Blob sizes of one tree in a single `git ls-tree -r -l -z`; submodules are skipped.
+        Read-only, and used to count the bytes a preview is about to change."""
+        sizes: Dict[str, int] = {}
+        for record in self._git("ls-tree", "-r", "-l", "-z", tree).stdout.split(b"\0"):
+            if not record:
+                continue
+            meta, _, name = record.partition(b"\t")
+            fields = meta.split()
+            if len(fields) < 4 or fields[0] == b"160000":
+                continue
+            try:
+                sizes[os.fsdecode(name)] = int(fields[3])
+            except ValueError:
+                continue
+        return sizes
+
+    def _resolve(self, raw: str) -> str:
+        """One `--path` value as a repo-relative POSIX path. Relative values are read against
+        `--cwd`, which is the repository root; `.` becomes the whole tree. The value keeps the
+        spelling the user typed, so a case-insensitive volume can still match the repository's
+        own spelling instead of the case the filesystem reports."""
+        if not isinstance(raw, str) or not raw.strip():
+            raise CheckpointError("--path needs a file or folder inside the repository.")
+        if is_abs(raw):
+            resolved = os.path.normpath(raw)
+            parts = []
+        else:
+            resolved = os.path.normpath(os.path.join(str(self.root), raw.replace("\\", os.sep)))
+            parts = [p for p in raw.replace("\\", "/").split("/") if p and p != "."]
+        root = os.path.normcase(str(self.root))
+        candidate = os.path.normcase(resolved)
+        if candidate == root:
+            return ""
+        if not candidate.startswith(root + os.sep):
+            raise CheckpointError(f"path is outside the repository: {raw}")
+        name = "/".join(parts) if parts else os.path.relpath(resolved, str(self.root)).replace(
+            os.sep, "/")
+        return name
+
+    def _selected(self, paths: List[str], trees: Tuple[Dict[str, Tuple[str, str]], ...]) -> Tuple[str, ...]:
+        """The repository's own spelling for every `--path` value. A value must be a file or
+        folder either tree holds, or something that exists on disk. Spellings are matched
+        exactly first and case-insensitively second, because Windows and macOS volumes are not
+        case sensitive."""
+        known: Dict[str, str] = {}
+        for tree in trees:
+            for name in tree:
+                known.setdefault(name, name)
+        for name in sorted(known):
+            known.setdefault(name.casefold(), known[name])
+        selected = []
+        for raw in paths:
+            name = self._resolve(raw)
+            if name and name not in known and known.get(name.casefold()) is None:
+                # Nothing to restore from, no match to remove: the path is simply absent.
+                if _unsafe_path(name) or not os.path.lexists(self._path(name)):
+                    raise CheckpointError(
+                        f"no such path in the checkpoint or working tree: {raw}")
+            if name:
+                self._path(name)  # refuse `.git`, reserved names and other unsafe selections
+            selected.append(known.get(name) or known.get(name.casefold(), name))
+        return tuple(selected)
+
+    def plan(self, checkpoint: Checkpoint, current_tree: Optional[str] = None,
+             paths: Optional[List[str]] = None) -> Plan:
+        """The diff between the checkpoint and the working tree. With `paths`, only entries
+        inside those selections (literal file or folder prefixes) are restored or removed;
+        every other entry stays untouched and the stale-preview check still covers the whole
+        tree, so a change anywhere is caught."""
         current_tree = current_tree or self.snapshot_tree()
         current, target = self.entries(current_tree), self.entries(checkpoint.tree)
-        restore = sorted(p for p in target if current.get(p) != target[p])
-        extra = set(current) - set(target)
-        ignored = self._ignored(sorted(extra))
-        return Plan(checkpoint, current_tree, restore, sorted(extra - ignored), sorted(ignored))
+        if not paths:
+            restore = sorted(p for p in target if current.get(p) != target[p])
+            extra = set(current) - set(target)
+            ignored = self._ignored(sorted(extra))
+            return Plan(checkpoint, current_tree, restore, sorted(extra - ignored), sorted(ignored))
+        selected = self._selected(paths, (target, current))
+        restore = [p for p in sorted(target) if current.get(p) != target[p]
+                   and _within(p, selected)]
+        extra = [p for p in sorted(current) if p not in target and _within(p, selected)]
+        ignored = self._ignored(extra)
+        return Plan(checkpoint, current_tree, restore, [p for p in extra if p not in ignored],
+                    [], selected)
 
     def _preflight(self, plan: Plan, current: Dict[str, Tuple[str, str]]) -> List[str]:
         removing = set(plan.remove) | (set(plan.restore) & set(current))

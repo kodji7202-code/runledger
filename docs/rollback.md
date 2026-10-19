@@ -20,8 +20,9 @@ runledger rollback CHECKPOINT_ID
 ```
 
 The first command prints a checkpoint id. The list shows its UTC time, label, and files that
-would differ from the current working tree. The preview names files to restore or remove.
-Rollback asks for confirmation in a terminal. Without a terminal it refuses unless you pass
+would differ from the current working tree. The preview names files to restore or remove, and a
+`--path` run (see below) also counts the bytes it would restore. Rollback asks for confirmation
+in a terminal. Without a terminal it refuses unless you pass
 `--yes`. A dry run never asks for confirmation or creates a checkpoint ref.
 
 Before restoring anything, rollback saves a **safety checkpoint** of the current state. If saving
@@ -41,6 +42,7 @@ Other selectors and options:
 runledger rollback --last                     # newest checkpoint, including a safety checkpoint
 runledger rollback --run SESSION_ID           # earliest retained checkpoint for this run
 runledger rollback CHECKPOINT_ID --yes        # explicit confirmation for scripts
+runledger rollback CHECKPOINT_ID --path src/app.py --dry-run   # only this file (see below)
 runledger checkpoint --cwd "/path/to/project" --label "Before change"
 runledger checkpoints --cwd "/path/to/project"
 runledger rollback CHECKPOINT_ID --cwd "/path/to/project"
@@ -51,6 +53,49 @@ Omitting a selector is the same as `--last`. `--run` chooses the **earliest** re
 not the last prompt, so it returns to the start of the run. Pruning removes only old RunLedger
 checkpoint refs, including safety checkpoints. `--keep 0` removes all of them. It does not run
 Git garbage collection, delete files, or remove ordinary branches or stash entries.
+
+## Restore only part of a checkpoint (`--path`)
+
+`--path` restores one file or folder and leaves the rest of the working tree exactly as it is.
+Repeat it to select more than one path, and combine it with a checkpoint id, `--run`, `--last`,
+`--dry-run` or `--yes`:
+
+```bash
+runledger rollback CHECKPOINT_ID --path src/app.py --dry-run
+runledger rollback CHECKPOINT_ID --path src/app.py --path tests --yes
+runledger rollback --last --path "docs/release notes.md"
+```
+
+```
+Rollback to 20260518T101500Z-ab12cd in 'C:\\work\\app'
+  scope: src/app.py, tests
+  restore  'src/app.py'
+  restore  'tests/test_app.py'
+  delete   'tests/test_scratch.py'  (not in checkpoint)
+3 file(s) would change (4821 bytes). Everything outside the scope is untouched.
+Run with --yes to apply.
+```
+
+- **What matches.** Each value is read against `--cwd` (the repository root), or may be an
+  absolute path inside the repository. Matching is literal, not a glob: `src` selects `src/x.txt`
+  but never `src2/y.txt`, and a name with `[`, `*` or `?` is matched as written. A folder selects
+  everything under it, on any depth, including files created after the checkpoint (`delete`).
+- **What is refused.** A value outside the repository (`..\outside.txt`, or an absolute path
+  outside the root), `.git` or anything under it, an empty value, and a value that exists in
+  neither the checkpoint nor the working tree end the command with one error line (`error: ...`)
+  and exit code 1, before anything is written. An already-matching path is not an error: the
+  command prints `Nothing to restore for <path> (already matches <id>).`, exits 0, restores
+  nothing and creates no checkpoint.
+- **Everything else is untouched.** Files outside the selection keep their contents, and ignored
+  files under the selection stay untouched as they do for a whole-tree rollback.
+- **The same safety applies.** `--path` still saves one safety checkpoint of the **whole** working
+  tree before writing, so `runledger rollback <safety-id>` undoes a partial restore exactly. The
+  stale-preview check also covers the whole tree: if any file changes between the preview and the
+  confirmation, the rollback is refused even when the change is outside the selection. Symlinks,
+  Windows junctions, `.git` overlaps, reserved names and case-colliding checkpoint entries are
+  refused exactly as they are without `--path`; a blocker outside the selection is ignored.
+- `--path .` selects the whole tree, which is the same as running `rollback` without `--path`.
+  Without `--path` everything above is unchanged.
 
 ## Associate a receipt
 

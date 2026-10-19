@@ -5,6 +5,7 @@ import os
 import stat
 import subprocess
 import sys
+import tempfile
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -1278,3 +1279,451 @@ def test_parse_duration_accepts_days_weeks_and_hours(text, expected):
 @pytest.mark.parametrize("text", ["", "30", "d30", "-1d", "1.5d", "30dd", "1 day", None, 30])
 def test_parse_duration_rejects_anything_else(text):
     assert rollback.parse_duration(text) is None
+
+# ---------------------------------------------------------------- selective restore (rollback --path)
+
+@pytest.fixture
+def scoped_repo(repo):
+    """A committed repository with a local identity, so the `--path` CLI checks run wherever the
+    developer's Git identity lives outside the isolated test HOME."""
+    for key, value in (("user.email", "runledger@example.test"), ("user.name", "RunLedger Test")):
+        git(repo.root, "config", key, value)
+    git(repo.root, "commit", "-qm", "Initial test tree")
+    return repo
+
+
+def _write(root, name, text):
+    path = root.joinpath(*name.split("/"))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def _tree_from(repo, entries):
+    """A checkpoint tree built by hand, for names no working tree can hold on every platform
+    (reserved names, `.git` overlap, case collisions). `mktree` writes them, unlike the index."""
+    roots = {}
+    for name, content in entries:
+        blob = git(repo.root, "hash-object", "-w", "--stdin", data=content).decode().strip()
+        level = roots
+        parts = name.split("/")
+        for part in parts[:-1]:
+            level = level.setdefault(part, {})
+        level[parts[-1]] = blob
+    return _write_tree(repo, roots)
+
+
+def _write_tree(repo, level):
+    lines = []
+    for name, value in sorted(level.items()):
+        if isinstance(value, dict):
+            lines.append(f"040000 tree {_write_tree(repo, value)}\t{name}")
+        else:
+            lines.append(f"100644 blob {value}\t{name}")
+    data = ("\n".join(lines) + "\n").encode("utf-8")
+    return git(repo.root, "mktree", "--missing", data=data).decode().strip()
+
+
+def test_path_plan_keeps_the_whole_tree_without_selection(repo):
+    cp = tree_checkpoint(repo)
+    (repo.root / "tracked.txt").write_text("new\n", encoding="utf-8")
+    plan = repo.plan(cp)
+    assert plan.paths == ()
+    assert plan.restore == ["tracked.txt"]
+    assert plan.remove == []
+
+
+def test_path_restores_only_the_selected_file(scoped_repo, monkeypatch, capsys):
+    repo = scoped_repo
+    _write(repo.root, "a.txt", "one\n")
+    _write(repo.root, "b.txt", "one\n")
+    _write(repo.root, "sub/c.txt", "one\n")
+    checkpoint = repo.create()
+    _write(repo.root, "a.txt", "modified\n")
+    _write(repo.root, "b.txt", "modified\n")
+    _write(repo.root, "sub/c.txt", "modified\n")
+    (repo.root / "new.txt").write_text("untracked\n", encoding="utf-8")
+    monkeypatch.chdir(repo.root)
+    assert main(["rollback", checkpoint.id, "--path", "a.txt", "--yes"]) == 0
+    assert (repo.root / "a.txt").read_text(encoding="utf-8") == "one\n"
+    assert (repo.root / "b.txt").read_text(encoding="utf-8") == "modified\n"
+    assert (repo.root / "sub" / "c.txt").read_text(encoding="utf-8") == "modified\n"
+    assert (repo.root / "new.txt").read_text(encoding="utf-8") == "untracked\n"
+
+
+@pytest.mark.parametrize("scope", ["sub", "sub/", "sub\\", "./sub"])
+def test_path_restores_a_directory_subtree(scoped_repo, capsys, scope):
+    repo = scoped_repo
+    _write(repo.root, "a.txt", "one\n")
+    _write(repo.root, "sub/c.txt", "one\n")
+    _write(repo.root, "sub/d/e.txt", "one\n")
+    checkpoint = repo.create()
+    _write(repo.root, "a.txt", "modified\n")
+    _write(repo.root, "sub/c.txt", "modified\n")
+    _write(repo.root, "sub/scratch.txt", "after\n")
+    assert main(["rollback", checkpoint.id, "--path", scope, "--yes",
+                 "--cwd", str(repo.root)]) == 0
+    assert (repo.root / "sub" / "c.txt").read_text(encoding="utf-8") == "one\n"
+    assert (repo.root / "sub" / "d" / "e.txt").read_text(encoding="utf-8") == "one\n"
+    assert not (repo.root / "sub" / "scratch.txt").exists()
+    assert (repo.root / "a.txt").read_text(encoding="utf-8") == "modified\n"
+
+
+def test_path_multiple_selections_restore_exactly_their_scope(scoped_repo):
+    repo = scoped_repo
+    _write(repo.root, "a.txt", "one\n")
+    _write(repo.root, "b.txt", "one\n")
+    _write(repo.root, "sub/c.txt", "one\n")
+    checkpoint = repo.create()
+    _write(repo.root, "a.txt", "modified\n")
+    _write(repo.root, "b.txt", "modified\n")
+    _write(repo.root, "sub/c.txt", "modified\n")
+    plan = repo.plan(checkpoint, paths=["a.txt", "sub"])
+    assert plan.paths == ("a.txt", "sub")
+    repo.rollback(plan)
+    assert (repo.root / "a.txt").read_text(encoding="utf-8") == "one\n"
+    assert (repo.root / "sub" / "c.txt").read_text(encoding="utf-8") == "one\n"
+    assert (repo.root / "b.txt").read_text(encoding="utf-8") == "modified\n"
+
+
+def test_path_matching_is_literal_and_prefix_safe(scoped_repo):
+    repo = scoped_repo
+    _write(repo.root, "src/x.txt", "one\n")
+    _write(repo.root, "src2/y.txt", "one\n")
+    _write(repo.root, "weird[1].txt", "one\n")
+    checkpoint = repo.create()
+    for name in ("src/x.txt", "src2/y.txt", "weird[1].txt"):
+        _write(repo.root, name, "modified\n")
+    plan = repo.plan(checkpoint, paths=["src"])
+    assert plan.restore == ["src/x.txt"]
+    repo.rollback(plan)
+    assert (repo.root / "src" / "x.txt").read_text(encoding="utf-8") == "one\n"
+    assert (repo.root / "src2" / "y.txt").read_text(encoding="utf-8") == "modified\n"
+    assert repo.plan(checkpoint, paths=["weird[1].txt"]).restore == ["weird[1].txt"]
+    repo.rollback(repo.plan(checkpoint, paths=["weird[1].txt"]))
+    assert (repo.root / "weird[1].txt").read_text(encoding="utf-8") == "one\n"
+    with pytest.raises(rollback.CheckpointError, match="no such path"):
+        repo.plan(checkpoint, paths=["*.txt"])
+    assert (repo.root / "src2" / "y.txt").read_text(encoding="utf-8") == "modified\n"
+
+
+def test_path_resolves_against_the_cwd_and_accepts_absolute_paths(scoped_repo, monkeypatch, capsys):
+    repo = scoped_repo
+    _write(repo.root, "sub/c.txt", "one\n")
+    _write(repo.root, "sub/d.txt", "one\n")
+    checkpoint = repo.create()
+    _write(repo.root, "sub/c.txt", "modified\n")
+    _write(repo.root, "sub/d.txt", "modified\n")
+    other = repo.root.parent / "elsewhere"
+    other.mkdir()
+    monkeypatch.chdir(other)
+    assert main(["rollback", checkpoint.id, "--cwd", str(repo.root), "--path", "sub\\c.txt",
+                 "--yes"]) == 0
+    assert (repo.root / "sub" / "c.txt").read_text(encoding="utf-8") == "one\n"
+    assert (repo.root / "sub" / "d.txt").read_text(encoding="utf-8") == "modified\n"
+    _write(repo.root, "sub/c.txt", "modified\n")
+    assert main(["rollback", checkpoint.id, "--cwd", str(repo.root),
+                 "--path", str(repo.root / "sub" / "c.txt"), "--yes"]) == 0
+    assert (repo.root / "sub" / "c.txt").read_text(encoding="utf-8") == "one\n"
+
+
+def test_path_scope_does_not_restore_the_rest_of_the_tree(scoped_repo, capsys):
+    repo = scoped_repo
+    _write(repo.root, "sub/c.txt", "one\n")
+    checkpoint = repo.create()
+    _write(repo.root, "sub/c.txt", "modified\n")
+    _write(repo.root, "other.txt", "after\n")
+    assert main(["rollback", checkpoint.id, "--path", "sub", "--yes", "--cwd", str(repo.root)]) == 0
+    assert (repo.root / "sub" / "c.txt").read_text(encoding="utf-8") == "one\n"
+    assert (repo.root / "other.txt").read_text(encoding="utf-8") == "after\n"
+
+
+def test_path_dry_run_lists_only_the_selected_entries_and_changes_nothing(scoped_repo, capsys):
+    repo = scoped_repo
+    _write(repo.root, "a.txt", "one\n")
+    _write(repo.root, "b.txt", "one\n")
+    _write(repo.root, "sub/c.txt", "one\n")
+    checkpoint = repo.create()
+    _write(repo.root, "a.txt", "modified\n")
+    _write(repo.root, "b.txt", "modified\n")
+    _write(repo.root, "sub/scratch.txt", "after\n")
+    snapshot = repo.snapshot_tree()
+    refs = git(repo.root, "for-each-ref", rollback.PREFIX)
+    assert main(["rollback", checkpoint.id, "--path", "a.txt", "--path", "sub",
+                 "--dry-run", "--cwd", str(repo.root)]) == 0
+    output = capsys.readouterr().out
+    assert "scope: a.txt, sub" in output
+    assert "restore  'a.txt'" in output
+    assert "delete   'sub/scratch.txt'" in output
+    assert "not in checkpoint" in output
+    assert "2 file(s) would change" in output
+    assert "Everything outside the scope is untouched" in output
+    assert "'b.txt'" not in output
+    assert repo.snapshot_tree() == snapshot
+    assert git(repo.root, "for-each-ref", rollback.PREFIX) == refs
+
+
+def test_path_preview_counts_the_restored_bytes(scoped_repo, capsys):
+    repo = scoped_repo
+    _write(repo.root, "a.txt", "one\n")
+    _write(repo.root, "b.txt", "one\n")
+    checkpoint = repo.create()
+    _write(repo.root, "a.txt", "a much longer modified body\n")
+    _write(repo.root, "b.txt", "modified too\n")
+    scratch = _write(repo.root, "scratch.txt", "after\n")
+    assert main(["rollback", checkpoint.id, "--path", "a.txt", "--path", "scratch.txt",
+                 "--dry-run", "--cwd", str(repo.root)]) == 0
+    output = capsys.readouterr().out
+    restored = repo.tree_sizes(checkpoint.tree)["a.txt"]   # the checkpoint blob, not the edited file
+    deleted = len(scratch.read_bytes())
+    assert f"2 file(s) would change ({restored + deleted} bytes" in output
+    assert "1 restore" not in output  # the whole-tree summary line is not printed in a scoped run
+
+
+def test_path_nothing_to_restore_names_the_path_and_creates_no_ref(scoped_repo, capsys):
+    repo = scoped_repo
+    _write(repo.root, "a.txt", "one\n")
+    checkpoint = repo.create()
+    refs = git(repo.root, "for-each-ref", rollback.PREFIX)
+    assert main(["rollback", checkpoint.id, "--path", "a.txt", "--yes",
+                 "--cwd", str(repo.root)]) == 0
+    output = capsys.readouterr().out
+    assert f"Nothing to restore for a.txt (already matches {checkpoint.id})." in output
+    assert git(repo.root, "for-each-ref", rollback.PREFIX) == refs
+
+
+def test_path_combines_with_run_last_and_the_default_checkpoint(identity_repo):
+    folder = identity_repo
+    repo = rollback.Repository(str(folder))
+    file = folder / "file.txt"
+    file.write_text("v1\n", encoding="utf-8")
+    first = repo.create(run_id="R1")
+    file.write_text("v2\n", encoding="utf-8")
+    second = repo.create()
+    other = folder / "other.txt"
+    other.write_text("untouched\n", encoding="utf-8")
+    file.write_text("modified\n", encoding="utf-8")
+    assert repo.plan(repo.select(), paths=["file.txt"]).checkpoint == second
+    assert repo.plan(repo.select(run_id="R1"), paths=["file.txt"]).checkpoint == first
+    assert repo.plan(second, paths=["file.txt"]).restore == ["file.txt"]
+    assert repo.plan(first, paths=["file.txt"]).restore == ["file.txt"]
+    assert other.read_text(encoding="utf-8") == "untouched\n"
+
+
+@pytest.mark.parametrize("scope", ["..\\outside.txt", "sub/../../outside.txt"])
+def test_path_outside_the_repository_is_rejected(scoped_repo, capsys, scope):
+    repo = scoped_repo
+    _write(repo.root, "a.txt", "one\n")
+    checkpoint = repo.create()
+    _write(repo.root, "a.txt", "modified\n")
+    refs = git(repo.root, "for-each-ref", rollback.PREFIX)
+    assert main(["rollback", checkpoint.id, "--path", scope, "--yes",
+                 "--cwd", str(repo.root)]) == 1
+    assert "outside the repository" in capsys.readouterr().err
+    assert (repo.root / "a.txt").read_text(encoding="utf-8") == "modified\n"
+    assert git(repo.root, "for-each-ref", rollback.PREFIX) == refs
+
+
+def test_path_absolute_outside_the_repository_is_rejected(scoped_repo, tmp_path, capsys):
+    repo = scoped_repo
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside\n", encoding="utf-8")
+    checkpoint = repo.create()
+    refs = git(repo.root, "for-each-ref", rollback.PREFIX)
+    assert main(["rollback", checkpoint.id, "--path", str(outside), "--yes",
+                 "--cwd", str(repo.root)]) == 1
+    assert "outside the repository" in capsys.readouterr().err
+    assert git(repo.root, "for-each-ref", rollback.PREFIX) == refs
+
+
+@pytest.mark.parametrize("scope", [".git", ".git\\config", ".git/HEAD", ""])
+def test_path_git_and_empty_selections_are_rejected(scoped_repo, capsys, scope):
+    repo = scoped_repo
+    checkpoint = repo.create()
+    config = repo.root / ".git" / "config"
+    before = config.read_bytes()
+    assert main(["rollback", checkpoint.id, "--path", scope, "--yes",
+                 "--cwd", str(repo.root)]) == 1
+    assert capsys.readouterr().err.strip()
+    assert config.read_bytes() == before
+
+
+def test_path_absent_from_checkpoint_and_working_tree_is_an_error(scoped_repo, capsys):
+    repo = scoped_repo
+    _write(repo.root, "a.txt", "one\n")
+    checkpoint = repo.create()
+    _write(repo.root, "a.txt", "modified\n")
+    refs = git(repo.root, "for-each-ref", rollback.PREFIX)
+    assert main(["rollback", checkpoint.id, "--path", "does/not/exist.txt", "--yes",
+                 "--cwd", str(repo.root)]) == 1
+    err = capsys.readouterr().err
+    assert "no such path" in err and "does/not/exist.txt" in err
+    assert (repo.root / "a.txt").read_text(encoding="utf-8") == "modified\n"
+    assert git(repo.root, "for-each-ref", rollback.PREFIX) == refs
+
+
+def test_path_restores_a_file_deleted_since_the_checkpoint(scoped_repo, capsys):
+    repo = scoped_repo
+    _write(repo.root, "gone.txt", "keep me\n")
+    checkpoint = repo.create()
+    (repo.root / "gone.txt").unlink()
+    assert main(["rollback", checkpoint.id, "--path", "gone.txt", "--yes",
+                 "--cwd", str(repo.root)]) == 0
+    assert (repo.root / "gone.txt").read_text(encoding="utf-8") == "keep me\n"
+
+
+def test_path_created_after_the_checkpoint_is_previewed_as_a_delete(scoped_repo, capsys):
+    repo = scoped_repo
+    checkpoint = repo.create()
+    _write(repo.root, "new.txt", "after\n")
+    assert main(["rollback", checkpoint.id, "--path", "new.txt", "--dry-run",
+                 "--cwd", str(repo.root)]) == 0
+    output = capsys.readouterr().out
+    assert "delete   'new.txt'" in output
+    assert (repo.root / "new.txt").read_text(encoding="utf-8") == "after\n"
+
+
+def test_path_stale_preview_is_refused_for_changes_outside_the_scope(scoped_repo):
+    repo = scoped_repo
+    _write(repo.root, "a.txt", "one\n")
+    _write(repo.root, "b.txt", "one\n")
+    checkpoint = repo.create()
+    _write(repo.root, "a.txt", "modified\n")
+    _write(repo.root, "b.txt", "modified\n")
+    plan = repo.plan(checkpoint, paths=["a.txt"])
+    _write(repo.root, "b.txt", "changed after the preview\n")
+    with pytest.raises(rollback.CheckpointError, match="changed since the preview"):
+        repo.rollback(plan)
+    assert (repo.root / "a.txt").read_text(encoding="utf-8") == "modified\n"
+    assert (repo.root / "b.txt").read_text(encoding="utf-8") == "changed after the preview\n"
+
+
+def test_path_safety_checkpoint_snapshots_the_whole_tree_and_undoes_the_rollback(scoped_repo):
+    repo = scoped_repo
+    _write(repo.root, "a.txt", "one\n")
+    _write(repo.root, "b.txt", "one\n")
+    checkpoint = repo.create()
+    _write(repo.root, "a.txt", "modified\n")
+    _write(repo.root, "b.txt", "modified\n")
+    (repo.root / "new.txt").write_text("untracked\n", encoding="utf-8")
+    before = repo.snapshot_tree()
+    safety = repo.rollback(repo.plan(checkpoint, paths=["a.txt"]))
+    assert safety.kind == "safety"
+    assert safety.tree == before
+    assert (repo.root / "b.txt").read_text(encoding="utf-8") == "modified\n"
+    (repo.root / "new.txt").unlink()
+    repo.rollback(repo.plan(safety))
+    assert repo.snapshot_tree() == before
+
+
+@pytest.mark.parametrize("direction", ["file-to-directory", "directory-to-file"])
+def test_path_file_directory_replacements_inside_the_scope(scoped_repo, direction):
+    repo = scoped_repo
+    shape = repo.root / "shape"
+    if direction == "file-to-directory":
+        shape.write_text("file\n", encoding="utf-8")
+        checkpoint = repo.create()
+        shape.unlink()
+        shape.mkdir()
+        (shape / "child.txt").write_text("child\n", encoding="utf-8")
+        scope = ["shape"]
+    else:
+        shape.mkdir()
+        (shape / "child.txt").write_text("child\n", encoding="utf-8")
+        checkpoint = repo.create()
+        (shape / "child.txt").unlink()
+        shape.rmdir()
+        shape.write_text("file\n", encoding="utf-8")
+        scope = ["shape"]
+    repo.rollback(repo.plan(checkpoint, paths=scope))
+    assert repo.snapshot_tree() == checkpoint.tree
+
+
+def test_path_symlink_blocker_inside_the_scope_is_refused(scoped_repo, tree_safety, tmp_path, capsys):
+    repo = scoped_repo
+    _write(repo.root, "a.txt", "one\n")
+    (repo.root / "keep").mkdir()
+    (repo.root / "keep" / "inner.txt").write_text("one\n", encoding="utf-8")
+    checkpoint = repo.create()
+    del tree_safety[:]
+    _write(repo.root, "a.txt", "modified\n")
+    (repo.root / "keep" / "inner.txt").unlink()
+    (repo.root / "keep" / "inner.txt").symlink_to(tmp_path)
+    refs = git(repo.root, "for-each-ref", rollback.PREFIX)
+    assert main(["rollback", checkpoint.id, "--path", "keep", "--yes",
+                 "--cwd", str(repo.root)]) == 1
+    assert capsys.readouterr().err.strip()
+    assert (repo.root / "keep" / "inner.txt").is_symlink()
+    assert tree_safety == []
+    assert git(repo.root, "for-each-ref", rollback.PREFIX) == refs
+
+
+def test_path_symlink_blocker_outside_the_scope_does_not_block(scoped_repo, tree_safety, tmp_path):
+    repo = scoped_repo
+    _write(repo.root, "a.txt", "one\n")
+    (repo.root / "keep").mkdir()
+    (repo.root / "keep" / "inner.txt").write_text("one\n", encoding="utf-8")
+    checkpoint = repo.create()
+    _write(repo.root, "a.txt", "modified\n")
+    (repo.root / "keep" / "inner.txt").unlink()
+    (repo.root / "keep" / "inner.txt").symlink_to(tmp_path)
+    repo.rollback(repo.plan(checkpoint, paths=["a.txt"]))
+    assert (repo.root / "a.txt").read_text(encoding="utf-8") == "one\n"
+
+
+@pytest.mark.parametrize("entries,scope", [
+    ([("CON", b"x\n"), ("sub/keep.txt", b"keep\n")], "CON"),
+    ([("sub/.git/x", b"x\n"), ("a.txt", b"a\n")], "sub/.git"),
+    ([("sub/A.txt", b"A\n"), ("sub/a.txt", b"a\n")], "sub"),
+])
+def test_path_scope_does_not_hide_unsafe_checkpoint_names(scoped_repo, entries, scope):
+    repo = scoped_repo
+    bad = _tree_from(repo, entries)
+    checkpoint = rollback.Checkpoint("20260101T000000000000Z-01234567", "", bad,
+                                     "2026-01-01T00:00:00+00:00", "hand-built", None)
+    with pytest.raises(rollback.CheckpointError) as excinfo:
+        repo.plan(checkpoint, paths=[scope])
+    # The same refusal as a whole-tree rollback: the unsafe name is checked whatever the scope.
+    assert any(text in str(excinfo.value).casefold()
+               for text in ("unsafe path", "unsupported on windows", "case-colliding"))
+    with pytest.raises(rollback.CheckpointError):
+        repo.plan(checkpoint)
+
+
+def test_path_dot_restores_the_whole_tree(scoped_repo, capsys):
+    repo = scoped_repo
+    _write(repo.root, "a.txt", "one\n")
+    _write(repo.root, "sub/c.txt", "one\n")
+    checkpoint = repo.create()
+    _write(repo.root, "a.txt", "modified\n")
+    _write(repo.root, "sub/c.txt", "modified\n")
+    _write(repo.root, "sub/scratch.txt", "after\n")
+    (repo.root / "new.txt").write_text("untracked\n", encoding="utf-8")
+    assert main(["rollback", checkpoint.id, "--path", ".", "--yes", "--cwd", str(repo.root)]) == 0
+    assert repo.snapshot_tree() == checkpoint.tree
+    assert not (repo.root / "new.txt").exists()
+    assert (repo.root / "cache" / "private.txt").read_text(encoding="utf-8") == "do not touch\n"
+
+
+def test_path_ignored_files_are_never_removed(scoped_repo):
+    repo = scoped_repo
+    (repo.root / "cache" / "private.txt").write_text("do not touch\n", encoding="utf-8")
+    checkpoint = repo.create()
+    _write(repo.root, "cache/scratch.txt", "ignored\n")
+    plan = repo.plan(checkpoint, paths=["cache"])
+    assert plan.remove == []
+    repo.rollback(plan)
+    assert (repo.root / "cache" / "private.txt").read_text(encoding="utf-8") == "do not touch\n"
+    assert (repo.root / "cache" / "scratch.txt").read_text(encoding="utf-8") == "ignored\n"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="needs a case-insensitive filesystem")
+def test_path_matches_case_insensitively_on_windows(scoped_repo):
+    repo = scoped_repo
+    _write(repo.root, "readme.md", "one\n")
+    checkpoint = repo.create()
+    _write(repo.root, "readme.md", "modified\n")
+    plan = repo.plan(checkpoint, paths=["README.md"])
+    assert plan.restore == ["readme.md"]
+    repo.rollback(plan)
+    assert (repo.root / "readme.md").read_text(encoding="utf-8") == "one\n"
