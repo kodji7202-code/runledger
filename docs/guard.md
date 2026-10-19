@@ -386,7 +386,10 @@ deny, `ask` entries ask, and a command that matches both is denied.
 
 `tool_rules` matches the tool name with `fnmatch` globs (`*` and `?`), case-sensitively, against
 the whole name. Rules apply to any tool, not only MCP ones: `Edit` can be denied, and
-`mcp__vercel__*` can ask for every Vercel tool. A tool on both lists is denied.
+`mcp__vercel__*` can ask for every Vercel tool. A tool on both lists is denied. A Droid connector
+call is matched in both spellings, so `mcp__supabase__execute_query` also denies the bare
+`supabase__execute_query` event Droid reports (the spelling a receipt reads), and a rule written
+in the bare spelling keeps working.
 
 `mcp_verbs` adds words to the three MCP vocabularies the classifier uses (see above), so a server
 whose destructive tool is called something else is graded as you expect. A project file may extend

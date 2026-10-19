@@ -1313,17 +1313,28 @@ def command_rule_risks(command: str, view: str, policy: Optional[Dict[str, Any]]
     return risks
 
 
+def _tool_rule_names(tool: str) -> List[str]:
+    """The names a `tool_rules` glob is matched against: the tool's own name and, for a bare
+    Droid connector name, its canonical `mcp__<server>__<tool>` spelling - the one receipts
+    carry - so a rule covers the same call whichever agent reports it (GE-006)."""
+    if tool.startswith("mcp__") or mcp_parts(tool) is None:
+        return [tool]
+    return [tool, "mcp__" + tool]
+
+
 def tool_rule_risks(tool: str, policy: Optional[Dict[str, Any]], index: int) -> List[Risk]:
     """Risks for the `tool_rules` of the user's file and the project's file.
 
-    The globs match the whole tool name, case-sensitively. A tool that is on both lists
-    carries both findings, so the guard denies it: deny beats ask."""
+    The globs match the whole name, case-sensitively, in both spellings a connector call can
+    arrive in (see `_tool_rule_names`). A tool that is on both lists carries both findings, so
+    the guard denies it: deny beats ask."""
     rules = policy.get("tool_rules") if isinstance(policy, dict) else None
     risks: List[Risk] = []
     if not isinstance(rules, dict):
         return risks
+    names = _tool_rule_names(tool)
     for kind, code, severity in RULE_CODES:
-        hits = [p for p in rules.get(kind) or [] if fnmatchcase(tool, p)]
+        hits = [p for p in rules.get(kind) or [] if any(fnmatchcase(n, p) for n in names)]
         risks.extend(_rule_matched_risks(kind, code, severity, hits, index))
     return risks
 

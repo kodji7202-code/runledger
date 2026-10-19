@@ -986,6 +986,24 @@ def test_session_counts_and_homes_per_agent(tmp_path, monkeypatch):
     assert codes(found) == 0
 
 
+def test_the_droid_session_check_names_the_directory_discovery_reads(tmp_path, monkeypatch):
+    """GE-001 / VAL-AGENT-028: the doctor counts and names the same Factory directory
+    `runledger list --agent droid` reads when HOME differs from USERPROFILE."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    env_home = tmp_path / "env-home"
+    env_profile = tmp_path / "env-profile"
+    monkeypatch.setenv("HOME", str(env_home))
+    monkeypatch.setenv("USERPROFILE", str(env_profile))
+    session_droid(env_home / ".factory", proj, "one")
+    session_droid(env_home / ".factory", proj, "two")
+    session_droid(env_profile / ".factory", proj, "other")
+    check = one(checks(proj), "sessions", "droid")
+    assert check.status == "info", check
+    assert "2 session" in check.detail, check.detail
+    assert str(env_home / ".factory") in check.detail, check.detail
+
+
 def test_empty_homes_report_zero_without_warnings(tmp_path, monkeypatch):
     proj = tmp_path / "proj"
     proj.mkdir()

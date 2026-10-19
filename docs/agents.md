@@ -16,6 +16,12 @@ Any agent can write the RunLedger format, so an agent does not need an adapter t
 risk scores and pushes. The format is specified in [format.md](format.md), with a Python and a
 Node example.
 
+**Home directories.** Every default that lives under a user home (`~/.claude`, `~/.factory`,
+`~/.codex`, `~/.runledger`) resolves that home the same way: `HOME`, else `USERPROFILE`, else the
+home Python itself reports. On Windows the two variables can name different folders (a shell can
+set `HOME`); RunLedger follows `HOME` in every consumer, so session discovery,
+`guard install --global` and `runledger doctor` always name the same folder.
+
 ## Choosing sessions
 
 `list`, `receipt` and `push` all accept `--agent`. Without it, they use the newest session of any
@@ -97,7 +103,10 @@ Droid writes a JSONL transcript and a sibling settings file:
 - **Config directory.** `FACTORY_HOME` names the Factory config directory, overriding the default
   `~/.factory`. `FACTORY_HOME_OVERRIDE` names a *home* directory instead: the config directory
   becomes `<FACTORY_HOME_OVERRIDE>/.factory`, which is how the droid binary itself reads it.
-  When both are set, `FACTORY_HOME` wins.
+  When both are set, `FACTORY_HOME` wins. Without either, the directory is the `.factory` folder of
+  the user home resolved as described above, and session discovery,
+  `guard install --global --agent droid` and the doctor's `sessions` check all resolve it through
+  the same helper, so they never name different folders.
 - **Relative `cwd`.** `droid exec --cwd .` records `cwd` as `.`. RunLedger recovers the real folder
   from, in order: the session's own `% pwd` context, a folder field in the settings file, the Git
   work tree that a majority of the absolute tool paths lie in, and the encoded session folder name.
