@@ -910,3 +910,30 @@ def test_tool_rules_apply_to_droid_edit_and_codex_ask_hits_become_deny(tmp_path,
     out = handle("codex", "mcp__vercel__get_project", {"project": "p"}, tmp_path)
     assert permission(out) == "deny"
     assert "cannot prompt" in out["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+def test_tool_rules_match_a_droid_bare_connector_name(tmp_path, isolated_settings):
+    """GE-006: a rule written for the canonical `mcp__<server>__<tool>` name also covers the
+    bare connector name Droid reports, exactly as receipts read it, while the log keeps the
+    agent's own spelling."""
+    write_user_config(isolated_settings, {"tool_rules": {"deny": ["mcp__supabase__execute_query"],
+                                                         "ask": ["mcp__vercel__*"]}})
+    denied = decide("droid", "supabase__execute_query", {"query": "SELECT 1"}, tmp_path)
+    assert denied["decision"] == "deny" and "rule_deny" in denied["codes"]
+    asked = decide("droid", "vercel__get_project", {"project": "p"}, tmp_path)
+    assert asked["decision"] == "ask" and "rule_ask" in asked["codes"]
+
+    assert permission(handle("droid", "supabase__execute_query", {"query": "SELECT 1"},
+                             tmp_path, session="sess-bare")) == "deny"
+    row = [r for r in log_records(tmp_path) if r["session_id"] == "sess-bare"][-1]
+    assert row["tool"] == "supabase__execute_query"
+    assert row["canonical_tool"] == "mcp__supabase__execute_query"
+    assert "rule_deny" in row["codes"]
+
+
+def test_a_droid_bare_connector_name_rule_still_matches_its_own_spelling(tmp_path, isolated_settings):
+    """The bare spelling a user may already have written keeps working next to the canonical one."""
+    write_user_config(isolated_settings, {"tool_rules": {"deny": ["supabase__execute_query"]}})
+    d = decide("droid", "supabase__execute_query", {"query": "SELECT 1"}, tmp_path)
+    assert d["decision"] == "deny" and "rule_deny" in d["codes"]
+    assert decide("droid", "vercel__get_project", {"project": "p"}, tmp_path)["decision"] == "allow"

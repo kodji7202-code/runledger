@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from runledger import adapters
+from runledger import adapters, hook_targets
 from runledger.adapters import droid
 from runledger.cli import main
 from runledger.client import build_payload
@@ -485,6 +485,21 @@ def test_factory_home_override_expands_user_and_falls_back_to_the_home_directory
     assert droid.factory_home() == Path.home() / "example-home" / ".factory"
     monkeypatch.setenv("FACTORY_HOME_OVERRIDE", "")
     assert droid.factory_home() == Path.home() / ".factory"
+
+
+def test_factory_home_is_the_one_resolver_discovery_and_the_installer_share(tmp_path, monkeypatch):
+    """GE-001 / VAL-AGENT-028: with both Factory overrides unset and HOME != USERPROFILE,
+    discovery, `guard install --global` (hook_targets) and the doctor resolve one directory."""
+    env_home = tmp_path / "env-home"
+    env_profile = tmp_path / "env-profile"
+    monkeypatch.setenv("HOME", str(env_home))
+    monkeypatch.setenv("USERPROFILE", str(env_profile))
+    assert droid.factory_home() == hook_targets.factory_dir() == env_home / ".factory"
+
+    found = _discovered(env_home / ".factory", "/demo/widget", "env-home.jsonl", 100)
+    _discovered(env_profile / ".factory", "/demo/widget", "profile.jsonl", 200)
+    assert droid.find_sessions() == [found]
+    assert adapters.find_sessions(agent="droid") == [found]
 
 
 def test_relative_project_discovery(tmp_path, monkeypatch):

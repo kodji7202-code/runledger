@@ -148,6 +148,18 @@ change behavior, so read the entry before you upgrade.
 
 ### Fixed
 
+- **Droid discovery and global installation resolve one Factory directory (`runledger.adapters.droid`):**
+  with `FACTORY_HOME` and `FACTORY_HOME_OVERRIDE` unset, session discovery used Python's home
+  (`USERPROFILE` on Windows) while `guard install --global --agent droid` and `runledger doctor`
+  used `HOME`, so a customized `HOME` was handed a global hook outside the folder `runledger list`
+  and `runledger receipt` read. All three now resolve the directory through the same helper - the
+  user home is `HOME`, then `USERPROFILE`, then Python's own home - which `docs/agents.md` documents.
+- **Droid connector names match the canonical `tool_rules` (`runledger.risk`):** a `tool_rules`
+  entry written as `mcp__supabase__execute_query` or `mcp__vercel__*` now also decides the bare
+  `supabase__execute_query` / `vercel__get_project` events Droid reports - the spelling a receipt
+  already reads - so the live guard and a receipt agree on the same call. A rule written in the
+  bare spelling keeps working, and the log still records the agent's own tool name
+  (`docs/guard.md`).
 - **Codex runs the installed hook on Windows (`runledger.guard`):** Codex starts a hook command
   itself instead of handing the string to a shell, and the `"<python>" -m runledger guard --agent
   codex` form never started there - the quotes were read as part of the program name - so a real
