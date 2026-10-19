@@ -377,6 +377,81 @@ def test_chained_real_commands_are_detected(command, severity, needle):
     _hit(command, severity, needle)
 
 
+# ---------------------------------------------------------------- GE-003: a separator ends an option
+
+@pytest.mark.parametrize("command", [
+    "git push origin feature --delete; echo done",
+    "git push origin feature --delete&&echo done",
+    "git push origin feature --delete|cat",
+    "git push origin feature --delete\necho done",
+    "git push origin feature --delete && echo done",
+    "git push origin feature -d; echo done",
+    "git push origin feature -d&&echo done",
+])
+def test_remote_delete_right_before_a_separator(command):
+    _hit(command, "high", "Deleted a remote git branch or tag")
+
+
+@pytest.mark.parametrize("command,needle", [
+    ("git branch -D; echo done", "Force-deleted a git branch (git branch -D)"),
+    ("git branch -D&&echo done", "Force-deleted a git branch (git branch -D)"),
+    ("git branch --delete --force; echo done", "Force-deleted a git branch"),
+    ("git branch --force --delete; echo done", "Force-deleted a git branch"),
+])
+def test_branch_delete_right_before_a_separator(command, needle):
+    _hit(command, "medium", needle)
+
+
+@pytest.mark.parametrize("command", [
+    "git push origin feature; echo done",
+    "git branch -d feature; echo done",
+    "git push origin feature:feature; echo done",
+])
+def test_a_plain_command_before_a_separator_is_not_a_delete(command):
+    reasons = [r.reason for r in _command_risks(command)]
+    assert not any("Deleted a remote git branch or tag" in why or "Force-deleted a git branch" in why
+                   for why in reasons), reasons
+
+
+@pytest.mark.parametrize("command,needle", [
+    ("rm ./x -rf; echo done", "Recursive force delete (rm -rf)"),
+    ("rm ./x -r -f; echo done", "Recursive force delete (rm -rf)"),
+    ("git push origin main --force; echo done", "Force-pushed to a git remote"),
+    ("git push origin main -f; echo done", "Force-pushed to a git remote"),
+])
+def test_a_pre_existing_flag_rule_also_ends_at_a_separator(command, needle):
+    _hit(command, "high", needle)
+
+
+def test_a_plain_rm_or_push_before_a_separator_is_not_forced():
+    reasons = [r.reason for r in _command_risks("rm ./x; echo done")]
+    assert not any("Recursive force delete" in why for why in reasons), reasons
+    reasons = [r.reason for r in _command_risks("git push origin main; echo done")]
+    assert not any("Force-pushed" in why for why in reasons), reasons
+
+
+# ---------------------------------------------------------------- GE-004: quoted patterns are data
+
+@pytest.mark.parametrize("command", [
+    "find . -name 'helm uninstall web' -print",
+    'find . -name "helm uninstall web" -print',
+    "find . -name 'gh repo delete' -print",
+    "find . -name x -o -name 'helm uninstall web' -print",
+    "find . -iname 'git push --delete origin main'",
+    "find . -name 'DELETE FROM users' -print",
+    "find . -path './docker volume prune' -print",
+])
+def test_a_quoted_find_pattern_is_not_a_command(command):
+    _clean(command)
+
+
+def test_a_real_command_in_a_find_expression_still_matches():
+    _hit("helm uninstall web", "high", "Uninstalled a Helm release")
+    _hit("find . -name x -exec helm uninstall web \\;", "high", "Uninstalled a Helm release")
+    _hit("find . -name x -delete", "medium", "Deleted files with find")
+    _hit("find . -name x | xargs gh repo delete", "high", "Deleted a GitHub repository")
+
+
 # ---------------------------------------------------------------- existing rules (VAL-RULES-017)
 
 @pytest.mark.parametrize("command,severity,needle", [

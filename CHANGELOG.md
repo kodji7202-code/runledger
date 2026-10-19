@@ -173,6 +173,28 @@ change behavior, so read the entry before you upgrade.
   it had no step to link to. Each call inside the script is now one `Bash` or `PowerShell` step
   carrying its `cmd`, and a code-mode result's text blocks are shown as their text instead of raw
   JSON.
+- **A quoted SQL name is an identifier (`runledger.mcp_risk`):** single-quoted string literals are
+  still blanked before the statement is matched, but a double-quoted or backtick name keeps an
+  identifier placeholder. `DELETE FROM "users"` and `UPDATE "users" SET admin = true` are high
+  like their unquoted forms, and `DELETE FROM "users" WHERE id = 1` stays medium: it used to be
+  read as `DELETE FROM WHERE id = 1` and graded high.
+- **A separator ends a delete option (`runledger.risk`):** the 0.7.0 rules accepted only a space or
+  the end of the command after a flag, so `git push origin feature --delete; echo done` (and the
+  same with `&&`, `|` or a newline, and `-d`, `git branch -D`, `git branch --delete --force`)
+  carried only the generic medium `git push` finding or none at all. A shell separator now ends the
+  option list, so the high `Deleted a remote git branch or tag` finding fires there too. The
+  older flag rules had the same gap: `rm ./x -rf; echo done` and
+  `git push origin main --force; echo done` now carry the finding their end-of-command forms had.
+- **A `find -name` pattern is not a command (`runledger.risk`):** find's pattern options are read
+  as text in the blanked view, so `find . -name 'helm uninstall web' -print` no longer produces the
+  high `Uninstalled a Helm release` finding - the same for any other destructive name in a `-name`,
+  `-path`, `-iname` or related pattern. A real command in the expression, such as
+  `find . -name x -exec helm uninstall web \;`, still matches.
+- **A command rule that can backtrack catastrophically is dropped (`runledger.secrets`):** the
+  safe-regex check now rejects a quantifier inside a quantifier, the shape of
+  `(?:a{1,32}){1,32}b`, so a user or project `command_rules` entry (or an `extra_secret_paths`
+  pattern) with one is dropped with the existing `Dropped invalid command_rules.deny pattern ...`
+  warning instead of stalling the guard hook or a receipt on a long command.
 
 ## [0.6.1] - 2026-10-18
 

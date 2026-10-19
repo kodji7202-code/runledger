@@ -11,6 +11,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -166,6 +167,54 @@ def test_a_project_invalid_regex_is_dropped_with_a_warning(tmp_path):
     assert "(unclosed" in warning_texts(tmp_path)
     assert json.loads((tmp_path / ".runledger" / "guard.log").read_text(encoding="utf-8")
                       .splitlines()[0])["decision"] == "warning"
+
+
+# ---------------------------------------------------------------- GE-005: a rule regex cannot stall
+
+CATASTROPHIC_RULE = r"(?:a{1,32}){1,32}b"
+CATASTROPHIC = {"command_rules": {"deny": [{"pattern": CATASTROPHIC_RULE, "raw": True,
+                                            "reason": "nested repeat"},
+                                           r"\bgoodrule\b"]}}
+
+
+def test_a_catastrophic_user_regex_is_dropped_with_a_warning(tmp_path, isolated_settings):
+    write_user_config(isolated_settings, CATASTROPHIC)
+    d = decide(tmp_path, "echo aaa!")
+    assert d["decision"] == "allow"
+    assert any(CATASTROPHIC_RULE in w and "command_rules.deny" in w and "Dropped" in w
+               for w in d["warnings"]), d["warnings"]
+    assert decide(tmp_path, "goodrule x")["decision"] == "deny"
+
+
+def test_a_catastrophic_project_regex_is_dropped_with_a_warning(tmp_path):
+    write_project(tmp_path, CATASTROPHIC)
+    assert permission(handle(tmp_path, "goodrule x")) == "deny"
+    assert "Dropped invalid command_rules.deny pattern" in warning_texts(tmp_path)
+    assert CATASTROPHIC_RULE in warning_texts(tmp_path)
+
+
+def test_a_catastrophic_project_regex_never_reaches_a_receipt_policy(tmp_path):
+    from runledger.risk import load_policy
+
+    write_project(tmp_path, CATASTROPHIC)
+    rules = load_policy(str(tmp_path))["command_rules"]
+    assert [r["label"] for r in rules["deny"]] == [r"\bgoodrule\b"]
+
+
+def test_the_hook_cannot_be_stalled_by_a_command_rule(tmp_path, isolated_settings):
+    """The 40-character probe would take hours if the pattern were accepted (GE-005)."""
+    write_user_config(isolated_settings, CATASTROPHIC)
+    assert handle(tmp_path, "echo aaa!") is None
+    assert permission(handle(tmp_path, "goodrule x")) == "deny"
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(PROJECT_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+    start = time.monotonic()
+    proc = subprocess.run([sys.executable, "-m", "runledger", "guard"],
+                          input=json.dumps(bash_event(tmp_path, "echo " + "a" * 40 + "!")).encode("utf-8"),
+                          capture_output=True, cwd=str(tmp_path), env=env, timeout=30)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == b"" and b"Traceback" not in proc.stderr
+    assert time.monotonic() - start < 15.0
 
 
 def test_oddly_typed_rules_do_not_break_the_hook_process(tmp_path, isolated_settings):

@@ -140,13 +140,14 @@ RULE_CODES = (("deny", RULE_DENY_CODE, "high"), ("ask", RULE_ASK_CODE, "medium")
 # Shell rules shared by Bash and PowerShell steps, matched against the command text
 # with heredoc bodies, comments and text arguments removed (see _code_view).
 # Flag rules use lookaheads limited to one command (stops at ; & | newline), so the
-# flags may come in any order.
+# flags may come in any order. A shell separator ends an option list like whitespace or
+# the end of the command does, so a flag right before `;`, `&&`, `|` or a newline matches.
 DANGEROUS_CMDS: List[Tuple[str, str, str]] = [
-    (r"\brm\b(?=[^;&|\n]*\s(?:-[a-zA-Z]*[rR][a-zA-Z]*|--recursive)(?=\s|$))"
-     r"(?=[^;&|\n]*\s(?:-[a-zA-Z]*f[a-zA-Z]*|--force)(?=\s|$))",
+    (r"\brm\b(?=[^;&|\n]*\s(?:-[a-zA-Z]*[rR][a-zA-Z]*|--recursive)(?=\s|$|[;&|]))"
+     r"(?=[^;&|\n]*\s(?:-[a-zA-Z]*f[a-zA-Z]*|--force)(?=\s|$|[;&|]))",
      "high", "Recursive force delete (rm -rf)"),
-    (r"\bgit\s+push\b[^;&|\n]*?(?:(?<!\S)-[a-zA-Z]*f[a-zA-Z]*(?=\s|$)"
-     r"|--force(?:-with-lease|-if-includes)?(?=\s|$)|(?<=\s)\+\S)",
+    (r"\bgit\s+push\b[^;&|\n]*?(?:(?<!\S)-[a-zA-Z]*f[a-zA-Z]*(?=\s|$|[;&|])"
+     r"|--force(?:-with-lease|-if-includes)?(?=\s|$|[;&|])|(?<=\s)\+\S)",
      "high", "Force-pushed to a git remote"),
     (r"\bgit\s+reset\s+--hard\b", "medium", "Hard git reset (discards uncommitted work)"),
     (r"\bgit\s+clean\s+-[a-zA-Z]*f", "medium", "git clean (deletes untracked files)"),
@@ -171,11 +172,11 @@ DANGEROUS_CMDS: List[Tuple[str, str, str]] = [
     (r"\b(curl|wget|http)\s+https?://", "low", "Made a network request from the shell"),
     # Deleting more than the command says it does: force-deleting a branch, dropping the stash,
     # wiping a remote branch, a container or cluster, a registry key, a device or a whole tree.
-    (r"\bgit\s+branch\b(?=[^;&|\n]*\s-[a-zA-Z]*(?-i:D)[a-zA-Z]*(?=\s|$))",
+    (r"\bgit\s+branch\b(?=[^;&|\n]*\s-[a-zA-Z]*(?-i:D)[a-zA-Z]*(?=\s|$|[;&|]))",
      "medium", "Force-deleted a git branch (git branch -D)"),
-    (r"\bgit\s+branch\b(?=[^;&|\n]*\s--delete(?=\s|$))(?=[^;&|\n]*\s(?:--force|-f)(?=\s|$))",
+    (r"\bgit\s+branch\b(?=[^;&|\n]*\s--delete(?=\s|$|[;&|]))(?=[^;&|\n]*\s(?:--force|-f)(?=\s|$|[;&|]))",
      "medium", "Force-deleted a git branch"),
-    (r"\bgit\s+push\b[^;&|\n]*?(?:\s--delete(?=\s|$)|\s-d(?=\s|$)|\s:[^\s:]\S*)",
+    (r"\bgit\s+push\b[^;&|\n]*?(?:\s--delete(?=\s|$|[;&|])|\s-d(?=\s|$|[;&|])|\s:[^\s:]\S*)",
      "high", "Deleted a remote git branch or tag"),
     (r"\bgit\s+checkout\b(?:[^;&|\n]*\s)?--\s+\.(?=\s|$|[;&|])|\bgit\s+checkout\s+\.(?=\s|$|[;&|])",
      "medium", "Discarded all working-tree changes (git checkout .)"),
@@ -871,9 +872,11 @@ def _plan(words: List[_Word], ps: bool) -> Optional[str]:
             elif w.value in _CODE_FLAGS or (name in ("perl", "ruby") and _PERL_CODE_RE.match(w.value)):
                 take = True
     if name == "find":
+        # A -name/-path pattern is a glob or regex the search matches against, never a command,
+        # so the dangerous-command rules read the pattern as text (the _code_view blanks it).
         for q, w in enumerate(rest[:-1]):
             if w.value in _FIND_PATTERN_OPTS:
-                rest[q + 1].role = "skip"
+                rest[q + 1].role = "text"
     if delete_from is None:
         for q in range(j + 1, len(plain) - 1):
             if plain[q].value in ("-exec", "-execdir", "-ok") and _name(plain[q + 1].value) in _DELETE_CMDS:
@@ -962,8 +965,9 @@ def _check_shell_word(w: _Word, name: str, cwd: Optional[str], workdir: Optional
 
 
 def _code_view(text: str, comments: List[Tuple[int, int]], text_words: List[_Word]) -> str:
-    """The command text the dangerous-command rules read: comments removed, and quoted text
-    arguments (echo, git commit -m, python -c) blanked. Unquoted $VAR words are kept."""
+    """The command text the dangerous-command rules read: comments removed, and text
+    arguments (echo, git commit -m, python -c, a `find -name` pattern) blanked. Unquoted
+    $VAR words are kept."""
     spans = [(s, e, "") for s, e in comments]
     for w in text_words:
         if w.quoted or not w.value.startswith("$") or "$(" in w.value:

@@ -272,11 +272,7 @@ SECRET_PATH_PATTERNS: Tuple[Pattern[str], ...] = (
 )
 
 
-def _walk_regex_ast(
-    parsed: Any,
-    in_repeat: bool = False,
-    in_unbounded: bool = False,
-) -> Tuple[bool, int]:
+def _walk_regex_ast(parsed: Any, in_repeat: bool = False) -> Tuple[bool, int]:
     """Inspect a parsed `re._parser` / `sre_parse` AST for catastrophic backtracking shapes.
     Returns `(is_safe, unbounded_repeat_count)`."""
     unbounded_count = 0
@@ -289,16 +285,15 @@ def _walk_regex_ast(
             max_is_inf = getattr(max_rep, "name", "").upper() == "MAXREPEAT" or int(max_rep) > 65534
             is_unbounded = max_is_inf or int(max_rep) > _MAX_BOUNDED_REPEAT
             is_repeat = is_unbounded or int(max_rep) > 1
-            if in_unbounded and is_repeat:
-                return False, unbounded_count
-            if in_repeat and is_unbounded:
+            if in_repeat and is_repeat:
+                # A quantifier inside a quantifier, bounded or not: `(?:a{1,32}){1,32}b`
+                # and `(a+)+` both backtrack catastrophically.
                 return False, unbounded_count
             if is_unbounded:
                 unbounded_count += 1
             ok, sub_unbounded = _walk_regex_ast(
                 subpattern,
                 in_repeat=in_repeat or is_repeat,
-                in_unbounded=in_unbounded or is_unbounded,
             )
             if not ok:
                 return False, unbounded_count
@@ -308,24 +303,24 @@ def _walk_regex_ast(
             if in_repeat and len(branches) > 1:
                 return False, unbounded_count
             for branch in branches:
-                ok, sub_unbounded = _walk_regex_ast(branch, in_repeat=in_repeat, in_unbounded=in_unbounded)
+                ok, sub_unbounded = _walk_regex_ast(branch, in_repeat=in_repeat)
                 if not ok:
                     return False, unbounded_count
                 unbounded_count += sub_unbounded
         elif op_name == "SUBPATTERN":
             subpattern = av[-1]
-            ok, sub_unbounded = _walk_regex_ast(subpattern, in_repeat=in_repeat, in_unbounded=in_unbounded)
+            ok, sub_unbounded = _walk_regex_ast(subpattern, in_repeat=in_repeat)
             if not ok:
                 return False, unbounded_count
             unbounded_count += sub_unbounded
         elif op_name == "ATOMIC_GROUP":
-            ok, sub_unbounded = _walk_regex_ast(av, in_repeat=in_repeat, in_unbounded=in_unbounded)
+            ok, sub_unbounded = _walk_regex_ast(av, in_repeat=in_repeat)
             if not ok:
                 return False, unbounded_count
             unbounded_count += sub_unbounded
         elif op_name in ("ASSERT", "ASSERT_NOT"):
             _, subpattern = av
-            ok, sub_unbounded = _walk_regex_ast(subpattern, in_repeat=in_repeat, in_unbounded=in_unbounded)
+            ok, sub_unbounded = _walk_regex_ast(subpattern, in_repeat=in_repeat)
             if not ok:
                 return False, unbounded_count
             unbounded_count += sub_unbounded

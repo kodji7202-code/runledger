@@ -44,6 +44,7 @@ SQL_HIGH_CLASSES = frozenset({"drop", "truncate", "delete_no_where", "update_no_
 
 SQL_MAX_CHARS = 20000
 SQL_ARGUMENT_KEYS = ("query", "sql", "statement")
+_SQL_IDENTIFIER = "x"  # stands in for a quoted table/column name; never a SQL keyword
 _TOOL_SQL_TOKENS = frozenset({"sql", "query", "statement", "execute"})
 _MAX_SHOWN_NAME = 120
 
@@ -131,8 +132,13 @@ def sql_argument(tool_input: Any) -> Optional[str]:
 
 
 def blank_sql_literals(sql: str) -> str:
-    """The statement with string literals and comments replaced by spaces, so a `DROP TABLE x`
-    inside a string or a comment cannot be read as a statement."""
+    """The statement with string literals and comments replaced, so a `DROP TABLE x` inside a
+    string or a comment cannot be read as a statement.
+
+    A single-quoted string is a literal and becomes a space. Double-quoted and backtick names
+    are identifiers: they become a placeholder token instead, so `DELETE FROM "users"` still
+    has a table name for the DELETE rules while the identifier's own text is never read as SQL
+    (`DELETE FROM "users where id = 1"` is a table name, not a WHERE clause)."""
     out: List[str] = []
     i, n = 0, len(sql)
     while i < n:
@@ -148,7 +154,7 @@ def blank_sql_literals(sql: str) -> str:
                     i += 1
                     break
                 i += 2 if (sql[i] == "\\" and i + 1 < n) else 1
-            out.append(" ")
+            out.append(" " if quote == "'" else _SQL_IDENTIFIER)
         elif ch == "-" and sql.startswith("--", i):
             end = sql.find("\n", i)
             i = n if end < 0 else end
