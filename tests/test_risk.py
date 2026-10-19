@@ -991,6 +991,8 @@ def test_public_key_and_normal_paths_are_not_secret(public_path):
     "(x+x+)+y",
     r"(\w+\.)+com",
     "(a+){2,}",
+    "(?:a{1,32}){1,32}b",
+    "(ab{1,3}){2,}x",
     r"(a+)\1",
     "a" * 201,
 ])

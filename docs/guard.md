@@ -257,8 +257,10 @@ are. An execute-class call (the name carries `sql`, `query`, `statement` or `exe
 `query`/`sql`/`statement` argument opens like a statement) is graded by its SQL instead: dropping
 or truncating, a `DELETE` or `UPDATE` without a `WHERE`, and `ALTER TABLE ... DROP` are high; any
 other statement that changes data is medium; read-only SQL keeps the low wording, and a call with
-no SQL the guard can read is medium. The SQL text is never written to the reason, the log, an
-approval request or a receipt.
+no SQL the guard can read is medium. Strings and comments are blanked first, and a double-quoted
+or backtick name is kept as an identifier: `DELETE FROM "users"` is a `DELETE` without a `WHERE`,
+while `DELETE FROM "users" WHERE id = 1` is not. The SQL text is never written to the reason, the
+log, an approval request or a receipt.
 
 Because a destructive MCP call is high, it **asks** under the default policy below. Lower
 `mcp` in your own file (`severity_overrides`) or ignore it (`ignore`) to soften that, or add
@@ -266,7 +268,10 @@ Because a destructive MCP call is high, it **asks** under the default policy bel
 
 The command rules added in 0.7.0 read the same blanked view, so `echo "git branch -D x"` is not
 the command being run, and a `DELETE FROM` inside a heredoc body is not scanned (the same
-limitation quoted text always had). The rule families, by severity:
+limitation quoted text always had). A flag right before a separator still counts, so
+`git push origin feature --delete; echo done` is the delete it looks like, and a `find -name`
+pattern is text rather than a command: `find . -name 'helm uninstall web' -print` is a search.
+The rule families, by severity:
 
 - **medium:** force-deleting a git branch (`git branch -D`, `git branch -fD`,
   `git branch --delete --force`), discarding the working tree (`git checkout .`,

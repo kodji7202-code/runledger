@@ -11,7 +11,7 @@ import pytest
 
 from runledger import guard
 from runledger.cli import main
-from runledger.mcp_risk import mcp_tokens
+from runledger.mcp_risk import mcp_tokens, sql_statement_class
 from runledger.parser import Step
 from runledger.risk import assess_step, classify_mcp, mcp_parts
 
@@ -224,6 +224,38 @@ def test_read_verb_first_token_does_not_beat_the_sql_verdict():
 def test_a_non_sql_tool_with_a_query_argument_is_not_escalated():
     risk = _mcp("mcp__x__search_recent_posts", query="release notes")
     assert (risk.severity, risk.reason) == ("low", "Called an external MCP tool (search_recent_posts)")
+
+
+# ---------------------------------------------------------------- GE-002: quoted SQL names
+
+QUOTED_HIGH_SQL = ['DELETE FROM "users"', 'delete from "users";',
+                   'UPDATE "users" SET admin = true', "DELETE FROM `users`",
+                   'ALTER TABLE "users" DROP COLUMN email']
+QUOTED_MEDIUM_SQL = ['DELETE FROM "users" WHERE id = 1',
+                     'UPDATE "users" SET admin = true WHERE id = 1',
+                     "DELETE FROM `users` WHERE id = 1"]
+
+
+@pytest.mark.parametrize("sql", QUOTED_HIGH_SQL)
+def test_quoted_table_names_do_not_hide_a_destructive_statement(sql):
+    risk = _mcp("mcp__supabase__execute_query", query=sql)
+    assert risk.severity == "high"
+    assert risk.reason.startswith("Ran SQL that ")
+    assert sql not in risk.reason
+
+
+@pytest.mark.parametrize("sql", QUOTED_MEDIUM_SQL)
+def test_a_filtered_statement_with_a_quoted_table_name_stays_medium(sql):
+    risk = _mcp("mcp__supabase__execute_query", query=sql)
+    assert risk.severity == "medium"
+    assert risk.reason.startswith("Ran SQL that changes data (")
+
+
+def test_a_quoted_name_is_an_identifier_not_a_string_literal():
+    assert sql_statement_class('DELETE FROM "users"') == "delete_no_where"
+    assert sql_statement_class('DELETE FROM "users where id = 1"') == "delete_no_where"
+    assert sql_statement_class('SELECT * FROM "users where"') == "other"
+    assert sql_statement_class("SELECT 'DROP TABLE users'") == "other"
 
 
 # ---------------------------------------------------------------- privacy and size
