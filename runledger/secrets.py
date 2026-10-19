@@ -274,7 +274,11 @@ SECRET_PATH_PATTERNS: Tuple[Pattern[str], ...] = (
 
 def _walk_regex_ast(parsed: Any, in_repeat: bool = False) -> Tuple[bool, int]:
     """Inspect a parsed `re._parser` / `sre_parse` AST for catastrophic backtracking shapes.
-    Returns `(is_safe, unbounded_repeat_count)`."""
+    Returns `(is_safe, unbounded_repeat_count)`.
+
+    Inside the body of ANY repeat (`?`, `*`, `+`, `{m,n}`) a nested repeat of any kind and any
+    alternation are rejected: `(?:a{1,32}){1,32}b`, `(?:a?){40}b`, `(a+)+` and `(a|aa)+` all
+    backtrack exponentially, however small the inner maximum looks."""
     unbounded_count = 0
     for op, av in parsed:
         op_name = getattr(op, "name", str(op)).upper()
@@ -284,17 +288,13 @@ def _walk_regex_ast(parsed: Any, in_repeat: bool = False) -> Tuple[bool, int]:
             min_rep, max_rep, subpattern = av
             max_is_inf = getattr(max_rep, "name", "").upper() == "MAXREPEAT" or int(max_rep) > 65534
             is_unbounded = max_is_inf or int(max_rep) > _MAX_BOUNDED_REPEAT
-            is_repeat = is_unbounded or int(max_rep) > 1
-            if in_repeat and is_repeat:
-                # A quantifier inside a quantifier, bounded or not: `(?:a{1,32}){1,32}b`
-                # and `(a+)+` both backtrack catastrophically.
+            if in_repeat:
+                # A quantifier inside a quantifier, optional or not: `(?:a?){40}b` needs one
+                # optional branch per input character and stalls the synchronous guard.
                 return False, unbounded_count
             if is_unbounded:
                 unbounded_count += 1
-            ok, sub_unbounded = _walk_regex_ast(
-                subpattern,
-                in_repeat=in_repeat or is_repeat,
-            )
+            ok, sub_unbounded = _walk_regex_ast(subpattern, in_repeat=True)
             if not ok:
                 return False, unbounded_count
             unbounded_count += sub_unbounded

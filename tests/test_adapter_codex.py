@@ -286,6 +286,55 @@ def test_code_mode_exec_reads_the_real_call_after_quoted_text(tmp_path):
     assert any(r.step == 1 and r.severity == "high" for r in risks)
 
 
+def test_code_mode_exec_reads_the_call_after_a_regex_with_a_quote(tmp_path):
+    """A quote inside a JavaScript regex literal is part of the pattern, not a string opener:
+    the shell call after `/"\\/` is still read, so its deletion risk and its guard decision
+    keep the step they belong to (GE-018)."""
+    script = ('const stripQuotes = /\\"/g;\n'
+              'const r = await tools.exec_command({cmd:"rm -rf victim",shell:"bash"});\n'
+              'text(r.output);')
+    run = _parse_items(tmp_path, [_meta_line(), _exec_call(script)])
+    assert [(s.tool, s.input) for s in run.steps] == [("Bash", {"command": "rm -rf victim"})]
+    _, _, risks = assess(run)
+    assert [r.code for r in risks if r.step == 1] == ["command"]
+    assert risks[0].severity == "high"
+
+
+@pytest.mark.parametrize("prefix", [
+    'const re = /[\\/"\']+/g;\n',                 # a character class holding both quote kinds
+    'const ratio = total / count;\n',             # a division, not a regex start
+    'const re = /`/;\n',                          # a backtick inside a regex
+    'return_value = a / b / c;\n',
+])
+def test_code_mode_exec_reads_the_call_after_a_regex_or_a_division(tmp_path, prefix):
+    """The standard rule decides where a regex literal starts and ends: neither its quotes nor
+    its slashes can hide the call that follows."""
+    script = prefix + 'const r = await tools.exec_command({cmd:"rm -rf victim",shell:"bash"});\n'
+    run = _parse_items(tmp_path, [_meta_line(), _exec_call(script)])
+    assert [(s.tool, s.input) for s in run.steps] == [("Bash", {"command": "rm -rf victim"})]
+
+
+def test_code_mode_exec_keeps_the_precise_scan_after_a_spaced_division(tmp_path):
+    """A `/` whose previous significant token is an identifier divides, spaces or not, so the
+    scan still finishes cleanly: the same call text in a comment stays an example rather than
+    becoming a step (GE-018)."""
+    script = ('const ratio = total / count;\n'
+              '// tools.exec_command({cmd:"rm -rf victim",shell:"bash"})\n'
+              'const r = await tools.exec_command({cmd:"echo hello",shell:"bash"});\n')
+    run = _parse_items(tmp_path, [_meta_line(), _exec_call(script)])
+    assert [(s.tool, s.input) for s in run.steps] == [("Bash", {"command": "echo hello"})]
+
+
+def test_code_mode_exec_unreadable_source_falls_back_to_the_raw_call(tmp_path):
+    """A script the scanner cannot finish cleanly (an unterminated literal) is read leniently:
+    the raw text is searched for calls instead, so a call that is there is reported rather
+    than hidden (GE-018)."""
+    script = ('const broken = "unterminated\n'
+              'const r = await tools.exec_command({cmd:"rm -rf victim",shell:"bash"});\n')
+    run = _parse_items(tmp_path, [_meta_line(), _exec_call(script)])
+    assert [(s.tool, s.input) for s in run.steps] == [("Bash", {"command": "rm -rf victim"})]
+
+
 def test_mcp_and_unknown_tool_names(tmp_path):
     run = _parse_items(tmp_path, [
         _meta_line(),

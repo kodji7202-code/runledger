@@ -452,6 +452,37 @@ def test_a_real_command_in_a_find_expression_still_matches():
     _hit("find . -name x | xargs gh repo delete", "high", "Deleted a GitHub repository")
 
 
+# ---------------------------------------------------------------- GE-017: the substitution really runs
+
+@pytest.mark.parametrize("command,severity,needle", [
+    ('find . -name "$(rm -rf ./victim)" -print', "high", "Recursive force delete (rm -rf)"),
+    ('find . -name "$(helm uninstall web)"', "high", "Uninstalled a Helm release"),
+    ("find . -name $(helm uninstall web)", "high", "Uninstalled a Helm release"),
+    ("find . -name `helm uninstall web`", "high", "Uninstalled a Helm release"),
+    ('find . -path "./$(docker volume prune)" -print', "high",
+     "Pruned Docker volumes (data loss)"),
+    ('find . -iname "$(git push --force origin main)"', "high", "Force-pushed to a git remote"),
+])
+def test_a_find_pattern_that_runs_a_command_is_still_a_command(command, severity, needle):
+    """The shell runs a `$(...)` or backtick the pattern carries before find starts, so the
+    pattern is not all text: the substitution stays visible to the rules (GE-017)."""
+    _hit(command, severity, needle)
+
+
+@pytest.mark.parametrize("command", [
+    "find . -name '$(rm -rf ./victim)' -print",
+    "find . -name '`helm uninstall web`' -print",
+    'find . -name "\\$(rm -rf ./victim)" -print',
+    "find . -name 'helm uninstall web' -print",
+    'find . -name "helm uninstall web" -print',
+    'find . -name "*.$(date +%s).tmp" -print',
+])
+def test_a_literal_find_pattern_is_still_data(command):
+    """Single-quoted text is literal and an escaped `$` computes nothing: `date` is not a
+    dangerous command, and a literal pattern stays blank."""
+    _clean(command)
+
+
 # ---------------------------------------------------------------- existing rules (VAL-RULES-017)
 
 @pytest.mark.parametrize("command,severity,needle", [

@@ -389,7 +389,10 @@ def test_selftest_fails_when_the_interpreter_path_is_wrong(tmp_path):
     f'"{sys.executable}" -c "print(\'not json at all\')"',
     f'"{sys.executable}" -c "print(\'{{}}\')"',
 ])
-def test_a_hook_edited_to_misbehave_is_a_failure(tmp_path, replacement):
+def test_a_hook_edited_to_misbehave_is_a_failure_and_is_not_run(tmp_path, replacement,
+                                                                monkeypatch):
+    """A command that is no longer RunLedger's guard command is reported as the failure it is,
+    but doctor never runs it: an arbitrary replacement can write or delete files (GE-010)."""
     proj = tmp_path / "proj"
     proj.mkdir()
     assert install(proj, "droid") == 0
@@ -398,10 +401,77 @@ def test_a_hook_edited_to_misbehave_is_a_failure(tmp_path, replacement):
     data["PreToolUse"][0]["hooks"][0]["command"] = replacement
     write_json(path, data)
 
-    check = one(checks(proj, selftest=True), "guard.selftest", "droid")
+    def boom(*args, **kwargs):
+        raise AssertionError("doctor must not run a hook command it does not own")
+
+    monkeypatch.setattr(doctor, "_run_hook_command", boom)
+    found = checks(proj, selftest=True)
+    check = one(found, "guard.selftest", "droid")
     assert check.status == "fail", check
-    assert "exit" in check.detail.lower() or "deny" in check.detail.lower()
-    assert codes(checks(proj, selftest=True)) == 2
+    assert "not a RunLedger guard command" in check.detail, check.detail
+    assert codes(found) == 2
+
+
+def test_a_foreign_hook_beside_a_checkpoint_is_neither_run_nor_shadowing_the_global_guard(
+        tmp_path, isolated_settings, monkeypatch):
+    """GE-010: a surviving project checkpoint is not ownership of the PreToolUse command next
+    to it. That command is reported, never executed, and the genuine global guard is still the
+    entry doctor self-tests."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    assert install(proj, "claude-code") == 0
+    path = hook_file(proj, "claude-code")
+    data = read_json(path)
+    events = events_of(data, "claude-code")
+    events["PreToolUse"] = [{"matcher": "*", "hooks": [
+        {"type": "command", "command": "echo hi", "timeout": 135}]}]
+    write_json(path, data)
+    assert cli_main(["guard", "install", "--agent", "claude-code", "--global"]) == 0
+
+    ran = []
+    real = doctor._run_hook_command
+
+    def record(command, payload, env, cwd):
+        ran.append(command)
+        return real(command, payload, env, cwd)
+
+    monkeypatch.setattr(doctor, "_run_hook_command", record)
+    found = checks(proj, selftest=True)
+
+    assert ran, "the genuine global guard must still be self-tested"
+    assert all("echo hi" not in command for command in ran), ran
+    self_test = pick(found, "guard.selftest", "claude-code")
+    assert len(self_test) == 1 and self_test[0].status == "ok", [c.as_dict() for c in self_test]
+    assert "global" in self_test[0].detail
+    project_hooks = one(found, "guard.hooks", "claude-code", "project")
+    assert project_hooks.status == "warn", project_hooks
+    assert "echo hi" in project_hooks.detail, project_hooks
+    assert "guard install" in project_hooks.fix, project_hooks
+    assert codes(found) == 1
+
+
+def test_a_foreign_windows_override_is_never_run(tmp_path, monkeypatch):
+    """GE-010: the same gate covers Codex's `commandWindows`, the string that agent runs on
+    Windows: a foreign override is reported and never executed."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    assert install(proj, "codex") == 0
+    path = hook_file(proj, "codex")
+    data = read_json(path)
+    data["hooks"]["PreToolUse"][0]["hooks"][0]["commandWindows"] = 'cmd /c "echo hi"'
+    write_json(path, data)
+
+    monkeypatch.setattr(doctor, "_IS_WINDOWS", True, raising=False)
+
+    def boom(*args, **kwargs):
+        raise AssertionError("doctor must not run a hook command it does not own")
+
+    monkeypatch.setattr(doctor, "_run_hook_command", boom)
+    found = checks(proj, selftest=True)
+    check = one(found, "guard.selftest", "codex")
+    assert check.status == "fail", check
+    assert "not a RunLedger guard command" in check.detail, check.detail
+    assert codes(found) == 2
 
 
 def test_no_selftest_skips_the_check_and_starts_no_subprocess(tmp_path, monkeypatch):
@@ -1390,8 +1460,9 @@ def test_a_broken_codex_windows_command_is_a_failure_and_posix_ignores_it(tmp_pa
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Codex runs commandWindows on Windows only")
-def test_the_self_test_runs_the_codex_windows_override(tmp_path):
-    """GE-011: the self-test runs the command Codex actually runs there."""
+def test_the_self_test_runs_the_codex_windows_override(tmp_path, monkeypatch):
+    """GE-011/GE-010: the self-test runs the command Codex actually runs there, and only when
+    RunLedger owns it: an override that is not the guard command is reported, never run."""
     proj = tmp_path / "proj"
     proj.mkdir()
     assert install(proj, "codex") == 0
@@ -1400,9 +1471,16 @@ def test_the_self_test_runs_the_codex_windows_override(tmp_path):
     data["hooks"]["PreToolUse"][0]["hooks"][0]["commandWindows"] = 'cmd /c "exit 1"'
     write_json(path, data)
 
-    check = one(checks(proj, selftest=True), "guard.selftest", "codex")
+    def boom(*args, **kwargs):
+        raise AssertionError("doctor must not run an override it does not own")
+
+    monkeypatch.setattr(doctor, "_run_hook_command", boom)
+    found = checks(proj, selftest=True)
+    check = one(found, "guard.selftest", "codex")
     assert check.status == "fail", check
-    assert "exit code 1" in check.detail, check
+    assert "not a RunLedger guard command" in check.detail, check
+    assert one(found, "guard.hooks", "codex", "project").status == "fail"
+    assert codes(found) == 2
 
 
 def test_a_global_hook_timeout_is_compared_with_the_project_approval_wait(tmp_path):
