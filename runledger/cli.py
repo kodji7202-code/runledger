@@ -22,7 +22,7 @@
   runledger checkpoint [--label TEXT] [--run RUN_ID] [--cwd DIR]
   runledger checkpoints [--cwd DIR]
   runledger checkpoints prune --keep N [--cwd DIR]
-  runledger rollback [CHECKPOINT | --run RUN_ID | --last] [--dry-run] [--yes] [--cwd DIR]
+  runledger rollback [CHECKPOINT | --run RUN_ID | --last] [--path PATH ...] [--dry-run] [--yes] [--cwd DIR]
   runledger doctor [--project PATH] [--agent AGENT ...] [--offline] [--no-selftest] [--json] [--verbose]
   runledger stats [--project PATH | --all] [--agent AGENT] [--since WHEN] [--until WHEN]
                   [--by agent|model|day|week|project] [--top N] [--format table|json|md]
@@ -212,21 +212,48 @@ def cmd_checkpoints(args) -> int:
         return 1
 
 
+def _changed_bytes(repo, plan, failure) -> int:
+    """The bytes a preview would write: the checkpoint blobs for restores, the current blobs for
+    removals. A tree that cannot be read gives -1, and the caller then omits the size."""
+    try:
+        sizes = repo.tree_sizes(plan.current_tree) if plan.remove else {}
+        sizes.update(repo.tree_sizes(plan.checkpoint.tree))
+    except failure:
+        return -1
+    return sum(sizes.get(name, 0) for name in list(plan.restore) + list(plan.remove))
+
+
 def cmd_rollback(args) -> int:
     from .rollback import CheckpointError, Repository
     try:
         repo = Repository(args.cwd)
         checkpoint = repo.select(args.checkpoint, run_id=args.run)
-        plan = repo.plan(checkpoint)
+        plan = repo.plan(checkpoint, paths=args.path)
         print(f"Rollback to {checkpoint.id} in {str(repo.root)!r}")
-        for path in plan.restore:
-            print(f"  restore {path!r}")
-        for path in plan.remove:
-            print(f"  remove  {path!r}")
-        for path in plan.keep_ignored:
-            print(f"  keep ignored {path!r}")
-        print(f"{len(plan.restore)} restore, {len(plan.remove)} remove. "
-              "HEAD, branch, and index stay unchanged.")
+        if plan.paths:
+            print(f"  scope: {', '.join(plan.paths)}")
+            for path in plan.restore:
+                print(f"  restore  {path!r}")
+            for path in plan.remove:
+                print(f"  delete   {path!r}  (not in checkpoint)")
+            if not (plan.restore or plan.remove):
+                print(f"Nothing to restore for {', '.join(plan.paths)} "
+                      f"(already matches {checkpoint.id}).")
+                return 0
+            count = len(plan.restore) + len(plan.remove)
+            size = _changed_bytes(repo, plan, CheckpointError)
+            detail = f" ({size} bytes)" if size >= 0 else ""
+            print(f"{count} file(s) would change{detail}. "
+                  "Everything outside the scope is untouched. Run with --yes to apply.")
+        else:
+            for path in plan.restore:
+                print(f"  restore {path!r}")
+            for path in plan.remove:
+                print(f"  remove  {path!r}")
+            for path in plan.keep_ignored:
+                print(f"  keep ignored {path!r}")
+            print(f"{len(plan.restore)} restore, {len(plan.remove)} remove. "
+                  "HEAD, branch, and index stay unchanged.")
         if args.dry_run:
             print("Dry run. No files restored and no safety checkpoint created.")
             return 0
@@ -1055,6 +1082,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     target.add_argument("checkpoint", nargs="?", help="checkpoint id (default: latest, including safety checkpoints)")
     target.add_argument("--run", help="restore the earliest checkpoint for a run/session id")
     target.add_argument("--last", action="store_true", help="restore the latest checkpoint, including safety checkpoints")
+    prb.add_argument("--path", action="append", metavar="PATH",
+                     help="restore only this file or folder (repeatable; matched literally)")
     prb.add_argument("--dry-run", action="store_true", help="preview without restoring files or creating a ref")
     prb.add_argument("--yes", action="store_true", help="confirm restoration without a terminal prompt")
     prb.add_argument("--cwd", help="Git working tree folder (default: current folder)")

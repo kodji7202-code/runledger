@@ -9,6 +9,22 @@ change behavior, so read the entry before you upgrade.
 
 ### Added
 
+- **Selective restore with `runledger rollback <id> --path P` (`runledger.rollback`):** the option
+  (repeatable) restores only the named file or folder and leaves everything else exactly as it is.
+  A value is read against `--cwd` or may be an absolute path inside the repository; matching is
+  literal, so `src` restores `src/x.txt` but never `src2/y.txt`, and names with `[` or `*` behave.
+  Directories restore their whole subtree, including the deletion of files created after the
+  checkpoint (labelled `delete`, not in checkpoint); a value that is already identical prints
+  `Nothing to restore for <path> (already matches <id>).` and exits 0. Paths outside the
+  repository, `.git` and its contents, empty values and values present in neither the checkpoint
+  nor the working tree are refused with a one-line error before anything is written. All the
+  whole-tree safety stays in place: one safety checkpoint of the whole tree is still created
+  first (so `runledger rollback <safety-id>` undoes a partial restore), the stale-preview check
+  still covers the whole tree, and the symlink, junction, `.git` overlap, reserved-name and
+  case-collision refusals apply to an in-scope path exactly as before. `--path` combines with a
+  checkpoint id, `--run`, `--last`, `--dry-run` and `--yes`, and the preview lists the scope, each
+  change, and a summary with the number of files and the bytes to restore. `--path .` is the same
+  as a whole-tree rollback, which is unchanged without the option.
 - **Droid discovery follows `FACTORY_HOME_OVERRIDE` (`runledger.adapters.droid`):** the variable
   is read as a HOME, so the Factory config directory becomes `<FACTORY_HOME_OVERRIDE>/.factory`,
   and that is where sessions, settings files and a global hook file are looked for.
