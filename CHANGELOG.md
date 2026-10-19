@@ -269,6 +269,17 @@ change behavior, so read the entry before you upgrade.
   hook or a receipt. A user or project rule also reads at most the first 20 000 characters of a
   command, like the SQL inspection, so no rule can make the synchronous guard path walk an
   arbitrarily long command.
+- **The `log` check is `info` outside a Git work tree (`runledger.doctor`):** the ignore rule can
+  only be verified inside a Git repository, so an existing `.runledger/guard.log` in a plain folder
+  no longer prints an `ok` line that reads as if the rule had been checked. The line still carries
+  the log's size, its last decision time and its 7-day error count, never its contents, and the
+  status change does not touch the exit code; recent error rows still warn (fail-open), and every
+  other status is unchanged - ignored `ok`, not ignored `warn`, tracked `warn`, no log `info`.
+- **`docs/doctor.md` shows the report the CLI really prints (`docs/doctor.md`):** the text samples
+  no longer label an uninstalled hook `[ok]` (the CLI reports it as `info`), they use the check
+  titles the text report prints (`guard log`, not `log`), and the numbers in the sample summary and
+  in the `--json` example are the ones that run prints. The `log` section documents the outside-Git
+  `info` status.
 
 ## [0.6.1] - 2026-10-18
 

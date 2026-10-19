@@ -52,17 +52,34 @@ to one, and the detail. The first line is a header with the RunLedger version, t
 the platform and the project folder. Warnings and failures add a `->` line with what to do:
 
 ```text
+RunLedger doctor 0.7.0  |  python 3.12.10  |  win32  |  D:\my-app
 [ok] install: runledger 0.7.0 | python 3.12.10 | win32 | D:\my-app | runledger on PATH (C:\Python312\Scripts\runledger.exe)
 [ok] guard hooks claude-code project: Claude Code project: guard hook (PreToolUse) and 1 + 1 checkpoint hooks (SessionStart, UserPromptSubmit) in D:\my-app\.claude\settings.json
+[info] guard hooks claude-code global: Claude Code global: not installed (C:\Users\me\.claude\settings.json)
+[info] guard hooks droid project: Droid project: not installed (D:\my-app\.factory\hooks.json)
+[info] guard hooks droid global: Droid global: not installed (C:\Users\me\.factory\hooks.json)
 [info] guard hooks codex project: Codex project: not installed (D:\my-app\.codex\hooks.json)
-[info] guard notes codex: Codex: Codex runs only hooks you trust: open `codex` and review the RunLedger entries in /hooks. ...
-[warn] log: D:\my-app\.runledger\guard.log: 412 bytes; 3 row(s); last decision 2026-10-19T15:55:02+00:00; 0 error row(s) in the last 7 days; .runledger/ is not git-ignored: guard.log holds command summaries
+[info] guard hooks codex global: Codex global: not installed (C:\Users\me\.codex\hooks.json)
+[ok] hook self-test claude-code: Claude Code project: "C:\Python312\python.exe" -m runledger guard denies `rm -rf /` (JSON deny) and stays silent for `ls` in 455 ms
+[info] config: no user config file (C:\Users\me\.runledger\config.json)
+[info] config: no project config file (D:\my-app\.runledger.json)
+[info] approval server: no approval server configured; key RUNLEDGER_API_KEY not set (the guard decides locally)
+[warn] guard log: D:\my-app\.runledger\guard.log: 412 bytes; 3 row(s); last decision 2026-10-19T15:55:02+00:00; 0 error row(s) in the last 7 days; .runledger/ is not git-ignored: guard.log holds command summaries
         -> Add `.runledger/` to .gitignore: the log holds command summaries you do not want to commit.
-Summary: 6 ok, 1 warnings, 0 failures
+[ok] rollback checkpoints: git 2.52.0; 0 checkpoints
+[ok] pricing: prices.json checked 2026-10-08 (11 days ago)
+[info] sessions claude-code: claude-code: 0 session(s) for this project (home C:\Users\me\.claude)
+[info] sessions codex: codex: 0 session(s) for this project (home C:\Users\me\.codex)
+[info] sessions droid: droid: 0 session(s) for this project (home C:\Users\me\.factory)
+[info] sessions aider: aider: 0 session(s) for this project (home D:\my-app)
+[info] sessions native: native: 0 session(s) for this project (home D:\my-app)
+Summary: 5 ok, 1 warnings, 0 failures
 ```
 
-The summary line counts only `[ok]`, `[warn]` and `[fail]` lines, so its numbers always match the
-report above it.
+That is the whole report for a project where Claude Code has the project-scope hooks and the log is
+not ignored yet. The summary line counts only `[ok]`, `[warn]` and `[fail]` lines, so its numbers
+always match the report above it. An agent that has no hooks installed prints `[info] ... not
+installed`, which is not a warning: only `[warn]` and `[fail]` raise the exit code.
 
 ## The JSON report
 
@@ -73,7 +90,7 @@ report above it.
   "version": 1,
   "runledger": "0.7.0",
   "project": "D:\\my-app",
-  "summary": {"ok": 8, "warn": 1, "fail": 0, "info": 4},
+  "summary": {"ok": 5, "warn": 1, "fail": 0, "info": 13},
   "checks": [
     {
       "id": "log",
@@ -213,8 +230,10 @@ not covered by `.gitignore`, the check warns that `guard.log` holds command summ
 want to commit. A log that is in the Git index warns as well, even when an ignore rule covers it:
 a file committed before the rule was added keeps recording every change and stays publishable, so
 the fix is `git rm --cached .runledger/guard.log` (which leaves it on disk). No log yet is `info`.
-The check counts rows and never prints their contents, so no command text from the log appears in
-the report.
+Outside a Git work tree, or with Git unavailable, the ignore rule cannot be checked at all, so an
+existing log is `info` there rather than `ok`: the line still shows its size, its last decision and
+its recent-error count, and recent error rows still make it a `warn`. The check counts rows and
+never prints their contents, so no command text from the log appears in the report.
 
 ### `rollback`
 
@@ -262,13 +281,23 @@ set `mode: "monitor"` shows up as an ignored-key warning while the mode line sti
 
 ```text
 [ok] guard hooks claude-code project: Claude Code project: guard hook (PreToolUse) and 1 + 1 checkpoint hooks (SessionStart, UserPromptSubmit) in D:\my-app\.claude\settings.json
-[ok] guard hooks claude-code global: Claude Code global: not installed (C:\Users\me\.claude\settings.json)
+[info] guard hooks claude-code global: Claude Code global: not installed (C:\Users\me\.claude\settings.json)
+[info] guard hooks droid project: Droid project: not installed (D:\my-app\.factory\hooks.json)
+[info] guard hooks droid global: Droid global: not installed (C:\Users\me\.factory\hooks.json)
+[info] guard hooks codex project: Codex project: not installed (D:\my-app\.codex\hooks.json)
+[info] guard hooks codex global: Codex global: not installed (C:\Users\me\.codex\hooks.json)
+[info] config: no user config file (C:\Users\me\.runledger\config.json)
+[info] config: no project config file (D:\my-app\.runledger.json)
+[info] approval server: no approval server configured; key RUNLEDGER_API_KEY not set (the guard decides locally)
+[warn] guard log: D:\my-app\.runledger\guard.log: 412 bytes; 3 row(s); last decision 2026-10-19T15:55:02+00:00; 0 error row(s) in the last 7 days; .runledger/ is not git-ignored: guard.log holds command summaries
+        -> Add `.runledger/` to .gitignore: the log holds command summaries you do not want to commit.
 [info] guard mode: mode enforce; fail_closed off
-Summary: 4 ok, 0 warnings, 0 failures
+Summary: 1 ok, 1 warnings, 0 failures
 ```
 
-The lines shown are a sample of the real output: `guard status` prints one line per agent and
-scope, then the notes, the config, approval and log lines, the mode line and the summary.
+That is the full output for the same project as the report above, without the header: one line per
+agent and scope, then the notes (only when an agent needs one), the config, approval and log lines,
+the mode line and the summary.
 
 ## Troubleshooting
 
