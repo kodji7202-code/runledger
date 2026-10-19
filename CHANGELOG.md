@@ -62,6 +62,23 @@ change behavior, so read the entry before you upgrade.
   regular expression are ignored and logged as warnings. Receipts: a receipt re-runs the rules with
   the project's file only, so a rule that lives in your user file is enforced live but does not
   appear in a receipt built from an older session (`docs/guard.md`).
+- **The guard reads Claude Code, Factory Droid and Codex payloads (`runledger.guard`):** the hook
+  command carries `--agent claude-code|droid|codex` (without the flag the agent is inferred from the
+  payload, and Claude Code is the default, so existing hooks are unchanged), so a Droid `Execute`
+  is decided as the shell call it is, `Create`/`Edit` as writes and edits, `ApplyPatch`/`apply_patch`
+  as one step per file the patch touches (one bad file denies the whole call, and the log lists the
+  paths, never the bodies), its searches as `Search` and `FetchUrl` as `WebFetch`; MCP names keep
+  both shapes (`mcp__server__tool` and Droid's bare `server__tool`). The log keeps the agent's own
+  tool name and adds `agent` and `canonical_tool` (`Execute` becomes `Bash`), and `session_id` stays
+  the agent's own session id, so a receipt can match the decisions to the session. Codex cannot
+  prompt from a hook, so an ask becomes a **deny** there with a reason that names the rule and how
+  to proceed (`guard.codex_ask: "allow"` in the user file opts out; a project file cannot set it),
+  while Claude Code and Droid keep asking. PowerShell commands sent under `Bash` (Codex) or
+  `Execute` (Droid) are analysed as PowerShell. An unknown `--agent`, a malformed payload or an
+  internal error never blocks a call: the hook exits 0, keeps the fail-open/fail-closed semantics
+  and reports a bad agent on stderr. A hook command stored with `--agent` is recognised as
+  RunLedger's own by `install`, `uninstall` and the install-time self-test, `guard test --agent X`
+  reads a native payload, and the hook stays fast and offline (`docs/guard.md`).
 
 ### Changed
 

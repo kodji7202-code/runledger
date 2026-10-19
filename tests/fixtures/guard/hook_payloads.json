@@ -1,0 +1,36 @@
+{
+  "_comment": "Recorded PreToolUse payloads from research/hook-payloads (claude 2.1.293, droid 0.232.0, codex 0.159.0), sanitised: the recording user's home and the scratch project folders were replaced. Session ids and tool ids are the recorded ones.",
+  "claude-code": {
+    "session_id": "ad4fc5c6-5bc7-4c66-81c3-e4d6c2924991",
+    "transcript_path": "C:\\Users\\user\\.claude\\projects\\-C-work-claude-proj\\ad4fc5c6-5bc7-4c66-81c3-e4d6c2924991.jsonl",
+    "cwd": "C:\\work\\claude-proj",
+    "prompt_id": "a098a94b-cb93-4f8d-9f2e-1ca28bd63585",
+    "permission_mode": "bypassPermissions",
+    "effort": {"level": "medium"},
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Bash",
+    "tool_input": {"command": "echo rl-ready", "description": "Print rl-ready string"},
+    "tool_use_id": "toolu_019hztH6nJytyKJBxn2sTown"
+  },
+  "droid": {
+    "session_id": "a96d6f95-c82e-463d-947c-e0cf04eb7fac",
+    "transcript_path": "C:\\Users\\user\\.factory\\sessions\\-C-work-droid-proj\\a96d6f95-c82e-463d-947c-e0cf04eb7fac.jsonl",
+    "cwd": "C:\\work\\droid-proj",
+    "permission_mode": "auto-low",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Execute",
+    "tool_input": {"command": "echo rl-ready", "summary": "Echo rl-ready", "riskLevel": "low"}
+  },
+  "codex": {
+    "session_id": "01a148d0-fad4-7553-891d-c68363b89cf2",
+    "turn_id": "01a148d1-03f7-74a3-a481-cb6f47098230",
+    "transcript_path": "C:\\Users\\user\\.codex\\sessions\\2026\\10\\17\\rollout-2026-10-17T10-43-37-01a148d0-fad4-7553-891d-c68363b89cf2.jsonl",
+    "cwd": "C:\\work\\codex-proj",
+    "hook_event_name": "PreToolUse",
+    "model": "gpt-6-luna",
+    "permission_mode": "bypassPermissions",
+    "tool_name": "Bash",
+    "tool_input": {"command": "echo rl-ready"},
+    "tool_use_id": "exec-d104c04d-3781-427f-83c5-5d76ad502f98"
+  }
+}

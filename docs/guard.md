@@ -1,13 +1,15 @@
 # The real-time guard
 
-The guard is a Claude Code `PreToolUse` hook. Before each tool call runs, Claude Code runs
-`runledger guard` with the call as JSON on stdin. The guard applies the same rules as the receipt
+The guard is a `PreToolUse` hook for Claude Code, Factory Droid and the Codex CLI. Before each
+tool call runs, the agent runs `runledger guard` with the call as JSON on stdin. The guard applies
+the same rules as the receipt
 (see the code list below), decides **allow**, **ask** or **deny**, optionally asks a human on the
 team server, and appends the decision to a log in the project.
 
 Contents:
 
 - [Install and test](#install-and-test)
+- [Agents: Claude Code, Factory Droid and Codex](#agents-claude-code-factory-droid-and-codex)
 - [What the guard looks at](#what-the-guard-looks-at)
 - [Default policy](#default-policy)
 - [Policy files](#policy-files)
@@ -95,15 +97,75 @@ project. A `--global` install uses the wait from your user file.
 
 ```bash
 runledger guard test '{"session_id":"s1","cwd":"D:\\my-app","tool_name":"Bash","tool_input":{"command":"rm -rf /"}}'
+runledger guard test --agent droid '{"session_id":"s1","cwd":"D:\\my-app","permission_mode":"auto-low","tool_name":"Execute","tool_input":{"command":"rm -rf /"}}'
 ```
 
 The output is an object with `decision` (the full decision, including `risks` and `warnings`) and
-`hook_output` (what the hook would print). `test` uses the project file in the
+`hook_output` (what the hook would print for that agent). With `--agent` the event is read as that
+agent's payload; without it the agent is inferred from the payload's own fields. `test` uses the
+project file in the
 event's `cwd` and your user file. If an approval server is configured and the decision is ask,
 `test` sends a real approval request and waits for an answer, as the hook does.
 
-The event format is the one Claude Code sends: `session_id`, `cwd`, `tool_name`, `tool_input`
-and `tool_use_id`. The tool id links the decision to its step in the receipt.
+The event format is the one the agent sends: `session_id`, `cwd`, `tool_name`, `tool_input`
+and, for Claude Code and Codex, `tool_use_id`. The tool id links the decision to its step in the
+receipt.
+
+## Agents: Claude Code, Factory Droid and Codex
+
+Each installed guard hook carries an explicit `--agent claude-code|droid|codex`, so the guard
+reads the call with that agent's vocabulary and answers in the shape the agent understands.
+Without the flag (an older Claude Code hook) the agent is inferred from the payload's own fields,
+and `claude-code` is the default, so Claude Code behaves exactly as before.
+
+| Agent | Command | Hook output |
+| --- | --- | --- |
+| Claude Code | `"<python>" -m runledger guard` | `permissionDecision` `deny`, `ask` or `allow`; a plain allow prints nothing. |
+| Factory Droid | `"<python>" -m runledger guard --agent droid` | The same JSON object; `ask` is supported. A plain allow prints nothing. |
+| Codex | `"<python>" -m runledger guard --agent codex` | Only `deny` is printed (as the same JSON object). Codex cannot prompt from a hook, so an **ask becomes a deny** with an explanatory reason. A plain allow prints nothing. |
+
+The exit code is always `0`. Claude Code and Droid would also read exit code `2` as a block, but
+the guard never uses it: an unrecognised `--agent` value, a malformed payload or an internal error
+never blocks the call. An unknown agent is reported on stderr and the agent is then read from the
+payload.
+
+**Tool names are translated to the ones the rules know.** The log keeps the agent's own name
+(`tool`) and adds the canonical one (`canonical_tool`):
+
+| Agent tool | Assessed as |
+| --- | --- |
+| Droid `Execute` | `Bash` (the command may be PowerShell, which is analysed as such) |
+| Droid `Create` / `Edit` | `Write` / `Edit` (`old_str`/`new_str` read as `old_string`/`new_string`) |
+| Droid `ApplyPatch`, Codex `apply_patch` | one `Write`, `Edit` or `Delete` per file the patch touches |
+| Droid `LS`, `Glob`, `Grep` | `Search` |
+| Droid `FetchUrl` | `WebFetch` |
+| `mcp__server__tool`, Droid's bare `server__tool` | unchanged: one classifier, both name shapes |
+
+A tool name the agent's vocabulary does not know keeps its own name and is logged with
+`canonical_tool` `null`; the decision is then allow unless a `tool_rules` entry matches it.
+
+**Codex and `ask`.** Codex marks a hook that answers `ask` as failed and runs the call anyway, so
+the guard turns an ask into a deny whose reason names the rule and how to proceed. The user's own
+file can choose to allow it instead:
+
+```json
+{ "guard": { "codex_ask": "allow" } }
+```
+
+Only the user file may set this; a project file that tries is ignored with a warning. `deny` is the
+default. The log row keeps `policy_decision: "ask"` with `decision: "allow"` or `"deny"`, so you
+can always see what the rules wanted. With an approval server configured, an approved ask is an
+allow for every agent, and a denied or timed-out ask is a deny that carries the Codex explanation.
+
+**PowerShell commands under `Bash` or `Execute`.** On Windows both Codex and Droid may report a
+PowerShell command under their shell tool name. The guard recognises PowerShell syntax in any shell
+command, so `Remove-Item -Recurse -Force victim` is denied and `Get-Content .env` asks (denied for
+Codex) whichever name carried it.
+
+**Project root per agent.** Claude Code sets `CLAUDE_PROJECT_DIR`, Droid sets `FACTORY_PROJECT_DIR`
+(and `DROID_PROJECT_DIR`); Codex sets none, so the root comes from the payload `cwd` and its
+nearest ancestor holding `.runledger.json` or `.git`. The same log, policy and outside-the-project
+checks apply as for Claude Code (see [Install and test](#install-and-test)).
 
 ## What the guard looks at
 
@@ -219,6 +281,7 @@ What each file can set:
 | `guard.approval.on_timeout` | `deny` or `ask`. | `deny` only. `ask` would turn a timeout denial into a local prompt, so only your file can set it. |
 | `guard.approval.server` | Sets it. | Ignored. |
 | `guard.approval.api_key_env` | Sets it. | Ignored. |
+| `guard.codex_ask`: `deny` (default) or `allow` | Decides what an ask means for Codex, which cannot prompt from a hook. | Ignored and logged: only your file may allow an ask there. |
 | `ignore` | Hides matching findings from the guard and the receipt. | Ignored by both the guard and the receipt (the receipt adds a note). |
 | `severity_overrides` | Sets any severity. | Can raise a severity, never lower it (in both the guard and the receipt). |
 | `extra_secret_paths` | Adds safe regular expressions or `glob:...` patterns (up to 20, max 200 characters each). | Adds safe regular expressions or `glob:...` patterns. Unsafe backtracking patterns are ignored and logged. |
@@ -371,9 +434,9 @@ The flow:
 2. The guard polls `GET {server}/api/approvals/{id}` every 2 seconds.
 3. A person decides the approval on the dashboard (`/approvals/{id}`), or through the API
    (`POST /api/approvals/{id}/decision`). See [api.md](api.md).
-4. The guard answers Claude Code from the decision.
+4. The guard answers the agent from the decision.
 
-| Outcome | What the hook prints | Reason shown to Claude |
+| Outcome | What the hook prints | Reason shown to the agent |
 | --- | --- | --- |
 | Approved | `allow` | "Approved in RunLedger: ..." |
 | Denied | `deny` | "Denied in the RunLedger approval queue: ..." |
@@ -381,8 +444,10 @@ The flow:
 | No answer within `timeout_s` | `deny`, or a local `ask` if `on_timeout` is `ask` | "No approval within 120s: ..." |
 | Server unreachable, bad key, or an HTTP error | `ask`, which is the local prompt | "... (approval unavailable: ...)" |
 
-An approval is the only way the guard prints `allow`. A plain allow prints nothing, so Claude Code's
-own permission rules still decide. An approved call skips Claude Code's prompt for that one call.
+An approval is the only way the guard prints `allow`. A plain allow prints nothing, so the agent's
+own permission rules still decide. An approved call skips the agent's prompt for that one call.
+For Codex the two `ask` rows above are printed as a `deny` instead, with the Codex explanation
+added (see [Agents](#agents-claude-code-factory-droid-and-codex)).
 
 The summary sent to the server is cut at 200 characters and has known secrets masked (the same
 masking as the log, described below). Each finding's reason is a display copy: the whole spaced
@@ -394,7 +459,7 @@ findings.
 ## Fail-open, fail-closed and monitor mode
 
 **Fail open (the default).** If the guard cannot evaluate a call, for example because the input is
-not valid JSON or a bug occurs, it prints nothing. Claude Code's normal permissions then apply. If
+not valid JSON or a bug occurs, it prints nothing. The agent's normal permissions then apply. If
 the settings files cannot be read at all, the guard also fails open.
 
 **Fail closed.** Set `"fail_closed": true` in either file. An evaluation error then becomes a deny
@@ -402,20 +467,27 @@ whose reason says the guard could not evaluate the call.
 
 **Monitor mode.** Set `"mode": "monitor"` in your user file. Monitor mode never blocks or asks. It
 prints nothing, logs what it would have done, and ignores `fail_closed`. Use it to see what the
-rules would stop before you enforce them. Only your user file can turn monitor mode on. A project
-file that says `enforce` switches a monitor setting in your file to enforcement.
+rules would stop before you enforce them, whichever agent you hook. Only your user file can turn
+monitor mode on. A project file that says `enforce` switches a monitor setting in your file to
+enforcement.
 
 ## The guard log
 
-Each project's decisions go to `<project>/.runledger/guard.log`, where `<project>` is the folder in
-the event's `cwd`. Each line is a JSON object:
+Each project's decisions go to `<project>/.runledger/guard.log`, where `<project>` is the project
+root resolved above (the payload `cwd` for Codex, which sets no project variable). Each line is a
+JSON object:
 
 ```json
-{"ts": "2026-10-08T16:39:27+00:00", "session_id": "s1", "tool_use_id": "toolu-1", "tool": "Bash", "mode": "monitor", "decision": "allow", "policy_decision": "deny", "codes": ["command"], "approval": null, "summary": "rm -rf /", "reason": "Monitor mode, not enforced. Blocked by RunLedger guard: Recursive force delete (rm -rf)"}
+{"ts": "2026-10-08T16:39:27+00:00", "session_id": "s1", "tool_use_id": "toolu-1", "tool": "Execute", "agent": "droid", "canonical_tool": "Bash", "mode": "monitor", "decision": "allow", "policy_decision": "deny", "codes": ["command"], "approval": null, "summary": "rm -rf /", "reason": "Monitor mode, not enforced. Blocked by RunLedger guard: Recursive force delete (rm -rf)"}
 ```
 
 - `decision` is what happened (`allow`, `ask`, `deny`, or `error`). `policy_decision` is what the
-  rules said before monitor mode and approvals changed it.
+  rules said before monitor mode, approvals and the Codex ask rule changed it.
+- `agent` is the hook's agent (`claude-code`, `droid` or `codex`) and `tool` is that agent's own
+  tool name. `canonical_tool` is the name the rules used (`Execute` becomes `Bash`, `Create`
+  becomes `Write`); it is `null` for a name the agent's vocabulary does not have.
+  `session_id` is the agent's own session id (the transcript stem, or the Codex rollout id),
+  which is how a receipt matches the decisions to the session.
 - `approval` is `approved`, `denied`, `expired`, `timeout` or `unavailable` when an approval was
   asked for, otherwise `null`.
 - A line with `"decision": "warning"` records a setting the guard ignored: a project setting that
@@ -458,7 +530,9 @@ warnings and evaluation errors are not shown in this section. Summaries and reas
 again before inclusion in a receipt.
 
 The log records the tool name, the **summary**, the codes and the reason. For shell tools the
-summary is the command. For file tools it is the path. Write and Edit bodies, file contents and MCP
+summary is the command. For file tools it is the path. For a patch (`ApplyPatch`, Codex
+`apply_patch`) it is the comma list of the paths the patch touches. Write and Edit bodies, file
+contents and MCP
 arguments (including the SQL of an execute-class tool) are never logged. Each string is cut at 200
 characters.
 
