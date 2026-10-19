@@ -537,21 +537,22 @@ class Repository:
         own spelling instead of the case the filesystem reports."""
         if not isinstance(raw, str) or not raw.strip():
             raise CheckpointError("--path needs a file or folder inside the repository.")
+        root = os.path.normcase(str(self.root))
         if is_abs(raw):
             resolved = os.path.normpath(raw)
-            parts = []
         else:
-            resolved = os.path.normpath(os.path.join(str(self.root), raw.replace("\\", os.sep)))
-            parts = [p for p in raw.replace("\\", "/").split("/") if p and p != "."]
-        root = os.path.normcase(str(self.root))
+            # On Windows both separators split a path; elsewhere a backslash is a file name.
+            inside = raw.replace("\\", "/") if os.sep == "\\" else raw
+            resolved = os.path.normpath(os.path.join(str(self.root), inside))
         candidate = os.path.normcase(resolved)
         if candidate == root:
             return ""
         if not candidate.startswith(root + os.sep):
             raise CheckpointError(f"path is outside the repository: {raw}")
-        name = "/".join(parts) if parts else os.path.relpath(resolved, str(self.root)).replace(
-            os.sep, "/")
-        return name
+        # Strip the root as text rather than with `relpath`, which would fold the case on a
+        # case-insensitive volume and lose the spelling the user typed.
+        name = resolved[len(str(self.root)) + 1:]
+        return name.replace(os.sep, "/")
 
     def _selected(self, paths: List[str], trees: Tuple[Dict[str, Tuple[str, str]], ...]) -> Tuple[str, ...]:
         """The repository's own spelling for every `--path` value. A value must be a file or
