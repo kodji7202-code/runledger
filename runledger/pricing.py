@@ -186,9 +186,45 @@ def _parse_table(data: Any, source: str) -> Dict[Tuple[str, str], Tuple[float, f
 
 
 _WARNED: set[Tuple[str, str]] = set()
-_DEFAULT_TEXT = resources.files(__package__).joinpath("prices.json").read_text(encoding="utf-8")
-_DEFAULT_RAW = json.loads(_DEFAULT_TEXT)
+
+
+def prices_path() -> Path:
+    """The bundled prices.json, inside the installed package."""
+    return Path(__file__).with_name("prices.json")
+
+
+def _load_default() -> Dict[str, Any]:
+    """The bundled table, or `{}` when the packaged file is missing or unusable.
+
+    A broken packaged file must not stop every command with a traceback: with an empty table
+    each model is simply unpriced (`n/a`), and `runledger doctor` names the file as a failure.
+    """
+    try:
+        data = json.loads(resources.files(__package__).joinpath("prices.json")
+                          .read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    try:
+        _parse_table(data, "prices.json")
+    except ValueError:
+        return {}
+    return data
+
+
+_DEFAULT_RAW = _load_default()
 CHECKED: str = str(_DEFAULT_RAW.get("checked", "2026-10-08"))
+
+
+def parse_checked_date(value: Any) -> Optional[_date]:
+    """A `checked` value as a date, or None when it is missing or unusable."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return _date.fromisoformat(value.strip()[:10])
+    except ValueError:
+        return None
 
 
 def _today() -> str:
@@ -245,13 +281,7 @@ def prices_checked() -> Optional[_date]:
     carries no usable `checked` value. `_parse_table` skips that key, so it is read here.
     A `checked` key in a user prices file is informational only: the staleness policy is
     about the bundled table."""
-    value = _DEFAULT_RAW.get("checked")
-    if not isinstance(value, str):
-        return None
-    try:
-        return _date.fromisoformat(value.strip()[:10])
-    except ValueError:
-        return None
+    return parse_checked_date(_DEFAULT_RAW.get("checked"))
 
 
 def is_stale(today: Optional[Union[str, _date]] = None) -> bool:

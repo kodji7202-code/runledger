@@ -16,6 +16,7 @@ Contents:
 - [Approvals on the team server](#approvals-on-the-team-server)
 - [Fail-open, fail-closed and monitor mode](#fail-open-fail-closed-and-monitor-mode)
 - [The guard log](#the-guard-log)
+- [Check your setup with `doctor`](#check-your-setup-with-doctor)
 - [Troubleshooting](#troubleshooting)
 
 ## Install and test
@@ -609,6 +610,26 @@ capitals such as `GITHUB_TOKEN` are not masked. A secret in another format, or a
 get through. Treat `guard.log` as sensitive and keep it out of version control. The
 RunLedger repository's `.gitignore` lists `.runledger/`, but your project's `.gitignore` does not
 include it unless you add it.
+
+## Check your setup with `doctor`
+
+`runledger doctor` reads your hook files, config, approval settings, log, checkpoints, prices and
+sessions, runs the installed hook command in a temporary folder to prove it still denies a
+destructive call, and reports one line per check. `runledger guard status` is the compact version
+for the guard alone: hook state per agent and scope, config, approval, log and the effective mode
+(`enforce` or `monitor`, plus `fail_closed`), without the self-test and without the checks that do
+not belong to the guard.
+
+```bash
+runledger doctor
+runledger doctor --json            # exit 0 ok, 1 warnings, 2 failures
+runledger guard status
+```
+
+It is read-only: no hook file, config, log, checkpoint ref or `.runledger` folder is written, and
+no secret is ever printed (the approval key shows as `set (env RUNLEDGER_API_KEY)` or `not set`).
+[docs/doctor.md](doctor.md) lists every check, its statuses, the `--json` schema and the
+troubleshooting steps.
 
 ## Troubleshooting
 

@@ -18,10 +18,12 @@
   runledger guard install [--agent claude-code|droid|codex|all] [--project PATH | --global]
   runledger guard uninstall [--agent claude-code|droid|codex|all] [--project PATH | --global]
   runledger guard test [--agent claude-code|droid|codex] 'EVENT_JSON'
+  runledger guard status [--project PATH] [--agent AGENT ...] [--json]
   runledger checkpoint [--label TEXT] [--run RUN_ID] [--cwd DIR]
   runledger checkpoints [--cwd DIR]
   runledger checkpoints prune --keep N [--cwd DIR]
   runledger rollback [CHECKPOINT | --run RUN_ID | --last] [--dry-run] [--yes] [--cwd DIR]
+  runledger doctor [--project PATH] [--agent AGENT ...] [--offline] [--no-selftest] [--json] [--verbose]
 
 SESSION is a session file of any supported agent; the agent is detected from the file.
 AGENT is one of claude-code, codex, droid, aider, native (the RunLedger format, docs/format.md).
@@ -783,12 +785,14 @@ def print_guard_help() -> None:
                                             "Factory Droid and Codex CLI.")
     p.add_argument("--agent", metavar="AGENT", default=None,
                    help="the agent this hook belongs to: claude-code (default), droid or codex")
-    gsub = p.add_subparsers(dest="guard_cmd", metavar="{install,uninstall,test}")
+    gsub = p.add_subparsers(dest="guard_cmd", metavar="{install,uninstall,test,status}")
     gsub.add_parser("install", help="add guard and checkpoint hooks for one agent, or for every "
                                     "agent that has a config folder (`--agent all`)")
     gsub.add_parser("uninstall", help="remove the RunLedger hooks from one agent's hook file "
                                       "(or from every agent's)")
     gsub.add_parser("test", help="print the decision for one PreToolUse event (JSON)")
+    gsub.add_parser("status", help="the compact guard-only view: hook state per agent, config, "
+                                   "approval server, log and the effective guard mode")
     p.print_help()
 
 
@@ -803,6 +807,10 @@ def cmd_guard(args) -> int:
         return guard.cmd_uninstall(args.project, args.global_scope, agent=agent)
     if args.guard_cmd == "test":
         return guard.cmd_test(args.event, agent)
+    if args.guard_cmd == "status":
+        from . import doctor
+
+        return doctor.cmd_guard_status(args)
     if sys.stdin is not None and sys.stdin.isatty():
         if hasattr(args, "_guard_parser"):
             args._guard_parser.print_help()
@@ -810,6 +818,12 @@ def cmd_guard(args) -> int:
             print_guard_help()
         return 2
     return guard.main(agent)
+
+
+def cmd_doctor(args) -> int:
+    from . import doctor
+
+    return doctor.cmd_doctor(args)
 
 
 def _positive_int(raw: str) -> int:
@@ -1002,7 +1016,32 @@ def main(argv: Optional[List[str]] = None) -> int:
     pgt.add_argument("event", help="the event as a JSON object")
     pgt.add_argument("--agent", metavar="AGENT", choices=GUARD_AGENTS,
                      help="read the event as that agent's payload (default: inferred from the payload)")
+    pgs = gsub.add_parser("status", help="check the installed guard hooks, the config files, the "
+                                         "approval server and the guard log, and show the effective "
+                                         "guard mode")
+    pgs.add_argument("--project", metavar="PATH",
+                     help="project folder to check (default: the project root of the current folder)")
+    pgs.add_argument("--agent", metavar="AGENT", choices=GUARD_AGENTS, action="append",
+                     help="check only this agent (repeatable): claude-code, droid or codex")
+    pgs.add_argument("--json", dest="as_json", action="store_true",
+                     help="print one JSON object instead of the text report")
     pg.set_defaults(func=cmd_guard, _guard_parser=pg)
+
+    pdoc = sub.add_parser("doctor", help="check the install, the guard hooks, the config files, "
+                                         "the approval server, the log, the checkpoints, the prices "
+                                         "and session discovery")
+    pdoc.add_argument("--project", metavar="PATH",
+                      help="project folder to check (default: the project root of the current folder)")
+    pdoc.add_argument("--agent", metavar="AGENT", choices=GUARD_AGENTS, action="append",
+                      help="check only this agent (repeatable): claude-code, droid or codex")
+    pdoc.add_argument("--offline", action="store_true",
+                      help="skip the approval server /health request")
+    pdoc.add_argument("--no-selftest", dest="no_selftest", action="store_true",
+                      help="skip the hook command self-test (no hook subprocess is started)")
+    pdoc.add_argument("--json", dest="as_json", action="store_true",
+                      help="print one JSON object instead of the text report")
+    pdoc.add_argument("--verbose", action="store_true", help="add detail lines")
+    pdoc.set_defaults(func=cmd_doctor)
 
     args = p.parse_args(argv)
     _tolerant_console()

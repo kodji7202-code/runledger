@@ -39,6 +39,9 @@ More in [docs/quickstart.md](docs/quickstart.md).
 - **A CI gate:** `runledger receipt --fail-on 60` exits with code 2 when the score is 60 or more.
 - **A real-time guard** for Claude Code. It denies, asks or allows each tool call, and it can route
   "ask" decisions to a person on the team server. See [docs/guard.md](docs/guard.md).
+- **A setup check:** `runledger doctor` reports every hook, config, approval, log, checkpoint,
+  price and session detail it can read, with exit codes 0/1/2 for CI. See
+  [docs/doctor.md](docs/doctor.md).
 - **A team server:** a shared dashboard, API keys with roles, an audit log, approvals with Slack and
   webhook notifications, team budgets with alerts, and compliance exports. See
   [docs/enterprise.md](docs/enterprise.md) and [docs/api.md](docs/api.md).
@@ -193,6 +196,7 @@ your Anthropic API key and may incur charges from Anthropic.
 - [Session format](docs/format.md): the open format for any agent
 - [JSON receipt](docs/receipt-json.md): the versioned receipt contract and its JSON Schema
 - [Real-time guard](docs/guard.md): policy files, approvals, fail-open and fail-closed, the log
+- [Doctor](docs/doctor.md): the nine setup checks, `--json`, exit codes and `guard status`
 - [Rollback](docs/rollback.md): Git checkpoints, previews, safety checkpoints, undo and agent hooks
 - [Analysis](docs/analysis.md): the quality score, cost tips and the AI risk review
 - [Enterprise guide](docs/enterprise.md): roles, API keys, audit, budgets, exports, HTTPS
