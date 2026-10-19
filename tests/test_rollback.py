@@ -1511,7 +1511,8 @@ def test_path_combines_with_run_last_and_the_default_checkpoint(identity_repo):
     assert other.read_text(encoding="utf-8") == "untouched\n"
 
 
-@pytest.mark.parametrize("scope", ["..\\outside.txt", "sub/../../outside.txt"])
+@pytest.mark.parametrize("scope", ["sub/../../outside.txt"]
+                         + (["..\\outside.txt"] if os.name == "nt" else []))
 def test_path_outside_the_repository_is_rejected(scoped_repo, capsys, scope):
     repo = scoped_repo
     _write(repo.root, "a.txt", "one\n")
@@ -1673,11 +1674,10 @@ def test_path_symlink_blocker_outside_the_scope_does_not_block(scoped_repo, tree
 
 
 @pytest.mark.parametrize("entries,scope", [
-    ([("CON", b"x\n"), ("sub/keep.txt", b"keep\n")], "CON"),
     ([("sub/.git/x", b"x\n"), ("a.txt", b"a\n")], "sub/.git"),
-    ([("sub/A.txt", b"A\n"), ("sub/a.txt", b"a\n")], "sub"),
 ])
-def test_path_scope_does_not_hide_unsafe_checkpoint_names(scoped_repo, entries, scope):
+def test_path_scope_does_not_hide_a_git_overlapping_checkpoint_name(scoped_repo, entries,
+                                                                     scope):
     repo = scoped_repo
     bad = _tree_from(repo, entries)
     checkpoint = rollback.Checkpoint("20260101T000000000000Z-01234567", "", bad,
@@ -1689,6 +1689,49 @@ def test_path_scope_does_not_hide_unsafe_checkpoint_names(scoped_repo, entries, 
                for text in ("unsafe path", "unsupported on windows", "case-colliding"))
     with pytest.raises(rollback.CheckpointError):
         repo.plan(checkpoint)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the unsafe names are Windows reserved names")
+def test_path_unquoted_backslash_spelling_outside_the_repository_is_rejected(
+        scoped_repo, capsys):
+    repo = scoped_repo
+    _write(repo.root, "a.txt", "one\n")
+    checkpoint = repo.create()
+    _write(repo.root, "a.txt", "modified\n")
+    refs = git(repo.root, "for-each-ref", rollback.PREFIX)
+    assert main(["rollback", checkpoint.id, "--path", "..\\outside.txt", "--yes",
+                 "--cwd", str(repo.root)]) == 1
+    assert "outside the repository" in capsys.readouterr().err
+    assert (repo.root / "a.txt").read_text(encoding="utf-8") == "modified\n"
+    assert git(repo.root, "for-each-ref", rollback.PREFIX) == refs
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the unsafe names are Windows reserved names")
+def test_path_scope_does_not_hide_a_reserved_checkpoint_name(scoped_repo):
+    repo = scoped_repo
+    bad = _tree_from(repo, [("CON", b"x\n"), ("sub/keep.txt", b"keep\n")])
+    checkpoint = rollback.Checkpoint("20260101T000000000000Z-01234567", "", bad,
+                                     "2026-01-01T00:00:00+00:00", "hand-built", None)
+    for scope in ("CON", "sub"):
+        with pytest.raises(rollback.CheckpointError) as excinfo:
+            repo.plan(checkpoint, paths=[scope])
+        assert "unsupported on windows" in str(excinfo.value).casefold()
+
+
+def test_path_scope_does_not_hide_a_case_colliding_checkpoint_name(scoped_repo):
+    repo = scoped_repo
+    bad = _tree_from(repo, [("sub/A.txt", b"A\n"), ("sub/a.txt", b"a\n")])
+    checkpoint = rollback.Checkpoint("20260101T000000000000Z-01234567", "", bad,
+                                     "2026-01-01T00:00:00+00:00", "hand-built", None)
+    if os.name == "nt":
+        # Windows cannot tell the two entries apart, so the whole tree is refused.
+        with pytest.raises(rollback.CheckpointError) as excinfo:
+            repo.plan(checkpoint, paths=["sub"])
+        assert "case-colliding" in str(excinfo.value).casefold()
+    else:
+        # A case-sensitive volume holds both, and the scope only selects the one written.
+        plan = repo.plan(checkpoint, paths=["sub"])
+        assert plan.restore == ["sub/A.txt", "sub/a.txt"]
 
 
 def test_path_dot_restores_the_whole_tree(scoped_repo, capsys):
