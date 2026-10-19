@@ -133,6 +133,12 @@ change behavior, so read the entry before you upgrade.
 
 ### Fixed
 
+- **The release workflow installs the package before it runs the tests
+  (`.github/workflows/release.yml`):** the `Run tests` step installed pytest only, so every test
+  importing `runledger` failed when the v0.6.1 tag was pushed and the run stopped before it built
+  or published anything; the step now installs the package exactly like the CI test job
+  (`python -m pip install -e . pytest`), and `tests/test_packaging.py` pins that so the drift
+  cannot come back.
 - **The stored receipt of a run with no recorded usage no longer carries a `$0.00` cost
   (`runledger.server`):** the run row, the list and the aggregates already read `n/a`, but
   `GET /api/runs/{id}` still served the client's original `cost_usd` `0.0` inside the embedded
