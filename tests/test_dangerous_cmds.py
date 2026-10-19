@@ -2,13 +2,21 @@
 
 Every case runs through `assess_step`, so the command is read the way the guard reads it:
 quoted text and heredoc bodies are blanked first, and one rule may not reach across a
-command boundary (;, &, |, newline).
+command boundary (;, &, |, newline). The GE-017 block also drives the installed hook entry
+point (`python -m runledger guard`) with the payload a real agent writes to its stdin.
 """
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
 import pytest
 
 from runledger.parser import Step
 from runledger.risk import assess_step
 
+ROOT = Path(__file__).resolve().parents[1]
 WIN_CWD = "D:\\runledger"
 NO_POLICY = {"ignore": [], "severity_overrides": {}, "extra_secret_paths": []}
 
@@ -507,15 +515,72 @@ def test_a_pattern_with_a_harmless_substitution_is_still_clean():
 
 
 @pytest.mark.parametrize("command", [
-    "find . -name '$(rm -rf ./victim)' -print",
-    "find . -name '`helm uninstall web`' -print",
     "find . -name 'helm uninstall web' -print",
     'find . -name "helm uninstall web" -print',
 ])
 def test_a_literal_find_pattern_is_still_data(command):
-    """Single-quoted text is literal, so a pattern whose only substitution syntax sits inside
-    single quotes, and one with no substitution syntax at all, stay blank."""
+    """A pattern with no substitution syntax at all stays blank."""
     _clean(command)
+
+
+# -------------------------------------- GE-017 round 4: the pattern is read with no quote state
+
+# Bash runs the `$(...)` in this pattern before `find` starts: `\"` is a literal double quote,
+# `'"'` a quoted one, and the substitution sits in the double-quoted segment that follows them.
+ROUND4_PATTERN = 'find . -name \\"\'"\'"$(rm -rf ./victim)" -print'
+
+
+@pytest.mark.parametrize("command,needle", [
+    # round 2: a substitution that runs before the search
+    ('find . -name "$(rm -rf ./victim)" -print', "Recursive force delete (rm -rf)"),
+    ("find . -name $(helm uninstall web)", "Uninstalled a Helm release"),
+    ('find . -name "`helm uninstall web`"', "Uninstalled a Helm release"),
+    # round 3: a nested substitution behind an escaped inner backtick
+    ('find . -name "`echo \\`rm -rf ./victim\\``"', "Recursive force delete (rm -rf)"),
+    ('find . -name "`printf \\`helm uninstall web\\``"', "Uninstalled a Helm release"),
+    # round 4: an unquoted escaped double quote and a quoted one before the substitution
+    (ROUND4_PATTERN, "Recursive force delete (rm -rf)"),
+])
+def test_a_pattern_word_with_substitution_syntax_is_read_with_no_quote_state(command, needle):
+    """No quote state is read at all: a text word whose raw text carries `$(` or a backtick is
+    kept whole, whatever the quoting and the escapes around it look like, so no transition from
+    one quoted region to another can hide the command behind it (GE-017)."""
+    _hit(command, "high", needle)
+
+
+def test_a_single_quoted_pattern_with_substitution_syntax_is_over_reported():
+    """The accepted price of reading no quote state: the shell substitutes nothing inside single
+    quotes, and the word is still read as code, so a pattern that only mentions a deletion is
+    reported instead of blanked (GE-017). It is the rule for every text argument, not only a
+    `find` pattern."""
+    _hit("find . -name '$(rm -rf ./victim)' -print", "high", "Recursive force delete (rm -rf)")
+    _hit("find . -name '`helm uninstall web`' -print", "high", "Uninstalled a Helm release")
+    _hit("echo '$(rm -rf ./victim)'", "high", "Recursive force delete (rm -rf)")
+    _hit("git commit -m 'fix `helm uninstall web`'", "high", "Uninstalled a Helm release")
+
+
+@pytest.mark.parametrize("command", [
+    'find . -name "$(rm -rf ./victim)" -print',
+    'find . -name "`echo \\`rm -rf ./victim\\``"',
+    ROUND4_PATTERN,
+])
+def test_the_installed_hook_denies_a_substitution_in_a_pattern(tmp_path, command):
+    """The same commands through the installed hook entry point (`python -m runledger guard`, the
+    command `guard install` stores) with the payload a real Claude Code hook receives: the
+    deletion is a high finding and the hook answers deny, never allow with no risks (GE-017)."""
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+    event = {"session_id": "s1", "cwd": str(tmp_path), "hook_event_name": "PreToolUse",
+             "tool_name": "Bash", "tool_use_id": "toolu-1",
+             "tool_input": {"command": command}}
+    proc = subprocess.run([sys.executable, "-m", "runledger", "guard"],
+                          input=json.dumps(event).encode("utf-8"),
+                          capture_output=True, cwd=str(tmp_path), env=env, timeout=30)
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout.decode("utf-8"))
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "Recursive force delete (rm -rf)" in \
+        out["hookSpecificOutput"]["permissionDecisionReason"]
 
 
 # ---------------------------------------------------------------- existing rules (VAL-RULES-017)

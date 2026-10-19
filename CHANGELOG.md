@@ -249,15 +249,18 @@ change behavior, so read the entry before you upgrade.
   as text in the blanked view, so `find . -name 'helm uninstall web' -print` no longer produces the
   high `Uninstalled a Helm release` finding - the same for any other destructive name in a `-name`,
   `-path`, `-iname` or related pattern. A real command in the expression, such as
-  `find . -name x -exec helm uninstall web \;`, still matches. Only a pattern with no substitution
-  syntax is blanked: a word carrying a `$(...)` or backtick outside single quotes is kept whole as
-  the code it is, so the shell runs it before `find` starts and
+  `find . -name x -exec helm uninstall web \;`, still matches. Only a pattern whose own text holds
+  no substitution syntax is blanked: a word carrying `$(` anywhere, or a backtick for a POSIX shell,
+  is kept whole as the code it is, so the shell runs it before `find` starts and
   `find . -name "$(rm -rf ./victim)"`, ``find . -name `helm uninstall web` `` and a pattern with a
-  nested or escaped backtick (``find . -name "`echo \`rm -rf ./victim\``"``) are all denied. The
-  reading is deliberately coarse: escapes are not resolved, so a `$(` or backtick an escape makes
-  literal is read as code too and can raise a finding for text that never runs. Single-quoted text
-  stays literal - the shell substitutes nothing there - so
-  `find . -name '$(rm -rf ./victim)' -print` is a search.
+  nested or escaped backtick (``find . -name "`echo \`rm -rf ./victim\``"``) are all denied. No
+  quote state is read at all - quoting and escapes are not resolved - so a quoted region can never
+  cover a substitution the shell really runs: the escaped double quote in
+  `find . -name \"'"'"$(rm -rf ./victim)" -print` no longer desynchronises the reading and hides the
+  deletion. The reading is deliberately coarse, and the price is a finding for text that never
+  runs: a `$(` or backtick in single-quoted or escaped text is read as code too, so
+  `find . -name '$(rm -rf ./victim)' -print` is denied as well, although the shell substitutes
+  nothing there.
 - **A command rule that can backtrack catastrophically is dropped (`runledger.secrets`):** the
   safe-regex check rejects a repeat of any kind inside a repeat (`(?:a{1,32}){1,32}b`,
   `(?:a?){40}b`, `(a+)+`) and an alternation inside one (`(a|a)*b`, `(a|aa)+b`), so a user or

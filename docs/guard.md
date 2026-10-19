@@ -271,15 +271,18 @@ the command being run, and a `DELETE FROM` inside a heredoc body is not scanned 
 limitation quoted text always had). A flag right before a separator still counts, so
 `git push origin feature --delete; echo done` is the delete it looks like, and a `find -name`
 pattern is text rather than a command: `find . -name 'helm uninstall web' -print` is a search.
-A text argument is blanked only when it carries no substitution syntax outside single-quoted
-text, though: the shell runs a `$(...)` or a backtick the word carries before the command starts,
-so `find . -name "$(rm -rf ./victim)"`, ``find . -name `helm uninstall web` `` and a pattern with
-a nested or escaped backtick (``find . -name "`echo \`rm -rf ./victim\``"``) all stay denied. That
-reading is deliberately coarse - escapes are not resolved, so a `$(` or backtick an escape makes
-literal is read as code too and can raise a finding for text that never runs - because a pattern
-that only looks like a substitution may be over-reported, while one that really is must never be
-hidden. Single-quoted text is literal and stays blank: `find . -name '$(rm -rf ./victim)' -print`
-is a search.
+A text argument is blanked only when its text carries no substitution syntax at all, though: the
+shell runs a `$(...)` or a backtick the word carries before the command starts, so
+`find . -name "$(rm -rf ./victim)"`, ``find . -name `helm uninstall web` `` and a pattern with
+a nested or escaped backtick (``find . -name "`echo \`rm -rf ./victim\``"``) all stay denied. No
+quote state is read at all: quoting and escapes are not resolved, so a region a quote opens cannot
+cover a substitution the shell really runs, and the escaped quote in
+`find . -name \"'"'"$(rm -rf ./victim)" -print` leaves the deletion denied. That reading is
+deliberately coarse - a `$(` or backtick in single-quoted or escaped text is read as code too and
+can raise a finding for text that never runs - because a pattern that only looks like a
+substitution may be over-reported, while one that really is must never be hidden:
+`find . -name '$(rm -rf ./victim)' -print` is denied as well, although the shell substitutes
+nothing there.
 The rule families, by severity:
 
 - **medium:** force-deleting a git branch (`git branch -D`, `git branch -fD`,
