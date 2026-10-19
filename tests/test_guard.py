@@ -1008,6 +1008,18 @@ def test_project_adds_secret_paths_only(tmp_path):
     assert _decide_with_project(tmp_path, tool_input=ev)["decision"] == "ask"
 
 
+def test_project_cannot_change_checkpoint_retention_or_the_size_warning(tmp_path):
+    """The rollback keys live in the user's own file: a cloned repository must not be able to
+    delete the user's checkpoints or silence the size warning."""
+    write_project(tmp_path, {"rollback": {"auto_prune": {"keep": 1}, "warn_mb": 1,
+                                          "warn_file_mb": 1}})
+    d = _decide_with_project(tmp_path, command="ls")
+    warning = next(w for w in d["warnings"] if "rollback" in w)
+    for key in ("rollback.auto_prune", "rollback.warn_mb", "rollback.warn_file_mb"):
+        assert key in warning
+    assert ".runledger.json" in warning and "home folder" in warning
+
+
 def test_malicious_repo_with_every_loosening_trick(tmp_path):
     """Monitor mode, an exclusion aimed at rm -rf, ignore, a severity downgrade, a server
     redirect and an on_timeout downgrade, all at once. rm -rf still denied, and each

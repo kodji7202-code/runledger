@@ -21,7 +21,7 @@
   runledger guard status [--project PATH] [--agent AGENT ...] [--json]
   runledger checkpoint [--label TEXT] [--run RUN_ID] [--cwd DIR]
   runledger checkpoints [--cwd DIR]
-  runledger checkpoints prune --keep N [--cwd DIR]
+  runledger checkpoints prune [--keep N] [--older-than DUR] [--cwd DIR]
   runledger rollback [CHECKPOINT | --run RUN_ID | --last] [--path PATH ...] [--dry-run] [--yes] [--cwd DIR]
   runledger doctor [--project PATH] [--agent AGENT ...] [--offline] [--no-selftest] [--json] [--verbose]
   runledger stats [--project PATH | --all] [--agent AGENT] [--since WHEN] [--until WHEN]
@@ -169,26 +169,47 @@ def _run(args) -> int:
 
 
 def cmd_checkpoint(args) -> int:
-    from .rollback import CheckpointError, Repository, hook_main
+    from .rollback import CheckpointError, Repository, hook_main, load_settings
     if args.hook:
         return hook_main()
     try:
+        repo = Repository(args.cwd)
         run_id = args.run or os.environ.get("RUNLEDGER_RUN_ID") or os.environ.get("RUNLEDGER_SESSION_ID")
-        checkpoint = Repository(args.cwd).create(label=args.label or "", run_id=run_id)
+        checkpoint = repo.create(label=args.label or "", run_id=run_id)
         print(checkpoint.id)
+        warning = repo.size_warning(checkpoint.tree, load_settings())
+        if warning:
+            print(warning, file=sys.stderr)
         return 0
     except (CheckpointError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
 
+def _prune_scope(keep, older_than) -> str:
+    """What the prune command kept, in the words the user typed."""
+    if keep is not None and older_than:
+        return f"Kept the newest {keep} and everything younger than {older_than}."
+    if keep is not None:
+        return f"Kept the newest {keep}."
+    return f"Removed only checkpoints older than {older_than}."
+
+
 def cmd_checkpoints(args) -> int:
-    from .rollback import CheckpointError, Repository
+    from .rollback import CheckpointError, Repository, parse_duration
     try:
         repo = Repository(args.cwd)
         if args.checkpoints_cmd == "prune":
-            removed = repo.prune(args.keep)
-            print(f"Pruned {len(removed)} checkpoint(s). Kept the newest {args.keep}.")
+            older_than = parse_duration(args.older_than) if args.older_than else None
+            removed = repo.prune(args.keep, older_than)
+            safety = sum(1 for checkpoint in removed if checkpoint.kind == "safety")
+            detail = (f", including {safety} safety checkpoint" + ("" if safety == 1 else "s")
+                      if safety else "")
+            print(f"Pruned {len(removed)} checkpoint(s){detail}. "
+                  f"{_prune_scope(args.keep, args.older_than)}")
+            if removed:
+                print("Removed checkpoint refs only; run 'git gc --prune=now' later to reclaim "
+                      "the space.")
             return 0
         checkpoints = repo.checkpoints()
         if not checkpoints:
@@ -949,6 +970,16 @@ def _non_negative_int(raw: str) -> int:
     return val
 
 
+def _duration_arg(raw: str) -> str:
+    """`--older-than` accepts the same `30d`/`2w`/`12h` spellings as the user config, and is
+    checked by argparse so a wrong one fails before anything is deleted."""
+    from .rollback import parse_duration
+    if parse_duration(raw) is None:
+        raise argparse.ArgumentTypeError(
+            f"invalid duration {raw!r}: use a number with d, w or h, like 30d, 2w or 12h")
+    return raw
+
+
 def _agent_arg(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--agent", choices=AGENTS,
                         help="only sessions from this agent (default: every agent)")
@@ -1073,7 +1104,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     pcs.add_argument("--cwd", help="Git working tree folder (default: current folder)")
     cssub = pcs.add_subparsers(dest="checkpoints_cmd")
     prune = cssub.add_parser("prune", help="delete old checkpoint refs, including safety checkpoints")
-    prune.add_argument("--keep", type=_non_negative_int, required=True, help="number of newest checkpoints to keep")
+    prune.add_argument("--keep", type=_non_negative_int,
+                       help="number of newest checkpoints to keep")
+    prune.add_argument("--older-than", type=_duration_arg, metavar="DUR",
+                       help="remove checkpoints older than DUR, like 30d, 2w or 12h")
     prune.add_argument("--cwd", default=argparse.SUPPRESS, help="Git working tree folder")
     pcs.set_defaults(func=cmd_checkpoints)
 

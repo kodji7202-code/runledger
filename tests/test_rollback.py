@@ -6,7 +6,7 @@ import stat
 import subprocess
 import sys
 import tempfile
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -279,13 +279,15 @@ def test_metadata_selection_and_prune_reject_symbolic_or_foreign_refs(repo, monk
                                  "2026-10-15T13:00:00+00:00", "Prompt", first.run_id)
     safety = rollback.Checkpoint("20261015T140000000000Z-fedcba98", "3" * 40, first.tree,
                                  "2026-10-15T14:00:00+00:00", "Safety", None, "safety")
+    listed_at = datetime.fromtimestamp(1760533200, timezone.utc)  # the date the fake prints
+    first.committed_at = second.committed_at = safety.committed_at = listed_at
     checkpoints = [first, second, safety]
     real_git = repo._git
     deleted = []
 
-    def record(ref, oid, obj_type, symref, tree, body):
+    def record(ref, oid, obj_type, symref, tree, body, date="1760533200 +0000"):
         fields = [ref.encode(), oid.encode(), obj_type.encode(), symref.encode(),
-                  tree.encode(), str(len(body)).encode(), body]
+                  tree.encode(), date.encode(), str(len(body)).encode(), body]
         return b"\x00".join(fields) + b"\x1e\n"
 
     def checkpoint_body(cp):
@@ -316,7 +318,9 @@ def test_metadata_selection_and_prune_reject_symbolic_or_foreign_refs(repo, monk
         return subprocess.CompletedProcess(args, 0, stdout=output, stderr=b"")
 
     monkeypatch.setattr(repo, "_git", run)
-    assert repo.checkpoints() == [safety, second, first]
+    listed = repo.checkpoints()
+    assert listed == [safety, second, first]
+    assert [cp.committed_at for cp in listed] == [listed_at] * 3
     assert repo.select(run_id=first.run_id) == first
     assert repo.select() == safety
     assert repo.select(second.ref) == second
@@ -1773,3 +1777,293 @@ def test_path_matches_case_insensitively_on_windows(scoped_repo):
     assert plan.restore == ["readme.md"]
     repo.rollback(plan)
     assert (repo.root / "readme.md").read_text(encoding="utf-8") == "one\n"
+
+
+# ---------------------------------------------------------------- retention
+
+def refs_of(repo):
+    return sorted(git(repo.root, "for-each-ref", "--format=%(refname)",
+                      rollback.PREFIX).decode().split())
+
+
+def commit_dated(repo, label, run_id, days, monkeypatch):
+    """A checkpoint whose Git commit date is `days` in the past, the way a repository that
+    has been running for a while looks (`GIT_COMMITTER_DATE` is what Git records)."""
+    stamp = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    monkeypatch.setenv("GIT_AUTHOR_DATE", stamp)
+    monkeypatch.setenv("GIT_COMMITTER_DATE", stamp)
+    return rollback.Repository(str(repo.root)).create(label=label, run_id=run_id)
+
+
+def test_prune_needs_keep_or_older_than(repo, capsys):
+    repo.create(label="only", run_id="run-1")
+    with pytest.raises(rollback.CheckpointError, match="--keep or --older-than is required"):
+        repo.prune()
+    assert len(repo.checkpoints()) == 1
+    assert main(["checkpoints", "prune", "--cwd", str(repo.root)]) == 1
+    err = capsys.readouterr().err
+    assert "--keep" in err and "--older-than" in err and "required" in err
+    assert len(repo.checkpoints()) == 1
+
+
+def test_prune_older_than_removes_the_aged_checkpoints_only(repo, monkeypatch, capsys):
+    recent = [repo.create(label=f"new-{index}", run_id="new") for index in range(3)]
+    aged = [commit_dated(repo, f"old-{index}", "old", 40, monkeypatch) for index in range(3)]
+    for name in ("GIT_AUTHOR_DATE", "GIT_COMMITTER_DATE"):
+        monkeypatch.delenv(name)
+    assert main(["checkpoints", "prune", "--older-than", "30d", "--cwd", str(repo.root)]) == 0
+    assert "Pruned 3 checkpoint(s)" in capsys.readouterr().out
+    assert refs_of(repo) == sorted(cp.ref for cp in recent)
+    assert aged and not any(cp.ref in refs_of(repo) for cp in aged)
+
+
+@pytest.mark.parametrize("text,age,removed", [
+    ("12h", timedelta(hours=13), True),
+    ("12h", timedelta(hours=11), False),
+    ("2w", timedelta(days=15), True),
+    ("2w", timedelta(days=13), False),
+    ("30d", timedelta(days=31), True),
+])
+def test_prune_older_than_accepts_days_weeks_and_hours(repo, monkeypatch, text, age, removed):
+    made = repo.create(label="only", run_id="run-1")
+    now = datetime.now(timezone.utc)
+    made.committed_at = now - age
+    monkeypatch.setattr(repo, "checkpoints", lambda: [made])
+    assert bool(repo.prune(older_than=rollback.parse_duration(text), now=now)) is removed
+
+
+def test_prune_keeps_a_checkpoint_exactly_at_the_age_limit(repo, monkeypatch):
+    made = repo.create(label="only", run_id="run-1")
+    now = datetime.now(timezone.utc)
+    limit = timedelta(days=30)
+    made.committed_at = now - limit
+    monkeypatch.setattr(repo, "checkpoints", lambda: [made])
+    assert repo.prune(older_than=limit, now=now) == []
+    assert refs_of(repo) == [made.ref]
+    made.committed_at = now - limit - timedelta(seconds=1)
+    assert repo.prune(older_than=limit, now=now) == [made]
+
+
+@pytest.mark.parametrize("keep,expected", [
+    (6, []),
+    (5, [0]),
+    (3, [2, 1, 0]),
+    (2, [3, 2, 1, 0]),
+    (0, [3, 2, 1, 0]),
+])
+def test_prune_with_keep_and_older_than_removes_only_both(repo, monkeypatch, keep, expected):
+    made = [repo.create(label=f"cp-{index}", run_id="run-1") for index in range(6)]
+    now = datetime.now(timezone.utc)
+    for index, checkpoint in enumerate(made):  # made[0] is the oldest by both id and date
+        checkpoint.committed_at = (now - timedelta(days=40) if index < 4
+                                   else now - timedelta(hours=1))
+    listed = list(reversed(made))
+    monkeypatch.setattr(repo, "checkpoints", lambda: listed)
+    removed = repo.prune(keep=keep, older_than=timedelta(days=30), now=now)
+    assert removed == [made[index] for index in expected]
+
+
+def test_prune_with_both_flags_keeps_a_young_checkpoint_beyond_the_window(repo, monkeypatch):
+    made = [repo.create(label=f"cp-{index}", run_id="run-1") for index in range(3)]
+    now = datetime.now(timezone.utc)
+    for checkpoint in made:
+        checkpoint.committed_at = now - timedelta(hours=1)
+    monkeypatch.setattr(repo, "checkpoints", lambda: list(reversed(made)))
+    assert repo.prune(keep=1, older_than=timedelta(days=30), now=now) == []
+
+
+def test_prune_treats_safety_checkpoints_like_any_other(repo, capsys):
+    made = [repo.create(label=f"cp-{index}", run_id=f"run-{index}",
+                        kind="safety" if index in (1, 4) else "checkpoint")
+            for index in range(5)]
+    assert main(["checkpoints", "prune", "--keep", "3", "--cwd", str(repo.root)]) == 0
+    assert "Pruned 2 checkpoint(s), including 1 safety checkpoint." in capsys.readouterr().out
+    assert refs_of(repo) == sorted(cp.ref for cp in (made[4], made[3], made[2]))
+
+
+def test_prune_reports_the_count_and_runs_no_git_gc(repo, capsys):
+    made = [repo.create(label=f"cp-{index}", run_id="run-1") for index in range(3)]
+    assert main(["checkpoints", "prune", "--keep", "1", "--cwd", str(repo.root)]) == 0
+    out = capsys.readouterr().out
+    assert "Pruned 2 checkpoint(s)." in out
+    assert "git gc --prune=now" in out
+    for checkpoint in made[:2]:
+        assert git(repo.root, "cat-file", "-t", checkpoint.oid).strip() == b"commit"
+    assert main(["checkpoints", "prune", "--keep", "1", "--cwd", str(repo.root)]) == 0
+    assert "Pruned 0 checkpoint(s)." in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("text", ["30x", "abc", "d30", "-1d", "1.5d"])
+def test_prune_rejects_an_invalid_duration(repo, capsys, text):
+    repo.create(label="only", run_id="run-1")
+    with pytest.raises(SystemExit) as exc:
+        main(["checkpoints", "prune", "--older-than", text, "--cwd", str(repo.root)])
+    assert exc.value.code == 2
+    assert "--older-than" in capsys.readouterr().err
+    assert len(repo.checkpoints()) == 1
+
+
+def test_prune_help_lists_keep_and_older_than(capsys):
+    with pytest.raises(SystemExit) as exc:
+        main(["checkpoints", "prune", "--help"])
+    assert exc.value.code == 0
+    text = capsys.readouterr().out
+    assert "--keep" in text and "--older-than" in text
+    assert "required" not in text
+
+
+# ---------------------------------------------------------------- auto-prune
+
+
+def write_config(folder, data):
+    path = folder / "config.json"
+    path.write_text(data if isinstance(data, str) else json.dumps(data), encoding="utf-8")
+    return path
+
+
+def run_hook(repo, session_id, monkeypatch, capsys):
+    event = dict(cwd=str(repo.root), session_id=session_id, hook_event_name="UserPromptSubmit")
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(event)))
+    code = main(["checkpoint", "--hook"])
+    return code, capsys.readouterr()
+
+
+def test_hook_auto_prune_keeps_the_newest_and_this_session(repo, monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("RUNLEDGER_CONFIG",
+                       str(write_config(tmp_path, {"rollback": {"auto_prune": {"keep": 2}}})))
+    for index in range(5):
+        repo.create(label=f"cp-{index}", run_id=f"other-{index}")
+    mine = repo.create(label="SessionStart", run_id="keepme")
+    code, captured = run_hook(repo, "keepme", monkeypatch, capsys)
+    assert code == 0 and captured.out == "" and captured.err == ""
+    remaining = rollback.Repository(str(repo.root)).checkpoints()
+    assert [cp.run_id for cp in remaining] == ["keepme", "keepme"]
+    assert mine.id in [cp.id for cp in remaining]
+
+
+def test_hook_auto_prune_follows_the_user_keep_across_runs(repo, monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("RUNLEDGER_CONFIG",
+                       str(write_config(tmp_path, {"rollback": {"auto_prune": {"keep": 3}}})))
+    for index in range(6):
+        code, captured = run_hook(repo, f"s{index}", monkeypatch, capsys)
+        assert code == 0 and captured.out == ""
+    checkpoints = rollback.Repository(str(repo.root)).checkpoints()
+    assert [cp.run_id for cp in checkpoints] == ["s5", "s4", "s3"]
+
+
+def test_hook_auto_prune_off_keeps_every_checkpoint(repo, monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("RUNLEDGER_CONFIG",
+                       str(write_config(tmp_path, {"rollback": {"auto_prune": False}})))
+    for index in range(4):
+        assert run_hook(repo, f"s{index}", monkeypatch, capsys)[0] == 0
+    assert len(rollback.Repository(str(repo.root)).checkpoints()) == 4
+
+
+def test_hook_auto_prune_age_limit_spares_recent_checkpoints(repo, monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("RUNLEDGER_CONFIG", str(write_config(
+        tmp_path, {"rollback": {"auto_prune": {"keep": 1, "older_than": "30d"}}})))
+    for index in range(4):
+        assert run_hook(repo, f"s{index}", monkeypatch, capsys)[0] == 0
+    assert len(rollback.Repository(str(repo.root)).checkpoints()) == 4
+
+
+@pytest.mark.parametrize("broken", ["{bad json", '{"rollback": {"auto_prune": {"keep": "x"}}}'])
+def test_hook_with_an_unusable_config_keeps_the_default_and_stays_silent(
+        repo, monkeypatch, capsys, tmp_path, broken):
+    monkeypatch.setenv("RUNLEDGER_CONFIG", str(write_config(tmp_path, broken)))
+    for index in range(5):
+        code, captured = run_hook(repo, f"s{index}", monkeypatch, capsys)
+        assert code == 0 and captured.out == ""
+    assert len(rollback.Repository(str(repo.root)).checkpoints()) == 5
+
+
+def test_hook_auto_prune_failure_is_swallowed(repo, monkeypatch, capsys):
+    def explode(self, *args, **kwargs):
+        raise OSError("prune exploded")
+
+    monkeypatch.setattr(rollback.Repository, "auto_prune", explode)
+    code, captured = run_hook(repo, "s1", monkeypatch, capsys)
+    assert code == 0 and captured.out == ""
+    assert len(rollback.Repository(str(repo.root)).checkpoints()) == 1
+
+
+# ---------------------------------------------------------------- size warning
+
+
+def test_checkpoint_size_warning_above_the_user_thresholds(repo, monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("RUNLEDGER_CONFIG", str(write_config(
+        tmp_path, {"rollback": {"warn_mb": 5, "warn_file_mb": 3}})))
+    (repo.root / "big.bin").write_bytes(b"x" * (4 * 1024 * 1024))
+    (repo.root / "second.bin").write_bytes(b"y" * (3 * 1024 * 1024))
+    assert main(["checkpoint", "--cwd", str(repo.root)]) == 0
+    captured = capsys.readouterr()
+    assert rollback.ID_RE.fullmatch(captured.out.strip())
+    assert "warning:" not in captured.out
+    warning = captured.err.strip()
+    assert warning.startswith("warning: this checkpoint holds 7.0 MB in ")
+    assert "files (largest: big.bin 4.0 MB)" in warning
+    assert warning.endswith("Add big or generated folders to .gitignore.")
+
+
+def test_no_size_warning_for_a_small_checkpoint(repo, capsys):
+    assert main(["checkpoint", "--cwd", str(repo.root)]) == 0
+    assert capsys.readouterr().err == ""
+
+
+def test_default_file_threshold_warns_on_one_large_file(repo, capsys):
+    (repo.root / "big.bin").write_bytes(b"x" * (60 * 1024 * 1024))
+    assert main(["checkpoint", "--cwd", str(repo.root)]) == 0
+    captured = capsys.readouterr()
+    assert "warning:" in captured.err and "big.bin 60.0 MB" in captured.err
+    assert "warning:" not in captured.out
+
+
+def test_default_total_threshold_ignores_files_each_under_the_file_limit(repo, capsys):
+    for index in range(6):
+        (repo.root / f"part{index}.bin").write_bytes(b"x" * (10 * 1024 * 1024))
+    assert main(["checkpoint", "--cwd", str(repo.root)]) == 0
+    assert capsys.readouterr().err == ""
+
+
+def test_size_threshold_zero_switches_the_warning_off(repo, monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("RUNLEDGER_CONFIG", str(write_config(
+        tmp_path, {"rollback": {"warn_mb": 0, "warn_file_mb": 0}})))
+    (repo.root / "big.bin").write_bytes(b"x" * (60 * 1024 * 1024))
+    assert main(["checkpoint", "--cwd", str(repo.root)]) == 0
+    assert capsys.readouterr().err == ""
+
+
+def test_hook_size_warning_is_stderr_only_and_once_per_session(repo, monkeypatch, capsys,
+                                                               tmp_path):
+    monkeypatch.setenv("RUNLEDGER_CONFIG", str(write_config(
+        tmp_path, {"rollback": {"warn_mb": 5, "warn_file_mb": 3}})))
+    (repo.root / "big.bin").write_bytes(b"x" * (6 * 1024 * 1024))
+    first_code, first = run_hook(repo, "s1", monkeypatch, capsys)
+    assert first_code == 0 and first.out == "" and ".gitignore" in first.err
+    second_code, second = run_hook(repo, "s1", monkeypatch, capsys)
+    assert second_code == 0 and second.out == "" and second.err == ""
+    third_code, third = run_hook(repo, "s2", monkeypatch, capsys)
+    assert third_code == 0 and third.out == "" and ".gitignore" in third.err
+
+
+def test_hook_size_warning_repeats_after_the_marker_expires(repo, monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("RUNLEDGER_CONFIG", str(write_config(
+        tmp_path, {"rollback": {"warn_mb": 5, "warn_file_mb": 3}})))
+    (repo.root / "big.bin").write_bytes(b"x" * (6 * 1024 * 1024))
+    assert run_hook(repo, "s1", monkeypatch, capsys)[1].err != ""
+    marker = repo.root / ".runledger" / ".size-warned"
+    old = json.loads(marker.read_text(encoding="utf-8"))
+    old["s1"] = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+    marker.write_text(json.dumps(old), encoding="utf-8")
+    assert run_hook(repo, "s1", monkeypatch, capsys)[1].err != ""
+
+
+def test_a_project_config_cannot_change_retention_or_the_warning(repo, monkeypatch, capsys):
+    (repo.root / ".runledger.json").write_text(
+        json.dumps({"rollback": {"auto_prune": {"keep": 1}, "warn_mb": 1, "warn_file_mb": 1}}),
+        encoding="utf-8")
+    (repo.root / "small.bin").write_bytes(b"x" * 1024)
+    for index in range(3):
+        code, captured = run_hook(repo, f"s{index}", monkeypatch, capsys)
+        assert code == 0 and captured.out == "" and captured.err == ""
+    assert len(rollback.Repository(str(repo.root)).checkpoints()) == 3

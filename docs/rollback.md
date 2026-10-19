@@ -47,12 +47,63 @@ runledger checkpoint --cwd "/path/to/project" --label "Before change"
 runledger checkpoints --cwd "/path/to/project"
 runledger rollback CHECKPOINT_ID --cwd "/path/to/project"
 runledger checkpoints prune --keep 20 --cwd "/path/to/project"
+runledger checkpoints prune --older-than 30d --cwd "/path/to/project"
 ```
 
 Omitting a selector is the same as `--last`. `--run` chooses the **earliest** retained checkpoint,
-not the last prompt, so it returns to the start of the run. Pruning removes only old RunLedger
-checkpoint refs, including safety checkpoints. `--keep 0` removes all of them. It does not run
-Git garbage collection, delete files, or remove ordinary branches or stash entries.
+not the last prompt, so it returns to the start of the run. Retention is described below.
+
+## Retention: prune and auto-prune
+
+```bash
+runledger checkpoints prune --keep 20                  # keep the newest 20
+runledger checkpoints prune --older-than 30d           # remove everything older than 30 days
+runledger checkpoints prune --keep 20 --older-than 30d # both rules, conservatively
+```
+
+`--keep N` and `--older-than DUR` (`30d`, `2w`, `12h`) are both optional, but at least one is
+required. Giving both is conservative: a checkpoint is removed only when it is **both** beyond the
+newest N **and** older than the limit, so the two rules can never add up to a wider deletion than
+each one alone. A checkpoint exactly at the limit age is kept, and `--older-than` refuses anything
+that is not a number followed by `d`, `w` or `h`. Safety checkpoints count like any other
+checkpoint, so `--keep 0` removes all of them, and the report says how many checkpoints were
+removed and how many of them were safety checkpoints.
+
+The age is read from Git's own commit date for the ref, the date `git log` shows. Pruning deletes
+the checkpoint refs only: the commits stay readable until Git reclaims the objects, and the
+command never runs `git gc` (it mentions `git gc --prune=now` as text only). It does not delete
+files, or remove ordinary branches or stash entries.
+
+The checkpoint hooks prune automatically after each checkpoint they create, so a long-running
+session does not grow without limit. Tune the `rollback.auto_prune` key in your own
+`~/.runledger/config.json`:
+
+```json
+{"rollback": {"auto_prune": {"keep": 50, "older_than": "30d"}}}
+```
+
+The default keeps the newest 50 checkpoints and has no age limit; `"auto_prune": false` switches
+auto-prune off entirely. Only your own config file counts: a project `.runledger.json` cannot
+change retention (the guard logs and prints a warning when it tries). Auto-prune never removes the
+checkpoint it just created, or any checkpoint of the session in progress, so `rollback` and
+`rollback --run` keep working for the run the agent is in. It removes refs only, and a failure
+inside auto-prune never breaks the hook.
+
+### Size warning
+
+`runledger checkpoint` warns on stderr when the snapshot is bigger than the configured thresholds:
+
+```
+warning: this checkpoint holds 1.2 GB in 48,213 files (largest: data/dump.sql 640 MB). Add big or generated folders to .gitignore.
+```
+
+The thresholds live in your own `~/.runledger/config.json` as `rollback.warn_mb` (default 500,
+the total size in MB) and `rollback.warn_file_mb` (default 50, one file in MB); `0` switches a
+threshold off. A project file cannot change them. Because a checkpoint takes the whole non-ignored
+working tree (`git add -A` semantics), the fix for a huge snapshot is to add big or generated
+folders to `.gitignore`, which is what the warning says. In the automatic hooks the same warning
+goes to **stderr only** - never to stdout, which becomes agent context there - and at most once per
+session per 24 hours, so a large tree does not repeat the message on every prompt.
 
 ## Restore only part of a checkpoint (`--path`)
 
@@ -125,6 +176,13 @@ Without a matching local checkpoint, `rollback` is `null`. The command must be r
 repository, or with `--cwd`. A receipt does not upload checkpoint contents or make rollback work
 on another clone. A saved receipt may refer to a checkpoint that was later pruned.
 
+A locally generated receipt reads each changed file's line counts, and its `verified` flag, from
+the **current working tree** (`files[].added`, `files[].removed`, `files[].verified`, and the
+quality score and signals built from them). A rollback changes the working tree, so those numbers
+move with it: a restored file no longer shows the session's change, and the receipt says so. The
+rest of the receipt, the session's recorded facts (steps, tokens, cost, risk reasons and guard
+decisions), is unchanged by a rollback.
+
 ## Automatic checkpoints for Claude Code, Droid and Codex
 
 ```bash
@@ -153,8 +211,9 @@ agent context. Outside a
 Git repository it is silent; a repository Git cannot read (for example a malformed `.git/config`,
 or a permission problem) counts as a failure and prints a short warning to stderr, while
 `runledger checkpoint` on its own prints Git's reason. Each
-invocation creates a checkpoint, including resumed sessions and unchanged trees. Prune periodically
-to control retention.
+invocation creates a checkpoint, including resumed sessions and unchanged trees, and then applies
+auto-prune (see [Retention](#retention-prune-and-auto-prune)). A snapshot above the size thresholds
+prints its warning on stderr only, at most once per session per day.
 
 ## Factory Droid hooks
 
