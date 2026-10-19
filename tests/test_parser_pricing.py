@@ -6,8 +6,9 @@ from pathlib import Path
 
 import pytest
 
-from runledger import pricing
-from runledger.parser import Run, Usage, encode_project_path, find_sessions, parse_session
+from runledger import doctor, hook_targets, pricing
+from runledger.parser import (Run, Usage, claude_projects_dir, encode_project_path, find_sessions,
+                              parse_session)
 from runledger.pricing import cost_of, load_prices, model_key, price_for, unknown_models
 from runledger.receipt import render
 
@@ -53,6 +54,30 @@ def test_find_sessions_uses_encoded_folder(tmp_path, monkeypatch):
     assert find_sessions("D:\\runledger") == [session]
     assert find_sessions("D:/runledger") == [session]
     assert find_sessions("D:\\missing") == []
+
+
+def test_claude_projects_dir_is_the_one_resolver_discovery_and_the_doctor_share(tmp_path, monkeypatch):
+    """GE-001 class / docs/agents.md: with HOME != USERPROFILE and no CLAUDE_CONFIG_DIR,
+    discovery, `guard install --global` and the doctor resolve one Claude Code directory."""
+    env_home = tmp_path / "env-home"
+    env_profile = tmp_path / "env-profile"
+    monkeypatch.setenv("HOME", str(env_home))
+    monkeypatch.setenv("USERPROFILE", str(env_profile))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+
+    assert claude_projects_dir() == hook_targets.claude_dir() / "projects"
+    assert claude_projects_dir() == env_home / ".claude" / "projects"
+    assert doctor._agent_home("claude-code", str(tmp_path)) == str(env_home / ".claude")
+
+    folder = env_home / ".claude" / "projects" / encode_project_path("/work/demo")
+    folder.mkdir(parents=True)
+    session = folder / "one.jsonl"
+    session.write_text("", encoding="utf-8")
+    other = env_profile / ".claude" / "projects" / encode_project_path("/work/demo")
+    other.mkdir(parents=True)
+    (other / "profile.jsonl").write_text("", encoding="utf-8")
+
+    assert find_sessions("/work/demo") == [session]
 
 
 def test_multi_tool_message_usage_split_keeps_integer_remainders(tmp_path):

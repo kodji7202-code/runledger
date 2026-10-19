@@ -570,8 +570,13 @@ def peek_session(path: str | os.PathLike) -> Tuple[str, str, int, str, Optional[
 
 
 def claude_projects_dir() -> Path:
-    base = os.environ.get("CLAUDE_CONFIG_DIR")
-    return Path(base) / "projects" if base else Path.home() / ".claude" / "projects"
+    """Claude Code's project folder: `$CLAUDE_CONFIG_DIR/projects`, else `<home>/.claude/projects`.
+
+    Discovery, `guard install --global` and the doctor resolve the config directory through the
+    one resolver in `hook_targets`, so a HOME that differs from USERPROFILE cannot split them
+    (docs/agents.md)."""
+    from .hook_targets import claude_dir
+    return claude_dir() / "projects"
 
 
 _WINDOWS_ABSOLUTE = re.compile(r"^[A-Za-z]:[\\/]")
