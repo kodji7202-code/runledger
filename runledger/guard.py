@@ -1235,6 +1235,43 @@ def guard_hook_command(portable: bool = False, agent: Optional[str] = None) -> s
     return base
 
 
+def windows_hook_command(command: str) -> str:
+    """The `cmd /c` copy of a hook command, for Codex on Windows.
+
+    Codex starts hook commands itself instead of handing the string to a shell, and on Windows
+    the quoted interpreter path of `"C:\\...\\python.exe" -m runledger guard` comes out as a
+    program name with the quotes in it, so the hook never starts (measured with codex 0.163.0:
+    the same path unquoted, or wrapped in `cmd /c`, fires). Codex reads this field on Windows
+    only, so storing it never affects the other platforms."""
+    return f'cmd /c "{command}"'
+
+
+def command_handler(command: str, timeout: int, agent: Optional[str] = None) -> Dict[str, Any]:
+    """One stored hook handler: the command, its timeout, and the Windows copy Codex runs."""
+    handler: Dict[str, Any] = {"type": "command", "command": command, "timeout": timeout}
+    if agent == AGENT_CODEX:
+        handler["commandWindows"] = windows_hook_command(command)
+    return handler
+
+
+def _sync_handler(handler: Dict[str, Any], command: str, timeout: int,
+                  agent: Optional[str]) -> bool:
+    """Bring one stored handler in line with the command and timeout we write. True if it changed."""
+    changed = False
+    if handler.get("command") != command:
+        handler["command"] = command
+        changed = True
+    if agent == AGENT_CODEX:
+        windows = windows_hook_command(command)
+        if handler.get("commandWindows") != windows:
+            handler["commandWindows"] = windows
+            changed = True
+    if handler.get("timeout") != timeout:
+        handler["timeout"] = timeout
+        changed = True
+    return changed
+
+
 def checkpoint_hook_command(portable: bool = False) -> str:
     """The checkpoint hook command written to settings.json: `"<sys.executable>" -m runledger checkpoint --hook`
     by default, or bare `runledger checkpoint --hook` when `portable=True`."""
@@ -1245,8 +1282,8 @@ def checkpoint_hook_command(portable: bool = False) -> str:
 def hook_entry(hook_seconds: int, portable: bool = False, agent: Optional[str] = None,
                matcher: str = "*") -> Dict[str, Any]:
     return {"matcher": matcher,
-            "hooks": [{"type": "command", "command": guard_hook_command(portable=portable, agent=agent),
-                       "timeout": hook_seconds}]}
+            "hooks": [command_handler(guard_hook_command(portable=portable, agent=agent),
+                                      hook_seconds, agent=agent)]}
 
 
 def _owned_command_parts(command: Any) -> Optional[List[str]]:
@@ -1311,12 +1348,7 @@ def install_into(target: HookTarget, approval_timeout_s: Optional[float] = None,
         found = True
         for h in group["hooks"]:
             if _is_guard_hook(h):
-                if h.get("command") != want_cmd:
-                    h["command"] = want_cmd
-                    changed = True
-                if h.get("timeout") != want:
-                    h["timeout"] = want
-                    changed = True
+                changed = _sync_handler(h, want_cmd, want, target.agent) or changed
     if not found:
         pre.append(hook_entry(want, portable=portable, agent=target.agent, matcher=target.matcher))
         changed = True
@@ -1333,14 +1365,12 @@ def install_into(target: HookTarget, approval_timeout_s: Optional[float] = None,
                 if is_checkpoint_hook(h):
                     if group.get("matcher") in (None, "", "*"):
                         found_checkpoint = True
-                        if h.get("command") != want_cp_cmd:
-                            h["command"] = want_cp_cmd
-                            changed = True
+                        changed = _sync_handler(h, want_cp_cmd, 120, target.agent) or changed
                     if h.get("timeout") != 120:
                         h["timeout"] = 120
                         changed = True
         if not found_checkpoint:
-            groups.append({"hooks": [{"type": "command", "command": want_cp_cmd, "timeout": 120}]})
+            groups.append({"hooks": [command_handler(want_cp_cmd, 120, agent=target.agent)]})
             changed = True
         hooks[event] = groups
     if not changed:

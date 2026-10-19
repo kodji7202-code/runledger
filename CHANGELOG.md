@@ -127,6 +127,34 @@ change behavior, so read the entry before you upgrade.
   exposes the bundled `prices.json` verification date as a `date` (or `None` when the packaged
   table carries no usable `checked` value) for the price-staleness checks.
 
+### Fixed
+
+- **Codex runs the installed hook on Windows (`runledger.guard`):** Codex starts a hook command
+  itself instead of handing the string to a shell, and the `"<python>" -m runledger guard --agent
+  codex` form never started there - the quotes were read as part of the program name - so a real
+  Codex session left `guard.log` empty and created no lifecycle checkpoint. Every Codex entry now
+  also stores `commandWindows`, the same command as `cmd /c "<command>"`, the copy Codex reads on
+  Windows: for the guard hook and for both checkpoint hooks. `install` writes it, repairs an entry
+  that lacks or has a stale one in place, and leaves the files of Claude Code and Droid (whose own
+  hook runners do start the quoted path) unchanged. Measured with codex 0.163.0: the destructive
+  command is denied by the hook, a benign one runs, and `SessionStart`/`UserPromptSubmit` create
+  their checkpoints (`docs/guard.md`).
+- **Droid and Codex guard decisions reach their receipt (`runledger.guard_receipt`):** records are
+  linked in two passes - every record whose `tool_use_id` the transcript knows takes that step
+  first, then the rest match the logged tool and summary in transcript order. That second pass is
+  what links a Droid call (its payload carries no id, and the log tool `Execute` faces a `Bash`
+  step), a Codex call (the hook's `exec-...` id is not the rollout's `call_id`) and a legacy
+  no-id row, using the canonical tool name and the `Bash`/`PowerShell` pair the adapters choose
+  between. Rows without an `agent` (v0.6.0) keep matching their tool name exactly, and a decision
+  that fits no step stays visible in the receipt as unmatched.
+- **A Codex code-mode `exec` script becomes the shell step it ran (`runledger.adapters.codex`):**
+  current Codex versions send shell calls as a `custom_tool_call` named `exec` whose input is
+  JavaScript around `tools.exec_command({cmd: ..., shell: ...})`. RunLedger read that as one
+  nameless `exec` step, so the command was invisible to the risk rules and the guard's decision on
+  it had no step to link to. Each call inside the script is now one `Bash` or `PowerShell` step
+  carrying its `cmd`, and a code-mode result's text blocks are shown as their text instead of raw
+  JSON.
+
 ## [0.6.1] - 2026-10-18
 
 ### Changed

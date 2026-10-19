@@ -75,6 +75,12 @@ which has no envelope on each line.
 
 - **Matching.** A session belongs to a folder when the working directory recorded in the session
   equals that folder.
+- **Shell calls.** Recent Codex versions send shell calls through code mode: a `custom_tool_call`
+  named `exec` whose input is JavaScript around `tools.exec_command({cmd: ..., shell: ...})`.
+  RunLedger reads each of those calls as one `Bash` or `PowerShell` step carrying the `cmd` it
+  runs, so the command is scored and the guard's decision on it links to that step. A script
+  without such a call stays one step under its own name, and the result's text blocks are shown as
+  their text.
 - **Usage.** The run total is the last cumulative token count in the session. Each model call's
   usage is split evenly across the steps issued since the previous count.
 - **Cost.** Estimated from list prices. Codex does not report its own cost.
@@ -189,7 +195,10 @@ runledger guard install --agent all             # every agent that can be instal
 Add `--global` for the agent's own file, `--portable` for bare `runledger ...` commands, and
 `--project PATH` for another folder. Droid must be restarted (or the hooks reviewed in `/hooks`)
 before it loads them, and Codex runs only hooks you trust (`/hooks` in `codex`). The installer
-explains both. `docs/guard.md` has the file locations, the commands and the per-agent behaviour.
+explains both. Every Codex entry also stores a `commandWindows` copy (`cmd /c "<command>"`),
+because Codex starts the stored command itself on Windows and does not accept a quoted interpreter
+path there; `install` writes and repairs both fields. `docs/guard.md` has the file locations, the
+commands and the per-agent behaviour.
 
 `checkpoint`, `checkpoints` and `rollback` work with every agent in a Git working tree; any other
 agent can use the manual commands or its own wrappers. See [rollback.md](rollback.md) for examples

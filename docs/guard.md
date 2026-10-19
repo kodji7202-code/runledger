@@ -55,6 +55,12 @@ and when the interpreter path contains spaces. The command carries the agent exp
 | Factory Droid | `"<python>" -m runledger guard --agent droid` |
 | Codex | `"<python>" -m runledger guard --agent codex` |
 
+Every Codex entry also carries the same command as `commandWindows`, the `cmd /c "<command>"` copy
+Codex reads on Windows: Codex starts the stored command itself, and a quoted interpreter path in
+`command` does not run there (the guard hook stays silent, and so do the checkpoint hooks).
+`command` keeps the portable form the self-test and the other platforms use. The installer writes
+and repairs both fields on every `install`.
+
 Without `--project`, the hook file is written at the project root, so installing from a
 subfolder configures the whole project.
 After writing the file, `install` runs the configured hook command once with `{}` on stdin
@@ -176,6 +182,7 @@ payload.
 | Agent tool | Assessed as |
 | --- | --- |
 | Droid `Execute` | `Bash` (the command may be PowerShell, which is analysed as such) |
+| Codex code-mode `exec` | one `Bash` or `PowerShell` step per `tools.exec_command({...})` call in the script, carrying the command it runs |
 | Droid `Create` / `Edit` | `Write` / `Edit` (`old_str`/`new_str` read as `old_string`/`new_string`) |
 | Droid `ApplyPatch`, Codex `apply_patch` | one `Write`, `Edit` or `Delete` per file the patch touches |
 | Droid `LS`, `Glob`, `Grep` | `Search` |
@@ -544,8 +551,14 @@ folder where you invoke `receipt`. Only the run's `session_id` is included. The 
 missing or unreadable files, corrupt lines and oversized lines (over 64 KiB of text) are skipped.
 
 The **Guard decisions** section shows the tool, summary, decision, outcome, reason, codes and
-timestamp. It links to a step by `tool_use_id`. Older records without an id match the tool and
-Guard summary in transcript order. Records with no matching step remain visible as **unmatched**.
+timestamp. A record is linked to its step in two passes: first every record whose `tool_use_id`
+the transcript knows takes that step, then the remaining records match the tool name and the Guard
+summary in transcript order. The second pass is what links a legacy record (v0.6.0 wrote no id), a
+Droid call (its payload carries no id, and the log tool is `Execute` while the transcript step is
+`Bash`) and a Codex call (the hook's `exec-...` id is not the rollout's `call_id`), so a decision
+appears on the step it decided. A record matches under the canonical tool name, and a record that
+names its agent may also cross `Bash`/`PowerShell`, because the adapters choose that name from the
+program the call ran. Records with no matching step at all remain visible as **unmatched**.
 A blocked call is a requested step, not evidence that the tool executed.
 
 | Decision | Receipt outcome |
@@ -603,6 +616,25 @@ include it unless you add it.
   it prints a deny, the guard works and the problem is the hook. Check that
   `.claude/settings.json` has a `PreToolUse` entry with `runledger guard`, that `runledger` is on
   Claude Code's PATH.
+- **A real Droid or Codex run leaves no rows in `guard.log`.** The hook is installed but the agent
+  never loaded it. Restart Droid: it snapshots its hooks at startup, and `/hooks` reviews them in a
+  running session. Codex runs only trusted hooks, so open `codex`, run `/hooks` and trust the
+  RunLedger entries (a scratch project can start it with `--dangerously-bypass-hook-trust`).
+  `runledger doctor` reports Codex's trust state as unverified, because the installer cannot read
+  it. Also check the run used the folder you installed into: Droid sets `FACTORY_PROJECT_DIR`, and
+  Codex sets nothing, so the guard resolves the root from the payload `cwd`.
+- **Codex on Windows still never ran the hook.** Codex starts the stored command itself and does
+  not accept a quoted interpreter path there. The installer writes the portable form in `command`
+  (`"<python>" -m runledger guard --agent codex`, which the self-test and the other platforms use)
+  and its Windows copy in `commandWindows`
+  (`cmd /c ""<python>" -m runledger guard --agent codex"`), which is the one Codex runs. An entry
+  whose `commandWindows` was removed or hand-edited is corrected by running
+  `runledger guard install --agent codex --project PATH` again.
+- **A decision shows `step: null` in a Droid or Codex receipt.** The record is real and the step
+  was not matched: a session recorded by an older version whose guard summary differs, or a tool
+  the adapter keeps as its own step (for example a Codex code-mode `exec` script with no
+  `tools.exec_command` call inside). Markdown receipts list it as unmatched rather than dropping
+  it.
 - **Approvals never reach the dashboard.** Check `RUNLEDGER_SERVER` and the key variable, and that
   the key has the member role. Look for `approval: "unavailable"` in `guard.log`. The reason text
   says why, for example `HTTP 401` for a wrong key.

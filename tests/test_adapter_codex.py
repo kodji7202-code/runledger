@@ -175,6 +175,72 @@ def test_local_shell_call_maps_to_shell_tool(tmp_path):
     assert step.result_text == "commit abc123"
 
 
+# ---------------------------------------------------------------- code-mode exec
+
+def _exec_call(script, call_id="ctc1"):
+    return _line("response_item", {"type": "custom_tool_call", "name": "exec", "call_id": call_id,
+                                   "id": "ctc_" + call_id, "status": "completed", "input": script})
+
+
+def test_code_mode_exec_unwraps_the_shell_command_it_runs(tmp_path):
+    """Codex 0.163 sends shell calls through code mode: a `custom_tool_call` named `exec` whose
+    input is JavaScript around `tools.exec_command({cmd: ..., shell: ...})`. The hook payload and
+    the risk engine both see the plain command, so the step carries that command too - without it
+    the receipt shows a nameless `exec` step the guard decision cannot be linked to. The script
+    below is the real one from a recorded run (`\\` stays a backslash inside the JSON string, `\\n`
+    is a newline in the command)."""
+    script = ("const r = await tools.exec_command({cmd:\"$target = (Resolve-Path -LiteralPath "
+              "'C:\\\\work\\\\proj\\\\victim' -ErrorAction Stop).Path\\n$root = (Resolve-Path "
+              "-LiteralPath 'C:\\\\work\\\\proj' -ErrorAction Stop).Path\\nif (-not "
+              "$target.StartsWith($root + [IO.Path]::DirectorySeparatorChar, "
+              "[StringComparison]::OrdinalIgnoreCase)) { throw 'Target is not a child of the "
+              "intended workspace.' }\\nRemove-Item -LiteralPath $target -Recurse -Force\","
+              "\"shell\":\"powershell\",\"login\":false,\"yield_time_ms\":10000,"
+              "\"max_output_tokens\":2000}); text(r.output);")
+    run = _parse_items(tmp_path, [
+        _meta_line(),
+        _exec_call(script),
+        _line("response_item", {"type": "custom_tool_call_output", "call_id": "ctc1",
+                                "output": [{"type": "input_text", "text": "Script error: blocked"}]}),
+    ])
+    step = run.steps[0]
+    assert step.tool == "PowerShell"
+    assert step.tool_use_id == "ctc1"
+    assert step.result_text == "Script error: blocked"
+    assert step.input["command"].startswith("$target = (Resolve-Path -LiteralPath 'C:\\work\\proj\\victim'")
+    assert step.input["command"].endswith("Remove-Item -LiteralPath $target -Recurse -Force")
+    assert "\nRemove-Item" in step.input["command"] and "\\\\work" not in step.input["command"]
+
+
+def test_code_mode_exec_decodes_escapes_and_argv_commands(tmp_path):
+    script = ('const a = await tools.exec_command({cmd:"echo one\\ntwo",shell:"bash"});\n'
+              'const b = await tools.exec_command({cmd:["bash","-lc","make test"],shell:"bash"});\n'
+              'text(a.output); text(b.output);')
+    run = _parse_items(tmp_path, [_meta_line(), _exec_call(script)])
+    assert [(s.tool, s.input) for s in run.steps] == [
+        ("Bash", {"command": "echo one\ntwo"}),
+        ("Bash", {"command": "make test"}),
+    ]
+
+
+def test_code_mode_exec_script_without_a_shell_call_stays_one_step(tmp_path):
+    run = _parse_items(tmp_path, [_meta_line(), _exec_call("const x = 1; text(x);")])
+    assert run.steps[0].tool == "exec"
+    assert run.steps[0].input == {"input": "const x = 1; text(x);"}
+
+
+def test_code_mode_exec_output_text_blocks_are_joined(tmp_path):
+    """The code-mode result is a list of text blocks; the receipt shows the text, not the JSON."""
+    run = _parse_items(tmp_path, [
+        _meta_line(),
+        _exec_call("const r = await tools.exec_command({cmd:\"echo hi\",shell:\"bash\"});"),
+        _line("response_item", {"type": "custom_tool_call_output", "call_id": "ctc1",
+                                "output": [{"type": "input_text", "text": "hi"},
+                                           {"type": "input_text", "text": "exit code: 0"}]}),
+    ])
+    assert run.steps[0].result_text == "hi\nexit code: 0"
+
+
 def test_mcp_and_unknown_tool_names(tmp_path):
     run = _parse_items(tmp_path, [
         _meta_line(),
