@@ -969,50 +969,24 @@ def _check_shell_word(w: _Word, name: str, cwd: Optional[str], workdir: Optional
 
 
 def _has_substitution(raw: str, ps: bool = False) -> bool:
-    """Whether `raw` carries substitution syntax outside single-quoted text: `$(...)` anywhere,
-    and a backtick for a POSIX shell. Escapes are not resolved, so an escaped `$(` or backtick
-    counts as one too: a substitution the shell really runs must stay visible, and a pattern
-    that only looks like one is over-reported instead. A quote an escape covers is literal, so
-    it neither opens nor closes the quoted text."""
-    i, n = 0, len(raw)
-    while i < n:
-        ch = raw[i]
-        if ch == "'" and raw[i - 1:i] not in ("\\", "`"):
-            close = raw.find("'", i + 1)
-            i = n if close < 0 else close + 1
-            continue
-        if ch == '"':
-            i += 1
-            while i < n and raw[i] != '"':
-                if raw[i] == "\\" and raw[i + 1:i + 2] == '"' and not ps:
-                    i += 2
-                    continue
-                if raw[i] == "`" and raw[i + 1:i + 2] == '"' and ps:
-                    i += 2
-                    continue
-                if raw[i] == "$" and raw[i + 1:i + 2] == "(":
-                    return True
-                if raw[i] == "`" and not ps:
-                    return True
-                i += 1
-            i += 1
-            continue
-        if ch == "$" and raw[i + 1:i + 2] == "(":
-            return True
-        if ch == "`" and not ps:
-            return True
-        i += 1
-    return False
+    """Whether `raw` carries substitution syntax at all: the two characters `$(` anywhere, and a
+    backtick for a POSIX shell. Nothing is read out of the quoting or the escapes, so a quote
+    state that desynchronises cannot blank a substitution the shell really runs: a word that only
+    looks like one - single-quoted text, or one an escape makes literal - is read as code and
+    over-reported instead (GE-017)."""
+    if "$(" in raw:
+        return True
+    return "`" in raw and not ps
 
 
 def _code_view(text: str, comments: List[Tuple[int, int]], text_words: List[_Word],
                ps: bool = False) -> str:
     """The command text the dangerous-command rules read: comments removed, and text
     arguments (echo, git commit -m, python -c, a `find -name` pattern) blanked. A text word
-    carrying substitution syntax outside single quotes is not blanked at all: whatever the
-    shell computes there stays visible, whatever reads it, which over-reports a word that only
-    looks like a substitution but never hides one that really is (GE-017). Unquoted $VAR words
-    are kept."""
+    carrying substitution syntax at all (`$(`, or a backtick for a POSIX shell) is not blanked:
+    whatever the shell computes there stays visible, whatever reads it. Quoting and escapes are
+    not resolved, so a word that only looks like a substitution is over-reported while one that
+    really is can never be hidden (GE-017). Unquoted $VAR words are kept."""
     spans = [(s, e, "") for s, e in comments]
     for w in text_words:
         raw = text[w.start:w.end]
