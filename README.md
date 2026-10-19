@@ -51,7 +51,7 @@ More in [docs/quickstart.md](docs/quickstart.md).
 | --- | --- | --- | --- |
 | Claude Code | `claude-code` | Stable | `~/.claude/projects/<project>/` |
 | Codex CLI | `codex` | Beta | `$CODEX_HOME/sessions/` (default `~/.codex`) |
-| Factory Droid | `droid` | Beta | `$FACTORY_HOME/sessions/<encoded project folder>/` (default `~/.factory`) |
+| Factory Droid | `droid` | Beta | `$FACTORY_HOME/sessions/<encoded project folder>/` (default `~/.factory`; `FACTORY_HOME_OVERRIDE` names the home instead) |
 | Aider | `aider` | Beta | `.aider.chat.history.md` in the project folder |
 | Any agent | `native` | Open format | `<project>/.runledger/runs/` |
 

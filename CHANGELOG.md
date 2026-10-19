@@ -7,6 +7,25 @@ change behavior, so read the entry before you upgrade.
 
 ## [Unreleased]
 
+### Added
+
+- **Droid discovery follows `FACTORY_HOME_OVERRIDE` (`runledger.adapters.droid`):** the variable
+  is read as a HOME, so the Factory config directory becomes `<FACTORY_HOME_OVERRIDE>/.factory`,
+  and that is where sessions, settings files and a global hook file are looked for.
+  `FACTORY_HOME`, which names the config directory itself, still wins over it; without either,
+  the directory is `~/.factory`.
+
+### Changed
+
+- **The user's config file is read in one place (`runledger.userconfig`, new):** `RUNLEDGER_CONFIG`
+  or `~/.runledger/config.json` is resolved and parsed by one module, which the guard, the risk
+  policy and the new `rollback.load_settings()` consume, so a missing or broken file is handled the
+  same way everywhere. `rollback.load_settings()` returns the documented `rollback` settings with
+  their defaults (auto-prune on, keeping the newest 50 checkpoints, no age limit; size warnings at
+  500 MB in total or 50 MB for one file, 0 switches a warning off), and `pricing.prices_checked()`
+  exposes the bundled `prices.json` verification date as a `date` (or `None` when the packaged
+  table carries no usable `checked` value) for the price-staleness checks.
+
 ## [0.6.1] - 2026-10-18
 
 ### Changed

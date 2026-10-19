@@ -64,6 +64,7 @@ from .ps_writes import ps_writes, shell_kind
 from .shell_syntax import ansi_c_end, strip_heredocs as _posix_strip_heredocs
 from .shell_writes import database_writes, shell_writes
 from .testdiff import SKIP_RE, TestChange, analyze as analyze_test_diffs
+from .userconfig import user_config_path as _user_config_path
 
 SEVERITY_POINTS = {"high": 30, "medium": 15, "low": 5}
 MEDIUM_POINTS_CAP = 45  # all medium findings together add at most this many points
@@ -1031,14 +1032,6 @@ _HIGH_DEFAULT_KINDS = frozenset({
     "test_deleted", "test_skipped", "destructive_delete", "git_force_push",
     "pipe_to_shell", "destructive_sql", "package_publish", "infra_change", "sudo",
 })
-
-
-def _user_config_path() -> Path:
-    override = os.environ.get("RUNLEDGER_CONFIG", "").strip()
-    if override:
-        return Path(override)
-    home = os.environ.get("HOME") or os.environ.get("USERPROFILE") or str(Path.home())
-    return Path(home) / ".runledger" / "config.json"
 
 
 def _read_json_dict(path: Path) -> Dict[str, Any]:

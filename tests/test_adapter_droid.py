@@ -454,6 +454,39 @@ def test_factory_home_default_expansion_and_missing_root(tmp_path, monkeypatch):
     assert droid.factory_home() == Path.home() / "example-factory"
 
 
+def test_factory_home_override_is_a_home_and_discovers_its_sessions(tmp_path, monkeypatch):
+    """The real droid binary reads FACTORY_HOME_OVERRIDE as a HOME: its config dir is
+    `<override>/.factory`, which is where sessions and settings live (VAL-AGENT-028)."""
+    override = tmp_path / "override"
+    monkeypatch.setenv("FACTORY_HOME_OVERRIDE", str(override))
+    assert droid.factory_home() == override / ".factory"
+
+    session = _discovered(override / ".factory", "/demo/widget", "over.jsonl", 100)
+    session.with_suffix(".settings.json").write_text("{}", encoding="utf-8")
+    assert droid.find_sessions() == [session]
+    assert droid.find_sessions("/demo/widget") == [session]
+    assert adapters.find_sessions(agent="droid") == [session]
+
+
+def test_factory_home_wins_over_the_override(tmp_path, monkeypatch):
+    legacy = tmp_path / "legacy"
+    override = tmp_path / "override"
+    monkeypatch.setenv("FACTORY_HOME", str(legacy))
+    monkeypatch.setenv("FACTORY_HOME_OVERRIDE", str(override))
+    legacy_session = _discovered(legacy, "/demo/widget", "legacy.jsonl", 100)
+    _discovered(override / ".factory", "/demo/widget", "over.jsonl", 200)
+
+    assert droid.factory_home() == legacy
+    assert droid.find_sessions() == [legacy_session]
+
+
+def test_factory_home_override_expands_user_and_falls_back_to_the_home_directory(tmp_path, monkeypatch):
+    monkeypatch.setenv("FACTORY_HOME_OVERRIDE", "~/example-home")
+    assert droid.factory_home() == Path.home() / "example-home" / ".factory"
+    monkeypatch.setenv("FACTORY_HOME_OVERRIDE", "")
+    assert droid.factory_home() == Path.home() / ".factory"
+
+
 def test_relative_project_discovery(tmp_path, monkeypatch):
     project = tmp_path / "app"
     project.mkdir()
