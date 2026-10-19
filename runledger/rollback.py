@@ -569,8 +569,11 @@ class Repository:
         for raw in paths:
             name = self._resolve(raw)
             if name and name not in known and known.get(name.casefold()) is None:
-                # Nothing to restore from, no match to remove: the path is simply absent.
-                if _unsafe_path(name) or not os.path.lexists(self._path(name)):
+                # A folder that no entry starts with, and that is not on disk either, is
+                # simply absent. (A folder whose entries are in a tree is a valid selection.)
+                present = any(entry.startswith(name + "/")
+                              for entry in known.values() if entry)
+                if _unsafe_path(name) or not (present or os.path.lexists(self._path(name))):
                     raise CheckpointError(
                         f"no such path in the checkpoint or working tree: {raw}")
             if name:

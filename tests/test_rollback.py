@@ -1418,7 +1418,8 @@ def test_path_resolves_against_the_cwd_and_accepts_absolute_paths(scoped_repo, m
     other = repo.root.parent / "elsewhere"
     other.mkdir()
     monkeypatch.chdir(other)
-    assert main(["rollback", checkpoint.id, "--cwd", str(repo.root), "--path", "sub\\c.txt",
+    relative = "sub\\c.txt" if os.name == "nt" else "sub/c.txt"
+    assert main(["rollback", checkpoint.id, "--cwd", str(repo.root), "--path", relative,
                  "--yes"]) == 0
     assert (repo.root / "sub" / "c.txt").read_text(encoding="utf-8") == "one\n"
     assert (repo.root / "sub" / "d.txt").read_text(encoding="utf-8") == "modified\n"
@@ -1538,7 +1539,8 @@ def test_path_absolute_outside_the_repository_is_rejected(scoped_repo, tmp_path,
     assert git(repo.root, "for-each-ref", rollback.PREFIX) == refs
 
 
-@pytest.mark.parametrize("scope", [".git", ".git\\config", ".git/HEAD", ""])
+@pytest.mark.parametrize("scope", [".git", ".git/HEAD", 
+                                         ".git\\config" if os.name == "nt" else ".git/config", ""])
 def test_path_git_and_empty_selections_are_rejected(scoped_repo, capsys, scope):
     repo = scoped_repo
     checkpoint = repo.create()
@@ -1706,7 +1708,7 @@ def test_path_unquoted_backslash_spelling_outside_the_repository_is_rejected(
     assert git(repo.root, "for-each-ref", rollback.PREFIX) == refs
 
 
-@pytest.mark.skipif(os.name != "nt", reason="the unsafe names are Windows reserved names")
+@pytest.mark.skipif(os.name != "nt", reason="reserved names are unsafe on Windows only")
 def test_path_scope_does_not_hide_a_reserved_checkpoint_name(scoped_repo):
     repo = scoped_repo
     bad = _tree_from(repo, [("CON", b"x\n"), ("sub/keep.txt", b"keep\n")])
@@ -1729,7 +1731,7 @@ def test_path_scope_does_not_hide_a_case_colliding_checkpoint_name(scoped_repo):
             repo.plan(checkpoint, paths=["sub"])
         assert "case-colliding" in str(excinfo.value).casefold()
     else:
-        # A case-sensitive volume holds both, and the scope only selects the one written.
+        # A case-sensitive volume holds both; the scope selects the folder they are in.
         plan = repo.plan(checkpoint, paths=["sub"])
         assert plan.restore == ["sub/A.txt", "sub/a.txt"]
 
