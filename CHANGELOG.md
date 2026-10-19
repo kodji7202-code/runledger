@@ -14,9 +14,48 @@ change behavior, so read the entry before you upgrade.
   and that is where sessions, settings files and a global hook file are looked for.
   `FACTORY_HOME`, which names the config directory itself, still wins over it; without either,
   the directory is `~/.factory`.
+- **MCP calls are graded by their verb (`runledger.mcp_risk`, new; used by `runledger.risk`):** a
+  destructive tool (`delete_project`, `drop_table`, `reset_branch`, `purge_bucket`) is a **high**
+  `mcp` finding with the reason `Called a destructive MCP tool (<server>: <tool>)`, a
+  state-changing tool (`create_post`, `send_message`, `deploy`) is medium, and a read-only or
+  unknown name keeps the previous low finding and its wording. Words are matched exactly and case
+  insensitively, so `deleted_items` and `undelete_items` stay low while camelCase and kebab names
+  (`deleteBranch`, `delete-branch`) split into words; a leaf whose first word is a read verb
+  (`get_delete_policy`) never escalates. Both name shapes agents report are understood:
+  `mcp__<server>__<tool>` (Claude Code, Codex) and the bare connector name
+  (`supabase__delete_project`, Factory Droid).
+- **The SQL argument of an execute-class MCP tool is inspected (`runledger.mcp_risk`, new):** a
+  call whose name carries `sql`, `query`, `statement` or `execute`, or that carries a
+  `query`/`sql`/`statement` argument that opens like a statement, is graded by that statement
+  instead of its verb: `DROP`, `TRUNCATE`, a `DELETE` or `UPDATE` without a `WHERE` and
+  `ALTER TABLE ... DROP` are high, any other data-changing statement is medium, read-only SQL
+  keeps the low finding, and a call with no SQL the guard can read is medium. Strings and comments
+  are blanked before matching, so `select 'DROP TABLE x'` stays low. The SQL body is never copied
+  into a reason, `guard.log`, an approval request or a receipt, and an argument of up to 2 MB is
+  capped at 20 000 characters before any pattern runs.
+- **Twenty-two more dangerous-command rules (`runledger.risk`):** force-deleting a git branch
+  (`git branch -D`, `git branch --delete --force`), discarding all working-tree changes
+  (`git checkout .`, `git restore .`), `git stash drop`/`clear`, `git push --delete` and
+  `git push origin :branch` (high), `find ... -delete` and `find ... -exec rm|unlink|shred`,
+  `docker system|builder|image|container|network prune`, `gh <resource> delete`, `aws s3 rm` of a
+  single object, `rsync --delete`, `dd of=<file>` and `reg delete` of a user key (medium),
+  `helm uninstall`, `gh repo delete`, `docker volume prune` and `docker system prune --volumes`,
+  `aws s3 rm --recursive`, `aws s3 rb --force`, `dd of=/dev/...`, `rd /s /q`, a shell
+  `DELETE FROM` without a `WHERE` and `reg delete` of a machine-wide key (high), plus PowerShell
+  `Remove-Item -Recurse` without `-Force` (medium; the existing `-Force` rule stays high and does
+  not also report it). Every rule is confined to one command (the lookahead stops at `;`, `&`, `|`
+  and newlines) and runs on the quote-, comment- and heredoc-blanked view, so a commit message or a
+  string that mentions `git branch -D` is not flagged.
 
 ### Changed
 
+- **Destructive MCP calls ask by default (`runledger.guard`):** a high `mcp` finding now matches the
+  default `ask: ["severity:high"]`, so `mcp__supabase__delete_project`, and an execute-class call
+  whose SQL drops or rewrites rows, wait for confirmation instead of running. Nothing is denied by
+  default (`mcp:high` must be added to a `deny` list), and a user file can soften it again with
+  `severity_overrides` or `ignore`. The new command rules can turn a previously allowed call into a
+  deny (`git push origin --delete x`, `docker volume prune`, `helm uninstall`, `gh repo delete`) or
+  add a finding to it (`git branch -D x`, `rsync --delete`, `Remove-Item -Recurse`).
 - **The user's config file is read in one place (`runledger.userconfig`, new):** `RUNLEDGER_CONFIG`
   or `~/.runledger/config.json` is resolved and parsed by one module, which the guard, the risk
   policy and the new `rollback.load_settings()` consume, so a missing or broken file is handled the

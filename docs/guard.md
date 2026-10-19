@@ -107,8 +107,9 @@ and `tool_use_id`. The tool id links the decision to its step in the receipt.
 
 ## What the guard looks at
 
-The guard scores each call with the rules in `runledger/risk.py`. Each finding has a **code**, a
-**severity** (`high`, `medium` or `low`) and a reason. Policy lists match on codes and severities.
+The guard scores each call with the rules in `runledger/risk.py` (`runledger/mcp_risk.py` grades MCP
+tools). Each finding has a **code**, a **severity** (`high`, `medium` or `low`) and a reason. Policy
+lists match on codes and severities.
 
 | Code | Severity | Matches |
 | --- | --- | --- |
@@ -117,14 +118,33 @@ The guard scores each call with the rules in `runledger/risk.py`. Each finding h
 | `write_outside` | high | Write, Edit, MultiEdit, NotebookEdit or Delete of a path outside the working folder (including UNC shares, `\\?\` long-path prefixes, and local symlinks or junctions that resolve outside the project). Temp folders do not count. |
 | `shell_outside` | low, medium or high | A shell command that uses a path outside the working folder. Reading or writing is low, deleting is high, and running a command with `workdir` outside the folder is medium. The patterns of `grep`, `rg`, `ag` and `git grep` and the scripts of `sed` and `awk` are not treated as paths. |
 | `read_outside` | low | Read of a path outside the working folder. |
-| `command` | high | `rm -rf`, a force push, `curl ... \| sh` and similar downloads run in a shell, destructive SQL (`DROP`, `TRUNCATE`), `npm`, `twine` or `cargo publish`, `kubectl` or `terraform` apply, delete or destroy, `sudo`, and in PowerShell `Remove-Item -Recurse -Force`, `iwr ... \| iex` and `Start-Process -Verb RunAs`. |
-| `command` | medium | `git push` (any), `git reset --hard`, `git clean -f`, `chmod 777`, printing environment variables or secrets, `--no-verify`, `taskkill /IM`, `Set-ExecutionPolicy`, listing `env:`. |
+| `command` | high | `rm -rf`, a force push, `curl ... \| sh` and similar downloads run in a shell, destructive SQL (`DROP`, `TRUNCATE`), `npm`, `twine` or `cargo publish`, `kubectl` or `terraform` apply, delete or destroy, `sudo`, `git push --delete`/`git push origin :branch`, `helm uninstall`, `gh repo delete`, `aws s3 rm --recursive`, `aws s3 rb --force`, `docker volume prune` (and `docker system prune --volumes`), `dd of=/dev/...`, `rd /s /q`, `reg delete` of a machine-wide key, a `DELETE FROM` without a `WHERE` in a shell command, and in PowerShell `Remove-Item -Recurse -Force`, `iwr ... \| iex` and `Start-Process -Verb RunAs`. |
+| `command` | medium | `git push` (any), `git reset --hard`, `git clean -f`, `git branch -D` (or `--delete --force`), `git checkout .` and `git restore .`, `git stash drop`/`clear`, `find ... -delete` (or `-exec rm`), `chmod 777`, `docker system\|builder\|image\|container\|network prune`, `gh <resource> delete`, `aws s3 rm` of one object, `rsync --delete`, `reg delete` of a user key, `dd of=<file>`, printing environment variables or secrets, `--no-verify`, `taskkill /IM`, `Set-ExecutionPolicy`, listing `env:`, and in PowerShell `Remove-Item -Recurse` without `-Force`. |
 | `command` | low | Installing packages (`npm`, `pnpm`, `yarn`, `pip`, `brew`), and network requests from the shell (`curl`, `wget`, `http`). |
 | `test_deleted` | high or low | Deleting a test file (high). Deleting a fixture or data file under a test folder (low). |
 | `test_skipped` | high | An edit that adds a skip, only, ignore or disabled marker to a test. |
 | `test_weakened` | medium | An edit to a test file that removes at least two assertions, or removes at least 15 more lines than it adds. |
 | `git_internals` | medium | A write or delete inside a `.git` folder. |
-| `mcp` | low | Any call to an MCP tool. The reason names the tool. |
+| `mcp` | high | A destructive MCP tool (`delete`, `drop`, `destroy`, `reset`, ...), or an execute-class tool (`supabase__execute_query`) whose SQL drops or truncates, deletes or updates without a `WHERE`, or drops a column. |
+| `mcp` | medium | A state-changing MCP tool (`create`, `update`, `send`, `deploy`, ...), any other data-changing SQL statement (`INSERT`, `UPDATE ... WHERE`, `CREATE`, `ALTER`, `GRANT`), and an execute-class tool whose SQL the guard cannot read. |
+| `mcp` | low | A read-only MCP tool (`get`, `list`, `search`, ...), an unknown tool name, or SQL that only reads. The reason names the tool. |
+
+MCP tools are named `mcp__<server>__<tool>` by Claude Code and Codex, and as the bare connector
+name `supabase__delete_project` by Factory Droid. The guard grades them by the verb in the tool
+name: the first word decides the read rule, so `get_delete_policy` and `list_deleted_items` stay
+low; otherwise any word meaning destructive is high, any word meaning state-changing is medium,
+and any other name stays low. Words are matched exactly, so `deleted_items` and `undelete_items`
+are not destructive; camelCase, `-` and `.` split words, so `deleteBranch` and `delete-branch`
+are. An execute-class call (the name carries `sql`, `query`, `statement` or `execute`, or a
+`query`/`sql`/`statement` argument opens like a statement) is graded by its SQL instead: dropping
+or truncating, a `DELETE` or `UPDATE` without a `WHERE`, and `ALTER TABLE ... DROP` are high; any
+other statement that changes data is medium; read-only SQL keeps the low wording, and a call with
+no SQL the guard can read is medium. The SQL text is never written to the reason, the log, an
+approval request or a receipt.
+
+Because a destructive MCP call is high, it **asks** under the default policy below. Lower
+`mcp` in your own file (`severity_overrides`) or ignore it (`ignore`) to soften that, or add
+`mcp:high` to your `deny` list to block destructive MCP calls outright.
 
 The guard reads each risk's severity and code, not the receipt's 0 to 100 score. The receipt score
 is described in [quickstart.md](quickstart.md) and in the README.
@@ -139,7 +159,9 @@ Each policy list has a default, used when your user file does not set that list:
 
 So `rm -rf`, a force push and a hardcoded API key written into a file are denied. `sudo`, reading
 a `.env` file, writing outside the project and deleting a test file ask. A `git push` (medium) is
-allowed unless a policy file says otherwise.
+allowed unless a policy file says otherwise. A destructive MCP call
+(`mcp__supabase__delete_project`) and an execute-class call whose SQL drops or rewrites rows ask
+for the same reason: they are high findings.
 
 ## Policy files
 
@@ -339,7 +361,8 @@ again before inclusion in a receipt.
 
 The log records the tool name, the **summary**, the codes and the reason. For shell tools the
 summary is the command. For file tools it is the path. Write and Edit bodies, file contents and MCP
-arguments are never logged. Each string is cut at 200 characters.
+arguments (including the SQL of an execute-class tool) are never logged. Each string is cut at 200
+characters.
 
 **Redaction is pattern-based.** Before writing, the guard masks secrets in the summary and the
 reason. Receipts use the same masking. It recognises:

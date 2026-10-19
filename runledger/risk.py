@@ -35,6 +35,11 @@ added migration from a changed one.
 Delete tool (canonical "Delete" with file_path) is checked like rm of that path.
 Write, Edit, MultiEdit and Delete inside a .git folder are medium (git_internals).
 
+MCP tools (mcp__<server>__<tool>, or the bare <server>__<tool> names Factory Droid reports for
+connector tools) are graded by their verb (see mcp_risk): a destructive word is high, a
+state-changing word is medium, a read verb or an unknown name stays low. An execute-class call
+is graded by its SQL argument instead, and the SQL body never leaves the call.
+
 Test files: real test source (test_*.py, *.test.js, *_spec.rb, ...) deleted is high.
 Fixtures and data under a test folder (fixtures/, testdata/, __snapshots__/, or .json,
 .txt, .md and similar) deleted is low.
@@ -59,6 +64,7 @@ try:
     from . import secrets
 except Exception:  # pragma: no cover - fallback when runledger.secrets is unavailable
     secrets = None  # type: ignore[assignment]
+from .mcp_risk import classify_mcp, mcp_parts
 from .parser import Run, Step
 from .ps_writes import ps_writes, shell_kind
 from .shell_syntax import ansi_c_end, strip_heredocs as _posix_strip_heredocs
@@ -154,6 +160,46 @@ DANGEROUS_CMDS: List[Tuple[str, str, str]] = [
     (r"\btaskkill\b(?=[^;&|\n]*\s//?im\b)(?![^;&|\n]*\s//?pid\b)",
      "medium", "Killed all processes by image name (taskkill /IM)"),
     (r"\b(curl|wget|http)\s+https?://", "low", "Made a network request from the shell"),
+    # Deleting more than the command says it does: force-deleting a branch, dropping the stash,
+    # wiping a remote branch, a container or cluster, a registry key, a device or a whole tree.
+    (r"\bgit\s+branch\b(?=[^;&|\n]*\s-[a-zA-Z]*(?-i:D)[a-zA-Z]*(?=\s|$))",
+     "medium", "Force-deleted a git branch (git branch -D)"),
+    (r"\bgit\s+branch\b(?=[^;&|\n]*\s--delete(?=\s|$))(?=[^;&|\n]*\s(?:--force|-f)(?=\s|$))",
+     "medium", "Force-deleted a git branch"),
+    (r"\bgit\s+push\b[^;&|\n]*?(?:\s--delete(?=\s|$)|\s-d(?=\s|$)|\s:[^\s:]\S*)",
+     "high", "Deleted a remote git branch or tag"),
+    (r"\bgit\s+checkout\b(?:[^;&|\n]*\s)?--\s+\.(?=\s|$|[;&|])|\bgit\s+checkout\s+\.(?=\s|$|[;&|])",
+     "medium", "Discarded all working-tree changes (git checkout .)"),
+    (r"\bgit\s+restore\b(?![^;&|\n]*\s--staged(?![^;&|\n]*\s(?:--worktree|-[a-zA-Z]*W)))"
+     r"[^;&|\n]*\s\.(?=\s|$|[;&|])",
+     "medium", "Discarded all working-tree changes (git restore .)"),
+    (r"\bgit\s+stash\s+(?:drop|clear)\b", "medium", "Dropped git stash entries"),
+    (r"\bfind\b[^;&|\n]*\s-delete\b|\bfind\b[^;&|\n]*\s-exec\s+(?:rm|unlink|shred)\b",
+     "medium", "Deleted files with find"),
+    (r"\bdd\b[^;&|\n]*\sof=/dev/(?!null\b|zero\b|stdout\b|stderr\b)\S+",
+     "high", "Wrote raw data to a device (dd of=/dev/...)"),
+    (r"\bdd\b[^;&|\n]*\sof=(?!/dev/)\S+", "medium", "Overwrote a file with dd"),
+    (r"\bdocker\s+(?:system|builder|image|container|network)\s+prune\b(?![^;&|\n]*--volumes)",
+     "medium", "Pruned Docker resources"),
+    (r"\bdocker\s+volume\s+prune\b|\bdocker\s+system\s+prune\b[^;&|\n]*--volumes",
+     "high", "Pruned Docker volumes (data loss)"),
+    (r"\baws\s+s3\s+rm\b[^;&|\n]*\s--recursive\b|\baws\s+s3\s+rb\b[^;&|\n]*\s--force\b",
+     "high", "Deleted S3 objects/buckets recursively"),
+    (r"\baws\s+s3\s+rm\b(?![^;&|\n]*\s--recursive\b)", "medium", "Deleted an S3 object"),
+    (r"\bgh\s+repo\s+delete\b", "high", "Deleted a GitHub repository"),
+    (r"\bgh\s+(?:release|issue|gist|label|secret|variable|cache|run|workflow)\s+delete\b",
+     "medium", "Deleted GitHub resources"),
+    (r"\bhelm\s+(?:uninstall|delete)\b", "high", "Uninstalled a Helm release"),
+    (r"\bdelete\s+from\s+\S+(?![^;&|\n]*\bwhere\b)", "high", "SQL DELETE without WHERE"),
+    (r"\brsync\b(?![^;&|\n]*(?:\s--dry-run\b|\s-[a-zA-Z]*(?-i:n)[a-zA-Z]*(?=\s|$)))"
+     r"[^;&|\n]*\s--(?:delete(?:-[a-z]+)?|del|remove-source-files)\b",
+     "medium", "rsync that deletes files"),
+    (r"\breg(?:\.exe)?\s+delete\b(?![^;&|\n]*\b(?:hklm|hkey_local_machine)\b)",
+     "medium", "Deleted a registry key"),
+    (r"\breg(?:\.exe)?\s+delete\b[^;&|\n]*\b(?:hklm|hkey_local_machine)\b",
+     "high", "Deleted a machine-wide registry key"),
+    (r"\b(?:rd|rmdir)\b(?=[^;&|\n]*\s/s\b)(?=[^;&|\n]*\s/q\b)",
+     "high", "Recursive quiet delete (rd /s /q)"),
 ]
 _DANGEROUS = [(re.compile(p, re.I), sev, why) for p, sev, why in DANGEROUS_CMDS]
 
@@ -161,6 +207,8 @@ _DANGEROUS = [(re.compile(p, re.I), sev, why) for p, sev, why in DANGEROUS_CMDS]
 PS_CMDS: List[Tuple[str, str, str]] = [
     (r"\b(?:remove-item|ri|del|erase|rd|rmdir)\b(?=[^;&|\n]*\s-rec\w*)(?=[^;&|\n]*\s-fo\w*)",
      "high", "Recursive force delete (Remove-Item -Recurse -Force)"),
+    (r"\b(?:remove-item|ri|del|erase|rd|rmdir)\b(?=[^;&|\n]*\s-rec\w*)(?![^;&|\n]*\s-fo\w*)",
+     "medium", "Recursive delete (Remove-Item -Recurse)"),
     (r"\b(?:iwr|irm|invoke-webrequest|invoke-restmethod|curl|wget)\b[^|;\n]*\|\s*(?:iex|invoke-expression)\b",
      "high", "Piped a downloaded script into PowerShell (iex)"),
     (r"\b(?:iex|invoke-expression)\b[^;|\n]*\(\s*(?:iwr|irm|invoke-webrequest|invoke-restmethod)\b",
@@ -1262,8 +1310,9 @@ def assess_step(step: Step, cwd: Optional[str], policy: Optional[Dict[str, Any]]
         flagged = _shell_risks(step, cwd, extra, risks, default_workdir=base)
         _shell_write_risks(step, cwd, extra, risks, default_workdir=base, flagged=flagged)
 
-    if tool.startswith("mcp__"):
-        risks.append(Risk("low", "mcp", f"Called an external MCP tool ({tool.split('__', 2)[-1]})", step.index))
+    if mcp_parts(tool) is not None:
+        severity, reason = classify_mcp(tool, step.input, policy)
+        risks.append(Risk(severity, "mcp", reason, step.index))
 
     # de-duplicate by (code, reason)
     seen = set()
