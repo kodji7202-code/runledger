@@ -789,7 +789,8 @@ EXPECTED = {
     "robocopy_switches": [("low", "shell_outside")],
     "sed_expression": [],
     "ps_remove_recurse_force": [("high", "command")],
-    "ps_remove_recurse_outside": [("high", "shell_outside")],
+    # v0.7.0: a recursive delete without -Force is a medium command risk (VAL-RULES-015).
+    "ps_remove_recurse_outside": [("high", "shell_outside"), ("medium", "command")],
     "ps_printed_env_secret": [("medium", "command")],
     "ps_download_to_file": [],
     "ps_remove_test_file": [("high", "test_deleted")],
