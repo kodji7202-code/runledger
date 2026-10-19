@@ -101,6 +101,25 @@ change behavior, so read the entry before you upgrade.
   Codex runs only hooks you trust and turns an ask into a deny (`guard.codex_ask`) - neither message
   claims the hook is verified inside the agent, which only a real session shows
   (`docs/guard.md`, `docs/agents.md`, `docs/rollback.md`).
+- **`runledger doctor` and `runledger guard status` (`runledger.doctor`, new):** nine checks in one
+  report, with `--json`, `--agent`, `--project`, `--offline`, `--no-selftest` and `--verbose`, and
+  exit codes 0 (ok/info/skip), 1 (a warning) and 2 (a failure). It reports the install (version,
+  Python, how the CLI is reached), the guard hook of every agent and scope (`info` when nothing is
+  installed, `ok` with the entries found, `warn` for a missing checkpoint entry, a duplicate guard
+  entry, a hook timeout shorter than the approval wait or a `--portable` command whose `runledger`
+  is not on `PATH`, `fail` for unreadable JSON - with the line - or a missing interpreter), the
+  Codex trust and Droid restart notes, a real self-test that runs the installed command string
+  through the shell in a temporary folder with a temporary HOME (deny JSON for `rm -rf /`, silence
+  for `ls`, elapsed time in the detail; `--no-selftest` starts no subprocess), both config files
+  (invalid JSON and project keys that try to loosen the guard are named), the approval server
+  (unauthenticated `GET /health`, 3 s, `--offline` makes no request; the key is reported only as
+  set or not set), the guard log (size, last decision, error rows of the last 7 days, `.gitignore`
+  coverage; never its contents), the checkpoints (Git version, count, newest tree size, a warning
+  above 100), the bundled prices (120-day staleness, `fail` when the table is unreadable) and the
+  sessions per agent with the home directory each one was read from. `guard status` is the compact
+  guard-only view - hooks, notes, config, approval, log and the effective mode with `fail_closed` -
+  and runs no self-test. Both commands are read-only: no hook file, config, log, checkpoint ref or
+  cache is written, and no secret is printed (`docs/doctor.md`).
 
 ### Changed
 

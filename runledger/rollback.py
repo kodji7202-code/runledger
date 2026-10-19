@@ -404,6 +404,32 @@ class Repository:
             return None
         return Repository._parse_checkpoint_body(checkpoint_id, oid, tree, body)
 
+    def snapshot_stats(self, tree: str) -> Tuple[int, int, Tuple[str, int]]:
+        """`(files, bytes, (largest path, its bytes))` of one tree, from a single
+        `git ls-tree -r -l -z`. Submodule entries have no blob size and are skipped.
+        Read-only: it reports how much a checkpoint holds, it never writes."""
+        result = self._git("ls-tree", "-r", "-l", "-z", tree)
+        files = 0
+        total = 0
+        largest: Tuple[str, int] = ("", 0)
+        for record in result.stdout.split(b"\0"):
+            if not record:
+                continue
+            meta, _, name = record.partition(b"\t")
+            fields = meta.split()
+            if len(fields) < 4 or fields[0] == b"160000":
+                continue
+            try:
+                size = int(fields[3])
+            except ValueError:
+                continue
+            path = os.fsdecode(name)
+            files += 1
+            total += size
+            if size > largest[1]:
+                largest = (path, size)
+        return files, total, largest
+
     def checkpoints(self) -> List[Checkpoint]:
         result = []
         fmt = ("%(refname)%00%(objectname)%00%(objecttype)%00%(symref)%00%(tree)"
