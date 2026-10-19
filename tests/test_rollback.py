@@ -1351,7 +1351,8 @@ def test_path_restores_only_the_selected_file(scoped_repo, monkeypatch, capsys):
     assert (repo.root / "new.txt").read_text(encoding="utf-8") == "untracked\n"
 
 
-@pytest.mark.parametrize("scope", ["sub", "sub/", "sub\\", "./sub"])
+@pytest.mark.parametrize("scope", ["sub", "sub/", "./sub"]
+                         + (["sub\\"] if os.name == "nt" else []))
 def test_path_restores_a_directory_subtree(scoped_repo, capsys, scope):
     repo = scoped_repo
     _write(repo.root, "a.txt", "one\n")
