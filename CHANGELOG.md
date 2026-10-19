@@ -79,9 +79,34 @@ change behavior, so read the entry before you upgrade.
   and reports a bad agent on stderr. A hook command stored with `--agent` is recognised as
   RunLedger's own by `install`, `uninstall` and the install-time self-test, `guard test --agent X`
   reads a native payload, and the hook stays fast and offline (`docs/guard.md`).
+- **One `guard install` for Claude Code, Droid and Codex (`runledger.hook_targets`, new;
+  `runledger.guard`):** `runledger guard install|uninstall [--agent claude-code|droid|codex|all]
+  [--project PATH | --global]` writes each agent's own file. Claude Code keeps
+  `<project>/.claude/settings.json` / `~/.claude/settings.json` (the unchanged default); Factory
+  Droid gets `<project>/.factory/hooks.json` / `<FACTORY_HOME>/hooks.json` (or
+  `<FACTORY_HOME_OVERRIDE>/.factory`), keyed by event with **no** `hooks` wrapper and never its
+  `settings.json`; Codex gets `<project>/.codex/hooks.json` / `<CODEX_HOME>/hooks.json`, with the
+  events wrapped in `hooks`, matcher `.*` and `config.toml` never touched. The guard command carries
+  the agent (`"<python>" -m runledger guard --agent droid|codex`; `--portable` keeps the bare form),
+  the checkpoint hooks stay `runledger checkpoint --hook` for all three, and `install` runs the
+  stored command once. Installs are idempotent (one guard entry per file, `<file>.bak` written once
+  and never rewritten), keep every foreign hook and key, refuse a malformed or wrongly shaped file
+  untouched (exit 1, nothing written, no `.bak`/`.tmp`) and accept an empty or BOM-prefixed one;
+  `uninstall` removes only RunLedger's entries plus the groups, events and `hooks` object they
+  emptied, and an agent without a hook file is reported without creating one. `--agent all` installs
+  in a project for all three and, globally, only for agents whose config folder already exists (it
+  never creates `~/.factory` or `~/.codex`, and names each skipped agent with the reason). `guard
+  test --agent droid|codex` prints the decision and that agent's hook output, and the install output
+  says what each agent still needs: Droid snapshots its hooks at startup (restart or `/hooks`), and
+  Codex runs only hooks you trust and turns an ask into a deny (`guard.codex_ask`) - neither message
+  claims the hook is verified inside the agent, which only a real session shows
+  (`docs/guard.md`, `docs/agents.md`, `docs/rollback.md`).
 
 ### Changed
 
+- **A `--global` Claude Code install follows `CLAUDE_CONFIG_DIR` (`runledger.guard`):** the user
+  settings file is `$CLAUDE_CONFIG_DIR/settings.json` when that variable is set - the file Claude
+  Code itself reads - instead of always `~/.claude/settings.json`.
 - **Destructive MCP calls ask by default (`runledger.guard`):** a high `mcp` finding now matches the
   default `ask: ["severity:high"]`, so `mcp__supabase__delete_project`, and an execute-class call
   whose SQL drops or rewrites rows, wait for confirmation instead of running. Nothing is denied by
@@ -89,8 +114,7 @@ change behavior, so read the entry before you upgrade.
   `severity_overrides` or `ignore`. The new command rules can turn a previously allowed call into a
   deny (`git push origin --delete x`, `docker volume prune`, `helm uninstall`, `gh repo delete`) or
   add a finding to it (`git branch -D x`, `rsync --delete`, `Remove-Item -Recurse`).
-- **`nuke` is deliberately not one of the built-in destructive MCP words (`runledger.mcp_risk`):**
-  a tool whose name carries it stays low until you add it to `mcp_verbs.destructive`. The rest of
+- **`nuke` is deliberately not one of the built-in destructive MCP words (`runledger.mcp_risk`):**  a tool whose name carries it stays low until you add it to `mcp_verbs.destructive`. The rest of
   the vocabulary (`delete`, `drop`, `destroy`, `reset`, `purge`, `terminate`, `force`, `revoke`
   and the other words) is unchanged, and users who never set `mcp_verbs` see the difference only
   for names built on `nuke`.

@@ -173,12 +173,27 @@ push without any code in RunLedger.
 
 The field-by-field specification is [format.md](format.md).
 
-## Checkpoints across agents
+## Guard and checkpoints across agents
 
-`checkpoint`, `checkpoints` and `rollback` work with every agent in a Git working tree.
-`guard install` adds automatic Claude Code session-start and pre-prompt checkpoints. Droid can
-use the same lifecycle command in `.factory/hooks.json`. Codex and other agents can use manual
-commands or their own wrappers. See [rollback.md](rollback.md) for examples and safety limits.
+`runledger guard install` writes each agent's own hook file, so the real-time guard and the
+automatic session-start and pre-prompt checkpoints work natively for Claude Code, Factory Droid and
+Codex CLI:
+
+```bash
+runledger guard install --agent claude-code     # <project>/.claude/settings.json (the default)
+runledger guard install --agent droid           # <project>/.factory/hooks.json
+runledger guard install --agent codex           # <project>/.codex/hooks.json
+runledger guard install --agent all             # every agent that can be installed
+```
+
+Add `--global` for the agent's own file, `--portable` for bare `runledger ...` commands, and
+`--project PATH` for another folder. Droid must be restarted (or the hooks reviewed in `/hooks`)
+before it loads them, and Codex runs only hooks you trust (`/hooks` in `codex`). The installer
+explains both. `docs/guard.md` has the file locations, the commands and the per-agent behaviour.
+
+`checkpoint`, `checkpoints` and `rollback` work with every agent in a Git working tree; any other
+agent can use the manual commands or its own wrappers. See [rollback.md](rollback.md) for examples
+and safety limits.
 
 Associate a checkpoint with the transcript's session id using `checkpoint --run SESSION_ID`;
 the matching receipt then includes a local rollback command. Checkpoint contents are not uploaded.

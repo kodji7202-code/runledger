@@ -80,24 +80,31 @@ Without a matching local checkpoint, `rollback` is `null`. The command must be r
 repository, or with `--cwd`. A receipt does not upload checkpoint contents or make rollback work
 on another clone. A saved receipt may refer to a checkpoint that was later pruned.
 
-## Automatic Claude Code checkpoints
+## Automatic checkpoints for Claude Code, Droid and Codex
 
 ```bash
-runledger guard install                       # project settings
-runledger guard install --global              # or user settings, choose one scope
+runledger guard install                       # Claude Code, project settings (the default agent)
+runledger guard install --agent droid         # Droid: <project>/.factory/hooks.json
+runledger guard install --agent codex         # Codex: <project>/.codex/hooks.json
+runledger guard install --global              # or the agent's own file, choose one scope
 runledger guard uninstall                     # removes guard and checkpoint hooks
 ```
 
-The installer preserves other settings and hooks, backs up an existing settings file, and is
+The installer preserves other settings and hooks, backs up an existing hook file, and is
 idempotent. It installs unrestricted lifecycle hooks even if an existing checkpoint hook only
 matches resumed sessions. Alongside the existing `PreToolUse` guard, it installs:
 
 - `SessionStart`: `runledger checkpoint --hook`
 - `UserPromptSubmit`: `runledger checkpoint --hook`
 
+The same two commands go into every agent's file; only the guard entry differs, because it carries
+the agent (`runledger guard --agent droid`). `docs/guard.md` has the file each agent reads.
+
 Each lifecycle hook reads `cwd` and `session_id` from the JSON event on stdin and labels the
 checkpoint with the event name. It does not store the prompt in checkpoint metadata. It emits
-no stdout and returns zero even outside Git or on failure, so it never blocks the agent. Outside a
+no stdout and returns zero even outside Git or on failure, so it never blocks the agent. This
+matters most for Droid and Codex, where anything printed on a lifecycle hook's stdout becomes
+agent context. Outside a
 Git repository it is silent; a repository Git cannot read (for example a malformed `.git/config`,
 or a permission problem) counts as a failure and prints a short warning to stderr, while
 `runledger checkpoint` on its own prints Git's reason. Each
@@ -106,10 +113,13 @@ to control retention.
 
 ## Factory Droid hooks
 
-Droid supports the same JSON input and lifecycle events. Add the following event groups to
-`.factory/hooks.json` (project) or `~/.factory/hooks.json` (user), preserving your other groups.
-Replace the executable path with the absolute path to your installed `runledger`. On Windows,
-use a full executable path and JSON-escaped backslashes.
+Droid reads its hooks from `.factory/hooks.json` (project) or `~/.factory/hooks.json` (user);
+`runledger guard install --agent droid [--global]` writes both, preserving your other groups.
+Standalone Droid `hooks.json` uses event names at the top level, **without** a `"hooks"` wrapper,
+and RunLedger never writes Droid's `settings.json`. Use `/hooks` to review/reload the
+configuration, or restart `droid`: hooks are snapshotted at startup. To wire a group by hand,
+keep this shape and replace the executable path with the absolute path to your installed
+`runledger`. On Windows, use a full executable path and JSON-escaped backslashes.
 
 ```json
 {
@@ -122,15 +132,17 @@ use a full executable path and JSON-escaped backslashes.
 }
 ```
 
-Standalone Droid `hooks.json` uses event names at the top level, **without** a `"hooks"` wrapper.
-Use `/hooks` to review/reload the configuration. RunLedger's installer only edits Claude Code
-settings; it does not install Droid hooks. See
-[Factory's hooks reference](https://docs.factory.ai/harness/hooks).
+See [Factory's hooks reference](https://docs.factory.ai/harness/hooks).
 
 ## Codex and other agents
 
-The checkpoint commands are agent-independent. For Codex, create a checkpoint before starting
-the CLI or before submitting the next prompt:
+Codex reads its hooks from `.codex/hooks.json` (project, loaded only when that layer is trusted) or
+`$CODEX_HOME/hooks.json`, with the events wrapped in a `hooks` object;
+`runledger guard install --agent codex [--global]` writes both, and never `config.toml`. Codex
+runs only hooks you trust, so open `codex`, run `/hooks` and trust the RunLedger entries.
+
+The checkpoint commands are agent-independent. Any other agent can create a checkpoint before
+starting or before submitting the next prompt:
 
 ```bash
 runledger checkpoint --label "Before Codex"
@@ -139,9 +151,9 @@ codex
 
 To integrate a lifecycle hook or wrapper supplied by your agent, call
 `runledger checkpoint --run ACTUAL_SESSION_ID --cwd PROJECT_DIR` before any edits, or feed the
-JSON lifecycle format above to `runledger checkpoint --hook`. No Codex settings are edited and
-no particular Codex hook API is assumed. A manual checkpoint without a session id still works
-by checkpoint id or `--last`, but will not appear in the session receipt automatically.
+JSON lifecycle format above to `runledger checkpoint --hook`. A manual checkpoint without a
+session id still works by checkpoint id or `--last`, but will not appear in the session receipt
+automatically.
 
 ## Storage, ignored files, and limits
 

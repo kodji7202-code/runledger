@@ -15,8 +15,8 @@
   runledger push [SESSION | --latest] [--project PATH] [--agent AGENT] [--server URL] [--key KEY] [--user NAME]
                  [--review] [--review-model MODEL] [--safe | --no-safe]
   runledger guard [--agent claude-code|droid|codex]   PreToolUse hook (reads the event on stdin)
-  runledger guard install [--project PATH | --global]
-  runledger guard uninstall [--project PATH | --global]
+  runledger guard install [--agent claude-code|droid|codex|all] [--project PATH | --global]
+  runledger guard uninstall [--agent claude-code|droid|codex|all] [--project PATH | --global]
   runledger guard test [--agent claude-code|droid|codex] 'EVENT_JSON'
   runledger checkpoint [--label TEXT] [--run RUN_ID] [--cwd DIR]
   runledger checkpoints [--cwd DIR]
@@ -41,6 +41,7 @@ from urllib.parse import quote
 
 from . import __version__
 from . import adapters
+from . import hook_targets
 from .gitinfo import current_branch, file_diffs, repo_context, session_base, toplevel, working_changes
 from .guard import load_user_config, redact
 from .guard_receipt import load_guard_decisions
@@ -55,7 +56,8 @@ from .review import DEFAULT_REVIEW_MODEL, ai_review
 from .summarize import DEFAULT_AI_MODEL, ai_summaries, apply_templates, file_changes
 
 AGENTS = ("claude-code", "codex", "droid", "aider", "native")
-GUARD_AGENTS = ("claude-code", "droid", "codex")   # the agents the guard can hook
+GUARD_AGENTS = hook_targets.AGENTS                 # the agents the guard can hook
+GUARD_AGENT_CHOICES = hook_targets.AGENT_CHOICES   # `guard install|uninstall --agent`
 
 
 def build(session_path: str, use_ai: bool = False, ai_model: str = DEFAULT_AI_MODEL,
@@ -782,8 +784,10 @@ def print_guard_help() -> None:
     p.add_argument("--agent", metavar="AGENT", default=None,
                    help="the agent this hook belongs to: claude-code (default), droid or codex")
     gsub = p.add_subparsers(dest="guard_cmd", metavar="{install,uninstall,test}")
-    gsub.add_parser("install", help="add guard and automatic checkpoint hooks to Claude Code")
-    gsub.add_parser("uninstall", help="remove the guard hook from Claude Code settings.json")
+    gsub.add_parser("install", help="add guard and checkpoint hooks for one agent, or for every "
+                                    "agent that has a config folder (`--agent all`)")
+    gsub.add_parser("uninstall", help="remove the RunLedger hooks from one agent's hook file "
+                                      "(or from every agent's)")
     gsub.add_parser("test", help="print the decision for one PreToolUse event (JSON)")
     p.print_help()
 
@@ -794,9 +798,9 @@ def cmd_guard(args) -> int:
     agent = getattr(args, "agent", None)
     if args.guard_cmd == "install":
         return guard.cmd_install(args.project, args.global_scope,
-                                 portable=getattr(args, "portable", False))
+                                 portable=getattr(args, "portable", False), agent=agent)
     if args.guard_cmd == "uninstall":
-        return guard.cmd_uninstall(args.project, args.global_scope)
+        return guard.cmd_uninstall(args.project, args.global_scope, agent=agent)
     if args.guard_cmd == "test":
         return guard.cmd_test(args.event, agent)
     if sys.stdin is not None and sys.stdin.isatty():
@@ -972,16 +976,28 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="the agent this hook belongs to: claude-code (default), droid or codex; "
                          "an unknown value is reported on stderr and never blocks the call")
     gsub = pg.add_subparsers(dest="guard_cmd", metavar="{install,uninstall,test}")
-    pgi = gsub.add_parser("install", help="add guard and automatic checkpoint hooks to Claude Code")
+    pgi = gsub.add_parser("install", help="add the guard and checkpoint hooks for one agent "
+                                          "(or for every agent with a config folder)")
+    pgi.add_argument("--agent", choices=GUARD_AGENT_CHOICES, default="claude-code",
+                     help="the agent to install for: claude-code (default), droid, codex, or all "
+                          "of them (each only where its config folder exists)")
     scope = pgi.add_mutually_exclusive_group()
-    scope.add_argument("--project", metavar="PATH", help="project folder: writes PATH/.claude/settings.json (default: current folder)")
-    scope.add_argument("--global", dest="global_scope", action="store_true", help="writes ~/.claude/settings.json")
+    scope.add_argument("--project", metavar="PATH", help="project folder: writes PATH/.claude/settings.json, "
+                                                         "PATH/.factory/hooks.json or PATH/.codex/hooks.json "
+                                                         "(default: current folder)")
+    scope.add_argument("--global", dest="global_scope", action="store_true",
+                       help="writes the agent's own hook file (~/.claude/settings.json, ~/.factory/hooks.json, "
+                            "~/.codex/hooks.json, or the folder its environment variable names)")
     pgi.add_argument("--portable", action="store_true",
                      help="write bare 'runledger ...' hook commands instead of the current Python interpreter path")
-    pgu = gsub.add_parser("uninstall", help="remove the guard hook from Claude Code settings.json")
+    pgu = gsub.add_parser("uninstall", help="remove the RunLedger hooks from one agent's hook file")
+    pgu.add_argument("--agent", choices=GUARD_AGENT_CHOICES, default="claude-code",
+                     help="the agent to remove the hooks for: claude-code (default), droid, codex or all")
     uscope = pgu.add_mutually_exclusive_group()
-    uscope.add_argument("--project", metavar="PATH", help="project folder: edits PATH/.claude/settings.json (default: current folder)")
-    uscope.add_argument("--global", dest="global_scope", action="store_true", help="edits ~/.claude/settings.json")
+    uscope.add_argument("--project", metavar="PATH", help="project folder: edits that agent's hook file there "
+                                                          "(default: current folder)")
+    uscope.add_argument("--global", dest="global_scope", action="store_true",
+                        help="edits the agent's own hook file, resolved the same way as for install")
     pgt = gsub.add_parser("test", help="print the decision for one PreToolUse event (JSON)")
     pgt.add_argument("event", help="the event as a JSON object")
     pgt.add_argument("--agent", metavar="AGENT", choices=GUARD_AGENTS,

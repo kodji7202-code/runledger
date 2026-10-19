@@ -21,37 +21,69 @@ Contents:
 ## Install and test
 
 ```bash
-runledger guard install                  # this project (see project root below): writes <project root>/.claude/settings.json
-runledger guard install --project PATH   # the project at PATH instead of the current folder
-runledger guard install --global         # every project: writes ~/.claude/settings.json
-runledger guard install --portable       # write bare "runledger ..." commands instead of "<python>" -m runledger ...
-runledger guard uninstall                # remove it from this project (also --project PATH, --global)
-runledger guard test 'EVENT_JSON'        # print the decision for one event; writes no log
+runledger guard install                    # Claude Code, this project: <project root>/.claude/settings.json
+runledger guard install --agent droid      # Factory Droid: <project root>/.factory/hooks.json
+runledger guard install --agent codex      # Codex CLI: <project root>/.codex/hooks.json
+runledger guard install --agent all        # every agent above, each only where it can be installed
+runledger guard install --project PATH     # the project at PATH instead of the current folder
+runledger guard install --global           # the agent's own file (table below) instead of the project's
+runledger guard install --portable         # write bare "runledger ..." commands instead of "<python>" -m runledger ...
+runledger guard uninstall [--agent A]      # remove it again (also --project PATH, --global)
+runledger guard test [--agent A] 'EVENT'   # print the decision for one event; writes no log
 ```
 
-`install` adds one entry to `hooks.PreToolUse`, with matcher `*`, command
-`"<sys.executable>" -m runledger guard` (or bare `runledger guard` with `--portable`) and a
-`timeout`. It also adds `"<sys.executable>" -m runledger checkpoint --hook` (or bare
-`runledger checkpoint --hook` with `--portable`) to `SessionStart` and `UserPromptSubmit`
-so each run and prompt gets a rollback point. Using the current Python interpreter path by default
-means the hook works even when `runledger` is installed in a virtual environment that is not on the
-`PATH` Claude Code starts with, and when the interpreter path contains spaces.
-Without `--project`, the settings file is written at the project root, so installing from a
+Each agent reads its own hook file, and `--agent` picks it. `claude-code` is the default, so the
+command you already use installs exactly what it always did:
+
+| `--agent` | project file | global file | file structure |
+| --- | --- | --- | --- |
+| `claude-code` | `<project>/.claude/settings.json` | `~/.claude/settings.json`, or `CLAUDE_CONFIG_DIR` | events under `hooks` |
+| `droid` | `<project>/.factory/hooks.json` | `<factory dir>/hooks.json`: `FACTORY_HOME`, else `<FACTORY_HOME_OVERRIDE>/.factory`, else `~/.factory` | events at the top level, **no** `hooks` wrapper; never `settings.json` |
+| `codex` | `<project>/.codex/hooks.json` | `<CODEX_HOME>/hooks.json`, default `~/.codex/hooks.json` | events under `hooks` |
+
+`install` adds one entry to `PreToolUse`, with matcher `*` (`.*` for Codex, whose matcher is a
+regular expression on the tool name), the agent's command below and a `timeout`. It also adds
+`"<sys.executable>" -m runledger checkpoint --hook` (or bare `runledger checkpoint --hook` with
+`--portable`) to `SessionStart` and `UserPromptSubmit` so each run and prompt gets a rollback
+point. Using the current Python interpreter path by default means the hook works even when
+`runledger` is installed in a virtual environment that is not on the `PATH` the agent starts with,
+and when the interpreter path contains spaces. The command carries the agent explicitly:
+
+| Agent | Guard command the installer writes |
+| --- | --- |
+| Claude Code | `"<python>" -m runledger guard` |
+| Factory Droid | `"<python>" -m runledger guard --agent droid` |
+| Codex | `"<python>" -m runledger guard --agent codex` |
+
+Without `--project`, the hook file is written at the project root, so installing from a
 subfolder configures the whole project.
-After writing `settings.json`, `install` runs the configured hook command once with `{}` on stdin
-(timeout 15 seconds), from the project folder and with your environment exactly as it is, to verify
+After writing the file, `install` runs the configured hook command once with `{}` on stdin
+(timeout 15 seconds), from the project folder and with your environment exactly as it is, to check
 it exits `0`; it prints a warning if the command cannot be run or cannot start RunLedger there.
 These checkpoint hooks require Git, but no identity
 setup. They never block the agent and do not store prompt text in checkpoint metadata.
 See [rollback.md](rollback.md) for setup, privacy, retention, and undo.
 
+Two agents need one more step before the guard is live, and `install` says so:
+
+- **Factory Droid** snapshots its hooks at startup. Restart `droid`, or review the entries with
+  `/hooks`, or the new hooks are not loaded in the running session.
+- **Codex** runs only hooks you have trusted: open `codex`, run `/hooks` and trust the RunLedger
+  entries. Codex also cannot prompt from a hook, so a call the guard would `ask` about becomes a
+  `deny` there, with the reason why (`guard.codex_ask: "allow"` in your user file opts out). The
+  installer's self-test only shows that the command runs; it cannot see Codex's trust state, which
+  is why `runledger doctor` reports it as unverified.
+
 It keeps every other setting. Before it changes a file it copies the file to
-`settings.json.bak`, replacing any earlier backup. If the file already has a guard or checkpoint entry, its
+`settings.json.bak` (`hooks.json.bak` for Droid and Codex), replacing any earlier backup. If the
+file already has a guard or checkpoint entry, its
 command and timeout are updated in place and no second entry is added. If nothing would change, the file is not
 written. If the file is not valid JSON or is not an object, `install` stops with an error and
-changes nothing. Only the complete commands the installer writes count as RunLedger's, and they
+changes nothing. A hook file that exists but is empty, or carries a UTF-8 BOM, is accepted. Only
+the complete commands the installer writes count as RunLedger's, and they
 count only when the whole entry is that one command: `runledger guard` (optionally with a path or
-`.exe`) and `"<interpreter>" -m runledger guard`. `<interpreter>` is either the interpreter that
+`.exe`) and `"<interpreter>" -m runledger guard`, each optionally followed by `--agent
+claude-code|droid|codex`. `<interpreter>` is either the interpreter that
 runs `install` (it writes the literal `sys.executable`, so a renamed copy such as
 `agent-python.exe` is recognised too) or an interpreter name such as `python3.13t.exe`, `pythonw.exe`
 or `pypy3`, so an entry written by this installer is always recognised by a later `install`,
@@ -63,15 +95,22 @@ it.
 
 `uninstall` removes every complete `runledger guard` hook and both lifecycle checkpoint hooks (both interpreter-form
 and bare `--portable` entries) from the
-chosen settings file and keeps everything
+chosen hook file and keeps everything
 else, including other hooks in the same group, and hooks that merely mention the command. A group
 left empty is removed, and so are an empty
-event list and an empty `hooks` object. The file is copied to `settings.json.bak` first. If
+event list, an empty `hooks` object and, for Droid, an empty event at the top level. The file is
+copied to `<file>.bak` first. If
 there are no RunLedger hooks, the file is not written. Your policy files, checkpoints and `guard.log` stay where they
-are.
+are. Uninstalling an agent that has no hook file writes nothing and reports that.
 
-Choose one scope. Each settings file you install into gets its own entry, so installing in both
+Choose one scope. Each hook file you install into gets its own entry, so installing in both
 `~/.claude/settings.json` and a project's `.claude/settings.json` would check every call twice.
+
+`--agent all` installs for Claude Code, Droid and Codex. In a project it writes all three files.
+For a `--global` install it only touches agents that already have their config directory: it never
+creates `~/.factory` or `~/.codex` from nothing, and it names each skipped agent and why (Claude
+Code is always installed, as before). `guard uninstall --agent all` removes the RunLedger entries
+from every hook file that has them and creates nothing.
 
 When `runledger guard` is run interactively in a terminal (stdin is a TTY) with no subcommand, it
 prints the `guard` help text and exits with code `2` instead of waiting on stdin.
@@ -89,7 +128,7 @@ as well as any legacy subfolder `.runledger/guard.log` and de-duplicate identica
 
 **Hook timeout.** `install` writes the hook timeout as the approval wait plus 15 seconds: 135
 seconds with the default wait of 120 seconds. The hook must outlive the approval wait, or the
-answer arrives after Claude Code has stopped the hook. If you change `timeout_s`, run `install`
+answer arrives after the agent has stopped the hook. If you change `timeout_s`, run `install`
 again; it updates the existing entry. A project's own `timeout_s` is used when you install for that
 project. A `--global` install uses the wait from your user file.
 
@@ -113,10 +152,12 @@ receipt.
 
 ## Agents: Claude Code, Factory Droid and Codex
 
-Each installed guard hook carries an explicit `--agent claude-code|droid|codex`, so the guard
+Each installed guard hook carries an explicit `--agent claude-code|droid|codex` where the agent
+needs one: Droid and Codex store `--agent droid` and `--agent codex`, so the guard
 reads the call with that agent's vocabulary and answers in the shape the agent understands.
-Without the flag (an older Claude Code hook) the agent is inferred from the payload's own fields,
-and `claude-code` is the default, so Claude Code behaves exactly as before.
+Claude Code's hook is the unchanged `runledger guard` (no flag), because that payload is the
+default. Without the flag the agent is inferred from the payload's own fields, and `claude-code`
+is the default, so Claude Code behaves exactly as before.
 
 | Agent | Command | Hook output |
 | --- | --- | --- |
