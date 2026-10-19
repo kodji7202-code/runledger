@@ -974,6 +974,13 @@ def _log_check(root: str) -> Check:
         parts.append(f"{_guard.LOG_DIR}/ is not git-ignored: guard.log holds command summaries")
         fix = fix or (f"Add `{_guard.LOG_DIR}/` to .gitignore: the log holds command summaries "
                       f"you do not want to commit.")
+    elif ignored is None:
+        # Git could not answer (no work tree here, or no Git): the ignore rule was not checked,
+        # so an existing log is informational instead of a clean `ok` that never ran the check.
+        if status != WARN:
+            status = INFO
+        parts.append(f"Git could not check {_guard.LOG_DIR}/ against .gitignore here (outside a "
+                     f"Git work tree, or Git unavailable)")
     return Check("log", status, "guard log", f"{path}: " + "; ".join(parts), fix=fix)
 
 

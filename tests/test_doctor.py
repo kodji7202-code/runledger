@@ -825,12 +825,55 @@ def test_the_log_check_prints_no_command_text(tmp_path):
     assert "very/secret" not in text
 
 
-def test_a_log_outside_a_repo_does_not_crash(tmp_path):
-    proj = tmp_path / "proj"
+def test_a_log_outside_a_repo_is_info_with_its_counts_and_no_contents(tmp_path):
+    """VAL-DOCTOR-010: outside a Git work tree the ignore rule cannot be checked, so an existing
+    log is `info` - the size, the last decision and the recent-error count are still reported."""
+    proj = tmp_path / "plain"
+    proj.mkdir()
+    write_log(proj, [error_row(30),
+                     {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                      "session_id": "s", "tool": "Bash", "decision": "deny",
+                      "summary": "rm -rf /very/secret/path"}])
+
+    check = one(checks(proj), "log")
+    assert check.status == "info", check
+    assert "bytes" in check.detail and "last decision" in check.detail, check
+    assert "0 error row(s) in the last 7 days" in check.detail, check
+    assert "very/secret" not in check.detail
+    assert codes(checks(proj)) == 0
+    text = doctor.render_text(checks(proj))
+    assert "[info] guard log:" in text and "very/secret" not in text
+
+
+def test_recent_error_rows_outside_a_repo_still_warn(tmp_path):
+    """VAL-DOCTOR-010: the fail-open warning does not depend on Git being available."""
+    proj = tmp_path / "plain"
     proj.mkdir()
     write_log(proj, [error_row(0)])
+
     check = one(checks(proj), "log")
-    assert check.status in ("warn", "info", "ok"), check
+    assert check.status == "warn", check
+    assert "1 error row(s) in the last 7 days" in check.detail, check
+
+
+def test_doctor_json_outside_a_repo_gives_an_info_log_and_exits_zero(tmp_path, capsys):
+    """VAL-DOCTOR-010: the `info` log line does not raise the exit code of the run."""
+    proj = tmp_path / "plain"
+    proj.mkdir()
+    write_log(proj, [error_row(30)])
+
+    code = cli_main(["doctor", "--project", str(proj), "--offline", "--no-selftest", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    log = [c for c in payload["checks"] if c["id"] == "log"]
+    assert [c["status"] for c in log] == ["info"], payload
+    assert "bytes" in log[0]["detail"] and "0 error row(s)" in log[0]["detail"], log[0]
+    assert payload["summary"]["warn"] == 0, payload["summary"]
+    assert code == 0, payload
+
+    code = cli_main(["guard", "status", "--project", str(proj), "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert [c["status"] for c in payload["checks"] if c["id"] == "log"] == ["info"], payload
+    assert code == 0, payload
 
 
 # ---------------------------------------------------------------- VAL-DOCTOR-011
@@ -1573,6 +1616,66 @@ def test_a_malformed_approval_server_url_warns_instead_of_aborting(tmp_path, mon
     text = capsys.readouterr().out
     assert code == 1, text
     assert "[warn] approval server" in text, text
+
+
+# ---------------------------------------------------------------- VAL-DOCTOR-019
+
+DOC_PATH = Path(__file__).resolve().parents[1] / "docs" / "doctor.md"
+
+
+def doc_text_samples():
+    """Every line of every ```text block of docs/doctor.md."""
+    text = DOC_PATH.read_text(encoding="utf-8")
+    return [line for block in re.findall(r"```text\n(.*?)```", text, re.S)
+            for line in block.splitlines()]
+
+
+def report_head(line):
+    """`[ok] guard hooks claude-code project: ...` -> `guard hooks claude-code project`."""
+    match = re.match(r"^\[(?:ok|warn|fail|info|skip)\] ([^:]+): ", line)
+    return match.group(1) if match else None
+
+
+def without_agent(head):
+    return " ".join(word for word in head.split()
+                    if word not in AGENTS + ("project", "global"))
+
+
+def test_the_doc_never_labels_a_not_installed_hook_as_ok():
+    """VAL-DOCTOR-019: an uninstalled hook is `info` in the CLI, so the samples must say so."""
+    lines = [line for line in doc_text_samples() if "not installed" in line]
+    assert lines, "the doc should show a not-installed hook line"
+    assert [line for line in lines if not line.startswith("[info] ")] == []
+
+
+def test_doc_sample_lines_name_the_checks_the_report_really_prints(tmp_path):
+    """VAL-DOCTOR-019: the text report prints the check title (`guard log`), not its id."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    assert install(proj, "claude-code") == 0
+    assert install(proj, "codex") == 0
+    write_log(proj, [{"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                      "session_id": "s", "tool": "Bash", "decision": "deny", "reason": "x"}])
+
+    real = set()
+    for report in (checks(proj), doctor.run_guard_status(project=str(proj))):
+        for line in doctor.render_text(report).splitlines():
+            head = report_head(line)
+            if head:
+                real.add(without_agent(head))
+    assert {"install", "guard hooks", "guard notes", "guard log", "guard mode"} <= real, real
+
+    sampled = [without_agent(head) for head in map(report_head, doc_text_samples()) if head]
+    assert sampled, "the doc should show report lines"
+    assert [head for head in sampled if head not in real] == []
+
+
+def test_the_doc_says_the_log_check_cannot_check_git_outside_a_repo():
+    """VAL-DOCTOR-010/019: the `log` section explains the outside-Git `info` status."""
+    text = DOC_PATH.read_text(encoding="utf-8")
+    section = text.split("### `log`", 1)[1].split("### `rollback`", 1)[0]
+    assert re.search(r"outside a Git (work tree|repository)", section, re.I), section
+    assert "`info`" in section, section
 
 
 
