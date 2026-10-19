@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from runledger import adapters
+from runledger import adapters, doctor, hook_targets
 from runledger.adapters import codex
 from runledger.parser import Usage
 from runledger.pricing import apply_costs, cost_of, unknown_models
@@ -534,6 +534,27 @@ def test_find_sessions_missing_root_returns_empty(tmp_path, monkeypatch):
 def test_codex_home_defaults_to_user_profile(monkeypatch):
     monkeypatch.delenv("CODEX_HOME", raising=False)
     assert codex.codex_home() == Path.home() / ".codex"
+
+
+def test_codex_home_is_the_one_resolver_discovery_and_the_doctor_share(tmp_path, monkeypatch):
+    """GE-001 class / docs/agents.md: with HOME != USERPROFILE and no CODEX_HOME, discovery,
+    `guard install --global` and the doctor resolve one Codex directory."""
+    env_home = tmp_path / "env-home"
+    env_profile = tmp_path / "env-profile"
+    monkeypatch.setenv("HOME", str(env_home))
+    monkeypatch.setenv("USERPROFILE", str(env_profile))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+
+    assert codex.codex_home() == hook_targets.codex_dir() == env_home / ".codex"
+    assert doctor._agent_home("codex", str(tmp_path)) == str(env_home / ".codex")
+
+    mine = _rollout(env_home / ".codex" / "sessions" / "2026" / "10" / "19",
+                    [_meta_line(cwd="/work/demo")], name="rollout-2026-10-19T10-00-00-home.jsonl")
+    _rollout(env_profile / ".codex" / "sessions" / "2026" / "10" / "19",
+             [_meta_line(cwd="/work/demo")], name="rollout-2026-10-19T10-00-00-profile.jsonl")
+
+    assert codex.find_sessions("/work/demo") == [mine]
+    assert adapters.find_sessions(project="/work/demo", agent="codex") == [mine]
 
 
 # ---------------------------------------------------------------- robustness and old format

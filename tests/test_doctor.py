@@ -345,6 +345,12 @@ def commit_all(project, message="initial"):
                    capture_output=True)
 
 
+def untrack(project, path):
+    """Drop a path from the Git index, leaving the file on disk."""
+    subprocess.run(["git", "-C", str(project), "rm", "-q", "--cached", "--", path], check=True,
+                   capture_output=True)
+
+
 # ---------------------------------------------------------------- VAL-DOCTOR-007
 
 def test_selftest_runs_the_stored_command_for_each_installed_agent(tmp_path):
@@ -728,7 +734,6 @@ def test_a_log_that_is_not_git_ignored_warns(tmp_path):
     proj = git_init(tmp_path / "proj")
     write_log(proj, [{"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                       "session_id": "s", "tool": "Bash", "decision": "deny", "reason": "x"}])
-    commit_all(proj)
     check = one(checks(proj), "log")
     assert check.status == "warn", check
     assert "git-ignored" in check.detail or "gitignore" in check.detail.lower()
@@ -1337,5 +1342,159 @@ def test_the_doctor_lifecycle_before_install_after_install_and_broken_config(
                               [c for c in status["checks"]
                                if c["id"] == "guard.hooks" and c["agent"] == agent])
         assert status_state == doctor_state, agent
+
+
+# ---------------------------------------------------------------- scrutiny round 1 (GE-010..GE-015)
+
+def test_a_foreign_project_hook_is_not_self_tested_and_does_not_shadow_a_global_one(tmp_path):
+    """GE-010: a foreign project PreToolUse hook is neither run as RunLedger's self-test nor
+    reported as a RunLedger failure, and it does not hide a genuine global install."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    write_json(hook_file(proj, "claude-code"),
+               {"hooks": {"PreToolUse": [{"matcher": "*", "hooks": [
+                   {"type": "command", "command": "echo hi", "timeout": 135}]}]}})
+
+    found = checks(proj, selftest=True)
+    assert one(found, "guard.hooks", "claude-code", "project").status == "info"
+    assert pick(found, "guard.selftest") == [], [c.as_dict() for c in pick(found, "guard.selftest")]
+    assert codes(found) == 0
+
+    assert cli_main(["guard", "install", "--agent", "claude-code", "--global"]) == 0
+    found = checks(proj, selftest=True)
+    self_test = one(found, "guard.selftest", "claude-code")
+    assert "global" in self_test.detail, self_test
+    assert self_test.status == "ok", self_test
+    assert codes(found) == 0
+
+
+def test_a_broken_codex_windows_command_is_a_failure_and_posix_ignores_it(tmp_path, monkeypatch):
+    """GE-011: on Windows Codex runs `commandWindows`, so a broken override is a failure even
+    though `command` is healthy; on POSIX `command` stays the one that counts."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    assert install(proj, "codex") == 0
+    path = hook_file(proj, "codex")
+    data = read_json(path)
+    data["hooks"]["PreToolUse"][0]["hooks"][0]["commandWindows"] = 'cmd /c "exit 1"'
+    write_json(path, data)
+
+    monkeypatch.setattr(doctor, "_IS_WINDOWS", True, raising=False)
+    broken = one(checks(proj), "guard.hooks", "codex", "project")
+    assert broken.status == "fail", broken
+    assert "commandWindows" in broken.detail
+    assert codes(checks(proj)) == 2
+
+    monkeypatch.setattr(doctor, "_IS_WINDOWS", False, raising=False)
+    assert one(checks(proj), "guard.hooks", "codex", "project").status == "ok"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Codex runs commandWindows on Windows only")
+def test_the_self_test_runs_the_codex_windows_override(tmp_path):
+    """GE-011: the self-test runs the command Codex actually runs there."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    assert install(proj, "codex") == 0
+    path = hook_file(proj, "codex")
+    data = read_json(path)
+    data["hooks"]["PreToolUse"][0]["hooks"][0]["commandWindows"] = 'cmd /c "exit 1"'
+    write_json(path, data)
+
+    check = one(checks(proj, selftest=True), "guard.selftest", "codex")
+    assert check.status == "fail", check
+    assert "exit code 1" in check.detail, check
+
+
+def test_a_global_hook_timeout_is_compared_with_the_project_approval_wait(tmp_path):
+    """GE-012: the running global hook reads the project's `guard.approval.timeout_s`, so the
+    global hook's timeout must be compared with that wait, not with the default one."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    assert cli_main(["guard", "install", "--agent", "claude-code", "--global"]) == 0
+    write_json(project_policy_file(proj), {"guard": {"approval": {"timeout_s": 300}}})
+
+    check = one(checks(proj), "guard.hooks", "claude-code", "global")
+    assert check.status == "warn", check
+    assert "315" in check.detail, check
+
+
+def test_a_tracked_guard_log_warns_even_after_an_ignore_rule(tmp_path):
+    """GE-013: an ignore rule does not untrack the log; its command summaries stay publishable."""
+    proj = git_init(tmp_path / "proj")
+    write_log(proj, [{"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                      "session_id": "s", "tool": "Bash", "decision": "deny", "reason": "x"}])
+    commit_all(proj)
+    (proj / ".gitignore").write_text(".runledger/\n", encoding="utf-8")
+
+    check = one(checks(proj), "log")
+    assert check.status == "warn", check
+    assert "tracked" in check.detail, check
+    assert codes(checks(proj)) == 1
+
+    untrack(proj, ".runledger/guard.log")
+    clean = one(checks(proj), "log")
+    assert clean.status == "ok", clean
+
+
+@pytest.mark.parametrize("content", ["", "   \n\t\n"])
+def test_an_empty_or_whitespace_only_config_file_is_a_failure(tmp_path, content):
+    """GE-014: an empty file holds no JSON object, so it is a config failure, not a valid one."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    path = isolated_home(tmp_path) / ".runledger" / "config.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+    failing = [c for c in pick(checks(proj), "config") if c.status == "fail"]
+    assert len(failing) == 1, [c.as_dict() for c in pick(checks(proj), "config")]
+    assert "config.json" in failing[0].detail
+    assert failing[0].fix
+    assert codes(checks(proj)) == 2
+
+
+def test_a_non_utf8_config_file_is_a_failure_not_a_crash(tmp_path, capsys):
+    """GE-014: a UTF-16 config (an ordinary PowerShell redirection) is diagnosed, never raised."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    path = isolated_home(tmp_path) / ".runledger" / "config.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes('{"guard": {"fail_closed": true}}'.encode("utf-16"))
+
+    failing = [c for c in pick(checks(proj), "config") if c.status == "fail"]
+    assert len(failing) == 1, [c.as_dict() for c in pick(checks(proj), "config")]
+    assert "UTF-8" in failing[0].detail
+    assert codes(checks(proj)) == 2
+
+    code = cli_main(["doctor", "--project", str(proj), "--offline", "--no-selftest", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 2, payload
+    assert [c for c in payload["checks"] if c["id"] == "config" and c["status"] == "fail"]
+
+
+def test_a_malformed_approval_server_url_warns_instead_of_aborting(tmp_path, monkeypatch, capsys):
+    """GE-015: a server URL without a scheme is a warning with the fallback guidance, not a crash."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    monkeypatch.setenv("RUNLEDGER_SERVER", "approver.example")
+
+    code = cli_main(["doctor", "--project", str(proj), "--no-selftest", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    approval = [c for c in payload["checks"] if c["id"] == "approval"][0]
+    assert approval["status"] == "warn", approval
+    assert "on_timeout" in approval["detail"], approval
+    assert code == 1, payload
+
+    code = cli_main(["guard", "status", "--project", str(proj), "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    approval = [c for c in payload["checks"] if c["id"] == "approval"][0]
+    assert approval["status"] == "warn", approval
+    assert "on_timeout" in approval["detail"], approval
+    assert code == 1, payload
+
+    code = cli_main(["doctor", "--project", str(proj), "--no-selftest"])
+    text = capsys.readouterr().out
+    assert code == 1, text
+    assert "[warn] approval server" in text, text
+
 
 

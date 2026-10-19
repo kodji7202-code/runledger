@@ -55,6 +55,9 @@ LOG_ERROR_DAYS = 7
 HEALTH_TIMEOUT_S = 3.0
 SELFTEST_TIMEOUT_S = 10.0
 DETAIL_HEAD = 200
+# Codex runs the `commandWindows` copy of a stored command on Windows and `command` everywhere
+# else, so the platform decides which one doctor inspects and self-tests.
+_IS_WINDOWS = sys.platform == "win32"
 
 PROJECT_POLICY_FILE = ".runledger.json"
 # The top-level keys each file may carry; anything else is reported as unknown (info).
@@ -249,19 +252,19 @@ def _command_issues(entry: Dict[str, Any], agent: str, scope: str, path: Path,
     scope_flag = "--global" if scope == "global" else f"--project {path.parent.parent}"
     reinstall = (f"Re-run `runledger guard install --agent {agent} {scope_flag}` "
                  f"to rewrite the entry.")
-    if _paths.is_runledger_executable(parts[0]):
-        if not shutil.which(parts[0]):
-            issues.append((WARN, f"the hook command {command!r} depends on PATH and "
-                                 f"`{parts[0]}` was not found on it",
-                           f"Re-run `runledger guard install --agent {agent} {scope_flag}` "
-                           f"without `--portable`, or add `{parts[0]}` to PATH."))
-    else:
-        interpreter = parts[0]
-        if not (Path(interpreter).is_absolute() and Path(interpreter).exists()) \
-                and not shutil.which(interpreter):
-            issues.append((FAIL, f"the hook command interpreter {interpreter!r} does not exist",
+    issues.extend(_interpreter_issues(parts, command, agent, scope_flag, reinstall))
+    windows = _windows_override(agent, entry)
+    if windows is not None:
+        windows_parts = _windows_command_parts(windows)
+        if windows_parts is None:
+            issues.append((FAIL, f"the `commandWindows` value {windows!r} is not a RunLedger "
+                                 f"guard command: on Windows Codex would run that instead",
                            reinstall))
-    wait = _guard.approval_timeout(project_policy if scope == "project" else {}, user)
+        else:
+            issues.extend(_interpreter_issues(windows_parts, windows, agent, scope_flag, reinstall))
+    # The hook runs inside the project, so its effective approval wait is the project's,
+    # for a global entry too (guard.py reads the same policy at run time).
+    wait = _guard.approval_timeout(project_policy, user)
     required = _guard.hook_timeout_for(wait)
     timeout = entry.get("timeout")
     if not _is_number(timeout) or float(timeout) < required:
@@ -269,6 +272,48 @@ def _command_issues(entry: Dict[str, Any], agent: str, scope: str, path: Path,
                              f"{required}s: the agent would run the tool before an approval "
                              f"answers", reinstall))
     return issues
+
+
+def _interpreter_issues(parts: Sequence[str], command: str, agent: str, scope_flag: str,
+                        reinstall: str) -> List[Tuple[str, str, str]]:
+    """What is wrong with the interpreter one stored guard command starts with."""
+    if _paths.is_runledger_executable(parts[0]):
+        if not shutil.which(parts[0]):
+            return [(WARN, f"the hook command {command!r} depends on PATH and "
+                           f"`{parts[0]}` was not found on it",
+                     f"Re-run `runledger guard install --agent {agent} {scope_flag}` "
+                     f"without `--portable`, or add `{parts[0]}` to PATH.")]
+        return []
+    interpreter = parts[0]
+    if not (Path(interpreter).is_absolute() and Path(interpreter).exists()) \
+            and not shutil.which(interpreter):
+        return [(FAIL, f"the hook command interpreter {interpreter!r} does not exist", reinstall)]
+    return []
+
+
+_CMD_C = re.compile(r"^\s*cmd(?:\.exe)?\s+/c(?:\s+|$)", re.IGNORECASE)
+
+
+def _windows_override(agent: str, entry: Dict[str, Any]) -> Optional[str]:
+    """The `commandWindows` string Codex runs on Windows instead of `command`, when stored."""
+    if agent != AGENT_CODEX or not _IS_WINDOWS:
+        return None
+    value = entry.get("commandWindows")
+    return value if isinstance(value, str) and value.strip() else None
+
+
+def _windows_command_parts(value: str) -> Optional[List[str]]:
+    """The RunLedger words of a stored `commandWindows` value, else None.
+
+    The installer writes `cmd /c "<command>"`; the same command wrapped without the inner
+    quotes (`cmd /c <command>`) is what Codex runs there too, so it counts as ours as well."""
+    text = value.strip()
+    prefix = _CMD_C.match(text)
+    if prefix:
+        text = text[prefix.end():].strip()
+        if len(text) >= 2 and text[0] == '"' and text[-1] == '"':
+            text = text[1:-1]
+    return _guard._owned_command_parts(text)
 
 
 def _is_number(value: Any) -> bool:
@@ -298,18 +343,8 @@ def _hook_files(root: str, agent: str) -> List[Path]:
 
 def _guard_entries_in(path: Path, agent: str) -> List[Dict[str, Any]]:
     """The stored RunLedger guard hook entries of one file; unreadable files give []."""
-    try:
-        data = json.loads(path.read_text(encoding="utf-8-sig"))
-    except (OSError, ValueError):
-        return []
-    if not isinstance(data, dict):
-        return []
-    wrap = hook_targets.WRAP_KEY[agent]
-    events = data if wrap is None else data.get(wrap)
-    if not isinstance(events, dict):
-        return []
-    return [h for group in _groups(events, "PreToolUse")
-            for h in _entries(group) if _guard._is_guard_hook(h)]
+    return [entry for entry, _ in _pre_tool_use_entries(path, agent)
+            if _guard._is_guard_hook(entry)]
 
 
 def _note_checks(root: str, agents: Sequence[str]) -> List[Check]:
@@ -406,27 +441,47 @@ def _selftest_checks(root: str, agents: Sequence[str], user: Dict[str, Any]) -> 
 def _stored_command(root: str, agent: str) -> Optional[Tuple[str, str]]:
     """`(command, scope)` of the PreToolUse hook the agent would run for a tool call.
 
-    RunLedger's own guard entry comes first. A file whose guard entry was hand-edited no longer
+    RunLedger's own guard entry comes first, and for Codex the `commandWindows` copy is the
+    command that agent runs on Windows. A file whose guard entry was hand-edited no longer
     matches the installed shape, so any entry the agent would run for every tool is used
-    instead: the self-test has to see exactly what the agent will see."""
+    instead - but only in a file that still stores RunLedger's own hooks: a foreign PreToolUse
+    hook is never run as the guard's self-test, and it never hides a RunLedger entry that is
+    installed in another scope."""
     for scope in SCOPES:
         path = Path(hook_targets.target_for(agent, root, global_scope=(scope == "global")).path)
         entries = _pre_tool_use_entries(path, agent)
         if not entries:
             continue
-        own = [e for e, _ in entries if _guard._is_guard_hook(e)]
-        chosen = own or [e for e, matcher in entries if matcher in ("", "*", ".*")]
-        if not chosen:
-            chosen = [e for e, _ in entries]
+        chosen = [e for e, _ in entries if _guard._is_guard_hook(e)]
+        if not chosen and _holds_runledger_hooks(path, agent):
+            chosen = [e for e, matcher in entries if matcher in ("", "*", ".*")]
+            if not chosen:
+                chosen = [e for e, _ in entries]
         for entry in chosen:
             command = entry.get("command")
             if isinstance(command, str) and command.strip():
-                return command, scope
+                return _windows_override(agent, entry) or command, scope
     return None
+
+
+def _holds_runledger_hooks(path: Path, agent: str) -> bool:
+    """True when that agent's file still stores a RunLedger hook of its own (a guard or a
+    checkpoint entry): the evidence the edited-hook fallback needs before running an entry
+    that no longer matches the installed shape."""
+    for event in ("PreToolUse",) + CHECKPOINT_EVENTS:
+        for entry, _ in _stored_entries(path, agent, event):
+            if _guard._is_guard_hook(entry) or _rollback.is_checkpoint_hook(entry):
+                return True
+    return False
 
 
 def _pre_tool_use_entries(path: Path, agent: str) -> List[Tuple[Dict[str, Any], str]]:
     """`(entry, matcher)` for every command entry of that agent's PreToolUse section."""
+    return _stored_entries(path, agent, "PreToolUse")
+
+
+def _stored_entries(path: Path, agent: str, event: str) -> List[Tuple[Dict[str, Any], str]]:
+    """`(entry, matcher)` for every command entry of one event section; unreadable gives []."""
     try:
         data = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
@@ -438,7 +493,7 @@ def _pre_tool_use_entries(path: Path, agent: str) -> List[Tuple[Dict[str, Any], 
     if not isinstance(events, dict):
         return []
     out: List[Tuple[Dict[str, Any], str]] = []
-    for group in _groups(events, "PreToolUse"):
+    for group in _groups(events, event):
         matcher = group.get("matcher") if isinstance(group, dict) else None
         for entry in _entries(group):
             if isinstance(entry, dict) and isinstance(entry.get("command"), str):
@@ -566,15 +621,21 @@ def _permission_decision(out: str) -> Optional[str]:
 # ---------------------------------------------------------------- config
 
 def _read_config(path: Path) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """`(data, error)`. A missing file is `(None, None)`; a broken one carries the position."""
+    """`(data, error)`. A missing file is `(None, None)`; a broken one carries the reason."""
     if not path.exists():
         return None, None
     try:
-        text = path.read_text(encoding="utf-8-sig")
+        raw = path.read_bytes()
     except OSError as exc:
         return None, f"cannot read {path}: {exc}"
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        return None, (f"{path} is not UTF-8 text ({_one_line(exc)}); the guard and the receipts "
+                      f"read it as UTF-8, so re-save it (a UTF-16 file comes from a shell "
+                      f"redirection)")
     if not text.strip():
-        return {}, None
+        return None, f"{path} is empty: it holds no JSON object"
     try:
         data = json.loads(text)
     except ValueError as exc:
@@ -596,7 +657,8 @@ def _config_entry(kind: str, path: Path, known: Sequence[str], data: Dict[str, A
     parsed, error = _read_config(path)
     if error:
         return Check("config", FAIL, "config", error,
-                     f"Fix {path} (invalid JSON is ignored by the guard and the receipts).")
+                     f"Fix or remove {path}: the guard and the receipts read it as UTF-8 JSON "
+                     f"and ignore it while it is not.")
     if parsed is None:
         return Check("config", INFO, "config", f"no {kind} config file ({path})")
     # A project file may only tighten the guard, so what it tries to loosen is reported;
@@ -772,10 +834,13 @@ def _url_parts(server: str) -> Tuple[str, str]:
 
 
 def _health_get(server: str) -> Tuple[bool, str]:
-    """An unauthenticated `GET <server>/health` with a 3 s timeout. No key is ever sent."""
+    """An unauthenticated `GET <server>/health` with a 3 s timeout. No key is ever sent.
+
+    Building the request is part of the handled path: a server setting that urllib cannot
+    turn into a URL (`approver.example`, no scheme) is an unreachable server, not a crash."""
     url = server.rstrip("/") + "/health"
-    request = urllib.request.Request(url, method="GET")
     try:
+        request = urllib.request.Request(url, method="GET")
         with urllib.request.urlopen(request, timeout=HEALTH_TIMEOUT_S) as response:
             code = int(getattr(response, "status", 0) or 0)
             return (200 <= code < 300), str(code)
@@ -831,27 +896,44 @@ def _log_check(root: str) -> Check:
         parts.append("a hook error fails the call open")
         fix = (f"Read the error rows in {_guard.LOG_DIR}/{_guard.LOG_FILE} and remove what "
                f"breaks the hook.")
-    ignored = _log_ignored(root)
-    if ignored is False:
+    tracked = _log_tracked(root)
+    ignored = None if tracked else _log_ignored(root)
+    if tracked:
+        status = WARN
+        parts.append("guard.log is tracked by Git: its command summaries are committed and "
+                     "would be published even though an ignore rule may cover the path")
+        fix = fix or (f"Run `git rm --cached {_guard.LOG_DIR}/{_guard.LOG_FILE}` to untrack the "
+                      f"log (keep it on disk), and keep `{_guard.LOG_DIR}/` in .gitignore.")
+    elif ignored is False:
         status = WARN
         parts.append(f"{_guard.LOG_DIR}/ is not git-ignored: guard.log holds command summaries")
-        if not fix:
-            fix = (f"Add `{_guard.LOG_DIR}/` to .gitignore: the log holds command summaries "
-                   f"you do not want to commit.")
+        fix = fix or (f"Add `{_guard.LOG_DIR}/` to .gitignore: the log holds command summaries "
+                      f"you do not want to commit.")
     return Check("log", status, "guard log", f"{path}: " + "; ".join(parts), fix=fix)
 
 
 def _log_ignored(root: str) -> Optional[bool]:
     """True when `.runledger/guard.log` is git-ignored, False when it is not, None outside a repo."""
+    return _git_answers(root, ["check-ignore", "--no-index", "-q", "--",
+                               f"{_guard.LOG_DIR}/{_guard.LOG_FILE}"])
+
+
+def _log_tracked(root: str) -> Optional[bool]:
+    """True when `.runledger/guard.log` is in the Git index, False when it is not, None outside.
+
+    An ignore rule does not untrack a file: a log committed before `.gitignore` was added stays
+    tracked, keeps recording every later change and can still be published."""
+    return _git_answers(root, ["ls-files", "--error-unmatch", "--",
+                               f"{_guard.LOG_DIR}/{_guard.LOG_FILE}"])
+
+
+def _git_answers(root: str, argv: Sequence[str]) -> Optional[bool]:
+    """`git -C root <argv>`: True on exit 0, False on exit 1, None when Git cannot tell."""
     if not shutil.which("git"):
         return None
     env = dict(os.environ, GIT_OPTIONAL_LOCKS="0")
-    # `--no-index` answers "do the ignore rules match this path?", even after the log was
-    # committed by an older run that predates the .gitignore entry.
     try:
-        proc = subprocess.run(["git", "-C", root, "check-ignore", "--no-index", "-q", "--",
-                               f"{_guard.LOG_DIR}/{_guard.LOG_FILE}"],
-                              capture_output=True, env=env, timeout=20)
+        proc = subprocess.run(["git", "-C", root, *argv], capture_output=True, env=env, timeout=20)
     except (OSError, subprocess.SubprocessError):
         return None
     if proc.returncode == 0:

@@ -55,8 +55,12 @@ _PATCH_KIND = {"Add File": "add", "Update File": "update", "Delete File": "delet
 # ---------------------------------------------------------------- locating files
 
 def codex_home() -> Path:
-    base = os.environ.get("CODEX_HOME")
-    return Path(base).expanduser() if base else Path.home() / ".codex"
+    """The Codex config directory: `$CODEX_HOME` when set, else `<home>/.codex`.
+
+    Discovery, `guard install --global` and the doctor resolve it through the one resolver in
+    `hook_targets`, so a HOME that differs from USERPROFILE cannot split them (docs/agents.md)."""
+    from ..hook_targets import codex_dir
+    return codex_dir()
 
 
 def detect(path: Path) -> bool:

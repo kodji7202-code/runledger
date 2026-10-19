@@ -148,6 +148,37 @@ change behavior, so read the entry before you upgrade.
 
 ### Fixed
 
+- **Claude Code and Codex discovery resolve one home directory (`runledger.parser`,
+  `runledger.adapters.codex`):** with `CLAUDE_CONFIG_DIR` and `CODEX_HOME` unset, session
+  discovery used Python's home (`USERPROFILE` on Windows) while `guard install --global` and
+  `runledger doctor` used `HOME`, so `runledger list` and `runledger receipt` read a different
+  agent folder than the one a global install wrote to and the doctor named. Both now resolve the
+  directory through the same helper the Droid adapter uses - the user home is `HOME`, then
+  `USERPROFILE`, then Python's own home - which `docs/agents.md` documents.
+- **`runledger doctor` inspects what the agents actually run (`runledger.doctor`):** the self-test
+  no longer executes a foreign PreToolUse hook. A project that stores its own hook (an `echo hi`
+  preflight, say) but nothing of RunLedger's is neither run nor reported as a RunLedger failure,
+  and that hook no longer hides a genuine global install: doctor keeps looking through the scopes
+  and self-tests the RunLedger entry it finds. A hand-edited entry inside a file that still holds
+  RunLedger's own guard or checkpoint hooks is still run, as before. For Codex, the
+  `commandWindows` copy - the command Codex runs on Windows - is now the value doctor inspects and
+  self-tests, so a stale or broken override is a `fail` even when the plain `command` is healthy
+  (on the other platforms `command` stays the one that counts). The hook-timeout comparison uses
+  the project's `guard.approval.timeout_s` for a global hook as well, because that hook reads the
+  project policy when it runs: a 135 s global hook in a project that sets `timeout_s: 300` is now
+  a `warn` (exit 1) instead of `ok`.
+- **`doctor` fails cleanly on a broken config or approval URL (`runledger.doctor`):** a config file
+  that is empty or holds only whitespace is a `config` failure (exit 2) instead of a silently valid
+  empty file, and a config that is not UTF-8 JSON - a UTF-16 `~/.runledger/config.json` written by
+  an ordinary PowerShell redirection - names the encoding instead of ending the run in an uncaught
+  `UnicodeDecodeError`. A malformed approval server URL such as `approver.example` (no scheme) is
+  a `warn` that names the unusable server and the `on_timeout` fallback, in the text report, in
+  `--json` and in `guard status`, instead of aborting the whole report with a generic error.
+- **A tracked `guard.log` warns even after an ignore rule (`runledger.doctor`):** the `log` check
+  now asks the Git index as well, so a `guard.log` that was committed before `.runledger/` was
+  added to `.gitignore` is reported as tracked - its command summaries stay in the repository and
+  would be published - with `git rm --cached` as the fix. `git check-ignore` alone reported that
+  file as safely ignored. An untracked log under an ignore rule stays `ok`.
 - **Droid discovery and global installation resolve one Factory directory (`runledger.adapters.droid`):**
   with `FACTORY_HOME` and `FACTORY_HOME_OVERRIDE` unset, session discovery used Python's home
   (`USERPROFILE` on Windows) while `guard install --global --agent droid` and `runledger doctor`

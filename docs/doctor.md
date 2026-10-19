@@ -121,10 +121,11 @@ that agent's hook file and reports:
 | Guard hook, `SessionStart` and `UserPromptSubmit` checkpoint hooks present | `ok` | the file and the entries found |
 | A hook is missing (for example a hand-deleted `SessionStart` entry) | `warn` | what is missing and how to rewrite it |
 | The same file runs the guard twice | `warn` | the duplicate entries |
-| Hook `timeout` smaller than the approval wait needs | `warn` | the agent would run the tool before the approval answers; re-run `guard install` |
+| Hook `timeout` smaller than the approval wait needs | `warn` | the agent would run the tool before the approval answers; re-run `guard install`. The wait is the project's `guard.approval.timeout_s` when it sets one, for a global hook too: the hook reads the project's file when it runs |
 | A `--portable` command (`runledger guard`) and `runledger` is not on `PATH` | `warn` | the hook depends on `PATH`; reinstall without `--portable` or add it to `PATH` |
 | The hook command's interpreter path does not exist | `fail` | the interpreter that is missing; re-run `guard install` |
 | The file is not valid JSON | `fail` | the file and the line and column of the parse error |
+| Codex, on Windows: the entry's `commandWindows` is not a RunLedger command, or its interpreter does not exist | `fail` | that copy is the command Codex runs on Windows, not `command` |
 
 ### `guard.note` (Codex trust, Droid restart)
 
@@ -148,6 +149,14 @@ start, exits non-zero, prints something else, or fails to deny the destructive c
 detail then carries what was observed: exit code, stdout and stderr (truncated). A hook edited to
 exit `1`, to print garbage or to allow everything is caught here.
 
+What is run belongs to RunLedger: the installed guard entry, or - when that entry was hand-edited
+out of the installed shape - another entry the agent runs for every tool, but only in a file that
+still holds RunLedger's own guard or checkpoint hooks. A foreign project hook (someone else's
+`echo` preflight) is never executed here and never reported as a RunLedger failure, and it does
+not hide a RunLedger entry installed in another scope: doctor keeps looking and self-tests that
+one. For Codex, the `commandWindows` copy is the command Codex runs on Windows, so that is the
+one doctor runs there; on macOS and Linux Codex runs `command`, and so does doctor.
+
 The run is isolated: a temporary working directory, temporary `HOME`/`USERPROFILE`, temporary
 agent config folders, no `RUNLEDGER_SERVER` and no API key variables, so a `monitor` mode or an
 empty deny list in your own config cannot make it fail, no `.runledger` folder or log row appears
@@ -163,6 +172,9 @@ Two lines: your user file (`$RUNLEDGER_CONFIG`, else `~/.runledger/config.json`)
 - No file: `info`.
 - Not valid JSON: `fail`, with the file, the parse error and its line and column. The guard and
   the receipts ignore that file, so this is worth fixing before you trust your own rules.
+- Empty, or only whitespace: `fail` (the file holds no JSON object). A file that is not UTF-8
+  JSON is a `fail` too and says so: a config written as UTF-16 - an ordinary PowerShell `>`
+  redirection - is read as UTF-8 by the guard and the receipts, which then ignore it.
 - Unknown top-level keys: `info`, listing them.
 - Invalid rule entries or regexes (dropped as unsafe or mistyped): `warn`, with a count.
 - Project settings the guard ignores (`guard.mode: "monitor"`, a project-only approval server,
@@ -180,6 +192,7 @@ project file.
 | No server configured | `info` (the guard decides locally) |
 | Server reachable (`GET /health` answers 2xx) | `ok` |
 | Server configured but unreachable | `warn`: the guard then follows `on_timeout` for an ask |
+| The server setting is not a usable URL (`approver.example`, no scheme) | `warn`: the same `on_timeout` line, naming what urllib rejected; the rest of the report is unaffected |
 | `http://` on a non-loopback host | `warn`: cleartext would expose the approval key; use https |
 | `--offline` | `info` (or the cleartext `warn`); no request is made |
 
@@ -193,8 +206,11 @@ report by that much at most.
 and how many `decision: "error"` rows are from the last 7 days. Recent error rows mean the guard
 failed open on those calls, so they are a `warn`; older errors do not warn. When `.runledger/` is
 not covered by `.gitignore`, the check warns that `guard.log` holds command summaries you may not
-want to commit. No log yet is `info`. The check counts rows and never prints their contents, so no
-command text from the log appears in the report.
+want to commit. A log that is in the Git index warns as well, even when an ignore rule covers it:
+a file committed before the rule was added keeps recording every change and stays publishable, so
+the fix is `git rm --cached .runledger/guard.log` (which leaves it on disk). No log yet is `info`.
+The check counts rows and never prints their contents, so no command text from the log appears in
+the report.
 
 ### `rollback`
 
