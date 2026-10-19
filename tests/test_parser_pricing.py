@@ -324,6 +324,18 @@ def test_default_user_file_and_env_precedence(tmp_path, monkeypatch):
     assert load_prices()[("gpt", "6.1-sol")] == (3, 4, 0)
 
 
+def test_a_prices_file_with_a_utf8_bom_is_read(tmp_path, monkeypatch, capsys):
+    """A file written by a Windows editor or `Set-Content -Encoding UTF8` carries a BOM; the
+    rest of RunLedger's config readers tolerate one, and so does the price table."""
+    path = tmp_path / "prices.json"
+    path.write_bytes(json.dumps({
+        "gpt:6.1-sol": {"input": 5, "output": 6, "cache_read": 0},
+    }).encode("utf-8-sig"))
+    monkeypatch.setenv("RUNLEDGER_PRICES", str(path))
+    assert load_prices()[("gpt", "6.1-sol")] == (5, 6, 0)
+    assert capsys.readouterr().err == ""
+
+
 def test_custom_non_claude_prices_normalize_and_apply(tmp_path, monkeypatch):
     path = tmp_path / "prices.json"
     # Synthetic test rates, not published model prices.
