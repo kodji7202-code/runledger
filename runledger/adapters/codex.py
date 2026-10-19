@@ -483,7 +483,8 @@ def _code_mode_calls(source: str) -> List[Tuple[str, Dict[str, Any]]]:
     tool name of the shell that ran it. Only real calls count: the same text in a comment or a
     string is an example, not a call. A call whose arguments are not static is left out, so a
     script with no readable call keeps its single opaque step. A source the scanner cannot read
-    to the end is searched as raw text instead: over-reporting a call is safer than hiding one."""
+    to the end, or one whose `/` it will not classify (a regular expression or a division), is
+    searched as raw text instead: over-reporting a call is safer than hiding one."""
     calls: List[Tuple[str, Dict[str, Any]]] = []
     spans, clean = _code_spans(source)
     regions = spans if clean else [(0, len(source))]
@@ -511,7 +512,8 @@ def _code_mode_calls(source: str) -> List[Tuple[str, Dict[str, Any]]]:
 def _code_spans(source: str) -> Tuple[List[Tuple[int, int]], bool]:
     """The code regions of a JavaScript source, comments and literal text left out, and
     whether the scan finished cleanly. An unterminated literal leaves the rest of the source
-    unreadable, and then the caller searches the raw text instead.
+    unreadable, and so does a `/` that opens neither `//` nor `/*` (a regular expression or a
+    division); the caller then searches the raw text instead.
 
     A call written in a comment or inside a string is text, never a call. The `${...}` body of
     a template literal is code again."""
@@ -550,7 +552,9 @@ def _js_code_end(source: str, start: int, stop: str,
 
     Literals and comments are stepped over; with `spans`, every code region is collected. A
     quote inside a `/.../ ` pattern belongs to the pattern, so a regular expression is stepped
-    over as one literal. `state["clean"]` is set False when a literal or comment never ends."""
+    over as one literal. `state["clean"]` is set False when a literal or comment never ends, and
+    for any `/` that opens neither `//` nor `/*`: a regular expression or a division cannot be
+    told apart reliably, so the caller searches the raw text instead."""
     i, seg, depth = start, start, 0
     prev, prev_word = "", ""
     n = len(source)
@@ -568,12 +572,19 @@ def _js_code_end(source: str, start: int, stop: str,
             i = _js_comment_end(source, i, state)
             seg = i
             continue
-        if ch == "/" and _js_regex_starts(prev, prev_word):
-            if spans is not None and i > seg:
-                spans.append((seg, i))
-            i = _js_regex_end(source, i, state)
-            seg, prev, prev_word = i, "/", ""
-            continue
+        if ch == "/":
+            # A `/` that opens neither `//` nor `/*` is a regular expression or a division, and
+            # telling them apart is the one part of the scan that stays uncertain. The scan
+            # reports itself unclean instead, and the caller searches the raw text: a call that
+            # is found too often is safer than one that is missed.
+            if state is not None:
+                state["clean"] = False
+            if _js_regex_starts(prev, prev_word):
+                if spans is not None and i > seg:
+                    spans.append((seg, i))
+                i = _js_regex_end(source, i, state)
+                seg, prev, prev_word = i, "/", ""
+                continue
         if ch.isalnum() or ch in "_$":
             j = i
             while j < n and (source[j].isalnum() or source[j] in "_$"):
