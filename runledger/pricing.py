@@ -257,7 +257,9 @@ def load_prices(override: Optional[Union[str, os.PathLike]] = None
     path = Path(configured or "~/.runledger/prices.json")
     try:
         path = path.expanduser()
-        text = path.read_text(encoding="utf-8")
+        # utf-8-sig: a prices file written by a Windows editor or `Set-Content -Encoding UTF8`
+        # carries a BOM, and the rest of RunLedger's config readers tolerate one too.
+        text = path.read_text(encoding="utf-8-sig")
         user = _parse_table(json.loads(text), str(path))
         today = _today()
         prices.update({k: v for k, v in user.items()

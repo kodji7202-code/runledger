@@ -120,6 +120,22 @@ change behavior, so read the entry before you upgrade.
   guard-only view - hooks, notes, config, approval, log and the effective mode with `fail_closed` -
   and runs no self-test. Both commands are read-only: no hook file, config, log, checkpoint ref or
   cache is written, and no secret is printed (`docs/doctor.md`).
+- **`runledger stats` (`runledger.stats`, new):** one report over the local sessions - sessions,
+  steps, tokens and cost per group, the risk and quality distributions, the most common risk codes
+  and advisor recommendations, and the guard decisions in the window. `--project PATH` or `--all`,
+  `--agent`, `--since 7d|4w|1m|YYYY-MM-DD` (default `30d`), `--until`, `--by agent|model|day|week|
+  project` (default `agent`), `--top 5`, `--format table|json|md`, `--limit 500` (newest sessions in
+  the window, with a stderr note when it truncates), `--no-cache` and `--rebuild-cache`. Cost stays
+  honest: a model with no price gives `n/a`, a session that mixes priced and unpriced tokens gives a
+  `>=` lower bound with a footnote naming the unknown models, and no figure is ever a fake `$0.00`.
+  Exit codes are 0 (a report), 1 (no sessions for the scope, or none in the window, with the reason
+  on stderr) and 2 (usage error). The window is resolved from the current minute, so two runs in the
+  same minute agree. The command is read-only and runs no Git, no network request and
+  no AI: it parses each session once and caches tokens per model, the risk result, the grade and the
+  recommendation kinds in `~/.runledger/cache/stats-v1.json`, keyed by path + mtime + size and
+  invalidated by a change to the user config or the project's `.runledger.json`. The cache holds no
+  prompts, commands or file contents, and a corrupt session file is listed in `skipped` instead of
+  stopping the run (`docs/stats.md`).
 
 ### Changed
 
@@ -148,6 +164,12 @@ change behavior, so read the entry before you upgrade.
 
 ### Fixed
 
+- **A prices file with a UTF-8 BOM is read (`runledger.pricing`):** `~/.runledger/prices.json`
+  and a `RUNLEDGER_PRICES` file written by a Windows editor or by `Set-Content -Encoding UTF8`
+  start with a byte-order mark, which the JSON reader rejected, so the whole override was
+  ignored with a warning. The file is now decoded as `utf-8-sig`, like the user config and the
+  project's `.runledger.json` already were. A file that is still not valid UTF-8 (or not valid
+  JSON) is ignored with the same warning as before.
 - **Claude Code and Codex discovery resolve one home directory (`runledger.parser`,
   `runledger.adapters.codex`):** with `CLAUDE_CONFIG_DIR` and `CODEX_HOME` unset, session
   discovery used Python's home (`USERPROFILE` on Windows) while `guard install --global` and

@@ -42,6 +42,10 @@ More in [docs/quickstart.md](docs/quickstart.md).
 - **A setup check:** `runledger doctor` reports every hook, config, approval, log, checkpoint,
   price and session detail it can read, with exit codes 0/1/2 for CI. See
   [docs/doctor.md](docs/doctor.md).
+- **A stats report:** `runledger stats` adds up sessions, steps, tokens, cost, risk, quality and
+  guard decisions over a window, grouped by agent, model, day, week or project, as a table, JSON or
+  Markdown. It runs no Git, network or AI, is read-only, and caches its parse in
+  `~/.runledger/cache/stats-v1.json`. See [docs/stats.md](docs/stats.md).
 - **A team server:** a shared dashboard, API keys with roles, an audit log, approvals with Slack and
   webhook notifications, team budgets with alerts, and compliance exports. See
   [docs/enterprise.md](docs/enterprise.md) and [docs/api.md](docs/api.md).
@@ -197,6 +201,7 @@ your Anthropic API key and may incur charges from Anthropic.
 - [JSON receipt](docs/receipt-json.md): the versioned receipt contract and its JSON Schema
 - [Real-time guard](docs/guard.md): policy files, approvals, fail-open and fail-closed, the log
 - [Doctor](docs/doctor.md): the nine setup checks, `--json`, exit codes and `guard status`
+- [Stats](docs/stats.md): sessions, tokens, cost, risk and guard decisions over a window
 - [Rollback](docs/rollback.md): Git checkpoints, previews, safety checkpoints, undo and agent hooks
 - [Analysis](docs/analysis.md): the quality score, cost tips and the AI risk review
 - [Enterprise guide](docs/enterprise.md): roles, API keys, audit, budgets, exports, HTTPS

@@ -24,6 +24,9 @@
   runledger checkpoints prune --keep N [--cwd DIR]
   runledger rollback [CHECKPOINT | --run RUN_ID | --last] [--dry-run] [--yes] [--cwd DIR]
   runledger doctor [--project PATH] [--agent AGENT ...] [--offline] [--no-selftest] [--json] [--verbose]
+  runledger stats [--project PATH | --all] [--agent AGENT] [--since WHEN] [--until WHEN]
+                  [--by agent|model|day|week|project] [--top N] [--format table|json|md]
+                  [--limit N] [--no-cache | --rebuild-cache]
 
 SESSION is a session file of any supported agent; the agent is detected from the file.
 AGENT is one of claude-code, codex, droid, aider, native (the RunLedger format, docs/format.md).
@@ -31,6 +34,7 @@ AGENT is one of claude-code, codex, droid, aider, native (the RunLedger format, 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sqlite3
@@ -826,6 +830,78 @@ def cmd_doctor(args) -> int:
     return doctor.cmd_doctor(args)
 
 
+def cmd_stats(args) -> int:
+    from . import stats
+
+    now = stats.window_now()
+    try:
+        since = stats.parse_since(args.since, now) if args.since else stats.default_since(now)
+        until = stats.parse_until(args.until, now) if args.until else stats.default_until(now)
+    except stats.SinceError as exc:  # argparse already checked; keep the exit code honest
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    project = None if args.all else (args.project or os.getcwd())
+    try:
+        files = stats.discover(project, args.agent)
+    except KeyError as exc:  # the agent's adapter is not installed
+        print(f"error: {exc.args[0]}", file=sys.stderr)
+        return 1
+    if not files:
+        kind = f"{adapters.label(args.agent)} " if args.agent else ""
+        where = "any project" if args.all else project
+        print(f"No {kind}sessions found for {where}.", file=sys.stderr)
+        return 1
+    if args.no_cache:
+        cache = None
+    elif args.rebuild_cache:
+        cache = stats.StatsCache()
+    else:
+        cache = stats.StatsCache.load()
+    summaries, skipped, found = stats.collect(files, since, until, cache, limit=args.limit)
+    for entry in skipped:
+        print(f"stats: skipped {entry['path']}: {entry['reason']}", file=sys.stderr)
+    if not summaries:
+        print(stats.no_sessions_note(since, until), file=sys.stderr)
+        return 1
+    if found > len(summaries):
+        print(f"stats: {found} sessions in the window; counting the newest {len(summaries)} "
+              f"(--limit {args.limit}).", file=sys.stderr)
+    guard = stats.guard_counts([summary.cwd for summary in summaries], since, until)
+    agg = stats.aggregate(summaries, by=args.by, top=args.top,
+                          scope={"project": project, "agent": args.agent},
+                          window=(since, until), skipped=skipped, guard=guard)
+    render = {"by": args.by, "agents": len({summary.agent for summary in summaries}),
+              "models": stats.model_blocks(summaries), "top": args.top,
+              "label": stats.window_label(args.since, args.until, since, until)}
+    if args.format == "json":
+        _write_stdout(json.dumps(agg, indent=2) + "\n")
+    elif args.format == "md":
+        print(stats.render_md(agg, **render))
+    else:
+        print(stats.render_table(agg, **render))
+    return 0
+
+
+def _since_arg(raw: str) -> str:
+    """`--since`/`--until` values are checked here, so a bad one is an argparse usage error
+    (exit code 2) naming the value and the accepted forms."""
+    from .stats import SinceError, parse_since
+    try:
+        parse_since(raw)
+    except SinceError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+    return raw
+
+
+def _until_arg(raw: str) -> str:
+    from .stats import SinceError, parse_until
+    try:
+        parse_until(raw)
+    except SinceError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+    return raw
+
+
 def _positive_int(raw: str) -> int:
     try:
         val = int(raw, 10)
@@ -1042,6 +1118,33 @@ def main(argv: Optional[List[str]] = None) -> int:
                       help="print one JSON object instead of the text report")
     pdoc.add_argument("--verbose", action="store_true", help="add detail lines")
     pdoc.set_defaults(func=cmd_doctor)
+
+    pstats = sub.add_parser("stats", help="summarize the sessions of a folder or of every "
+                                          "project: sessions, steps, tokens, cost, risk, "
+                                          "quality and guard decisions")
+    stats_scope = pstats.add_mutually_exclusive_group()
+    stats_scope.add_argument("--project", metavar="PATH",
+                             help="project folder (default: current folder)")
+    stats_scope.add_argument("--all", action="store_true", help="sessions from every project")
+    _agent_arg(pstats)
+    pstats.add_argument("--since", type=_since_arg, metavar="WHEN",
+                        help="window start: 7d, 4w, 1m or YYYY-MM-DD (default: 30d)")
+    pstats.add_argument("--until", type=_until_arg, metavar="WHEN",
+                        help="window end: a date (whole day) or 7d back from now (default: now)")
+    pstats.add_argument("--by", choices=["agent", "model", "day", "week", "project"],
+                        default="agent", help="group the rows (default: agent)")
+    pstats.add_argument("--top", type=_positive_int, default=5,
+                        help="how many top codes, recommendations and models to list (default: 5)")
+    pstats.add_argument("--format", choices=["table", "json", "md"], default="table",
+                        help="output format (default: table)")
+    pstats.add_argument("--limit", type=_positive_int, default=500,
+                        help="how many of the newest sessions in the window to count (default: 500)")
+    stats_cache = pstats.add_mutually_exclusive_group()
+    stats_cache.add_argument("--no-cache", dest="no_cache", action="store_true",
+                             help="parse every session and neither read nor write the parse cache")
+    stats_cache.add_argument("--rebuild-cache", dest="rebuild_cache", action="store_true",
+                             help="ignore the parse cache and parse every session again")
+    pstats.set_defaults(func=cmd_stats)
 
     args = p.parse_args(argv)
     _tolerant_console()
