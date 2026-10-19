@@ -324,6 +324,22 @@ def test_release_workflow_verifies_tag_against_version():
     assert (ROOT / "tools" / "check_release.py").is_file()
 
 
+def test_release_workflow_installs_the_package_like_ci_before_testing():
+    """The release test step installs the package: it installed only pytest in the first
+    v0.6.1 run, so every test importing runledger failed and the release could not publish."""
+    release = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    install = "python -m pip install -e . pytest"
+    assert install in ci, "the CI test job installs the package and pytest"
+    jobs = _workflow_jobs(release)
+    assert jobs, "no jobs found in release.yml"
+    for name, body in jobs.items():
+        if "python -m pytest" not in body:
+            continue
+        assert install in body, f"the {name} job runs pytest without installing the package"
+        assert body.index(install) < body.index("python -m pytest"), f"{name} tests before it installs"
+
+
 def test_release_workflow_creates_the_release_with_least_privilege():
     release = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
     assert "permissions:\n  contents: read\n" in release
