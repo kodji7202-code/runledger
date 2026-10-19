@@ -128,6 +128,13 @@ lists match on codes and severities.
 | `mcp` | high | A destructive MCP tool (`delete`, `drop`, `destroy`, `reset`, ...), or an execute-class tool (`supabase__execute_query`) whose SQL drops or truncates, deletes or updates without a `WHERE`, or drops a column. |
 | `mcp` | medium | A state-changing MCP tool (`create`, `update`, `send`, `deploy`, ...), any other data-changing SQL statement (`INSERT`, `UPDATE ... WHERE`, `CREATE`, `ALTER`, `GRANT`), and an execute-class tool whose SQL the guard cannot read. |
 | `mcp` | low | A read-only MCP tool (`get`, `list`, `search`, ...), an unknown tool name, or SQL that only reads. The reason names the tool. |
+| `rule_deny` | high | A command or tool matched one of your own `command_rules.deny` or `tool_rules.deny` entries. The reason names the entry. Always enforced: adding `rule_deny` (or `!rule_deny`) to a policy list changes nothing. |
+| `rule_ask` | medium | A command or tool matched one of your own `command_rules.ask` or `tool_rules.ask` entries. The reason names the entry (or the `reason` you gave it), and it always asks. |
+
+A `rule_deny` finding is high and a `rule_ask` finding is medium, so `severity:high` and the other
+list entries see them like any other finding. What no entry can do is switch them off: an
+exclusion in your own or a project's list leaves a rule hit alone, and a project cannot remove a
+rule you wrote. Delete the entry from the file that holds it to soften it.
 
 MCP tools are named `mcp__<server>__<tool>` by Claude Code and Codex, and as the bare connector
 name `supabase__delete_project` by Factory Droid. The guard grades them by the verb in the tool
@@ -146,6 +153,30 @@ Because a destructive MCP call is high, it **asks** under the default policy bel
 `mcp` in your own file (`severity_overrides`) or ignore it (`ignore`) to soften that, or add
 `mcp:high` to your `deny` list to block destructive MCP calls outright.
 
+The command rules added in 0.7.0 read the same blanked view, so `echo "git branch -D x"` is not
+the command being run, and a `DELETE FROM` inside a heredoc body is not scanned (the same
+limitation quoted text always had). The rule families, by severity:
+
+- **medium:** force-deleting a git branch (`git branch -D`, `git branch -fD`,
+  `git branch --delete --force`), discarding the working tree (`git checkout .`,
+  `git restore .`), dropping stash entries (`git stash drop`, `git stash clear`),
+  `find ... -delete` and `find ... -exec rm|unlink|shred`, `dd of=<file>`,
+  `docker system|builder|image|container|network prune`, `aws s3 rm` of one object,
+  deleting a `gh` resource (`gh release|issue|gist|label|secret|variable|cache|run|workflow
+  delete`), `rsync --delete` (and `--del`, `--remove-source-files`), `reg delete` of a user
+  key, printing environment variables or secrets, and in PowerShell `Remove-Item -Recurse`
+  without `-Force`.
+- **high:** deleting a remote branch or tag (`git push --delete`, `git push origin -d`,
+  `git push origin :branch`), `dd of=/dev/...`, `docker volume prune` and
+  `docker system prune --volumes`, `aws s3 rm --recursive` and `aws s3 rb --force`,
+  `gh repo delete`, `helm uninstall` (or `helm delete`), a `DELETE FROM` without a `WHERE`
+  in a shell command, `reg delete` of a machine-wide (`HKLM`) key, `rd /s /q` and
+  `rmdir /s /q`, and in PowerShell `Remove-Item -Recurse -Force`.
+
+`find ... -delete` also covers `find /tmp/x -type f -delete`: `find` deletes below every
+starting path it was given. Those starting paths are then checked like any other delete argument,
+so a search root outside the working folder (and not a temp folder) is reported as well.
+
 The guard reads each risk's severity and code, not the receipt's 0 to 100 score. The receipt score
 is described in [quickstart.md](quickstart.md) and in the README.
 
@@ -161,7 +192,8 @@ So `rm -rf`, a force push and a hardcoded API key written into a file are denied
 a `.env` file, writing outside the project and deleting a test file ask. A `git push` (medium) is
 allowed unless a policy file says otherwise. A destructive MCP call
 (`mcp__supabase__delete_project`) and an execute-class call whose SQL drops or rewrites rows ask
-for the same reason: they are high findings.
+for the same reason: they are high findings. Whatever these two lists say, a finding one of your
+own rules produced is always decided: a `rule_deny` hit is denied and a `rule_ask` hit asks.
 
 ## Policy files
 
@@ -190,6 +222,9 @@ What each file can set:
 | `ignore` | Hides matching findings from the guard and the receipt. | Ignored by both the guard and the receipt (the receipt adds a note). |
 | `severity_overrides` | Sets any severity. | Can raise a severity, never lower it (in both the guard and the receipt). |
 | `extra_secret_paths` | Adds safe regular expressions or `glob:...` patterns (up to 20, max 200 characters each). | Adds safe regular expressions or `glob:...` patterns. Unsafe backtracking patterns are ignored and logged. |
+| `mcp_verbs.destructive`, `mcp_verbs.write`, `mcp_verbs.read` | Adds words to the three MCP verb vocabularies. | Adds `destructive` and `write` words. A `read` list is ignored and logged: a read word would lower a destructive tool. |
+| `tool_rules.deny`, `tool_rules.ask` | Adds `fnmatch` globs matched against the whole tool name (case-sensitive). | Adds globs. Nothing is removed. |
+| `command_rules.deny`, `command_rules.ask` | Adds regular expressions matched against shell commands. | Adds expressions. Nothing is removed. |
 
 The server and key can come only from the environment or your user file. A repository cannot send
 your key to a server of its choosing. See [approvals](#approvals-on-the-team-server).
@@ -204,12 +239,64 @@ Every list accepts these entries:
 | `severity:high` | Any finding at that severity: `high`, `medium` or `low`. |
 | `reason:force push` | Findings whose reason contains the text (case-insensitive). |
 | `command:high` | A code and a severity together. |
+| `rule_deny`, `rule_ask` | The codes of the findings your own rules produce. They behave like any other code, but the guard always keeps both on its effective lists, and no exclusion can drop a rule hit. |
 | `!` in front of any entry | An exclusion, applied only within the same list. |
 
 Entries that do not parse, such as `command:critical`, are ignored. Within a decision, the most
 restrictive outcome wins: any deny beats any ask, and any ask beats allow. Each list is checked on
 its own. A project's exclusion that would remove a user or default match is ignored and logged as a
 warning.
+
+### Rules you write yourself
+
+Besides the built-in rules you can write your own, under three top-level keys. Both files may
+carry them, and both only add: your rules and a project's rules are all applied, and nothing
+removes a built-in rule.
+
+`command_rules` matches the command of a `Bash` or `PowerShell` call. An entry is either a regular
+expression, or an object with `pattern`, an optional `reason` (what the decision shows instead of
+the pattern) and `raw`. The expression is searched case-insensitively:
+
+- by default it reads the command the way the built-in rules do: comments, the text arguments of
+  `echo`, `printf`, `Write-Output`, `git commit -m` and the like, and heredoc/here-string bodies
+  are blanked first, so `git commit -m "myfancytool wipe"` is not the command being run;
+- with `"raw": true` it reads the whole command, so a pattern can also match text the command only
+  prints. Use it only for words that cannot appear in an unrelated message.
+
+A pattern that is not a safe regular expression (unbalanced brackets, or one that can backtrack
+catastrophically) is dropped, and the warning names it and the file it came from. `deny` entries
+deny, `ask` entries ask, and a command that matches both is denied.
+
+`tool_rules` matches the tool name with `fnmatch` globs (`*` and `?`), case-sensitively, against
+the whole name. Rules apply to any tool, not only MCP ones: `Edit` can be denied, and
+`mcp__vercel__*` can ask for every Vercel tool. A tool on both lists is denied.
+
+`mcp_verbs` adds words to the three MCP vocabularies the classifier uses (see above), so a server
+whose destructive tool is called something else is graded as you expect. A project file may extend
+`destructive` and `write` only.
+
+```json
+{
+  "command_rules": {
+    "deny": ["\\bmyfancytool\\s+wipe\\b"],
+    "ask": [{ "pattern": "\\bkubectl\\s+exec\\b", "reason": "shell into prod" },
+            { "pattern": "secretword", "raw": true, "reason": "names a secret" }]
+  },
+  "tool_rules": { "deny": ["mcp__supabase__execute_query"], "ask": ["mcp__vercel__*"] },
+  "mcp_verbs": { "destructive": ["nuke"], "write": ["sync"], "read": ["peek"] }
+}
+```
+
+With this file `myfancytool wipe all` is denied (code `rule_deny`), `kubectl exec -it pod -- sh`
+asks (code `rule_ask`, reason "shell into prod"), `echo secretword` asks through the raw entry,
+`mcp__supabase__execute_query` is denied whatever SQL it carries, and `mcp__foo__nuke_cluster` is
+high while `mcp__foo__peek_queue` stays low.
+
+**Receipts see the project's rules only.** A receipt re-runs the rules over a transcript with the
+`.runledger.json` of the folder the session ran in, so that a receipt is reproducible from the
+repository it belongs to. A rule that lives only in your user file is enforced by the live guard
+and does not appear in a receipt built from an older session. Put a rule you want in receipts in
+the project file instead.
 
 ### Example: your user file
 
@@ -223,31 +310,41 @@ warning.
     "ask": ["severity:high", "mcp"],
     "fail_closed": false,
     "approval": { "timeout_s": 120, "on_timeout": "deny" }
-  }
+  },
+  "mcp_verbs": { "destructive": ["obliterate"] },
+  "tool_rules": { "deny": ["mcp__supabase__execute_query"] },
+  "command_rules": { "deny": ["\\bheroku\\s+apps:destroy\\b"] }
 }
 ```
 
 `server` is read from this file only if `RUNLEDGER_SERVER` is not set. The environment variable
-wins.
+wins. With the three rule keys, `heroku apps:destroy my-app` is denied (code `rule_deny`),
+`mcp__supabase__execute_query` is denied whatever SQL it carries (code `rule_deny`), and
+`mcp__foo__obliterate_everything` is destructive (high, so it asks) because you added the word.
 
 ### Example: a project file that tightens the guard
 
 ```json
 {
   "guard": {
-    "deny": ["mcp"],
+    "deny": ["mcp:high"],
     "ask": ["severity:medium"],
     "fail_closed": true,
     "approval": { "timeout_s": 60 }
   },
   "severity_overrides": { "shell_outside": "high" },
-  "extra_secret_paths": ["(^|/)config/prod\\.ya?ml$"]
+  "extra_secret_paths": ["(^|/)config/prod\\.ya?ml$"],
+  "command_rules": { "deny": ["\\bnpm\\s+run\\s+release\\b"] },
+  "tool_rules": { "ask": ["mcp__vercel__*"] },
+  "mcp_verbs": { "destructive": ["obliterate"] }
 }
 ```
 
-With this file, MCP calls are denied, medium findings ask, failures deny, and the approval wait is
-60 seconds. A repository cannot set `server`, `api_key_env` or `on_timeout: "ask"`, and any such
-value is logged as a warning.
+With this file, destructive MCP calls are denied, medium findings ask, failures deny, and the
+approval wait is 60 seconds. The repository's own rule denies `npm run release`, every Vercel tool
+asks, and a tool whose name carries the added word is destructive, so it is denied as well. A
+repository cannot set `server`, `api_key_env` or `on_timeout: "ask"`, cannot lower a severity,
+cannot add `read` words, and any such value is logged as a warning.
 
 Warnings appear in the log, for example:
 
@@ -321,7 +418,8 @@ the event's `cwd`. Each line is a JSON object:
   rules said before monitor mode and approvals changed it.
 - `approval` is `approved`, `denied`, `expired`, `timeout` or `unavailable` when an approval was
   asked for, otherwise `null`.
-- A line with `"decision": "warning"` records a project setting the guard ignored.
+- A line with `"decision": "warning"` records a setting the guard ignored: a project setting that
+  would loosen the guard, or a rule pattern in either file that is not a safe regular expression.
 - A line with `"decision": "error"` records an evaluation error.
 - Every decision is logged, including plain allows, server approvals and monitor-mode
   decisions. Receipts omit plain allows; the audit log retains them.
@@ -398,4 +496,6 @@ include it unless you add it.
 - **Approval waits end before the answer.** Run `runledger guard install` again after you change
   `timeout_s`, so the hook timeout follows it.
 - **A rule you expected does not match.** Check the entry syntax. An entry that does not parse is
-  ignored without a warning.
+  ignored without a warning. A `command_rules` pattern that the guard cannot compile safely is
+  dropped with a warning in the log, and a project `mcp_verbs.read` list, a project exclusion and
+  a project severity that would lower a risk are all logged as warnings too.

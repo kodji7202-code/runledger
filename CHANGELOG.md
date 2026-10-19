@@ -46,6 +46,22 @@ change behavior, so read the entry before you upgrade.
   not also report it). Every rule is confined to one command (the lookahead stops at `;`, `&`, `|`
   and newlines) and runs on the quote-, comment- and heredoc-blanked view, so a commit message or a
   string that mentions `git branch -D` is not flagged.
+- **Rules you write yourself (`command_rules`, `tool_rules`, `mcp_verbs`):** the user file
+  (`~/.runledger/config.json`) and a project's `.runledger.json` may now carry three top-level
+  keys. `command_rules.deny`/`.ask` take regular expressions, or objects with `pattern`, an
+  optional `reason` and `raw`; they are searched case-insensitively against the same
+  quote- and heredoc-blanked view the built-in command rules use, and `raw: true` reads the whole
+  command instead. `tool_rules.deny`/`.ask` take `fnmatch` globs matched against the whole tool
+  name, case-sensitively, for any tool (`Edit`, `mcp__vercel__*`); a tool on both lists is denied.
+  `mcp_verbs.destructive`/`.write`/`.read` add words to the MCP verb vocabularies, so a server
+  whose destructive tool is named something else is graded as expected. Hits are `rule_deny`
+  (high) and `rule_ask` (medium) findings whose reason names the entry. A rule hit is always
+  decided: replacing the default deny list keeps it, and no `!` exclusion can drop it. Both files
+  only add, so a project can tighten with rules but never remove one of yours; a project
+  `mcp_verbs.read` list, a project exclusion aimed at a rule hit and a pattern that is not a safe
+  regular expression are ignored and logged as warnings. Receipts: a receipt re-runs the rules with
+  the project's file only, so a rule that lives in your user file is enforced live but does not
+  appear in a receipt built from an older session (`docs/guard.md`).
 
 ### Changed
 
@@ -56,6 +72,11 @@ change behavior, so read the entry before you upgrade.
   `severity_overrides` or `ignore`. The new command rules can turn a previously allowed call into a
   deny (`git push origin --delete x`, `docker volume prune`, `helm uninstall`, `gh repo delete`) or
   add a finding to it (`git branch -D x`, `rsync --delete`, `Remove-Item -Recurse`).
+- **`nuke` is deliberately not one of the built-in destructive MCP words (`runledger.mcp_risk`):**
+  a tool whose name carries it stays low until you add it to `mcp_verbs.destructive`. The rest of
+  the vocabulary (`delete`, `drop`, `destroy`, `reset`, `purge`, `terminate`, `force`, `revoke`
+  and the other words) is unchanged, and users who never set `mcp_verbs` see the difference only
+  for names built on `nuke`.
 - **The user's config file is read in one place (`runledger.userconfig`, new):** `RUNLEDGER_CONFIG`
   or `~/.runledger/config.json` is resolved and parsed by one module, which the guard, the risk
   policy and the new `rollback.load_settings()` consume, so a missing or broken file is handled the

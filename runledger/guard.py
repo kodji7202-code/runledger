@@ -51,7 +51,7 @@ from . import labels
 from . import paths as _paths
 from . import risk as _risk
 from .parser import Step
-from .risk import POLICY_FILE, SEVERITY_POINTS, Risk, assess_step
+from .risk import POLICY_FILE, RULE_ASK_CODE, RULE_DENY_CODE, SEVERITY_POINTS, Risk, assess_step
 # The user's own file has one reader for every consumer (guard, risk, rollback, doctor).
 from .userconfig import USER_CONFIG_DIR, USER_CONFIG_FILE, load_user_config, user_config_path
 
@@ -278,11 +278,16 @@ def trusted_approval_settings(user: Optional[Dict[str, Any]] = None) -> Dict[str
 
 def _project_key_warnings(project: Dict[str, Any]) -> List[str]:
     approval = _section(_section(project, "guard"), "approval")
-    return [
+    warnings = [
         f"Ignored approval.{key} in {POLICY_FILE}: a project file cannot set the approval server or key. "
         f"Use {SERVER_ENV} / {KEY_ENV_DEFAULT} or {USER_CONFIG_DIR}/{USER_CONFIG_FILE} in your home folder."
         for key in PROJECT_APPROVAL_KEYS if key in approval
     ]
+    read_words = _section(project, "mcp_verbs").get("read")
+    if isinstance(read_words, list) and any(isinstance(w, str) and w.strip() for w in read_words):
+        warnings.append(f"Ignored mcp_verbs.read in {POLICY_FILE}: a read word in this list would lower a "
+                        f"destructive MCP tool, so a project may add destructive and write words only.")
+    return warnings
 
 
 # ---------------------------------------------------------------- rules
@@ -323,6 +328,14 @@ def _parse_rules(value: Any, default: List[str]) -> List[Dict[str, Any]]:
     return out
 
 
+def _rule_entry(code: str) -> Optional[Dict[str, Any]]:
+    """The entry that keeps a user or project rule hit decided, added to every effective list."""
+    rule = _parse_rule(code)
+    if rule is not None:
+        rule["raw"] = code
+    return rule
+
+
 def _rule_matches(rule: Dict[str, Any], risk: Risk) -> bool:
     kind = rule["kind"]
     if kind == "severity":
@@ -335,9 +348,14 @@ def _rule_matches(rule: Dict[str, Any], risk: Risk) -> bool:
 
 
 def _matches_list(rules: List[Dict[str, Any]], risk: Risk) -> bool:
-    """True when some positive entry matches and no `!` exclusion in the same list matches."""
+    """True when some positive entry matches and no `!` exclusion in the same list matches.
+
+    A `rule_deny`/`rule_ask` hit is never excluded: the rule it comes from must be removed
+    from the config instead, so one list entry cannot quietly switch a rule off."""
     if not any(_rule_matches(r, risk) for r in rules if not r["negate"]):
         return False
+    if risk.code in (RULE_DENY_CODE, RULE_ASK_CODE):
+        return True
     return not any(_rule_matches(r, risk) for r in rules if r["negate"])
 
 
@@ -381,8 +399,14 @@ def _effective_guard(project: Dict[str, Any], user: Dict[str, Any], trusted: Dic
         warnings.append(f"Ignored fail_closed false in {POLICY_FILE}: a project cannot turn fail_closed off.")
 
     # Lists: the user's (or default) list plus the project's. Each keeps its own exclusions.
+    # Both lists end with the code of the findings a user or project rule produced, so a rule
+    # hit is decided even when the user replaced the list the defaults would have come from.
     user_deny = _parse_rules(u.get("deny"), DEFAULT_DENY)
     user_ask = _parse_rules(u.get("ask"), DEFAULT_ASK)
+    for rules, code in ((user_deny, RULE_DENY_CODE), (user_ask, RULE_ASK_CODE)):
+        entry = _rule_entry(code)
+        if entry is not None:
+            rules.append(entry)
     project_deny = _parse_rules(p.get("deny"), [])
     project_ask = _parse_rules(p.get("ask"), [])
 
@@ -469,22 +493,37 @@ def _valid_extra(value: Any) -> List[str]:
 
 
 def _risk_settings(project: Dict[str, Any], user: Dict[str, Any]) -> Dict[str, Any]:
-    """`assess` is what risk.py gets: the user's ignore and severity overrides, and the
-    union of secret-path patterns. The project's ignore and severity overrides come
-    back separately, for the tighten-only checks."""
+    """`assess` is what risk.py gets: the user's ignore and severity overrides, the
+    union of secret-path patterns, and the user's rules plus the project's (a project may
+    add rules, never remove one). The project's ignore and severity overrides come back
+    separately, for the tighten-only checks."""
     user_extra, user_extra_warnings = _valid_extra_with_warnings(user.get("extra_secret_paths"))
     proj_extra, proj_extra_warnings = _valid_extra_with_warnings(
         project.get("extra_secret_paths"), existing_count=len(user_extra)
     )
+    user_commands, user_command_warnings = _risk.parse_command_rules(
+        user.get("command_rules"), f"{USER_CONFIG_DIR}/{USER_CONFIG_FILE}")
+    proj_commands, proj_command_warnings = _risk.parse_command_rules(
+        project.get("command_rules"), POLICY_FILE)
+    user_tools = _risk.parse_tool_rules(user.get("tool_rules"))
+    proj_tools = _risk.parse_tool_rules(project.get("tool_rules"))
     return {
         "assess": {
             "ignore": _valid_ignore(user.get("ignore")),
             "severity_overrides": _valid_overrides(user.get("severity_overrides")),
             "extra_secret_paths": user_extra + proj_extra,
+            "mcp_verbs": _risk.merge_mcp_verbs(
+                _risk.parse_mcp_verbs(user.get("mcp_verbs")),
+                _risk.parse_mcp_verbs(project.get("mcp_verbs"), allow_read=False)),
+            "tool_rules": {"deny": user_tools["deny"] + proj_tools["deny"],
+                           "ask": user_tools["ask"] + proj_tools["ask"]},
+            "command_rules": {"deny": user_commands["deny"] + proj_commands["deny"],
+                              "ask": user_commands["ask"] + proj_commands["ask"]},
         },
         "project_ignore": _valid_ignore(project.get("ignore")),
         "project_severity": _valid_overrides(project.get("severity_overrides")),
-        "extra_warnings": user_extra_warnings + proj_extra_warnings,
+        "extra_warnings": (user_extra_warnings + proj_extra_warnings
+                           + user_command_warnings + proj_command_warnings),
     }
 
 

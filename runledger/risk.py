@@ -56,6 +56,7 @@ import posixpath
 import re
 import tempfile
 from dataclasses import dataclass
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -127,6 +128,14 @@ _MIGRATION_VERB = re.compile(r"^Wrote a database migration \((.+)\)$")
 WRITE_TOOLS = ("Write", "Edit", "MultiEdit", "NotebookEdit")
 DELETE_TOOLS = ("Delete",)
 SHELL_TOOLS = ("Bash", "PowerShell")
+
+# The codes of findings that come from a rule the user or a project wrote down
+# (`command_rules`/`tool_rules`). `rule_deny` is high, `rule_ask` is medium, and the guard
+# always keeps both on its effective lists, so a rule hit is enforced whatever else the
+# lists say.
+RULE_ASK_CODE = "rule_ask"
+RULE_DENY_CODE = "rule_deny"
+RULE_CODES = (("deny", RULE_DENY_CODE, "high"), ("ask", RULE_ASK_CODE, "medium"))
 
 # Shell rules shared by Bash and PowerShell steps, matched against the command text
 # with heredoc bodies, comments and text arguments removed (see _code_view).
@@ -966,7 +975,8 @@ def _code_view(text: str, comments: List[Tuple[int, int]], text_words: List[_Wor
 
 
 def _shell_risks(step: Step, cwd: Optional[str], extra: List["re.Pattern"], risks: List[Risk],
-                 default_workdir: Optional[str] = None) -> Set[str]:
+                 default_workdir: Optional[str] = None,
+                 policy: Optional[Dict[str, Any]] = None) -> Set[str]:
     """Risks for the words of a shell command. Returns the paths reported as outside this step
     (`_path_key` form), so `_shell_write_risks` does not report the same write twice."""
     cmd = str(step.input.get("command") or "")
@@ -998,6 +1008,7 @@ def _shell_risks(step: Step, cwd: Optional[str], extra: List["re.Pattern"], risk
             risks.append(Risk(sev, "command", why, step.index))
     if _SUDO_RE.search(code):
         risks.append(Risk("high", "command", "Ran a command with sudo", step.index))
+    risks.extend(command_rule_risks(cmd, code, policy, step.index))
 
     assigns: Dict[str, Optional[str]] = {}
     for words, name in zip(cmds, names):
@@ -1144,8 +1155,14 @@ def load_policy(cwd: Optional[str]) -> Dict[str, Any]:
       checked per finding in `_apply_policy` (the project's own values are carried in
       `project_severity_overrides`).
     - `extra_secret_paths` are validated with `secrets.safe_user_regex` and capped at 20.
+    - `mcp_verbs`, `tool_rules` and `command_rules` are read from the PROJECT file only: a
+      receipt is reproducible from the repository it belongs to, so the user's own rules
+      (which the live guard does enforce) are not re-applied to an old transcript. Project
+      verbs may add `destructive`/`write` words, never `read`.
     """
-    policy: Dict[str, Any] = {"ignore": [], "severity_overrides": {}, "extra_secret_paths": []}
+    policy: Dict[str, Any] = {"ignore": [], "severity_overrides": {}, "extra_secret_paths": [],
+                              "mcp_verbs": parse_mcp_verbs({}), "tool_rules": parse_tool_rules({}),
+                              "command_rules": parse_command_rules({})[0]}
     user_data = _read_json_dict(_user_config_path())
     proj_data = _read_json_dict(Path(cwd) / POLICY_FILE) if (cwd and not paths.is_unc(cwd)) else {}
 
@@ -1187,6 +1204,9 @@ def load_policy(cwd: Optional[str]) -> Dict[str, Any]:
         if len(raw_extra) >= max_extra:
             break
     policy["extra_secret_paths"] = raw_extra
+    policy["mcp_verbs"] = parse_mcp_verbs(proj_data.get("mcp_verbs"), allow_read=False)
+    policy["tool_rules"] = parse_tool_rules(proj_data.get("tool_rules"))
+    policy["command_rules"] = parse_command_rules(proj_data.get("command_rules"), POLICY_FILE)[0]
     return policy
 
 
@@ -1194,6 +1214,114 @@ def _compiles(rx: str) -> bool:
     if secrets is not None:
         return secrets.safe_user_regex(rx) is not None
     return False
+
+
+def parse_command_rules(value: Any, source: str = "the config file"
+                        ) -> Tuple[Dict[str, List[Dict[str, Any]]], List[str]]:
+    """The `command_rules` of one config file: `{"deny": [...], "ask": [...]}`.
+
+    Each entry is a regular expression, or an object `{"pattern", "reason", "raw"}`. The
+    expression is matched case-insensitively against the quote/heredoc-blanked command; a
+    `raw: true` entry reads the whole command instead. A pattern that is not a safe regular
+    expression is dropped, and the warning names it and the file it came from."""
+    rules: Dict[str, List[Dict[str, Any]]] = {"deny": [], "ask": []}
+    warnings: List[str] = []
+    if not isinstance(value, dict):
+        return rules, warnings
+    for kind in ("deny", "ask"):
+        entries = value.get(kind)
+        for entry in entries if isinstance(entries, list) else []:
+            pattern = entry.get("pattern") if isinstance(entry, dict) else entry
+            reason = entry.get("reason") if isinstance(entry, dict) else None
+            if not isinstance(pattern, str) or not pattern.strip():
+                continue
+            compiled = secrets.safe_user_regex(pattern) if secrets is not None else None
+            if compiled is None:
+                warnings.append(f"Dropped invalid command_rules.{kind} pattern {pattern.strip()!r} in {source}: "
+                                f"it is not a safe regular expression.")
+                continue
+            rules[kind].append({"rx": compiled,
+                                "label": reason.strip() if isinstance(reason, str) and reason.strip()
+                                else pattern.strip(),
+                                "raw": bool(entry.get("raw")) if isinstance(entry, dict) else False})
+    return rules, warnings
+
+
+def parse_tool_rules(value: Any) -> Dict[str, List[str]]:
+    """The `tool_rules` of one config file: `{"deny": [...], "ask": [...]}`.
+
+    Every entry is an `fnmatch` glob on the whole tool name, matched case-sensitively."""
+    rules: Dict[str, List[str]] = {"deny": [], "ask": []}
+    if not isinstance(value, dict):
+        return rules
+    for kind in ("deny", "ask"):
+        entries = value.get(kind)
+        for entry in entries if isinstance(entries, list) else []:
+            if isinstance(entry, str) and entry.strip():
+                rules[kind].append(entry.strip())
+    return rules
+
+
+def parse_mcp_verbs(value: Any, allow_read: bool = True) -> Dict[str, List[str]]:
+    """The `mcp_verbs` of one config file: `{"destructive": [...], "write": [...], "read": [...]}`.
+
+    A project file may extend `destructive` and `write` only: with `allow_read` false its
+    `read` list is dropped, because a read word lowers a tool that carries it."""
+    verbs: Dict[str, List[str]] = {"destructive": [], "write": [], "read": []}
+    if not isinstance(value, dict):
+        return verbs
+    for key in verbs:
+        if key == "read" and not allow_read:
+            continue
+        words = value.get(key)
+        if isinstance(words, list):
+            verbs[key] = [w.strip().lower() for w in words if isinstance(w, str) and w.strip()]
+    return verbs
+
+
+def merge_mcp_verbs(*parts: Dict[str, List[str]]) -> Dict[str, List[str]]:
+    """The union of the `mcp_verbs` of several config files, each word kept once."""
+    out: Dict[str, List[str]] = {"destructive": [], "write": [], "read": []}
+    for part in parts:
+        for key in out:
+            for word in (part or {}).get(key) or []:
+                if word not in out[key]:
+                    out[key].append(word)
+    return out
+
+
+def _rule_matched_risks(kind: str, code: str, severity: str, matched: List[str], index: int) -> List[Risk]:
+    return [Risk(severity, code, f"Matched {kind} rule: {label}", index) for label in matched]
+
+
+def command_rule_risks(command: str, view: str, policy: Optional[Dict[str, Any]], index: int) -> List[Risk]:
+    """Risks for the `command_rules` of the user's file and the project's file.
+
+    `view` is the quote/heredoc-blanked command the built-in rules read; an entry with
+    `raw: true` reads `command` itself, so a rule can also match quoted text."""
+    rules = policy.get("command_rules") if isinstance(policy, dict) else None
+    risks: List[Risk] = []
+    if not isinstance(rules, dict):
+        return risks
+    for kind, code, severity in RULE_CODES:
+        hits = [r["label"] for r in rules.get(kind) or [] if r["rx"].search(command if r["raw"] else view)]
+        risks.extend(_rule_matched_risks(kind, code, severity, hits, index))
+    return risks
+
+
+def tool_rule_risks(tool: str, policy: Optional[Dict[str, Any]], index: int) -> List[Risk]:
+    """Risks for the `tool_rules` of the user's file and the project's file.
+
+    The globs match the whole tool name, case-sensitively. A tool that is on both lists
+    carries both findings, so the guard denies it: deny beats ask."""
+    rules = policy.get("tool_rules") if isinstance(policy, dict) else None
+    risks: List[Risk] = []
+    if not isinstance(rules, dict):
+        return risks
+    for kind, code, severity in RULE_CODES:
+        hits = [p for p in rules.get(kind) or [] if fnmatchcase(tool, p)]
+        risks.extend(_rule_matched_risks(kind, code, severity, hits, index))
+    return risks
 
 
 def _risk_matches_key(r: Risk, key: str, allow_substring: bool = False) -> bool:
@@ -1307,8 +1435,10 @@ def assess_step(step: Step, cwd: Optional[str], policy: Optional[Dict[str, Any]]
                 risks.append(Risk("high", "secret_in_content", f"Wrote a hardcoded {kind} into {name}", step.index))
 
     if tool in SHELL_TOOLS:
-        flagged = _shell_risks(step, cwd, extra, risks, default_workdir=base)
+        flagged = _shell_risks(step, cwd, extra, risks, default_workdir=base, policy=policy)
         _shell_write_risks(step, cwd, extra, risks, default_workdir=base, flagged=flagged)
+
+    risks.extend(tool_rule_risks(tool, policy, step.index))
 
     if mcp_parts(tool) is not None:
         severity, reason = classify_mcp(tool, step.input, policy)
