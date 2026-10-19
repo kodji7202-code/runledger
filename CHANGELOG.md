@@ -223,13 +223,16 @@ change behavior, so read the entry before you upgrade.
   it had no step to link to. Each call inside the script is now one `Bash` or `PowerShell` step
   carrying its `cmd`, and a code-mode result's text blocks are shown as their text instead of raw
   JSON. Calls are located in the JavaScript itself, so the same text in a comment, in a string or
-  in a regular-expression literal is an example, never a step: a `/.../ ` pattern is read as one
-  literal, so the quote in `const r = /\"/;` cannot hide the call that follows, and a `/` that
-  divides is not mistaken for one. `cmd`, `command` and `shell`/`program` values are read from
-  double-quoted, single-quoted and static template literals, while a template that interpolates a
-  variable leaves the script as its single step under `exec`. A script the reader cannot finish
-  (an unterminated string, template, comment or pattern) is searched as raw text instead, so a
-  call that is there is reported rather than hidden.
+  in a regular-expression literal is an example, never a step: the quote in `const r = /\"/;`
+  cannot hide the call that follows, and the division in
+  `n++ / (await tools.exec_command({...})).exit_code / 2` is not read as a pattern. Telling the two
+  apart is the one part of the reading that stays uncertain, so it no longer guesses: a script
+  carrying any `/` that opens neither `//` nor `/*` is searched as raw text instead, and the call
+  it names is reported even when it was written in a comment - a reported call beats a hidden one.
+  `cmd`, `command` and `shell`/`program` values are read from double-quoted, single-quoted and
+  static template literals, while a template that interpolates a variable leaves the script as its
+  single step under `exec`; an unterminated string, template or comment is searched as raw text
+  the same way.
 - **A quoted SQL name is an identifier (`runledger.mcp_risk`):** single-quoted string literals are
   still blanked before the statement is matched, but a double-quoted or backtick name keeps an
   identifier placeholder. `DELETE FROM "users"` and `UPDATE "users" SET admin = true` are high
@@ -246,11 +249,15 @@ change behavior, so read the entry before you upgrade.
   as text in the blanked view, so `find . -name 'helm uninstall web' -print` no longer produces the
   high `Uninstalled a Helm release` finding - the same for any other destructive name in a `-name`,
   `-path`, `-iname` or related pattern. A real command in the expression, such as
-  `find . -name x -exec helm uninstall web \;`, still matches. Only literal text is blanked: the
-  shell runs a `$(...)` or backtick the pattern carries before `find` starts, and those stay
-  visible, so `find . -name "$(rm -rf ./victim)"` and
-  ``find . -name `helm uninstall web` `` are still denied. Single-quoted text is literal - the
-  shell substitutes nothing there - and an escaped `\$` computes nothing either.
+  `find . -name x -exec helm uninstall web \;`, still matches. Only a pattern with no substitution
+  syntax is blanked: a word carrying a `$(...)` or backtick outside single quotes is kept whole as
+  the code it is, so the shell runs it before `find` starts and
+  `find . -name "$(rm -rf ./victim)"`, ``find . -name `helm uninstall web` `` and a pattern with a
+  nested or escaped backtick (``find . -name "`echo \`rm -rf ./victim\``"``) are all denied. The
+  reading is deliberately coarse: escapes are not resolved, so a `$(` or backtick an escape makes
+  literal is read as code too and can raise a finding for text that never runs. Single-quoted text
+  stays literal - the shell substitutes nothing there - so
+  `find . -name '$(rm -rf ./victim)' -print` is a search.
 - **A command rule that can backtrack catastrophically is dropped (`runledger.secrets`):** the
   safe-regex check rejects a repeat of any kind inside a repeat (`(?:a{1,32}){1,32}b`,
   `(?:a?){40}b`, `(a+)+`) and an alternation inside one (`(a|a)*b`, `(a|aa)+b`), so a user or

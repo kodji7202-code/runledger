@@ -469,17 +469,52 @@ def test_a_find_pattern_that_runs_a_command_is_still_a_command(command, severity
     _hit(command, severity, needle)
 
 
+@pytest.mark.parametrize("command,severity,needle", [
+    ('find . -name "`echo \\`rm -rf ./victim\\``"', "high", "Recursive force delete (rm -rf)"),
+    ('find . -name "`printf \\`helm uninstall web\\``"', "high", "Uninstalled a Helm release"),
+])
+def test_an_escaped_nested_backtick_pattern_is_still_code(command, severity, needle):
+    """GE-017 round-3: a pattern word carrying substitution syntax outside single quotes is kept
+    whole, so the command behind a nested substitution stays visible. The escaped inner backtick
+    used to close the substitution too early and blank the text after it."""
+    _hit(command, severity, needle)
+
+
+def test_a_nested_backtick_pattern_is_denied_by_the_guard():
+    """The guard reads the same view: with an empty policy the deletion inside the pattern is
+    denied with its finding, not allowed with no risks (GE-017)."""
+    from runledger import guard
+
+    command = 'find . -name "`echo \\`rm -rf ./victim\\``"'
+    event = {"session_id": "s1", "cwd": WIN_CWD, "hook_event_name": "PreToolUse",
+             "tool_name": "Bash", "tool_input": {"command": command}}
+    decision = guard.decide(event, {})
+    assert decision["decision"] == "deny"
+    assert any("Recursive force delete (rm -rf)" in r["reason"] for r in decision["risks"])
+
+
+def test_an_escaped_substitution_in_a_pattern_is_over_reported():
+    """GE-017 round-3: escapes are not resolved, so a `$(` an escape makes literal is read as
+    code too. The finding it produces is the accepted side of the trade: report a pattern that
+    only looks like a substitution rather than blank one that really runs."""
+    _hit('find . -name "\\$(rm -rf ./victim)" -print', "high", "Recursive force delete (rm -rf)")
+
+
+def test_a_pattern_with_a_harmless_substitution_is_still_clean():
+    """The same conservative reading keeps a real substitution visible; one that computes an
+    innocuous value leaves the command without a finding."""
+    _clean('find . -name "*.$(date +%s).tmp" -print')
+
+
 @pytest.mark.parametrize("command", [
     "find . -name '$(rm -rf ./victim)' -print",
     "find . -name '`helm uninstall web`' -print",
-    'find . -name "\\$(rm -rf ./victim)" -print',
     "find . -name 'helm uninstall web' -print",
     'find . -name "helm uninstall web" -print',
-    'find . -name "*.$(date +%s).tmp" -print',
 ])
 def test_a_literal_find_pattern_is_still_data(command):
-    """Single-quoted text is literal and an escaped `$` computes nothing: `date` is not a
-    dangerous command, and a literal pattern stays blank."""
+    """Single-quoted text is literal, so a pattern whose only substitution syntax sits inside
+    single quotes, and one with no substitution syntax at all, stay blank."""
     _clean(command)
 
 

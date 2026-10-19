@@ -968,103 +968,58 @@ def _check_shell_word(w: _Word, name: str, cwd: Optional[str], workdir: Optional
         risks.append(Risk("low", "shell_outside", f"Shell command referenced a path outside the working folder ({shown})", step.index))
 
 
-def _substitution_spans(raw: str, ps: bool = False) -> List[Tuple[int, int]]:
-    """The offsets of the commands a shell runs inside `raw` before the command itself starts:
-    `$(...)` everywhere, and a backtick for a POSIX shell. Single-quoted text is literal, so
-    `'$(rm -rf x)'` is a file name; an escaped `$` or backtick computes nothing either."""
-    spans: List[Tuple[int, int]] = []
+def _has_substitution(raw: str, ps: bool = False) -> bool:
+    """Whether `raw` carries substitution syntax outside single-quoted text: `$(...)` anywhere,
+    and a backtick for a POSIX shell. Escapes are not resolved, so an escaped `$(` or backtick
+    counts as one too: a substitution the shell really runs must stay visible, and a pattern
+    that only looks like one is over-reported instead. A quote an escape covers is literal, so
+    it neither opens nor closes the quoted text."""
     i, n = 0, len(raw)
     while i < n:
         ch = raw[i]
-        if ch == "'" and raw[i - 1:i] != "$":
+        if ch == "'" and raw[i - 1:i] not in ("\\", "`"):
             close = raw.find("'", i + 1)
             i = n if close < 0 else close + 1
             continue
         if ch == '"':
             i += 1
             while i < n and raw[i] != '"':
-                if raw[i] == "\\" and i + 1 < n and (ps or raw[i + 1] in '"\\$`'):
+                if raw[i] == "\\" and raw[i + 1:i + 2] == '"' and not ps:
+                    i += 2
+                    continue
+                if raw[i] == "`" and raw[i + 1:i + 2] == '"' and ps:
                     i += 2
                     continue
                 if raw[i] == "$" and raw[i + 1:i + 2] == "(":
-                    end = _substitution_end(raw, i)
-                elif raw[i] == "`" and not ps:
-                    close = raw.find("`", i + 1)
-                    end = n if close < 0 else close + 1
-                else:
-                    i += 1
-                    continue
-                spans.append((i, end))
-                i = end
+                    return True
+                if raw[i] == "`" and not ps:
+                    return True
+                i += 1
             i += 1
-            continue
-        if ch == "\\" and i + 1 < n:
-            i += 2
             continue
         if ch == "$" and raw[i + 1:i + 2] == "(":
-            end = _substitution_end(raw, i)
-        elif ch == "`" and not ps:
-            close = raw.find("`", i + 1)
-            end = n if close < 0 else close + 1
-        else:
-            i += 1
-            continue
-        spans.append((i, end))
-        i = end
-    return spans
-
-
-def _substitution_end(raw: str, start: int) -> int:
-    """The index after the `)` closing the `$(` at `start`; the end of `raw` when it never
-    closes, so an unreadable substitution stays visible rather than blanked."""
-    depth = 0
-    i, n = start + 1, len(raw)
-    while i < n:
-        ch = raw[i]
-        if ch == "\\" and i + 1 < n:
-            i += 2
-            continue
-        if ch == "'":
-            close = raw.find("'", i + 1)
-            i = n if close < 0 else close + 1
-            continue
-        if ch == '"':
-            i += 1
-            while i < n and raw[i] != '"':
-                i += 2 if raw[i] == "\\" else 1
-            i += 1
-            continue
-        if ch == "(":
-            depth += 1
-        elif ch == ")":
-            depth -= 1
-            if depth == 0:
-                return i + 1
+            return True
+        if ch == "`" and not ps:
+            return True
         i += 1
-    return n
+    return False
 
 
 def _code_view(text: str, comments: List[Tuple[int, int]], text_words: List[_Word],
                ps: bool = False) -> str:
     """The command text the dangerous-command rules read: comments removed, and text
-    arguments (echo, git commit -m, python -c, a `find -name` pattern) blanked. A command
-    substitution inside a text argument stays: the shell runs it before the command does, so
-    only the literal text around it is blanked (GE-017). Unquoted $VAR words are kept."""
+    arguments (echo, git commit -m, python -c, a `find -name` pattern) blanked. A text word
+    carrying substitution syntax outside single quotes is not blanked at all: whatever the
+    shell computes there stays visible, whatever reads it, which over-reports a word that only
+    looks like a substitution but never hides one that really is (GE-017). Unquoted $VAR words
+    are kept."""
     spans = [(s, e, "") for s, e in comments]
     for w in text_words:
         raw = text[w.start:w.end]
-        subs = _substitution_spans(raw, ps)
-        if not subs:
-            if w.quoted or not w.value.startswith("$") or "$(" in w.value:
-                spans.append((w.start, w.end, '""'))
+        if _has_substitution(raw, ps):
             continue
-        pos = 0
-        for s, e in subs:
-            if s > pos:
-                spans.append((w.start + pos, w.start + s, '""'))
-            pos = e
-        if pos < len(raw):
-            spans.append((w.start + pos, w.end, '""'))
+        if w.quoted or not w.value.startswith("$") or "$(" in w.value:
+            spans.append((w.start, w.end, '""'))
     out = text
     for s, e, rep in sorted(spans, key=lambda x: x[0], reverse=True):
         out = out[:s] + rep + out[e:]

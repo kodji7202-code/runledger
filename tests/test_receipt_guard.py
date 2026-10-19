@@ -365,16 +365,17 @@ def test_codex_row_links_by_the_recorded_tool_use_id(tmp_path):
     assert decision["step"] == 1 and decision["outcome"] == "Approved by approval server"
 
 
-def _codex_code_mode_run(tmp_path, command="rm -rf victim", call_id="ctc-1"):
+def _codex_code_mode_run(tmp_path, command="rm -rf victim", call_id="ctc-1", script=None):
     """A Codex code-mode `exec` call whose script scans a regular expression holding a quote
     before it really calls `tools.exec_command`."""
     from runledger.adapters import codex as codex_adapter
 
     project = tmp_path / "codex-code-proj"
     project.mkdir()
-    script = ('const stripQuotes = /\\"/g;\n'
-              'const r = await tools.exec_command({cmd:"' + command + '",shell:"bash"});\n'
-              'text(r.output);')
+    if script is None:
+        script = ('const stripQuotes = /\\"/g;\n'
+                  'const r = await tools.exec_command({cmd:"' + command + '",shell:"bash"});\n'
+                  'text(r.output);')
     lines = [
         {"timestamp": "2026-10-19T13:00:00.000Z", "type": "session_meta",
          "payload": {"id": CODEX_SESSION_ID, "cwd": str(project), "model": "gpt-6-luna"}},
@@ -394,6 +395,25 @@ def test_codex_code_mode_row_links_the_step_behind_a_regex_literal(tmp_path):
     """GE-018: a quote inside a regex literal before the real call cannot hide the shell step,
     so the guard decision that blocked it still links to that step."""
     run, project = _codex_code_mode_run(tmp_path)
+    assert [(s.tool, s.input) for s in run.steps] == [("Bash", {"command": "rm -rf victim"})]
+    _write_log(project, [{
+        "ts": "2026-10-19T13:00:01Z", "session_id": CODEX_SESSION_ID,
+        "tool_use_id": "ctc-1", "tool": "Bash", "agent": "codex", "canonical_tool": "Bash",
+        "decision": "deny", "policy_decision": "deny", "codes": ["command"],
+        "summary": "rm -rf victim",
+        "reason": "Blocked by RunLedger guard: Recursive force delete (rm -rf)",
+    }])
+    decision, = load_guard_decisions(run)
+    assert decision["step"] == 1 and decision["outcome"] == "Blocked by Guard"
+
+
+def test_codex_code_mode_row_links_the_step_behind_a_postfix_increment(tmp_path):
+    """GE-018 round-3: a division after `n++` used to be read as a regex literal, which swallowed
+    the shell call and left the blocked row with no step. The uncertain scan is searched as raw
+    text now, so the deletion keeps its step and the guard row keeps linking to it."""
+    run, project = _codex_code_mode_run(tmp_path, script=(
+        'let n = 1;\n'
+        'n++ / (await tools.exec_command({cmd:"rm -rf victim",shell:"bash"})).exit_code / 2;\n'))
     assert [(s.tool, s.input) for s in run.steps] == [("Bash", {"command": "rm -rf victim"})]
     _write_log(project, [{
         "ts": "2026-10-19T13:00:01Z", "session_id": CODEX_SESSION_ID,

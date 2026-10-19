@@ -287,9 +287,9 @@ def test_code_mode_exec_reads_the_real_call_after_quoted_text(tmp_path):
 
 
 def test_code_mode_exec_reads_the_call_after_a_regex_with_a_quote(tmp_path):
-    """A quote inside a JavaScript regex literal is part of the pattern, not a string opener:
-    the shell call after `/"\\/` is still read, so its deletion risk and its guard decision
-    keep the step they belong to (GE-018)."""
+    """A regex literal is one of the slashes the scanner does not classify: the source is
+    searched as raw text instead, so the call after `/"\\/` is still read and keeps its deletion
+    risk and its guard decision (GE-018)."""
     script = ('const stripQuotes = /\\"/g;\n'
               'const r = await tools.exec_command({cmd:"rm -rf victim",shell:"bash"});\n'
               'text(r.output);')
@@ -307,22 +307,52 @@ def test_code_mode_exec_reads_the_call_after_a_regex_with_a_quote(tmp_path):
     'return_value = a / b / c;\n',
 ])
 def test_code_mode_exec_reads_the_call_after_a_regex_or_a_division(tmp_path, prefix):
-    """The standard rule decides where a regex literal starts and ends: neither its quotes nor
-    its slashes can hide the call that follows."""
+    """Whether the slash opens a regex literal or divides is the one part of the scan that stays
+    uncertain, so the raw text is searched: neither a pattern's quotes nor its slashes can hide
+    the call that follows (GE-018)."""
     script = prefix + 'const r = await tools.exec_command({cmd:"rm -rf victim",shell:"bash"});\n'
     run = _parse_items(tmp_path, [_meta_line(), _exec_call(script)])
     assert [(s.tool, s.input) for s in run.steps] == [("Bash", {"command": "rm -rf victim"})]
 
 
-def test_code_mode_exec_keeps_the_precise_scan_after_a_spaced_division(tmp_path):
-    """A `/` whose previous significant token is an identifier divides, spaces or not, so the
-    scan still finishes cleanly: the same call text in a comment stays an example rather than
-    becoming a step (GE-018)."""
+def test_code_mode_exec_reads_the_call_after_a_postfix_increment(tmp_path):
+    """GE-018 round-3: `n++ / (...) / 2` is a division, not a regex literal - but the reader no
+    longer tries to tell them apart. A `/` that opens neither `//` nor `/*` leaves the scan
+    uncertain and the raw text is searched, so the shell call behind it keeps its step and its
+    deletion risk instead of vanishing into a misread pattern."""
+    script = ('let n = 1;\n'
+              'n++ / (await tools.exec_command({cmd:"rm -rf victim",shell:"bash"})).exit_code / 2;\n')
+    run = _parse_items(tmp_path, [_meta_line(), _exec_call(script)])
+    assert [(s.tool, s.input) for s in run.steps] == [("Bash", {"command": "rm -rf victim"})]
+    _, _, risks = assess(run)
+    assert [r.code for r in risks if r.step == 1] == ["command"]
+    assert risks[0].severity == "high"
+
+
+def test_code_mode_exec_with_a_division_searches_the_raw_text(tmp_path):
+    """The precise scan is used only for a script with no non-comment `/`. One division is
+    enough to make the reader uncertain, and the raw text is searched instead: a call written in
+    a comment next to it is reported as well. That over-report is the accepted side of the
+    trade (a reported call is safer than a hidden one)."""
     script = ('const ratio = total / count;\n'
               '// tools.exec_command({cmd:"rm -rf victim",shell:"bash"})\n'
               'const r = await tools.exec_command({cmd:"echo hello",shell:"bash"});\n')
     run = _parse_items(tmp_path, [_meta_line(), _exec_call(script)])
-    assert [(s.tool, s.input) for s in run.steps] == [("Bash", {"command": "echo hello"})]
+    assert [(s.tool, s.input) for s in run.steps] == [
+        ("Bash", {"command": "rm -rf victim"}),
+        ("Bash", {"command": "echo hello"}),
+    ]
+
+
+def test_code_mode_exec_comment_slashes_alone_keep_the_precise_scan(tmp_path):
+    """A script whose only slashes open comments is still read precisely, so a call written in a
+    comment stays an example rather than becoming a step (GE-018 round-3)."""
+    script = ('// tools.exec_command({cmd:"rm -rf victim",shell:"bash"})\n'
+              'text("done");')
+    run = _parse_items(tmp_path, [_meta_line(), _exec_call(script)])
+    assert len(run.steps) == 1
+    assert run.steps[0].tool == "exec"
+    assert run.steps[0].input == {"input": script}
 
 
 def test_code_mode_exec_unreadable_source_falls_back_to_the_raw_call(tmp_path):
