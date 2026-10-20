@@ -24,18 +24,27 @@ ID_RE = re.compile(r"[0-9]{8}T[0-9]{12}Z-[0-9a-f]{8}\Z")
 HOOK_COMMAND = "runledger checkpoint --hook"
 HOOK_EVENTS = ("SessionStart", "UserPromptSubmit")
 DURATION_RE = re.compile(r"(\d+)([dwh])\Z", re.I)
-DURATION_UNITS = {"d": "days", "w": "weeks", "h": "hours"}
+DURATION_SECONDS = {"d": 86400, "w": 604800, "h": 3600}
+DURATION_LIMIT_SECONDS = 365000 * 86400  # a thousand years: past this a value is a typo
 TZ_RE = re.compile(r"[+-][0-9]{4}\Z")
 
 
 def parse_duration(text: Any) -> Optional[timedelta]:
-    """`30d`, `2w` or `6h` as a timedelta; None for anything else (never raises)."""
+    """`30d`, `2w` or `6h` as a timedelta; None for anything else (never raises). A value past
+    the retention ceiling is refused rather than kept, so a misread setting can only fall back
+    to the documented default and never overflow the age arithmetic."""
     if not isinstance(text, str):
         return None
     m = DURATION_RE.match(text.strip())
     if not m:
         return None
-    return timedelta(**{DURATION_UNITS[m.group(2).lower()]: int(m.group(1))})
+    digits = m.group(1)
+    if len(digits) > 12:  # the ceiling is 11 digits of seconds; never build a huge int
+        return None
+    seconds = int(digits) * DURATION_SECONDS[m.group(2).lower()]
+    if seconds > DURATION_LIMIT_SECONDS:
+        return None
+    return timedelta(seconds=seconds)
 
 
 @dataclass
@@ -208,6 +217,57 @@ def _unsupported_reparse_point(path: Path, info: os.stat_result) -> bool:
         return True
     is_junction = getattr(os.path, "isjunction", None)  # Python 3.12+, absent on 3.9
     return bool(is_junction and is_junction(path))
+
+
+def _redirects(path: Path) -> bool:
+    """Whether `path` itself is a link or another reparse point. A checkpoint hook owns no part
+    of the working tree, so bookkeeping must never read or write through one of those."""
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    return stat.S_ISLNK(info.st_mode) or _unsupported_reparse_point(path, info)
+
+
+def _read_warn_marker(marker: Path) -> Dict[str, Any]:
+    """The remembered size warnings, or nothing at all when the marker is missing, unreadable
+    or a redirect the repository controls."""
+    if _redirects(marker.parent) or _redirects(marker):
+        return {}
+    try:
+        data = json.loads(marker.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError, TypeError, RecursionError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_warn_marker(marker: Path, text: str) -> None:
+    """Write the marker without following a redirect, and truncate only once the open file is
+    known to be the marker itself. `.runledger` is repository content, so a link there must
+    never turn a size warning into a write to another file."""
+    folder = marker.parent
+    if _redirects(folder) or _redirects(marker):
+        return
+    if not folder.is_dir():
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return
+        if _redirects(folder):
+            return
+    try:
+        fd = os.open(marker, os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    except OSError:
+        return
+    try:
+        if not os.path.samestat(os.fstat(fd), marker.lstat()):
+            return
+        os.ftruncate(fd, 0)
+        os.write(fd, text.encode("utf-8"))
+    except (OSError, ValueError):
+        return
+    finally:
+        os.close(fd)
 
 
 def _repo_discovery_error(result: subprocess.CompletedProcess) -> CheckpointError:
@@ -889,14 +949,12 @@ class Repository:
     def warn_size_once(self, message: str, session_id: str,
                        now: Optional[datetime] = None) -> bool:
         """Print a size warning to stderr at most once per session per day. The marker file is
-        best effort: a checkpoint hook must never fail because it could not be written."""
+        best effort: a checkpoint hook must never fail because of it, and one the repository can
+        redirect (a link or another reparse point at `.runledger` or at the marker itself) is
+        left alone instead of being read or written through."""
         when = now or datetime.now(timezone.utc)
         marker = self.root / WARN_MARKER
-        try:
-            seen = json.loads(marker.read_text(encoding="utf-8-sig"))
-            seen = seen if isinstance(seen, dict) else {}
-        except (OSError, ValueError, TypeError, RecursionError):
-            seen = {}
+        seen = _read_warn_marker(marker)
         recorded = seen.get(session_id)
         if isinstance(recorded, str):
             last = _parsed_time(recorded)
@@ -908,11 +966,7 @@ class Repository:
                       if isinstance(value, str) and (parsed := _parsed_time(value)) is not None
                       and when - parsed < WARN_WINDOW * 7}
         remembered[session_id] = when.isoformat()
-        try:
-            marker.parent.mkdir(parents=True, exist_ok=True)
-            marker.write_text(json.dumps(remembered), encoding="utf-8")
-        except OSError:
-            pass
+        _write_warn_marker(marker, json.dumps(remembered))
         return True
 
 
@@ -966,7 +1020,7 @@ def hook_main() -> int:
             return 0
         repo = Repository(cwd)
         checkpoint = repo.create(label=event["hook_event_name"], run_id=run_id)
-        settings = load_settings()
+        settings = _hook_settings()
         _hook_auto_prune(repo, settings, run_id, checkpoint)
         _hook_size_warning(repo, settings, run_id, checkpoint)
     except NotAGitRepository:
@@ -975,6 +1029,16 @@ def hook_main() -> int:
         print("RunLedger checkpoint unavailable. Run 'runledger checkpoint' manually for details.",
               file=sys.stderr)
     return 0
+
+
+def _hook_settings() -> Settings:
+    """The retention settings for one hook run. Decoding them is bookkeeping, so any failure at
+    all keeps the documented defaults: a config value must never cost the hook its exit code or
+    the checkpoint it just made."""
+    try:
+        return load_settings()
+    except Exception:
+        return Settings()
 
 
 def _hook_auto_prune(repo: Repository, settings: Settings, run_id: str,

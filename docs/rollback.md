@@ -59,15 +59,19 @@ not the last prompt, so it returns to the start of the run. Retention is describ
 runledger checkpoints prune --keep 20                  # keep the newest 20
 runledger checkpoints prune --older-than 30d           # remove everything older than 30 days
 runledger checkpoints prune --keep 20 --older-than 30d # both rules, conservatively
+runledger checkpoints prune --keep 20 --verbose        # ... and name what it removed
 ```
 
 `--keep N` and `--older-than DUR` (`30d`, `2w`, `12h`) are both optional, but at least one is
 required. Giving both is conservative: a checkpoint is removed only when it is **both** beyond the
 newest N **and** older than the limit, so the two rules can never add up to a wider deletion than
 each one alone. A checkpoint exactly at the limit age is kept, and `--older-than` refuses anything
-that is not a number followed by `d`, `w` or `h`. Safety checkpoints count like any other
+that is not a number followed by `d`, `w` or `h`, or that no calendar could hold (`9999999999d`
+exits 2 and deletes nothing). Safety checkpoints count like any other
 checkpoint, so `--keep 0` removes all of them, and the report says how many checkpoints were
-removed and how many of them were safety checkpoints.
+removed and how many of them were safety checkpoints. `--verbose` adds one `removed <checkpoint id>`
+line per checkpoint that was actually removed, in the order they were pruned (newest first);
+without it the report is unchanged, and nothing is listed when nothing matched.
 
 The age is read from Git's own commit date for the ref, the date `git log` shows. Pruning deletes
 the checkpoint refs only: the commits stay readable until Git reclaims the objects, and the
@@ -84,7 +88,10 @@ session does not grow without limit. Tune the `rollback.auto_prune` key in your 
 
 The default keeps the newest 50 checkpoints and has no age limit; `"auto_prune": false` switches
 auto-prune off entirely. Only your own config file counts: a project `.runledger.json` cannot
-change retention (the guard logs and prints a warning when it tries). Auto-prune never removes the
+change retention (the guard logs and prints a warning when it tries). A value the hook cannot use -
+a wrong type, a negative `keep`, or an age limit no calendar could hold such as `9999999999d` -
+keeps the documented default instead of stopping anything, and decoding it can never make the hook
+fail. Auto-prune never removes the
 checkpoint it just created, or any checkpoint of the session in progress, so `rollback` and
 `rollback --run` keep working for the run the agent is in. It removes refs only, and a failure
 inside auto-prune never breaks the hook.
@@ -104,6 +111,11 @@ working tree (`git add -A` semantics), the fix for a huge snapshot is to add big
 folders to `.gitignore`, which is what the warning says. In the automatic hooks the same warning
 goes to **stderr only** - never to stdout, which becomes agent context there - and at most once per
 session per 24 hours, so a large tree does not repeat the message on every prompt.
+
+The rate-limit marker is `<repo>/.runledger/.size-warned`, and that path is repository content: a
+symlink (or another reparse point) at the marker or at `.runledger` itself is never followed, so
+the hook leaves it alone and the warning simply repeats instead of writing its bookkeeping through
+the link. The marker is best effort either way - it can never fail the hook.
 
 ## Restore only part of a checkpoint (`--path`)
 
