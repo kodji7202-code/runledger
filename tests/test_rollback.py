@@ -2254,7 +2254,10 @@ def test_hook_settings_failure_keeps_the_defaults(repo, monkeypatch, capsys):
     ({"keep": -2}, 6),
     ({"keep": 2.5}, 6),
     ({"keep": True}, 6),
-    ({"keep": 10 ** 30}, 6),
+    # A keep past the documented maximum falls back the same way; six checkpoints cannot tell
+    # the fallback from the huge value, so that one is asserted beyond the default window by
+    # test_hook_bounds_a_huge_keep_beyond_the_default_window (LOCAL-R2-RET-01).
+    ({"keep": rollback.MAX_PRUNE_KEEP + 1}, 6),
     ({"older_than": 30}, 6),
     ({"older_than": "1.5d"}, 6),
     ({"older_than": "999999999d"}, 6),
@@ -2270,6 +2273,58 @@ def test_hook_retention_settings_never_break_the_hook(repo, monkeypatch, capsys,
     kept = rollback.Repository(str(repo.root)).checkpoints()
     assert kept[0].run_id == "s5"  # the checkpoint the hook just made survives
     assert len(kept) == remaining
+
+
+def test_keep_past_the_documented_maximum_decodes_to_the_default():
+    """LOCAL-R2-RET-01: `keep` is bounded, so a value above the maximum is unusable exactly
+    like a negative one and the hook applies its documented default instead."""
+    assert rollback.MAX_PRUNE_KEEP == 100000
+
+    def decode(keep):
+        return rollback.load_settings(
+            {"rollback": {"auto_prune": {"keep": keep}}}).auto_prune_keep
+
+    assert decode(1) == 1
+    assert decode(rollback.MAX_PRUNE_KEEP) == rollback.MAX_PRUNE_KEEP
+    assert decode(rollback.MAX_PRUNE_KEEP + 1) == 50
+    assert decode(10 ** 30) == 50
+
+
+def seed_checkpoints(repo, count):
+    """Publish `count` real checkpoint refs, one commit each, in a handful of Git calls.
+
+    `Repository.create` resolves the Git identity and lists the tree on every call, so fifty-odd
+    seeds through it cost minutes of test time; a retention test only needs the refs to count,
+    and every commit carries the message `create` writes."""
+    tree = repo.snapshot_tree()
+    identity = repo._checkpoint_identity()
+    refs = []
+    for index in range(count):
+        checkpoint_id = f"20261015T120000{index:06d}Z-{index:08x}"
+        metadata = dict(version=1, id=checkpoint_id, created_at="2026-10-15T12:00:00+00:00",
+                        label=f"cp-{index}", run_id=f"other-{index}", kind="checkpoint")
+        message = "RunLedger checkpoint\n\n" + json.dumps(metadata, ensure_ascii=True) + "\n"
+        oid = repo._git("commit-tree", tree, data=message.encode(),
+                        extra_env=identity).stdout.decode("ascii").strip()
+        refs.append((rollback.PREFIX + checkpoint_id, oid))
+    repo._git("update-ref", "--stdin",
+              data="".join(f"create {ref} {oid}\n" for ref, oid in refs).encode())
+
+
+def test_hook_bounds_a_huge_keep_beyond_the_default_window(repo, monkeypatch, capsys, tmp_path):
+    """LOCAL-R2-RET-01: with more checkpoints than the default window, `keep=10**30` must
+    retain the default 50 (its own checkpoint included), not everything on the branch."""
+    monkeypatch.setenv("RUNLEDGER_CONFIG", str(write_config(
+        tmp_path, {"rollback": {"auto_prune": {"keep": 10 ** 30}}})))
+    seed_checkpoints(repo, 51)
+    assert len(rollback.Repository(str(repo.root)).checkpoints()) == 51
+
+    code, captured = run_hook(repo, "keepme", monkeypatch, capsys)
+    assert code == 0 and captured.out == "" and captured.err == ""
+
+    kept = rollback.Repository(str(repo.root)).checkpoints()
+    assert len(kept) == 50
+    assert kept[0].run_id == "keepme"  # the checkpoint the hook just made survives
 
 
 def test_load_settings_never_raises_for_an_unusable_policy():

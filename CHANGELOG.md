@@ -420,6 +420,19 @@ change behavior, so read the entry before you upgrade.
   titles the text report prints (`guard log`, not `log`), and the numbers in the sample summary and
   in the `--json` example are the ones that run prints. The `log` section documents the outside-Git
   `info` status.
+- **A `stats` record is dropped when a watched dependency appears or is repaired (`runledger.stats`,
+  `runledger.parser`, `runledger.adapters.droid`):** the parse cache only watched the files a parse
+  had actually read, so a Droid `<id>.settings.json` sidecar written later, a child settings file
+  repaired after a malformed write, or a Claude sub-agent transcript added to (or filled in under) a
+  folder that held none left the warm report at its old tokens and cost while `--no-cache` showed
+  the new ones. Every dependency candidate is now recorded with how it turned out - `ok`, `missing`
+  or `rejected`, with its size and modification time - and a record is dropped when any candidate's
+  existence, size or time changes, so a warm run reports what `--no-cache` reports. The cache record
+  format is version 3, so an older cache is rebuilt once instead of being reused.
+- **`rollback.auto_prune.keep` is bounded (`runledger.rollback`):** a value above 100000 is
+  unusable like a negative one and keeps the documented default of 50, so a typo in
+  `~/.runledger/config.json` can no longer silently retain an unbounded number of checkpoints
+  (`keep: 10**30` used to keep everything on the branch). `docs/rollback.md` documents the bound.
 
 ### Security
 

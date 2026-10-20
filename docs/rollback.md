@@ -89,9 +89,9 @@ session does not grow without limit. Tune the `rollback.auto_prune` key in your 
 The default keeps the newest 50 checkpoints and has no age limit; `"auto_prune": false` switches
 auto-prune off entirely. Only your own config file counts: a project `.runledger.json` cannot
 change retention (the guard logs and prints a warning when it tries). A value the hook cannot use -
-a wrong type, a negative `keep`, or an age limit no calendar could hold such as `9999999999d` -
-keeps the documented default instead of stopping anything, and decoding it can never make the hook
-fail. Auto-prune never removes the
+a wrong type, a negative `keep`, a `keep` larger than 100000, or an age limit no calendar could
+hold such as `9999999999d` - keeps the documented default instead of stopping anything, and
+decoding it can never make the hook fail. Auto-prune never removes the
 checkpoint it just created, or any checkpoint of the session in progress, so `rollback` and
 `rollback --run` keep working for the run the agent is in. It removes refs only, and a failure
 inside auto-prune never breaks the hook.

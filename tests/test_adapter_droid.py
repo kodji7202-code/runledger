@@ -300,7 +300,9 @@ def test_unsafe_session_ids_are_never_used_to_search(tmp_path, monkeypatch, sid)
     path = tmp_path / "s.jsonl"
     path.write_text(json.dumps({"type": "session_start", "id": sid, "cwd": "/demo"}) + "\n",
                     encoding="utf-8")
-    assert droid._settings_path(path, droid._header(path)) is None
+    found, candidates = droid._settings_lookup(path, droid._header(path))
+    assert found is None
+    assert candidates == [path.with_suffix(".settings.json")]  # no glob was built from `sid`
 
 
 def test_missing_settings_show_na_and_a_note_and_no_cost(tmp_path, monkeypatch, capsys):

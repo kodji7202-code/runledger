@@ -18,7 +18,8 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
-from ..parser import Run, Step, Usage, _split_usage
+from ..parser import (SOURCE_MISSING, SOURCE_OK, SOURCE_REJECTED, Run, Step, Usage,
+                      _split_usage)
 from ..paths import _norm as _norm_style, join as _join
 from ..pricing import UNATTRIBUTED
 from .codex import patch_to_steps
@@ -275,30 +276,35 @@ def _tools(name: str, inp: Dict[str, Any], depth: int = 0) -> List[Tuple[str, Di
     return [(name, inp)]
 
 
-def _settings_path(path: Path, header: Dict[str, Any]) -> Optional[Path]:
-    """The sibling settings file, or the one Droid keeps for this session id under FACTORY_HOME.
-    The fallback covers transcripts that were copied or renamed without their settings file."""
+def _settings_lookup(path: Path, header: Dict[str, Any]) -> Tuple[Optional[Path], List[Path]]:
+    """The settings file to read for this transcript, and every path the lookup considered, so
+    `stats` can watch the ones that were not there: a sidecar written later invalidates its
+    record. The sibling file is read first; the fallback covers transcripts that were copied or
+    renamed without it, and the folder that fallback scans is a candidate of its own."""
     sibling = path.with_suffix(".settings.json")
     if sibling.is_file():
-        return sibling
-    sid = header.get("id")
-    if not isinstance(sid, str) or not _SESSION_ID.fullmatch(sid):
-        return None
-    name = f"{sid}.settings.json"
+        return sibling, [sibling]
+    candidates = [sibling]
+    session_id = header.get("id")
+    if not isinstance(session_id, str) or not _SESSION_ID.fullmatch(session_id):
+        return None, candidates
+    name = f"{session_id}.settings.json"
     root = factory_home() / "sessions"
     cwd = header.get("cwd")
     folder = _encode(cwd) if isinstance(cwd, str) else ""
     if folder not in ("", ".", ".."):
         preferred = root / folder / name
+        candidates.append(preferred)
         if preferred.is_file():
-            return preferred
+            return preferred, candidates
+    candidates.append(root)
     try:
         for candidate in sorted(root.glob(f"*/{name}")):
             if candidate.is_file():
-                return candidate
+                return candidate, candidates
     except OSError:
         pass
-    return None
+    return None, candidates
 
 
 def _minus(a: Usage, b: Usage) -> Usage:
@@ -306,22 +312,29 @@ def _minus(a: Usage, b: Usage) -> Usage:
 
 
 def _child_model(settings_path: Optional[Path], child_id: Any,
-                 sources: List[str]) -> Optional[str]:
+                 sources: List[Tuple[str, str]]) -> Optional[str]:
+    """The model of one child session, from its own settings file. The path is recorded as a
+    source whether the file is missing, unreadable or usable, so a child settings file that is
+    created or repaired later drops the cache record instead of leaving its usage unattributed."""
     if settings_path is None or not isinstance(child_id, str) or not _SESSION_ID.fullmatch(child_id):
         return None
     child = settings_path.parent / f"{child_id}.settings.json"
+    if not child.is_file():
+        sources.append((str(child), SOURCE_MISSING))
+        return None
     try:
         data = json.loads(child.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError, RecursionError):
-        return None
+        data = None
     if not isinstance(data, dict):
+        sources.append((str(child), SOURCE_REJECTED))
         return None
-    sources.append(str(child))
+    sources.append((str(child), SOURCE_OK))
     return _text(data.get("model")) or None
 
 
 def _child_usage(settings: Dict[str, Any], own: Usage, settings_path: Optional[Path],
-                 sources: List[str]) -> Dict[str, Usage]:
+                 sources: List[Tuple[str, str]]) -> Dict[str, Usage]:
     """Sub-agent usage: inclusiveTokenUsage minus the session's own tokenUsage. Each child
     session is credited to the model in its own settings file when that file is found;
     the rest is unattributed, never priced as the parent's model. Every child total is a
@@ -464,16 +477,20 @@ def parse(path: Path, git_root: bool = True) -> Run:
     """Parse one Droid transcript. `git_root=False` recovers a relative `cwd` without
     running git, which is what `runledger stats` parses with."""
     p = Path(path)
-    sources: List[str] = []
-    settings_path = _settings_path(p, _header(p))
+    settings_path, candidates = _settings_lookup(p, _header(p))
+    settings: Dict[str, Any] = {}
+    state = SOURCE_REJECTED if settings_path is not None else SOURCE_MISSING
     if settings_path is not None:
-        sources.append(str(settings_path))
-    try:
-        settings = json.loads(settings_path.read_text(encoding="utf-8-sig")) if settings_path else {}
-    except (OSError, ValueError, RecursionError):
-        settings = {}
-    if not isinstance(settings, dict):
-        settings = {}
+        try:
+            raw_settings = json.loads(settings_path.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError, RecursionError):
+            raw_settings = None
+        if isinstance(raw_settings, dict):
+            settings = raw_settings
+            state = SOURCE_OK
+    sources: List[Tuple[str, str]] = [
+        (str(candidate), state if candidate == settings_path else SOURCE_MISSING)
+        for candidate in candidates]
     default_model = _text(settings.get("model")) or "unknown"
     run = Run(p.stem, str(p), None, None, None, None, [], [], "", Usage(), {}, agent=NAME)
     calls: Dict[str, List[Step]] = {}
@@ -599,5 +616,5 @@ def parse(path: Path, git_root: bool = True) -> Run:
         run.usage_file = settings_path.name if settings_path else None
     else:
         run.usage_source = "messages"
-    run.source_files = sources
+    run.sources = sources
     return run

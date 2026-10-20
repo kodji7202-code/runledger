@@ -18,7 +18,19 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+# How a path a parse read or looked for beside a transcript turned out: it was read, it was not
+# there, or it was there and could not be used. `runledger stats` records the state beside the
+# path's size and modification time, so its cache record is dropped when a candidate appears
+# (a Droid settings sidecar written later), is repaired (a child settings file that was
+# malformed) or changes (a sub-agent transcript filled in).
+SOURCE_OK = "ok"
+SOURCE_MISSING = "missing"
+SOURCE_REJECTED = "rejected"
+
+# A Claude sub-agent folder tree deeper than this is watched at its roots only.
+_MAX_SUBAGENT_FOLDERS = 64
 
 
 @dataclass
@@ -152,9 +164,12 @@ class Run:
     # Droid only: where cwd came from. "header" (the log), "session" (`% pwd` output or the tool
     # paths' Git work tree), "settings", "session_dir" (the encoded session folder) or "unknown"
     cwd_source: Optional[str] = None
-    # Files beside the transcript whose content this parse read (a Droid settings sidecar,
-    # Claude sub-agent transcripts): `runledger stats` keys its cache on them too.
-    source_files: List[str] = field(default_factory=list)
+    # Every path this parse read or looked for beside the transcript - a Droid settings file or
+    # child settings file, each folder a Claude sub-agent transcript could live in, and the
+    # transcripts themselves - as `(path, state)`: the state is `SOURCE_OK`, `SOURCE_MISSING`
+    # or `SOURCE_REJECTED`. `runledger stats` keys its cache record on all of them, so one that
+    # appears, is repaired or changes drops the record.
+    sources: List[Tuple[str, str]] = field(default_factory=list)
     safe: bool = False  # safe.make_safe rewrote paths and masked e-mails for sharing
     # safe.make_safe: the changed files computed before paths were rewritten (summarize.FileChange values)
     frozen_changes: Optional[Dict[str, Any]] = None
@@ -276,47 +291,76 @@ def _fs_str(path: str | os.PathLike) -> str:
     return s
 
 
-def _discover_subagent_files(parent_path: Path, session_id: str) -> List[Tuple[Path, bool]]:
-    """Return `[(sub_path, is_legacy), ...]` for a parent Claude Code transcript."""
-    if any(part.lower() == "subagents" for part in parent_path.parent.parts):
-        return []
-    found: List[Tuple[Path, bool]] = []
-    seen = set()
+def _subagent_roots(parent_path: Path, session_id: str) -> List[Tuple[Path, bool]]:
+    """`[(folder, is_legacy)]`: every folder a sub-agent transcript of this parent could live
+    in, whether or not it exists - `<project>/<session>/subagents/**` (nested `workflows`
+    included) and the legacy `<project>/subagents/**`."""
     parent_dir = parent_path.parent
-
-    # 1. Session-scoped layout: <project>/<session>/subagents/**/*.jsonl
-    candidates = [parent_path.stem]
+    names = [parent_path.stem]
     if (session_id and session_id != parent_path.stem
             and "/" not in session_id and "\\" not in session_id
             and session_id not in (".", "..")):
-        candidates.append(session_id)
-    for sname in candidates:
-        sub_dir = Path(_fs_str(parent_dir / sname / "subagents"))
+        names.append(session_id)
+    roots = [(Path(_fs_str(parent_dir / name / "subagents")), False) for name in names]
+    roots.append((Path(_fs_str(parent_dir / "subagents")), True))
+    return roots
+
+
+def _folders_under(root: Path) -> List[Path]:
+    """`root` and the folders below it, breadth first: a transcript added anywhere in the tree
+    changes the modification time of the folder that holds it, so watching the folders watches
+    the whole tree. A tree holding more folders than `_MAX_SUBAGENT_FOLDERS` is watched at its
+    shallowest ones only."""
+    folders = [root]
+    index = 0
+    while index < len(folders) and len(folders) < _MAX_SUBAGENT_FOLDERS:
+        folder = folders[index]
+        index += 1
         try:
-            is_dir = sub_dir.is_dir()
+            entries = sorted(folder.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if len(folders) >= _MAX_SUBAGENT_FOLDERS:
+                break
+            try:
+                if entry.is_dir() and not entry.is_symlink():
+                    folders.append(entry)
+            except OSError:
+                continue
+    return folders
+
+
+def _discover_subagent_files(parent_path: Path, session_id: str
+                             ) -> Tuple[List[Tuple[Path, str]], List[Tuple[Path, bool]]]:
+    """`(candidates, files)`: how every folder a sub-agent transcript could live in turned out
+    (a folder that is not there is a `SOURCE_MISSING` candidate, so a transcript written into
+    it later is seen), and the transcripts that are there now."""
+    if any(part.lower() == "subagents" for part in parent_path.parent.parts):
+        return [], []
+    candidates: List[Tuple[Path, str]] = []
+    found: List[Tuple[Path, bool]] = []
+    seen = set()
+    for root, is_legacy in _subagent_roots(parent_path, session_id):
+        try:
+            is_dir = root.is_dir()
         except OSError:
             is_dir = False
-        if is_dir:
-            for f in sorted(sub_dir.rglob("*.jsonl")):
-                key = str(f)
-                if key not in seen:
-                    seen.add(key)
-                    found.append((f, False))
-
-    # 2. Legacy layout: <project>/subagents/**/*.jsonl
-    legacy_dir = Path(_fs_str(parent_dir / "subagents"))
-    try:
-        is_legacy_dir = legacy_dir.is_dir()
-    except OSError:
-        is_legacy_dir = False
-    if is_legacy_dir:
-        for f in sorted(legacy_dir.rglob("*.jsonl")):
-            key = str(f)
+        if not is_dir:
+            candidates.append((root, SOURCE_MISSING))
+            continue
+        candidates.extend((folder, SOURCE_OK) for folder in _folders_under(root))
+        try:
+            entries = sorted(root.rglob("*.jsonl"))
+        except OSError:
+            entries = []
+        for path in entries:
+            key = str(path)
             if key not in seen:
                 seen.add(key)
-                found.append((f, True))
+                found.append((path, is_legacy))
 
-    return found
+    return candidates, found
 
 
 def _merge_subagents(
@@ -324,13 +368,20 @@ def _merge_subagents(
     session_id: str,
     msg_usage: Dict[str, Usage],
     msg_model: Dict[str, Optional[str]],
-) -> List[Path]:
+) -> Tuple[List[Tuple[str, str]], int]:
     """Merge sub-agent assistant message usage into `msg_usage`/`msg_model`.
-    Returns the transcripts that contributed, so a caller can watch those files as well."""
-    merged_files: List[Path] = []
+
+    Returns `(sources, merged)`: every path the merge read or looked for beside the parent
+    transcript with how it turned out, and how many transcripts contributed. A transcript is a
+    source whether or not it contributed, and a folder a sub-agent transcript could live in is
+    one whether or not it exists, so `runledger stats` drops its cache record when one appears,
+    is filled in or changes."""
+    candidates, files = _discover_subagent_files(parent_path, session_id)
+    sources: List[Tuple[str, str]] = [(str(path), state) for path, state in candidates]
+    merged = 0
     valid_session_ids = {session_id, parent_path.stem}
 
-    for sub_path, is_legacy in _discover_subagent_files(parent_path, session_id):
+    for sub_path, is_legacy in files:
         sub_events: List[Dict[str, Any]] = []
         sub_sids = set()
         try:
@@ -351,14 +402,16 @@ def _merge_subagents(
                         if sid:
                             sub_sids.add(sid)
         except OSError:
+            sources.append((str(sub_path), SOURCE_REJECTED))
             continue
+        sources.append((str(sub_path), SOURCE_OK))
 
         if not sub_events:
             continue
         if is_legacy and sub_sids and not (sub_sids & valid_session_ids):
             continue
 
-        merged_files.append(sub_path)
+        merged += 1
         for idx, ev in enumerate(sub_events):
             if ev.get("type") != "assistant":
                 continue
@@ -378,7 +431,7 @@ def _merge_subagents(
                 if not msg_model.get(mid) and model:
                     msg_model[mid] = model
 
-    return merged_files
+    return sources, merged
 
 
 
@@ -479,11 +532,11 @@ def parse_session(path: str | os.PathLike) -> Run:
     if lines and not valid_events:
         raise ValueError(f"{path}: not a supported session file")
 
-    subagent_files = _merge_subagents(Path(path), session_id, msg_usage, msg_model)
+    subagent_sources, merged = _merge_subagents(Path(path), session_id, msg_usage, msg_model)
     notes: List[str] = []
-    if subagent_files:
-        suffix = "s" if len(subagent_files) != 1 else ""
-        notes.append(f"includes {len(subagent_files)} sub-agent transcript{suffix}")
+    if merged:
+        suffix = "s" if merged != 1 else ""
+        notes.append(f"includes {merged} sub-agent transcript{suffix}")
 
     # Attribute each assistant message's usage to the steps it issued
     # (split evenly); messages without tool calls count toward the run only.
@@ -502,7 +555,7 @@ def parse_session(path: str | os.PathLike) -> Run:
         session_id=session_id, path=path, cwd=cwd, git_branch=git_branch,
         started=started, ended=ended, prompts=prompts, steps=steps,
         final_message=final_message, usage=total, models=models, notes=notes,
-        source_files=[str(sub_path) for sub_path in subagent_files],
+        sources=subagent_sources,
     )
 
 

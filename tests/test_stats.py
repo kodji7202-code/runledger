@@ -1113,6 +1113,101 @@ def test_a_subagent_change_invalidates_the_cached_summary(capsys, isolated_setti
     assert after["totals"]["tokens"]["input"] == 1000 + 750
 
 
+def test_a_sidecar_that_appears_later_invalidates_the_cached_summary(
+        capsys, isolated_settings, monkeypatch):
+    """LOCAL-R2-STATS-01: the sidecar was not there when the record was built, so the record
+    must be dropped as soon as it exists (a warm run used to keep the old totals)."""
+    project = isolated_settings / "late-sidecar"
+    project.mkdir()
+    session = droid_session(isolated_settings, project, "late-sidecar", _started(1),
+                            model=MODEL, usage=(1000, 0, 0, 0))
+    (session.parent / f"{session.stem}.settings.json").unlink()
+    cold, _ = _json(capsys, "stats", "--all", "--format", "json")
+    assert cold["totals"]["tokens"]["input"] == 1000
+
+    droid_settings(session, MODEL, (9000, 0, 0, 0))
+    calls = _parse_calls(monkeypatch)
+    after, _ = _json(capsys, "stats", "--all", "--format", "json")
+    assert calls == [str(session)]
+    assert after["totals"]["tokens"]["input"] == 9000
+
+    fresh, _ = _json(capsys, "stats", "--all", "--no-cache", "--format", "json")
+    assert _without_generated(after) == _without_generated(fresh)
+
+
+def test_a_repaired_child_settings_file_invalidates_the_cached_summary(
+        capsys, isolated_settings, monkeypatch):
+    """LOCAL-R2-STATS-01: a child settings file that was unreadable when the record was built
+    must drop the record once it is repaired, so the child usage reaches its own model."""
+    project = isolated_settings / "child-settings"
+    project.mkdir()
+    session = droid_session(isolated_settings, project, "child-settings", _started(1),
+                            model=MODEL, usage=(1000, 0, 0, 0))
+    settings_path = session.parent / f"{session.stem}.settings.json"
+    settings_path.write_text(json.dumps({
+        "model": MODEL, "tokenUsage": {"inputTokens": 1000},
+        "inclusiveTokenUsage": {"inputTokens": 1500},
+        "childInclusiveTokenUsageBySessionId": {"child-1": {"inputTokens": 500}}}),
+        encoding="utf-8")
+    child = settings_path.parent / "child-1.settings.json"
+    child.write_text("{not json", encoding="utf-8")
+    cold, _ = _json(capsys, "stats", "--all", "--format", "json")
+    assert cold["totals"]["tokens"]["input"] == 1500
+    assert cold["totals"]["cost_partial"] is True  # the child's model is unknown
+
+    child.write_text(json.dumps({"model": MODEL}), encoding="utf-8")
+    calls = _parse_calls(monkeypatch)
+    after, _ = _json(capsys, "stats", "--all", "--format", "json")
+    assert calls == [str(session)]
+    assert after["totals"]["cost_partial"] is False
+
+    fresh, _ = _json(capsys, "stats", "--all", "--no-cache", "--format", "json")
+    assert _without_generated(after) == _without_generated(fresh)
+
+
+def test_a_subagent_that_appears_later_invalidates_the_cached_summary(
+        capsys, isolated_settings, monkeypatch):
+    """LOCAL-R2-STATS-01: no sub-agent folder existed when the record was built, so creating
+    one later must drop the record (a warm run used to keep the old totals)."""
+    project = isolated_settings / "late-subagent"
+    project.mkdir()
+    parent = claude_session(isolated_settings, project, "late-subagent", _started(1))
+    cold, _ = _json(capsys, "stats", "--all", "--format", "json")
+    assert cold["totals"]["tokens"]["input"] == 1000
+
+    claude_subagent(parent, "agent-1", _started(1), [(MODEL, (500, 0, 0, 0))])
+    calls = _parse_calls(monkeypatch)
+    after, _ = _json(capsys, "stats", "--all", "--format", "json")
+    assert calls == [str(parent)]
+    assert after["totals"]["tokens"]["input"] == 1500
+
+    fresh, _ = _json(capsys, "stats", "--all", "--no-cache", "--format", "json")
+    assert _without_generated(after) == _without_generated(fresh)
+
+
+def test_an_empty_subagent_populated_later_invalidates_the_cached_summary(
+        capsys, isolated_settings, monkeypatch):
+    """LOCAL-R2-STATS-01: a sub-agent transcript that held no event yet contributed nothing
+    and was not watched, so filling it in must drop the record."""
+    project = isolated_settings / "empty-subagent"
+    project.mkdir()
+    parent = claude_session(isolated_settings, project, "empty-subagent", _started(1))
+    folder = parent.parent / parent.stem / "subagents"
+    folder.mkdir(parents=True)
+    (folder / "agent-1.jsonl").write_text("", encoding="utf-8")
+    cold, _ = _json(capsys, "stats", "--all", "--format", "json")
+    assert cold["totals"]["tokens"]["input"] == 1000
+
+    claude_subagent(parent, "agent-1", _started(1), [(MODEL, (500, 0, 0, 0))])
+    calls = _parse_calls(monkeypatch)
+    after, _ = _json(capsys, "stats", "--all", "--format", "json")
+    assert calls == [str(parent)]
+    assert after["totals"]["tokens"]["input"] == 1500
+
+    fresh, _ = _json(capsys, "stats", "--all", "--no-cache", "--format", "json")
+    assert _without_generated(after) == _without_generated(fresh)
+
+
 def test_grouping_by_model_keeps_a_session_with_no_model(capsys, fixture_a):
     """A session that holds no usage at all keeps a row of its own under `--by model`."""
     folder = fixture_a["home"] / ".claude" / "projects" / encode_project_path(str(fixture_a["p1"]))
