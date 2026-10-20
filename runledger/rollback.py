@@ -172,6 +172,33 @@ def _within(name: str, prefixes: Tuple[str, ...]) -> bool:
                for prefix in prefixes)
 
 
+def _on_the_way(name: str, prefixes: Tuple[str, ...]) -> bool:
+    """A path and a selection are on the same vertical line: inside it, equal to it, or above
+    it (`sub` is on the way to `sub/x.txt`). Used to keep a blocker in scope when it is an
+    ancestor of the selected path. An empty prefix (the repository root) is the whole tree."""
+    return any(not prefix or name == prefix or name.startswith(prefix + "/")
+               or prefix.startswith(name + "/") for prefix in prefixes)
+
+
+def _case_insensitive_volume(folder: Path) -> bool:
+    """Whether the volume holding `folder` folds case. Windows is known from its own path
+    rules; elsewhere the folder is asked for under a different case, so a case-sensitive
+    volume (the Linux CI runners) keeps every spelling literal."""
+    if os.path.normcase("A") != "A":
+        return True
+    for candidate in [folder, *folder.parents]:
+        name = candidate.name
+        variant = name.upper() if name != name.upper() else name.lower()
+        if variant == name:
+            continue
+        probe = candidate.parent / variant
+        try:
+            return bool(probe.exists() and os.path.samefile(probe, candidate))
+        except OSError:
+            continue
+    return False
+
+
 def _unsupported_reparse_point(path: Path, info: os.stat_result) -> bool:
     """Detect directory junctions without following them, on old and new Python versions."""
     if stat.S_ISLNK(info.st_mode):
@@ -275,7 +302,10 @@ class Plan:
 
 class Repository:
     def __init__(self, cwd: Optional[str] = None):
-        self.root = Path(cwd or os.getcwd()).expanduser().resolve()
+        # The folder the command was invoked with: relative `--path` values are read against
+        # this one, while `root` is Git's top level, which is what all names are stored as.
+        self.cwd = Path(cwd or os.getcwd()).expanduser().resolve()
+        self.root = self.cwd
         self._trees: Dict[str, Dict[str, Tuple[str, str]]] = {}
         self.env = dict(os.environ)
         # An inherited alternate index/worktree must not redirect an explicit --cwd.
@@ -303,6 +333,7 @@ class Repository:
                 self.git_dirs.append((self.root / folder).resolve())
         if self._git("config", "--bool", "--get", "core.sparseCheckout", check=False).stdout.strip() == b"true":
             raise CheckpointError("Sparse checkouts are not supported; use a full working tree.")
+        self.folded = _case_insensitive_volume(self.root)
 
     def _git(self, *args: str, index: Optional[str] = None,
              data: Optional[bytes] = None, check: bool = True,
@@ -364,11 +395,14 @@ class Repository:
                     self._git("read-tree", "--empty", index=index)
             yield index
 
-    def snapshot_tree(self) -> str:
-        """Capture tracked and non-ignored untracked files using only a temporary index."""
+    def snapshot_tree(self, scope: Optional[Tuple[str, ...]] = None) -> str:
+        """Capture tracked and non-ignored untracked files using only a temporary index.
+        `scope` limits the Windows reparse-point refusal to the selected paths, so a junction
+        outside a `rollback --path` selection cannot stop a scoped restore; None refuses any
+        unignored reparse point, which is the whole-tree behaviour."""
         with self._index() as index:
             if os.name == "nt":
-                self._check_reparse_points(index)
+                self._check_reparse_points(index, scope)
             tracked = self._git("ls-files", "-z", index=index).stdout
             if tracked:
                 self._git("update-index", "--no-assume-unchanged", "-z", "--stdin",
@@ -380,8 +414,9 @@ class Repository:
         self.entries(tree)  # reject submodules and unsafe names before publishing any ref
         return tree
 
-    def _check_reparse_points(self, index: str) -> None:
+    def _check_reparse_points(self, index: str, scope: Optional[Tuple[str, ...]] = None) -> None:
         # Git may traverse NTFS junctions as directories. Refuse them before staging contents.
+        # With a selection the refusal covers the selected paths and their parents only.
         names = self._git("ls-files", "--cached", "--others", "--exclude-standard", "-z",
                           index=index).stdout
         checked = set()
@@ -402,6 +437,9 @@ class Repository:
                 if stat.S_ISLNK(mode.st_mode):
                     break
                 if _unsupported_reparse_point(candidate, mode):
+                    relative = candidate.relative_to(self.root).as_posix()
+                    if scope is not None and not self._blocks_scope(relative, scope):
+                        continue
                     raise CheckpointError("Windows junctions and other non-symlink reparse points "
                                           "are not supported.")
                 checked.add(candidate)
@@ -603,9 +641,10 @@ class Repository:
 
     def _resolve(self, raw: str) -> str:
         """One `--path` value as a repo-relative POSIX path. Relative values are read against
-        `--cwd`, which is the repository root; `.` becomes the whole tree. The value keeps the
-        spelling the user typed, so a case-insensitive volume can still match the repository's
-        own spelling instead of the case the filesystem reports."""
+        the invocation folder (`--cwd`, or the current folder), not Git's top level, so
+        `--cwd REPO/sub --path a.txt` means `REPO/sub/a.txt`; `.` becomes the whole tree. The
+        value keeps the spelling the user typed, so a case-insensitive volume can still match
+        the repository's own spelling instead of the case the filesystem reports."""
         if not isinstance(raw, str) or not raw.strip():
             raise CheckpointError("--path needs a file or folder inside the repository.")
         root = os.path.normcase(str(self.root))
@@ -614,7 +653,7 @@ class Repository:
         else:
             # On Windows both separators split a path; elsewhere a backslash is a file name.
             inside = raw.replace("\\", "/") if os.sep == "\\" else raw
-            resolved = os.path.normpath(os.path.join(str(self.root), inside))
+            resolved = os.path.normpath(os.path.join(str(self.cwd), inside))
         candidate = os.path.normcase(resolved)
         if candidate == root:
             return ""
@@ -625,31 +664,57 @@ class Repository:
         name = resolved[len(str(self.root)) + 1:]
         return name.replace(os.sep, "/")
 
+    @staticmethod
+    def _spellings(trees: Tuple[Dict[str, Tuple[str, str]], ...]) -> set:
+        """Every file and folder name the trees hold, in the repository's own spelling.
+        Folders are included because `--path sub` selects `sub/...` even though only the file
+        entries are stored."""
+        known = set()
+        for tree in trees:
+            for name in tree:
+                parts = name.split("/")
+                for depth in range(1, len(parts) + 1):
+                    known.add("/".join(parts[:depth]))
+        return known
+
+    def _selects(self, name: str, scope: Tuple[str, ...]) -> bool:
+        """Whether an entry is inside one of the selected prefixes. Case is folded only on a
+        case-insensitive volume, where `--path SUB` and `sub/...` are the same folder."""
+        if _within(name, scope):
+            return True
+        return self.folded and _within(name.casefold(),
+                                       tuple(prefix.casefold() for prefix in scope))
+
+    def _blocks_scope(self, name: str, scope: Tuple[str, ...]) -> bool:
+        """Whether a reparse point is part of the selection: inside it, or on the way to it."""
+        if _on_the_way(name, scope):
+            return True
+        return self.folded and _on_the_way(name.casefold(),
+                                           tuple(prefix.casefold() for prefix in scope))
+
     def _selected(self, paths: List[str], trees: Tuple[Dict[str, Tuple[str, str]], ...]) -> Tuple[str, ...]:
         """The repository's own spelling for every `--path` value. A value must be a file or
         folder either tree holds, or something that exists on disk. Spellings are matched
-        exactly first and case-insensitively second, because Windows and macOS volumes are not
-        case sensitive."""
-        known: Dict[str, str] = {}
-        for tree in trees:
-            for name in tree:
-                known.setdefault(name, name)
-        for name in sorted(known):
-            known.setdefault(name.casefold(), known[name])
+        exactly first and case-insensitively second, and only on a case-insensitive volume:
+        a case-sensitive one must treat `README.md` literally."""
+        known = self._spellings(trees)
+        folded: Dict[str, str] = {}
+        if self.folded:
+            for name in sorted(known):
+                folded.setdefault(name.casefold(), name)
         selected = []
         for raw in paths:
             name = self._resolve(raw)
-            if name and name not in known and known.get(name.casefold()) is None:
+            spelling = name if name in known else folded.get(name.casefold())
+            if name and spelling is None:
                 # A folder that no entry starts with, and that is not on disk either, is
                 # simply absent. (A folder whose entries are in a tree is a valid selection.)
-                present = any(entry.startswith(name + "/")
-                              for entry in known.values() if entry)
-                if _unsafe_path(name) or not (present or os.path.lexists(self._path(name))):
+                if _unsafe_path(name) or not os.path.lexists(self._path(name)):
                     raise CheckpointError(
                         f"no such path in the checkpoint or working tree: {raw}")
             if name:
                 self._path(name)  # refuse `.git`, reserved names and other unsafe selections
-            selected.append(known.get(name) or known.get(name.casefold(), name))
+            selected.append(spelling or name)
         return tuple(selected)
 
     def plan(self, checkpoint: Checkpoint, current_tree: Optional[str] = None,
@@ -657,18 +722,22 @@ class Repository:
         """The diff between the checkpoint and the working tree. With `paths`, only entries
         inside those selections (literal file or folder prefixes) are restored or removed;
         every other entry stays untouched and the stale-preview check still covers the whole
-        tree, so a change anywhere is caught."""
-        current_tree = current_tree or self.snapshot_tree()
-        current, target = self.entries(current_tree), self.entries(checkpoint.tree)
+        tree, so a change anywhere is caught. The Windows reparse-point refusal covers the
+        selection alone: a blocker outside it must not stop a scoped restore."""
         if not paths:
+            current_tree = current_tree or self.snapshot_tree()
+            current, target = self.entries(current_tree), self.entries(checkpoint.tree)
             restore = sorted(p for p in target if current.get(p) != target[p])
             extra = set(current) - set(target)
             ignored = self._ignored(sorted(extra))
             return Plan(checkpoint, current_tree, restore, sorted(extra - ignored), sorted(ignored))
+        scope = tuple(self._resolve(raw) for raw in paths)
+        current_tree = current_tree or self.snapshot_tree(scope=scope)
+        current, target = self.entries(current_tree), self.entries(checkpoint.tree)
         selected = self._selected(paths, (target, current))
         restore = [p for p in sorted(target) if current.get(p) != target[p]
-                   and _within(p, selected)]
-        extra = [p for p in sorted(current) if p not in target and _within(p, selected)]
+                   and self._selects(p, selected)]
+        extra = [p for p in sorted(current) if p not in target and self._selects(p, selected)]
         ignored = self._ignored(extra)
         return Plan(checkpoint, current_tree, restore, [p for p in extra if p not in ignored],
                     [], selected)
@@ -718,8 +787,10 @@ class Repository:
         return sorted(removing, key=lambda p: (p.count("/"), p), reverse=True)
 
     def rollback(self, plan: Plan) -> Checkpoint:
-        """Refuse stale previews, then save an undo checkpoint before the first worktree write."""
-        if self.snapshot_tree() != plan.current_tree:
+        """Refuse stale previews, then save an undo checkpoint before the first worktree write.
+        The stale check re-reads the whole tree under the same reparse-point scope the plan
+        used, so an out-of-scope junction cannot block a scoped restore here either."""
+        if self.snapshot_tree(scope=plan.paths or None) != plan.current_tree:
             raise CheckpointError("Working tree changed since the preview. Retry rollback.")
         current = self.entries(plan.current_tree)
         removing = self._preflight(plan, current)

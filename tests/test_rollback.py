@@ -1288,11 +1288,8 @@ def test_parse_duration_rejects_anything_else(text):
 
 @pytest.fixture
 def scoped_repo(repo):
-    """A committed repository with a local identity, so the `--path` CLI checks run wherever the
-    developer's Git identity lives outside the isolated test HOME."""
-    for key, value in (("user.email", "runledger@example.test"), ("user.name", "RunLedger Test")):
-        git(repo.root, "config", key, value)
-    git(repo.root, "commit", "-qm", "Initial test tree")
+    """A repository whose checkpoints publish real refs with no Git identity configured:
+    `Repository.create` fills the documented fallback only for its own `commit-tree`."""
     return repo
 
 
@@ -1301,6 +1298,17 @@ def _write(root, name, text):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
     return path
+
+
+def _volume_folds_case(folder):
+    """Whether this filesystem folds case for `folder`: Windows and macOS do, a Linux CI
+    volume does not, so a spelling test must ask the volume instead of the platform."""
+    probe = folder / "RunLedgerCaseProbe.txt"
+    probe.write_text("probe\n", encoding="utf-8")
+    try:
+        return (folder / "runledgercaseprobe.TXT").exists()
+    finally:
+        probe.unlink()
 
 
 def _tree_from(repo, entries):
@@ -1433,6 +1441,55 @@ def test_path_resolves_against_the_cwd_and_accepts_absolute_paths(scoped_repo, m
     assert (repo.root / "sub" / "c.txt").read_text(encoding="utf-8") == "one\n"
 
 
+def test_path_is_relative_to_the_invocation_cwd(scoped_repo, capsys):
+    """Design 4.1: a relative value is read against `--cwd`, not the Git top level, so
+    `--cwd REPO/sub --path a.txt` restores `REPO/sub/a.txt` and never `REPO/a.txt`."""
+    repo = scoped_repo
+    _write(repo.root, "a.txt", "root\n")
+    _write(repo.root, "sub/a.txt", "sub\n")
+    checkpoint = repo.create()
+    _write(repo.root, "a.txt", "root modified\n")
+    _write(repo.root, "sub/a.txt", "sub modified\n")
+    assert main(["rollback", checkpoint.id, "--cwd", str(repo.root / "sub"),
+                 "--path", "a.txt", "--yes"]) == 0
+    capsys.readouterr()
+    assert (repo.root / "sub" / "a.txt").read_text(encoding="utf-8") == "sub\n"
+    assert (repo.root / "a.txt").read_text(encoding="utf-8") == "root modified\n"
+
+
+def test_path_is_relative_to_the_current_folder_without_cwd(scoped_repo, monkeypatch, capsys):
+    """Without `--cwd` the invocation folder is the current one, so running from `REPO/sub`
+    restores `REPO/sub/a.txt`."""
+    repo = scoped_repo
+    _write(repo.root, "a.txt", "root\n")
+    _write(repo.root, "sub/a.txt", "sub\n")
+    checkpoint = repo.create()
+    _write(repo.root, "a.txt", "root modified\n")
+    _write(repo.root, "sub/a.txt", "sub modified\n")
+    monkeypatch.chdir(repo.root / "sub")
+    assert main(["rollback", checkpoint.id, "--path", "a.txt", "--yes"]) == 0
+    capsys.readouterr()
+    assert (repo.root / "sub" / "a.txt").read_text(encoding="utf-8") == "sub\n"
+    assert (repo.root / "a.txt").read_text(encoding="utf-8") == "root modified\n"
+
+
+def test_path_relative_to_a_subfolder_cwd_does_not_fall_back_to_the_root(scoped_repo, capsys):
+    """A value that exists relative to the repository root only is absent for a `--cwd` of a
+    subfolder: it must be refused, not silently restored from the top level."""
+    repo = scoped_repo
+    _write(repo.root, "a.txt", "root\n")
+    _write(repo.root, "sub/keep.txt", "keep\n")
+    checkpoint = repo.create()
+    _write(repo.root, "a.txt", "root modified\n")
+    refs = git(repo.root, "for-each-ref", rollback.PREFIX)
+    assert main(["rollback", checkpoint.id, "--cwd", str(repo.root / "sub"),
+                 "--path", "a.txt", "--yes"]) == 1
+    err = capsys.readouterr().err
+    assert "no such path" in err and "a.txt" in err
+    assert (repo.root / "a.txt").read_text(encoding="utf-8") == "root modified\n"
+    assert git(repo.root, "for-each-ref", rollback.PREFIX) == refs
+
+
 def test_path_scope_does_not_restore_the_rest_of_the_tree(scoped_repo, capsys):
     repo = scoped_repo
     _write(repo.root, "sub/c.txt", "one\n")
@@ -1484,6 +1541,20 @@ def test_path_preview_counts_the_restored_bytes(scoped_repo, capsys):
     deleted = len(scratch.read_bytes())
     assert f"2 file(s) would change ({restored + deleted} bytes" in output
     assert "1 restore" not in output  # the whole-tree summary line is not printed in a scoped run
+
+
+def test_whole_tree_preview_counts_the_bytes(scoped_repo, capsys):
+    """VAL-RB-031: the full-tree dry run summarizes the bytes it would change, like the
+    scoped preview does."""
+    repo = scoped_repo
+    _write(repo.root, "a.txt", "one\n")
+    checkpoint = repo.create()
+    _write(repo.root, "a.txt", "a much longer modified body\n")
+    assert main(["rollback", checkpoint.id, "--dry-run", "--cwd", str(repo.root)]) == 0
+    output = capsys.readouterr().out
+    size = repo.tree_sizes(checkpoint.tree)["a.txt"]  # the checkpoint blob, not the edited file
+    assert f"1 restore, 0 remove ({size} bytes)" in output
+    assert "HEAD, branch, and index stay unchanged" in output
 
 
 def test_path_nothing_to_restore_names_the_path_and_creates_no_ref(scoped_repo, capsys):
@@ -1647,36 +1718,96 @@ def test_path_file_directory_replacements_inside_the_scope(scoped_repo, directio
     assert repo.snapshot_tree() == checkpoint.tree
 
 
-def test_path_symlink_blocker_inside_the_scope_is_refused(scoped_repo, tree_safety, tmp_path, capsys):
+def test_path_reparse_blocker_inside_the_scope_is_refused(scoped_repo, junction_probe,
+                                                          monkeypatch, capsys):
+    """VAL-RB-014: a junction inside the selected path is still refused, with its own message
+    and before anything is written (a selectable checkpoint makes the CLI reach planning)."""
+    monkeypatch.setattr(rollback.os, "name", "nt")  # exercise the Windows scan everywhere
     repo = scoped_repo
-    _write(repo.root, "a.txt", "one\n")
-    (repo.root / "keep").mkdir()
-    (repo.root / "keep" / "inner.txt").write_text("one\n", encoding="utf-8")
+    _write(repo.root, "keep/inner.txt", "one\n")
+    junction = repo.root / "keep" / "junc"
+    junction.mkdir()
+    (junction / "child.txt").write_text("through the junction\n", encoding="utf-8")
     checkpoint = repo.create()
-    del tree_safety[:]
-    _write(repo.root, "a.txt", "modified\n")
-    (repo.root / "keep" / "inner.txt").unlink()
-    (repo.root / "keep" / "inner.txt").symlink_to(tmp_path)
+    _write(repo.root, "keep/inner.txt", "modified\n")
+    junction_probe(junction)
     refs = git(repo.root, "for-each-ref", rollback.PREFIX)
     assert main(["rollback", checkpoint.id, "--path", "keep", "--yes",
                  "--cwd", str(repo.root)]) == 1
-    assert capsys.readouterr().err.strip()
-    assert (repo.root / "keep" / "inner.txt").is_symlink()
-    assert tree_safety == []
+    err = capsys.readouterr().err
+    assert "Windows junctions and other non-symlink reparse points are not supported" in err
+    assert (repo.root / "keep" / "inner.txt").read_text(encoding="utf-8") == "modified\n"
+    assert junction.is_dir() and (junction / "child.txt").is_file()
     assert git(repo.root, "for-each-ref", rollback.PREFIX) == refs
 
 
-def test_path_symlink_blocker_outside_the_scope_does_not_block(scoped_repo, tree_safety, tmp_path):
+def test_path_reparse_blocker_outside_the_scope_does_not_block(scoped_repo, junction_probe,
+                                                               monkeypatch):
+    """VAL-RB-014: a scoped restore is only stopped by a blocker in its own selection, so an
+    unrelated junction elsewhere in the repository leaves the restore working."""
+    monkeypatch.setattr(rollback.os, "name", "nt")
     repo = scoped_repo
     _write(repo.root, "a.txt", "one\n")
-    (repo.root / "keep").mkdir()
-    (repo.root / "keep" / "inner.txt").write_text("one\n", encoding="utf-8")
+    _write(repo.root, "keep/inner.txt", "one\n")
+    junction = repo.root / "keep" / "junc"
+    junction.mkdir()
+    (junction / "child.txt").write_text("through the junction\n", encoding="utf-8")
     checkpoint = repo.create()
     _write(repo.root, "a.txt", "modified\n")
-    (repo.root / "keep" / "inner.txt").unlink()
-    (repo.root / "keep" / "inner.txt").symlink_to(tmp_path)
-    repo.rollback(repo.plan(checkpoint, paths=["a.txt"]))
+    _write(repo.root, "keep/inner.txt", "modified\n")
+    junction_probe(junction)
+    refs = git(repo.root, "for-each-ref", rollback.PREFIX)
+    assert main(["rollback", checkpoint.id, "--path", "a.txt", "--yes",
+                 "--cwd", str(repo.root)]) == 0
     assert (repo.root / "a.txt").read_text(encoding="utf-8") == "one\n"
+    assert (repo.root / "keep" / "inner.txt").read_text(encoding="utf-8") == "modified\n"
+    assert junction.is_dir() and (junction / "child.txt").is_file()
+    # The whole-tree safety checkpoint is still created for a scoped restore.
+    assert len(git(repo.root, "for-each-ref", rollback.PREFIX).splitlines()) == \
+        len(refs.splitlines()) + 1
+
+
+def test_path_symlink_at_a_restore_destination_is_replaced_without_following_it(
+        scoped_repo, tmp_path, capsys):
+    """A file symlink standing where the checkpoint has a file is the entry being replaced:
+    the link is removed, never followed, so its target stays untouched."""
+    repo = scoped_repo
+    _write(repo.root, "keep/inner.txt", "one\n")
+    checkpoint = repo.create()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "inner.txt").write_text("outside\n", encoding="utf-8")
+    inner = repo.root / "keep" / "inner.txt"
+    inner.unlink()
+    try:
+        inner.symlink_to(outside)
+    except OSError:
+        pytest.skip("Symlinks unavailable")
+    assert main(["rollback", checkpoint.id, "--path", "keep", "--yes",
+                 "--cwd", str(repo.root)]) == 0
+    capsys.readouterr()
+    assert not inner.is_symlink()
+    assert inner.read_text(encoding="utf-8") == "one\n"
+    assert (outside / "inner.txt").read_text(encoding="utf-8") == "outside\n"
+
+
+def test_path_symlink_outside_the_scope_does_not_block(scoped_repo, tmp_path, capsys):
+    repo = scoped_repo
+    _write(repo.root, "a.txt", "one\n")
+    _write(repo.root, "keep/inner.txt", "one\n")
+    checkpoint = repo.create()
+    _write(repo.root, "a.txt", "modified\n")
+    inner = repo.root / "keep" / "inner.txt"
+    inner.unlink()
+    try:
+        inner.symlink_to(tmp_path)
+    except OSError:
+        pytest.skip("Symlinks unavailable")
+    assert main(["rollback", checkpoint.id, "--path", "a.txt", "--yes",
+                 "--cwd", str(repo.root)]) == 0
+    capsys.readouterr()
+    assert (repo.root / "a.txt").read_text(encoding="utf-8") == "one\n"
+    assert inner.is_symlink()
 
 
 @pytest.mark.parametrize("entries,scope", [
@@ -1767,16 +1898,101 @@ def test_path_ignored_files_are_never_removed(scoped_repo):
     assert (repo.root / "cache" / "scratch.txt").read_text(encoding="utf-8") == "ignored\n"
 
 
-@pytest.mark.skipif(os.name != "nt", reason="needs a case-insensitive filesystem")
-def test_path_matches_case_insensitively_on_windows(scoped_repo):
+def test_path_matches_case_insensitively_on_a_case_insensitive_volume(scoped_repo):
     repo = scoped_repo
     _write(repo.root, "readme.md", "one\n")
     checkpoint = repo.create()
     _write(repo.root, "readme.md", "modified\n")
+    if not _volume_folds_case(repo.root):
+        pytest.skip("needs a case-insensitive filesystem")
     plan = repo.plan(checkpoint, paths=["README.md"])
+    assert plan.paths == ("readme.md",)
     assert plan.restore == ["readme.md"]
     repo.rollback(plan)
     assert (repo.root / "readme.md").read_text(encoding="utf-8") == "one\n"
+
+
+def test_path_directory_scope_folds_case_on_a_case_insensitive_volume(scoped_repo, monkeypatch):
+    """Design 4.1: the folded retry covers a folder name too, so `--path SUB` selects the
+    entries of `sub` and the preview shows the repository's spelling."""
+    repo = scoped_repo
+    _write(repo.root, "sub/c.txt", "one\n")
+    checkpoint = repo.create()
+    _write(repo.root, "sub/c.txt", "modified\n")
+    monkeypatch.setattr(repo, "folded", True)
+    plan = repo.plan(checkpoint, paths=["SUB"])
+    assert plan.paths == ("sub",)
+    assert plan.restore == ["sub/c.txt"]
+    repo.rollback(plan)
+    assert (repo.root / "sub" / "c.txt").read_text(encoding="utf-8") == "one\n"
+
+
+def test_path_directory_scope_folds_case_for_a_deleted_directory(scoped_repo, monkeypatch):
+    """A folder that is gone from the working tree is still selectable through its own
+    entries, whatever case the value carries."""
+    repo = scoped_repo
+    _write(repo.root, "sub/c.txt", "one\n")
+    checkpoint = repo.create()
+    (repo.root / "sub" / "c.txt").unlink()
+    (repo.root / "sub").rmdir()
+    monkeypatch.setattr(repo, "folded", True)
+    plan = repo.plan(checkpoint, paths=["SUB"])
+    assert plan.paths == ("sub",)
+    assert plan.restore == ["sub/c.txt"]
+    repo.rollback(plan)
+    assert (repo.root / "sub" / "c.txt").read_text(encoding="utf-8") == "one\n"
+
+
+def test_path_directory_scope_matches_case_through_the_real_volume(scoped_repo, capsys):
+    """The same request through the real CLI, on whichever volume CI gives us: Windows and
+    macOS fold, the case-sensitive Linux runners are covered by the literal test below."""
+    repo = scoped_repo
+    _write(repo.root, "sub/c.txt", "one\n")
+    checkpoint = repo.create()
+    _write(repo.root, "sub/c.txt", "modified\n")
+    if not _volume_folds_case(repo.root):
+        pytest.skip("case-sensitive filesystem: SUB is a different folder from sub")
+    assert main(["rollback", checkpoint.id, "--cwd", str(repo.root), "--path", "SUB",
+                 "--yes"]) == 0
+    capsys.readouterr()
+    assert (repo.root / "sub" / "c.txt").read_text(encoding="utf-8") == "one\n"
+
+
+def test_path_matching_stays_literal_when_the_volume_does_not_fold_case(scoped_repo, monkeypatch):
+    """Design 4.1: the folded retry belongs to a case-insensitive volume. With folding off a
+    differently cased spelling never selects the file that is there; on a real case-sensitive
+    volume the same value is reported absent (the next test)."""
+    repo = scoped_repo
+    _write(repo.root, "readme.md", "one\n")
+    checkpoint = repo.create()
+    _write(repo.root, "readme.md", "modified\n")
+    monkeypatch.setattr(repo, "folded", False)
+    try:
+        plan = repo.plan(checkpoint, paths=["README.md"])
+    except rollback.CheckpointError as exc:
+        assert "no such path" in str(exc)
+    else:
+        assert plan.paths == ("README.md",)
+        assert plan.restore == [] and plan.remove == []
+    assert (repo.root / "readme.md").read_text(encoding="utf-8") == "modified\n"
+
+
+def test_path_case_sensitive_volume_never_selects_a_differently_cased_file(scoped_repo, capsys):
+    """On the case-sensitive Ubuntu runners an absent `README.md` must never select and
+    overwrite the `readme.md` that is there (VAL-RB-012)."""
+    repo = scoped_repo
+    _write(repo.root, "readme.md", "one\n")
+    checkpoint = repo.create()
+    _write(repo.root, "readme.md", "modified\n")
+    if _volume_folds_case(repo.root):
+        pytest.skip("needs a case-sensitive filesystem")
+    refs = git(repo.root, "for-each-ref", rollback.PREFIX)
+    assert main(["rollback", checkpoint.id, "--cwd", str(repo.root), "--path", "README.md",
+                 "--yes"]) == 1
+    err = capsys.readouterr().err
+    assert "no such path" in err and "README.md" in err
+    assert (repo.root / "readme.md").read_text(encoding="utf-8") == "modified\n"
+    assert git(repo.root, "for-each-ref", rollback.PREFIX) == refs
 
 
 # ---------------------------------------------------------------- retention

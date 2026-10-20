@@ -20,8 +20,8 @@ runledger rollback CHECKPOINT_ID
 ```
 
 The first command prints a checkpoint id. The list shows its UTC time, label, and files that
-would differ from the current working tree. The preview names files to restore or remove, and a
-`--path` run (see below) also counts the bytes it would restore. Rollback asks for confirmation
+would differ from the current working tree. The preview names files to restore or remove and
+ends with the number of files and the bytes it would change. Rollback asks for confirmation
 in a terminal. Without a terminal it refuses unless you pass
 `--yes`. A dry run never asks for confirmation or creates a checkpoint ref.
 
@@ -127,10 +127,16 @@ Rollback to 20260518T101500Z-ab12cd in 'C:\\work\\app'
 Run with --yes to apply.
 ```
 
-- **What matches.** Each value is read against `--cwd` (the repository root), or may be an
-  absolute path inside the repository. Matching is literal, not a glob: `src` selects `src/x.txt`
+- **What matches.** Each value is read against `--cwd` (or the current folder without it), so
+  from `REPO/sub` a value of `a.txt` means `REPO/sub/a.txt` and never the `REPO/a.txt` at the
+  top level; an absolute path inside the repository is accepted too. Matching is literal, not a
+  glob: `src` selects `src/x.txt`
   but never `src2/y.txt`, and a name with `[`, `*` or `?` is matched as written. A folder selects
   everything under it, on any depth, including files created after the checkpoint (`delete`).
+  On a case-insensitive volume (Windows, macOS) a value that matches nothing exactly is retried
+  case-insensitively, for a folder as well as a file (`--path SUB` selects `sub/...`), and the
+  preview shows the repository's own spelling; a case-sensitive volume keeps the value literal,
+  so an absent `README.md` is refused instead of selecting the `readme.md` next to it.
 - **What is refused.** A value outside the repository (`..\outside.txt`, or an absolute path
   outside the root), `.git` or anything under it, an empty value, and a value that exists in
   neither the checkpoint nor the working tree end the command with one error line (`error: ...`)
@@ -144,7 +150,9 @@ Run with --yes to apply.
   stale-preview check also covers the whole tree: if any file changes between the preview and the
   confirmation, the rollback is refused even when the change is outside the selection. Symlinks,
   Windows junctions, `.git` overlaps, reserved names and case-colliding checkpoint entries are
-  refused exactly as they are without `--path`; a blocker outside the selection is ignored.
+  refused exactly as they are without `--path` when they are in the selection or on the way to
+  it; a blocker outside the selection is ignored, so a scoped restore is not stopped by an
+  unrelated junction elsewhere in the tree.
 - `--path .` selects the whole tree, which is the same as running `rollback` without `--path`.
   Without `--path` everything above is unchanged.
 

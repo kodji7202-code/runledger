@@ -223,6 +223,32 @@ change behavior, so read the entry before you upgrade.
 
 ### Fixed
 
+- **`rollback --path` reads a relative value against the invocation folder
+  (`runledger.rollback`):** `--cwd REPO/sub --path a.txt` resolved `a.txt` against Git's top
+  level, so it restored `REPO/a.txt` and left the intended `REPO/sub/a.txt` modified. A relative
+  value is now read against the folder the command was invoked with (`--cwd`, or the current
+  folder without it), and a value that only exists relative to the top level is refused with
+  `no such path` instead of being restored from there.
+- **A folder selection folds case on a case-insensitive volume (`runledger.rollback`):** only the
+  file entries carried a case-folded alias, so `--path SUB` on Windows selected nothing and left
+  `sub/c.txt` modified, and a deleted folder named with a different case was reported absent.
+  Folder names are part of the same spelling table now, so a value selects the repository's own
+  spelling for a file or a folder, existing or deleted.
+- **Case folding happens only where the volume folds case (`runledger.rollback`):** the retry ran
+  on every platform, so on a case-sensitive Linux volume an absent `--path README.md` selected and
+  restored an existing `readme.md` the value never named. Whether a volume folds case is decided
+  once per repository (Windows path rules, or asking the folder for a different case), so a
+  case-sensitive volume keeps every value literal and refuses the absent path (`docs/rollback.md`).
+- **A blocker outside a `--path` selection no longer stops the restore (`runledger.rollback`):**
+  the whole-tree snapshot refused any unignored junction in the repository, so one unrelated
+  junction made `rollback <id> --path a.txt` fail with "Windows junctions and other non-symlink
+  reparse points are not supported". The reparse-point scan now covers the selection and the way
+  to it, while an in-scope junction is still refused by name before anything is written; the
+  whole-tree refusal, the whole-tree stale-preview check and the safety checkpoint are unchanged.
+- **The full-tree rollback preview reports the bytes it would change (`runledger.cli`):** a
+  `--dry-run` without `--path` printed its restore and remove counts without the byte total the
+  scoped preview already had. The summary line carries it now (`1 restore, 0 remove (42 bytes).`);
+  restoring is unchanged.
 - **`runledger stats` prices a session exactly as `receipt` does (`runledger.stats`):** the
   cached token buckets keep the per-request boundaries the pricing path reads, so a session of
   several short requests is no longer charged a long-context tier for its total: two 60,000-token
