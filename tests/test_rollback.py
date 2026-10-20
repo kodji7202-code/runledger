@@ -2146,6 +2146,8 @@ def test_path_exact_directory_selection_never_restores_a_casefolded_sibling(
     """LOCAL-R2-RB-02: a value that matches a folder exactly selects that folder and nothing a
     Python casefold happens to fold onto it, so the sibling keeps its modified file."""
     repo = scoped_repo
+    if not _sharp_s_folders_stay_apart(repo.root.parent):
+        pytest.skip("this volume folds Stra\u00dfe and Strasse into one name")
     monkeypatch.setattr(repo, "folded", True)
     after = {"Stra\u00dfe/a.txt": "sharp-s after\n", "Strasse/b.txt": "unselected after\n"}
     for name in after:
@@ -2160,6 +2162,22 @@ def test_path_exact_directory_selection_never_restores_a_casefolded_sibling(
     for name, text in after.items():
         expected = "one\n" if name == restored else text
         assert repo.root.joinpath(*name.split("/")).read_text(encoding="utf-8") == expected
+
+
+def test_path_scope_never_selects_a_casefolded_sibling_of_a_hand_built_tree(
+        scoped_repo, monkeypatch):
+    """The same rule without a filesystem to ask: a Git tree spells the two folders out, so the
+    exact value must select one of them on every volume, including a case-sensitive one."""
+    repo = scoped_repo
+    monkeypatch.setattr(repo, "folded", True)
+    tree = _tree_from(repo, [("Stra\u00dfe/a.txt", b"sharp-s\n"),
+                             ("Strasse/b.txt", b"plain-s\n")])
+    checkpoint = rollback.Checkpoint("20260101T000000000000Z-01234567", "", tree,
+                                     "2026-01-01T00:00:00+00:00", "hand-built", None)
+    for scope, restored in (("Stra\u00dfe", "Stra\u00dfe/a.txt"), ("Strasse", "Strasse/b.txt")):
+        plan = repo.plan(checkpoint, paths=[scope])
+        assert plan.paths == (scope,)
+        assert plan.restore == [restored]
 
 
 def test_path_sharp_s_directory_scope_through_the_real_volume(scoped_repo, capsys):
@@ -2186,6 +2204,8 @@ def test_path_junction_in_a_sharp_s_sibling_folder_does_not_block_the_restore(
     not on the way to `Strasse` and a scoped restore of `Strasse` still runs."""
     monkeypatch.setattr(rollback.os, "name", "nt")
     repo = scoped_repo
+    if not _sharp_s_folders_stay_apart(repo.root.parent):
+        pytest.skip("this volume folds Stra\u00dfe and Strasse into one name")
     monkeypatch.setattr(repo, "folded", True)
     _write(repo.root, "Stra\u00dfe/a.txt", "one\n")
     _write(repo.root, "Strasse/b.txt", "one\n")
