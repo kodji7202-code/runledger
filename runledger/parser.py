@@ -152,6 +152,9 @@ class Run:
     # Droid only: where cwd came from. "header" (the log), "session" (`% pwd` output or the tool
     # paths' Git work tree), "settings", "session_dir" (the encoded session folder) or "unknown"
     cwd_source: Optional[str] = None
+    # Files beside the transcript whose content this parse read (a Droid settings sidecar,
+    # Claude sub-agent transcripts): `runledger stats` keys its cache on them too.
+    source_files: List[str] = field(default_factory=list)
     safe: bool = False  # safe.make_safe rewrote paths and masked e-mails for sharing
     # safe.make_safe: the changed files computed before paths were rewritten (summarize.FileChange values)
     frozen_changes: Optional[Dict[str, Any]] = None
@@ -321,10 +324,10 @@ def _merge_subagents(
     session_id: str,
     msg_usage: Dict[str, Usage],
     msg_model: Dict[str, Optional[str]],
-) -> int:
+) -> List[Path]:
     """Merge sub-agent assistant message usage into `msg_usage`/`msg_model`.
-    Returns the number of sub-agent transcripts merged."""
-    merged_files = 0
+    Returns the transcripts that contributed, so a caller can watch those files as well."""
+    merged_files: List[Path] = []
     valid_session_ids = {session_id, parent_path.stem}
 
     for sub_path, is_legacy in _discover_subagent_files(parent_path, session_id):
@@ -355,7 +358,7 @@ def _merge_subagents(
         if is_legacy and sub_sids and not (sub_sids & valid_session_ids):
             continue
 
-        merged_files += 1
+        merged_files.append(sub_path)
         for idx, ev in enumerate(sub_events):
             if ev.get("type") != "assistant":
                 continue
@@ -476,11 +479,11 @@ def parse_session(path: str | os.PathLike) -> Run:
     if lines and not valid_events:
         raise ValueError(f"{path}: not a supported session file")
 
-    subagent_count = _merge_subagents(Path(path), session_id, msg_usage, msg_model)
+    subagent_files = _merge_subagents(Path(path), session_id, msg_usage, msg_model)
     notes: List[str] = []
-    if subagent_count > 0:
-        suffix = "s" if subagent_count != 1 else ""
-        notes.append(f"includes {subagent_count} sub-agent transcript{suffix}")
+    if subagent_files:
+        suffix = "s" if len(subagent_files) != 1 else ""
+        notes.append(f"includes {len(subagent_files)} sub-agent transcript{suffix}")
 
     # Attribute each assistant message's usage to the steps it issued
     # (split evenly); messages without tool calls count toward the run only.
@@ -499,6 +502,7 @@ def parse_session(path: str | os.PathLike) -> Run:
         session_id=session_id, path=path, cwd=cwd, git_branch=git_branch,
         started=started, ended=ended, prompts=prompts, steps=steps,
         final_message=final_message, usage=total, models=models, notes=notes,
+        source_files=[str(sub_path) for sub_path in subagent_files],
     )
 
 

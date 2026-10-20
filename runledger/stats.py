@@ -3,10 +3,12 @@
 No Git, no network and no AI: every session is parsed, costed, risk-assessed and
 quality-scored with the same rule code a receipt uses, then grouped by agent, model, day,
 week or project. The parsed facts are cached in `~/.runledger/cache/stats-v1.json`, keyed
-by session path + mtime + size, so a second run only reads what changed. Costs are
-recomputed from the cached tokens on every run, so a price-table change needs no
-invalidation. The cache holds counts, model ids, token counts, session ids and cwd paths:
-never prompts, commands, risk reasons or anything else a session said.
+by session path + mtime + size plus every file the parse read beside it (a Droid settings
+sidecar, Claude sub-agent transcripts), so a second run only reads what changed. Costs are
+recomputed from the cached token and per-request numbers on every run, so a price-table
+change needs no invalidation and the figures match `runledger receipt`. The cache holds
+counts, model ids, token counts, session ids and cwd paths: never prompts, commands, risk
+reasons or anything else a session said.
 
 Cost honesty follows the rest of RunLedger: a model with no price gives `n/a`, a session
 that mixes priced and unpriced tokens gives a `>=` lower bound, and no figure is ever a
@@ -19,20 +21,20 @@ import os
 import re
 import sys
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from . import adapters, pricing
 from .guard import LOG_DIR, LOG_FILE, POLICY_FILE
-from .parser import Usage, _ts, mtime
+from .parser import Run, Usage, _ts, mtime
 from .quality import analyze
 from .risk import assess
 from .userconfig import user_config_path
 
 CACHE_VERSION = 1
-RECORD_VERSION = 1
+RECORD_VERSION = 2
 CACHE_FILE = "stats-v1.json"
 DEFAULT_DAYS = 30
 DEFAULT_LIMIT = 500
@@ -212,7 +214,11 @@ def _write_atomic(path: Path, data: bytes) -> None:
 
 @dataclass
 class SessionSummary:
-    """What one session contributes to the summary: counts, tokens and scores, no text."""
+    """What one session contributes to the summary: counts, tokens and scores, no text.
+
+    `sources` are the files the parse read beside the transcript itself (a Droid settings
+    sidecar, Claude sub-agent transcripts), each as `[path, mtime_ns, size]`, so the cache
+    can watch them too."""
     path: str
     agent: str
     session_id: str
@@ -226,6 +232,7 @@ class SessionSummary:
     codes: Dict[str, int]
     grade: str
     rec_kinds: Dict[str, int]
+    sources: List[List[Any]] = field(default_factory=list)
 
     @property
     def tokens(self) -> Dict[str, int]:
@@ -239,8 +246,8 @@ class SessionSummary:
 class StatsCache:
     """The on-disk parse cache, keyed by session path.
 
-    A record is valid while the session file's `(mtime_ns, size)`, the record version and
-    the policy files it was scored with are unchanged."""
+    A record is valid while the session file's `(mtime_ns, size)`, every file the parse read
+    beside it, the record version and the policy files it was scored with are unchanged."""
 
     def __init__(self, entries: Optional[Dict[str, Dict[str, Any]]] = None,
                  path: Optional[Path] = None, dirty: bool = False):
@@ -267,6 +274,8 @@ class StatsCache:
         if record.get("size") != stat_result.st_size:
             return None
         if record.get("policy") != policy_signature(record.get("cwd")):
+            return None
+        if not _sources_valid(record.get("sources")):
             return None
         try:
             return _summary_from_record(str(path), record)
@@ -306,6 +315,7 @@ def _record(stat_result: os.stat_result, summary: SessionSummary) -> Dict[str, A
         "mtime_ns": stat_result.st_mtime_ns,
         "size": stat_result.st_size,
         "policy": policy_signature(summary.cwd),
+        "sources": summary.sources,
         "agent": summary.agent,
         "session_id": summary.session_id,
         "cwd": summary.cwd,
@@ -319,18 +329,50 @@ def _record(stat_result: os.stat_result, summary: SessionSummary) -> Dict[str, A
     }
 
 
+def _source_entries(paths: Iterable[str]) -> List[List[Any]]:
+    """`[path, mtime_ns, size]` for every file a parse read beside the transcript itself. A
+    file that cannot be stat'ed is recorded with nulls, so it invalidates the record as soon
+    as it appears or changes."""
+    out: List[List[Any]] = []
+    for raw in paths:
+        path = str(raw)
+        try:
+            stat = os.stat(path)
+        except OSError:
+            out.append([path, None, None])
+        else:
+            out.append([path, stat.st_mtime_ns, stat.st_size])
+    return out
+
+
+def _sources_valid(sources: Any) -> bool:
+    """True while every file a parse read still has the size and modification time the
+    record was built from. A file that was unreadable then and is unreadable now is fine;
+    anything else invalidates the record, so the session is parsed again."""
+    if not isinstance(sources, list):
+        return False
+    for entry in sources:
+        if not isinstance(entry, list) or len(entry) != 3 or not isinstance(entry[0], str):
+            return False
+        try:
+            stat = os.stat(entry[0])
+        except OSError:
+            if entry[1] is not None or entry[2] is not None:
+                return False
+            continue
+        if entry[1] != stat.st_mtime_ns or entry[2] != stat.st_size:
+            return False
+    return True
+
+
 def _summary_from_record(path: str, record: Dict[str, Any]) -> SessionSummary:
     models = {}
     for model, bucket in record["models"].items():
         if not isinstance(model, str) or not isinstance(bucket, dict):
             raise ValueError("bad model bucket")
-        models[model] = {name: int(bucket.get(name) or 0) for name in TOKEN_FIELDS}
-        for optional in ("cache_write_1h", "prompt"):
-            if bucket.get(optional) is not None:
-                models[model][optional] = int(bucket[optional])
-        if bucket.get("cumulative"):
-            models[model]["cumulative"] = True
+        models[model] = _clean_bucket(bucket)
     cwd = record["cwd"]
+    sources = record.get("sources")
     return SessionSummary(
         path=path,
         agent=str(record["agent"]),
@@ -345,6 +387,7 @@ def _summary_from_record(path: str, record: Dict[str, Any]) -> SessionSummary:
         codes={str(code): int(count) for code, count in record["risk"]["codes"].items()},
         grade=str(record["quality"]["grade"]),
         rec_kinds={str(kind): int(count) for kind, count in record["rec_kinds"].items()},
+        sources=[list(entry) for entry in sources] if isinstance(sources, list) else [],
     )
 
 
@@ -359,7 +402,7 @@ def summarize(path: Path) -> SessionSummary:
     session = Path(path)
     if _is_empty_file(session):
         raise ValueError(f"{session}: not a supported session file")
-    run = adapters.detect(session).parse(session)
+    run = _parse(session)
     pricing.apply_costs(run)
     score, level, risks = assess(run)
     analyze(run, risks)
@@ -377,7 +420,17 @@ def summarize(path: Path) -> SessionSummary:
         codes=_counted(risk.code for risk in risks),
         grade=str((run.quality or {}).get("grade") or ""),
         rec_kinds=_counted(rec.get("kind") for rec in run.recommendations),
+        sources=_source_entries(run.source_files),
     )
+
+
+def _parse(path: Path) -> Run:
+    """Parse one session the way a receipt does, except that a Droid relative `cwd` is
+    recovered without a Git lookup: `stats` never runs git (VAL-STATS-018)."""
+    adapter = adapters.detect(path)
+    if adapter.NAME == "droid":
+        return adapter.parse(path, git_root=False)
+    return adapter.parse(path)
 
 
 def _is_empty_file(path: Path) -> bool:
@@ -406,7 +459,29 @@ def _local(moment: Optional[datetime]) -> Optional[datetime]:
 
 
 def _bucket(usage: Usage) -> Dict[str, Any]:
+    """A usage as cache-friendly numbers: the token counts plus the request-tier numbers
+    `pricing` needs, and nothing the session said."""
     out: Dict[str, Any] = {name: max(0, getattr(usage, f"{name}_tokens")) for name in TOKEN_FIELDS}
+    _tier_numbers(usage, out)
+    return out
+
+
+def _request_bucket(usage: Usage) -> Dict[str, Any]:
+    """One request of a session, compact: only the token fields it used."""
+    out: Dict[str, Any] = {}
+    for name in TOKEN_FIELDS:
+        value = max(0, getattr(usage, f"{name}_tokens"))
+        if value:
+            out[name] = value
+    _tier_numbers(usage, out)
+    return out
+
+
+def _tier_numbers(usage: Usage, out: Dict[str, Any]) -> None:
+    """The per-request pricing metadata the receipt path reads: each request's own token
+    counts (so a long-context tier is decided per request, not for the session total), the
+    request's prompt size, and whether the usage is only a cumulative estimate. Numbers
+    only: no prompt text, no command."""
     one_hour = getattr(usage, "cache_write_1h_tokens", 0)
     if one_hour:
         out["cache_write_1h"] = int(one_hour)
@@ -415,7 +490,9 @@ def _bucket(usage: Usage) -> Dict[str, Any]:
         out["prompt"] = int(prompt)
     if getattr(usage, "_cumulative_only", False):
         out["cumulative"] = True
-    return out
+    requests = getattr(usage, "_requests", None)
+    if requests:
+        out["requests"] = [_request_bucket(request) for request in requests]
 
 
 def _usage(bucket: Dict[str, Any]) -> Usage:
@@ -430,7 +507,28 @@ def _usage(bucket: Dict[str, Any]) -> Usage:
         usage._request_prompt_tokens = int(bucket["prompt"])
     if bucket.get("cumulative"):
         usage._cumulative_only = True
+    for request in bucket.get("requests") or []:
+        usage._requests.append(_usage(request))
     return usage
+
+
+def _clean_bucket(bucket: Dict[str, Any]) -> Dict[str, Any]:
+    """A cached bucket as numbers only; a malformed one raises `ValueError`, so the caller
+    reparses the session instead of pricing nonsense."""
+    if not isinstance(bucket, dict):
+        raise ValueError("bad token bucket")
+    out: Dict[str, Any] = {name: int(bucket.get(name) or 0) for name in TOKEN_FIELDS}
+    for key in ("cache_write_1h", "prompt"):
+        if bucket.get(key) is not None:
+            out[key] = int(bucket[key])
+    if bucket.get("cumulative"):
+        out["cumulative"] = True
+    requests = bucket.get("requests")
+    if requests is not None:
+        if not isinstance(requests, list):
+            raise ValueError("bad request list")
+        out["requests"] = [_clean_bucket(item) for item in requests]
+    return out
 
 
 def _counted(values: Iterable[Any]) -> Dict[str, int]:
@@ -487,22 +585,27 @@ def discover(project: Optional[str], agent: Optional[str] = None) -> List[Path]:
     """The session files to aggregate, newest first.
 
     Like `adapters.find_sessions`, except that Aider is only looked for in the project
-    folder itself: its other layouts walk up to the Git top level, which runs git, and
-    `stats` never runs git. `--agent aider` keeps the full search."""
-    if agent or not project:
-        return adapters.find_sessions(project, agent)
+    folder itself, with or without `--agent aider`: its other layouts walk up to the Git top
+    level, which runs git, and `stats` never runs git."""
+    chosen = [adapters.get(agent)] if agent else adapters.adapters()
     found: List[Path] = []
-    for adapter in adapters.adapters():
+    for adapter in chosen:
         if adapter.NAME == "aider":
-            history = Path(project) / adapter.HISTORY_FILE
-            try:
-                if history.is_file():
-                    found.append(history)
-            except OSError:
-                pass
+            found.extend(_aider_history(project, adapter.HISTORY_FILE))
             continue
         found.extend(adapter.find_sessions(project))
     return sorted(set(found), key=lambda path: (mtime(path), str(path)), reverse=True)
+
+
+def _aider_history(project: Optional[str], history_file: str) -> List[Path]:
+    """`<project>/<history file>`, the one Aider layout that needs no Git lookup."""
+    if not project:
+        return []
+    history = Path(project) / history_file
+    try:
+        return [history] if history.is_file() else []
+    except OSError:
+        return []
 
 
 # ---------------------------------------------------------------- collecting
@@ -676,8 +779,6 @@ def _week_key(moment: datetime) -> str:
 
 
 def _group_key(summary: SessionSummary, by: str) -> str:
-    if by == "model":
-        return _dominant_model(summary)
     if by == "day":
         return summary.started.date().isoformat()
     if by == "week":
@@ -687,7 +788,41 @@ def _group_key(summary: SessionSummary, by: str) -> str:
     return summary.agent
 
 
+def _model_groups(summaries: Sequence[SessionSummary]) -> List[Dict[str, Any]]:
+    """`--by model`: one row per model, priced as the receipt prices it.
+
+    A session that used several models contributes its tokens and cost to each of their
+    rows, so the totals stay the sum of the rows; its session and step counts stay with the
+    model that used most of its tokens, so those columns sum to the total as well."""
+    rows: Dict[str, Dict[str, Any]] = {}
+    for summary in summaries:
+        dominant = _dominant_model(summary)
+        buckets = summary.models or {dominant: {}}  # a session with no model keeps its row
+        for model, bucket in buckets.items():
+            row = rows.setdefault(model, {"sessions": 0, "steps": 0,
+                                          "tokens": {name: 0 for name in TOKEN_FIELDS},
+                                          "cost": 0.0, "known": False, "partial": False})
+            if model == dominant:
+                row["sessions"] += 1
+                row["steps"] += summary.steps
+            for name in TOKEN_FIELDS:
+                row["tokens"][name] += int(bucket.get(name) or 0)
+            cost = _bucket_cost(model, bucket) if summary.has_usage else None
+            if cost is not None:
+                row["cost"] += cost
+                row["known"] = True
+            elif _bucket_total(bucket) and model != pricing.UNATTRIBUTED:
+                row["partial"] = True
+    return [{"key": key, "sessions": row["sessions"], "steps": row["steps"],
+             "tokens": row["tokens"],
+             "cost": round(row["cost"], 6) if row["known"] else None,
+             "cost_partial": bool(row["known"] and row["partial"])}
+            for key, row in sorted(rows.items())]
+
+
 def _groups(summaries: Sequence[SessionSummary], by: str) -> List[Dict[str, Any]]:
+    if by == "model":
+        return _model_groups(summaries)
     buckets: Dict[str, List[SessionSummary]] = {}
     for summary in summaries:
         buckets.setdefault(_group_key(summary, by), []).append(summary)
