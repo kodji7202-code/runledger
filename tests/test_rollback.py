@@ -2198,6 +2198,86 @@ def test_path_sharp_s_directory_scope_through_the_real_volume(scoped_repo, capsy
     assert (repo.root / "Strasse" / "b.txt").read_text(encoding="utf-8") == "unselected after\n"
 
 
+def _kelvin_folders_stay_apart(folder):
+    """Whether this volume keeps U+212A KELVIN SIGN apart from `K`, as this NTFS volume does.
+    Python's `str.lower` maps both to `k`, so a volume that folds them together cannot hold the
+    scenario at all."""
+    first, second = folder / "\u212a", folder / "K"
+    try:
+        first.mkdir()
+        second.mkdir()
+        if os.path.samefile(first, second):
+            return False
+        (first / "probe.txt").write_text("one\n", encoding="utf-8")
+        (second / "probe.txt").write_text("two\n", encoding="utf-8")
+        return ((first / "probe.txt").read_text(encoding="utf-8") == "one\n"
+                and (second / "probe.txt").read_text(encoding="utf-8") == "two\n")
+    except OSError:
+        return False
+    finally:
+        for path in (first / "probe.txt", second / "probe.txt", first, second):
+            try:
+                path.unlink() if path.is_file() else path.rmdir()
+            except OSError:
+                pass
+
+
+def test_entry_filtering_is_literal_and_never_folds_case(scoped_repo, monkeypatch):
+    """LOCAL-R3-RB-01: resolving the value the user typed to one spelling is the only case
+    mapping a selection does. The scope that comes out of it is applied literally, so `sub`
+    never selects `SUB` and `\u212a` never selects `K` - two folders this volume keeps
+    apart though Python maps both names to `k`."""
+    repo = scoped_repo
+    monkeypatch.setattr(repo, "folded", True)
+    assert repo._selects("sub/c.txt", ("sub",))
+    assert not repo._selects("SUB/c.txt", ("sub",))
+    assert repo._selects("\u212a/a.txt", ("\u212a",))
+    assert not repo._selects("K/b.txt", ("\u212a",))
+    assert repo._blocks_scope("sub/junc", ("sub",))
+    assert not repo._blocks_scope("K/junc", ("\u212a",))
+
+
+def test_path_scope_never_widens_through_a_simple_case_mapping(scoped_repo, monkeypatch):
+    """LOCAL-R3-RB-01: `\u212a` (U+212A KELVIN SIGN) and `K` are distinct folders on NTFS and
+    both lowercase to `k`. Selecting one of them restores its own files and leaves the other
+    spelling's file exactly as it is, whatever the volume folds."""
+    repo = scoped_repo
+    monkeypatch.setattr(repo, "folded", True)
+    kelvin = "\u212a"
+    tree = _tree_from(repo, [(f"{kelvin}/a.txt", b"kelvin\n"), ("K/b.txt", b"ascii\n")])
+    checkpoint = rollback.Checkpoint("20260101T000000000000Z-01234567", "", tree,
+                                     "2026-01-01T00:00:00+00:00", "hand-built", None)
+    for scope, restored in ((kelvin, f"{kelvin}/a.txt"), ("K", "K/b.txt")):
+        plan = repo.plan(checkpoint, paths=[scope])
+        assert plan.paths == (scope,)
+        assert plan.restore == [restored]
+
+
+def test_path_kelvin_sign_directory_scope_through_the_real_volume(scoped_repo, capsys):
+    """The same request through the real CLI on whichever volume CI gives us: NTFS keeps the
+    Kelvin sign and `K` apart, so selecting one restores it and overwrites nothing of the
+    other's (a volume that folds them together cannot hold the scenario and skips)."""
+    repo = scoped_repo
+    if not _kelvin_folders_stay_apart(repo.root.parent):
+        pytest.skip("this volume folds U+212A KELVIN SIGN and K into one name")
+    kelvin = "\u212a"
+    _write(repo.root, f"{kelvin}/a.txt", "one\n")
+    _write(repo.root, "K/b.txt", "one\n")
+    checkpoint = repo.create()
+    _write(repo.root, f"{kelvin}/a.txt", "selected after\n")
+    _write(repo.root, "K/b.txt", "unselected after\n")
+    assert main(["rollback", checkpoint.id, "--cwd", str(repo.root), "--path", kelvin,
+                 "--yes"]) == 0
+    capsys.readouterr()
+    assert (repo.root / kelvin / "a.txt").read_text(encoding="utf-8") == "one\n"
+    assert (repo.root / "K" / "b.txt").read_text(encoding="utf-8") == "unselected after\n"
+    assert main(["rollback", checkpoint.id, "--cwd", str(repo.root), "--path", "K",
+                 "--yes"]) == 0
+    capsys.readouterr()
+    assert (repo.root / "K" / "b.txt").read_text(encoding="utf-8") == "one\n"
+    assert (repo.root / kelvin / "a.txt").read_text(encoding="utf-8") == "one\n"
+
+
 def test_path_junction_in_a_sharp_s_sibling_folder_does_not_block_the_restore(
         scoped_repo, junction_probe, monkeypatch):
     """The blocker scan asks the volume's own case question, so a junction inside `Straße` is

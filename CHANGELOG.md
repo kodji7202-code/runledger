@@ -282,6 +282,16 @@ change behavior, so read the entry before you upgrade.
   a Droid `.settings.json` sidecar or a Claude sub-agent transcript left warm stats reporting the
   old tokens and cost while `--no-cache` saw the new ones. Both files are now recorded with their
   size and modification time and re-parse the session when they change.
+- **A stats record is only built from a parse that tracked every dependency (`runledger.stats`,
+  `runledger.parser`, `runledger.adapters.droid`):** the sub-agent folder watch is capped for
+  speed, and past the cap the record simply did not mention the folders the walk never reached, so
+  a transcript added to one of them changed no watched source and warm stats kept its old totals
+  (1000 tokens against the 1500 `--no-cache` reported). A parse now reports whether it could track
+  everything it depends on - False when the folder watch hit its cap, when a folder could not be
+  listed, or when the Droid settings lookup could not scan its folder - and no record is stored for
+  such a session: an older record for it is dropped and it is parsed again on every run, so a warm
+  report always equals `--no-cache`. The record format is version 4, so an older cache is rebuilt
+  once (`docs/stats.md`).
 - **A prices file with a UTF-8 BOM is read (`runledger.pricing`):** `~/.runledger/prices.json`
   and a `RUNLEDGER_PRICES` file written by a Windows editor or by `Set-Content -Encoding UTF8`
   start with a byte-order mark, which the JSON reader rejected, so the whole override was
@@ -428,7 +438,7 @@ change behavior, so read the entry before you upgrade.
   the new ones. Every dependency candidate is now recorded with how it turned out - `ok`, `missing`
   or `rejected`, with its size and modification time - and a record is dropped when any candidate's
   existence, size or time changes, so a warm run reports what `--no-cache` reports. The cache record
-  format is version 3, so an older cache is rebuilt once instead of being reused.
+  format changed, so an older cache is rebuilt once instead of being reused.
 - **`rollback.auto_prune.keep` is bounded (`runledger.rollback`):** a value above 100000 is
   unusable like a negative one and keeps the documented default of 50, so a typo in
   `~/.runledger/config.json` can no longer silently retain an unbounded number of checkpoints
@@ -449,6 +459,16 @@ change behavior, so read the entry before you upgrade.
   case mapping, after the exact match, and a spelling two names share is left to the exact match
   instead of being guessed, so `Straße` and `Strasse` stay two folders and a junction inside one
   no longer blocks a restore of the other (`docs/rollback.md`).
+- **A resolved `--path` scope is applied literally (`runledger.rollback`):** picking the
+  repository's spelling for the value was only the first half - every entry the exact match did
+  not cover was folded again, and Python maps `K` (U+212A KELVIN SIGN) and `K` to the same name
+  while this NTFS volume keeps them apart, so `rollback --path K --yes` restored the selected
+  folder *and* overwrote `K/b.txt` outside the scope. Folding now happens only where a value is
+  resolved to the repository's own spelling (the exact match first, the volume's simple case
+  mapping second), and the selection is then applied literally - exact equality or the canonical
+  prefix plus `/` - to the restored and removed entries and to the reparse-point scan, so two
+  folders that only a Python case mapping confuses never select each other's files. A
+  case-insensitive volume still resolves `--path SUB` to `sub/...` (`docs/rollback.md`).
 
 ### Security
 

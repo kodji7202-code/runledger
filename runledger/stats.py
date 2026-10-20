@@ -5,11 +5,13 @@ quality-scored with the same rule code a receipt uses, then grouped by agent, mo
 week or project. The parsed facts are cached in `~/.runledger/cache/stats-v1.json`, keyed
 by session path + mtime + size plus every path the parse read or looked for beside it (a Droid
 settings sidecar or child settings file, the folders a Claude sub-agent transcript could live in
-and the transcripts themselves), so a second run only reads what changed. Costs are
-recomputed from the cached token and per-request numbers on every run, so a price-table
-change needs no invalidation and the figures match `runledger receipt`. The cache holds
-counts, model ids, token counts, session ids and cwd paths: never prompts, commands, risk
-reasons or anything else a session said.
+and the transcripts themselves), so a second run only reads what changed. A parse that could not
+track all of those - a sub-agent tree past the folder watch cap, a folder that could not be
+listed - is not cached at all and is parsed again on every run, so a warm report still equals
+`--no-cache`. Costs are recomputed from the cached token and per-request numbers on every run,
+so a price-table change needs no invalidation and the figures match `runledger receipt`. The
+cache holds counts, model ids, token counts, session ids and cwd paths: never prompts, commands,
+risk reasons or anything else a session said.
 
 Cost honesty follows the rest of RunLedger: a model with no price gives `n/a`, a session
 that mixes priced and unpriced tokens gives a `>=` lower bound, and no figure is ever a
@@ -36,7 +38,9 @@ from .risk import assess
 from .userconfig import user_config_path
 
 CACHE_VERSION = 1
-RECORD_VERSION = 3
+# 4: a record may only be built from a parse that tracked every dependency it depends on, so
+# every record an earlier version wrote is dropped once and rebuilt (LOCAL-R3-STATS-01).
+RECORD_VERSION = 4
 CACHE_FILE = "stats-v1.json"
 DEFAULT_DAYS = 30
 DEFAULT_LIMIT = 500
@@ -221,7 +225,11 @@ class SessionSummary:
     `sources` are the paths the parse read or looked for beside the transcript itself (a Droid
     settings sidecar, its child settings files, the folders a Claude sub-agent transcript could
     live in and the transcripts), each as `[path, mtime_ns, size, state]` - `state` is `ok`,
-    `missing` or `rejected` - so the cache can watch them too."""
+    `missing` or `rejected` - so the cache can watch them too.
+
+    `complete` is the parse's own answer to whether it could track all of them. Nothing is
+    cached for a summary that says no: sources that were never watched cannot invalidate a
+    record, so the only safe record is none at all (LOCAL-R3-STATS-01)."""
     path: str
     agent: str
     session_id: str
@@ -236,6 +244,7 @@ class SessionSummary:
     grade: str
     rec_kinds: Dict[str, int]
     sources: List[List[Any]] = field(default_factory=list)
+    complete: bool = True
 
     @property
     def tokens(self) -> Dict[str, int]:
@@ -288,6 +297,15 @@ class StatsCache:
             return None
 
     def put(self, path: Path, stat_result: os.stat_result, summary: SessionSummary) -> None:
+        """Store one summary - unless the parse could not track every path it depends on
+        (a sub-agent folder tree past the watch cap, a folder that could not be listed), in
+        which case no record is stored and an older one is dropped instead. A truncated record
+        would look valid while missing a transcript the watch never saw, so the session is
+        parsed again on every run and a warm report always equals `--no-cache`
+        (LOCAL-R3-STATS-01)."""
+        if not summary.complete:
+            self.drop(path)
+            return
         self.entries[str(path)] = _record(stat_result, summary)
         self.dirty = True
         if len(self.entries) > MAX_CACHE_ENTRIES:
@@ -439,6 +457,7 @@ def summarize(path: Path) -> SessionSummary:
         grade=str((run.quality or {}).get("grade") or ""),
         rec_kinds=_counted(rec.get("kind") for rec in run.recommendations),
         sources=_source_entries(run.sources),
+        complete=run.dependencies_complete,
     )
 
 

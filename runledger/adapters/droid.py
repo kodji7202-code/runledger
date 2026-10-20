@@ -276,18 +276,24 @@ def _tools(name: str, inp: Dict[str, Any], depth: int = 0) -> List[Tuple[str, Di
     return [(name, inp)]
 
 
-def _settings_lookup(path: Path, header: Dict[str, Any]) -> Tuple[Optional[Path], List[Path]]:
-    """The settings file to read for this transcript, and every path the lookup considered, so
-    `stats` can watch the ones that were not there: a sidecar written later invalidates its
-    record. The sibling file is read first; the fallback covers transcripts that were copied or
-    renamed without it, and the folder that fallback scans is a candidate of its own."""
+def _settings_lookup(path: Path, header: Dict[str, Any]
+                     ) -> Tuple[Optional[Path], List[Path], bool]:
+    """`(settings file, every path the lookup considered, complete)`.
+
+    The candidates are what `stats` watches: a sidecar written later invalidates its record.
+    The sibling file is read first; the fallback covers transcripts that were copied or renamed
+    without it, and the folder that fallback scans is a candidate of its own.
+
+    `complete` is False when the folder that fallback scans could not be listed: the sidecar may
+    be there without the lookup seeing it, so a parse that is missing it must not be cached
+    (LOCAL-R3-STATS-01)."""
     sibling = path.with_suffix(".settings.json")
     if sibling.is_file():
-        return sibling, [sibling]
+        return sibling, [sibling], True
     candidates = [sibling]
     session_id = header.get("id")
     if not isinstance(session_id, str) or not _SESSION_ID.fullmatch(session_id):
-        return None, candidates
+        return None, candidates, True
     name = f"{session_id}.settings.json"
     root = factory_home() / "sessions"
     cwd = header.get("cwd")
@@ -296,15 +302,15 @@ def _settings_lookup(path: Path, header: Dict[str, Any]) -> Tuple[Optional[Path]
         preferred = root / folder / name
         candidates.append(preferred)
         if preferred.is_file():
-            return preferred, candidates
+            return preferred, candidates, True
     candidates.append(root)
     try:
         for candidate in sorted(root.glob(f"*/{name}")):
             if candidate.is_file():
-                return candidate, candidates
+                return candidate, candidates, True
     except OSError:
-        pass
-    return None, candidates
+        return None, candidates, False
+    return None, candidates, True
 
 
 def _minus(a: Usage, b: Usage) -> Usage:
@@ -477,7 +483,7 @@ def parse(path: Path, git_root: bool = True) -> Run:
     """Parse one Droid transcript. `git_root=False` recovers a relative `cwd` without
     running git, which is what `runledger stats` parses with."""
     p = Path(path)
-    settings_path, candidates = _settings_lookup(p, _header(p))
+    settings_path, candidates, lookup_complete = _settings_lookup(p, _header(p))
     settings: Dict[str, Any] = {}
     state = SOURCE_REJECTED if settings_path is not None else SOURCE_MISSING
     if settings_path is not None:
@@ -617,4 +623,5 @@ def parse(path: Path, git_root: bool = True) -> Run:
     else:
         run.usage_source = "messages"
     run.sources = sources
+    run.dependencies_complete = lookup_complete
     return run

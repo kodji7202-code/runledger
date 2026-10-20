@@ -300,8 +300,8 @@ def test_unsafe_session_ids_are_never_used_to_search(tmp_path, monkeypatch, sid)
     path = tmp_path / "s.jsonl"
     path.write_text(json.dumps({"type": "session_start", "id": sid, "cwd": "/demo"}) + "\n",
                     encoding="utf-8")
-    found, candidates = droid._settings_lookup(path, droid._header(path))
-    assert found is None
+    found, candidates, complete = droid._settings_lookup(path, droid._header(path))
+    assert found is None and complete
     assert candidates == [path.with_suffix(".settings.json")]  # no glob was built from `sid`
 
 

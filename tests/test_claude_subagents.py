@@ -3,6 +3,7 @@ import json
 
 import pytest
 
+from runledger import parser
 from runledger.cli import main
 from runledger.parser import encode_project_path, find_sessions, parse_session
 
@@ -115,3 +116,60 @@ def test_legacy_subagents_merged_and_duplicate_message_ids_deduped(tmp_path, mon
     # Sub-agent files are never listed separately
     assert find_sessions(str(prj)) == [parent_file]
     assert find_sessions(None) == [parent_file]
+
+
+def test_folder_watch_says_whether_it_saw_the_whole_tree(tmp_path):
+    """LOCAL-R3-STATS-01: the watch is capped for speed, so it reports whether it listed every
+    folder. A capped walk means the parse cannot promise that a later transcript is seen."""
+    root = tmp_path / "subagents"
+    for index in range(parser._MAX_SUBAGENT_FOLDERS - 2):
+        (root / f"f{index:02d}").mkdir(parents=True)
+    folders, complete = parser._folders_under(root)
+    assert complete is True and len(folders) == parser._MAX_SUBAGENT_FOLDERS - 1
+
+    (root / "one-more").mkdir()
+    folders, complete = parser._folders_under(root)
+    assert complete is False and len(folders) >= parser._MAX_SUBAGENT_FOLDERS
+
+
+def test_an_unlistable_folder_makes_the_watch_incomplete(tmp_path, monkeypatch):
+    """A folder that cannot be listed is a folder whose sub-agent transcripts are unknown, so
+    the walk reports it instead of quietly watching less than the tree holds."""
+    root = tmp_path / "subagents"
+    (root / "known").mkdir(parents=True)
+    listings = []
+    real_iterdir = type(root).iterdir
+
+    def flaky_iterdir(self):
+        listings.append(self)
+        if self.name == "known":
+            raise PermissionError("synthetic unlistable folder")
+        return real_iterdir(self)
+
+    monkeypatch.setattr(type(root), "iterdir", flaky_iterdir)
+    folders, complete = parser._folders_under(root)
+    assert [folder.name for folder in folders] == ["subagents", "known"]
+    assert complete is False and listings
+
+
+def test_a_session_whose_folder_watch_was_capped_is_not_cacheable(tmp_path, monkeypatch):
+    """The parse carries the watch's completeness, which is what `stats` refuses to cache on:
+    a session whose sub-agent tree outgrows the watch is re-parsed, never trusted to a record."""
+    cfg = tmp_path / "c"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg))
+    prj, sid = "/work/capped", "capped"
+    proj_dir = cfg / "projects" / encode_project_path(prj)
+    proj_dir.mkdir(parents=True)
+    parent_file = proj_dir / f"{sid}.jsonl"
+    parent_file.write_text(
+        json.dumps({"type": "user", "sessionId": sid, "cwd": prj,
+                    "message": {"content": "run subagents"}}) + "\n"
+        + _assistant_line("msg_p1", "claude-sonnet-4-5-20250929", 1000, session_id=sid),
+        encoding="utf-8",
+    )
+    assert parse_session(parent_file).dependencies_complete is True
+
+    tree = proj_dir / sid / "subagents"
+    for index in range(parser._MAX_SUBAGENT_FOLDERS):
+        (tree / f"workflow-{index:02d}").mkdir(parents=True)
+    assert parse_session(parent_file).dependencies_complete is False

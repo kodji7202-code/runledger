@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from conftest import ISOLATED_ENV_VARS
-from runledger import adapters, gitinfo, pricing, stats
+from runledger import adapters, gitinfo, parser, pricing, stats
 from runledger.cli import build, main
 from runledger.parser import encode_project_path
 
@@ -188,10 +188,12 @@ def claude_mixed_session(home: Path, project: Path, session_id: str, started: da
     return _write(folder / f"{session_id}.jsonl", rows)
 
 
-def claude_subagent(parent: Path, name: str, started: datetime, messages) -> Path:
+def claude_subagent(parent: Path, name: str, started: datetime, messages, *,
+                    folder: Path = None) -> Path:
     """A sub-agent transcript of a Claude session: `<project>/<session>/subagents/<name>.jsonl`,
-    one assistant message per `(model, usage)` pair, merged into the parent's usage."""
-    folder = parent.parent / parent.stem / "subagents"
+    one assistant message per `(model, usage)` pair, merged into the parent's usage. `folder`
+    places it in another folder of the tree (a nested `workflows/<wf>` one, say)."""
+    folder = folder if folder is not None else parent.parent / parent.stem / "subagents"
     rows = [{"cwd": str(parent.parent), "sessionId": parent.stem, "version": "2.1.0",
              "timestamp": _stamp(started + timedelta(seconds=i + 1)), "type": "assistant",
              "message": {"id": f"{name}-{i}", "role": "assistant", "model": model,
@@ -1261,6 +1263,43 @@ def test_a_record_with_malformed_request_numbers_is_reparsed(capsys, fixture_a):
     cache_file.write_text(json.dumps(raw), encoding="utf-8")
     data, _ = _json(capsys, "stats", "--all", "--format", "json")
     assert _without_run_stamps(data) == _without_run_stamps(reference)
+
+
+def _cache_records(home: Path) -> dict:
+    """The parse cache's records per session path, or nothing at all when none was written."""
+    cache_file = home / ".runledger" / "cache" / "stats-v1.json"
+    if not cache_file.is_file():
+        return {}
+    return json.loads(cache_file.read_text(encoding="utf-8"))["entries"]
+
+
+def test_a_subagent_tree_beyond_the_watch_cap_is_never_cached(capsys, isolated_settings,
+                                                              monkeypatch):
+    """LOCAL-R3-STATS-01: a sub-agent tree holding more folders than the watch covers cannot be
+    watched in full, so its session is not cached at all. A transcript written into a folder
+    the watch never reached leaves every watched source unchanged, so a stored record would
+    keep the old totals (1000 tokens against 1500 with --no-cache) and the warm run must
+    therefore re-parse: warm equals --no-cache."""
+    project = isolated_settings / "capped-subagents"
+    project.mkdir()
+    parent = claude_session(isolated_settings, project, "capped", _started(1))
+    tree = parent.parent / parent.stem / "subagents"
+    for index in range(parser._MAX_SUBAGENT_FOLDERS + 2):
+        (tree / f"workflow-{index:02d}").mkdir(parents=True)
+
+    cold, _ = _json(capsys, "stats", "--all", "--format", "json")
+    assert cold["totals"]["tokens"]["input"] == 1000
+    assert _cache_records(isolated_settings) == {}  # a truncated record is never stored
+
+    claude_subagent(parent, "agent-late", _started(1), [(MODEL, (500, 0, 0, 0))],
+                    folder=tree / f"workflow-{parser._MAX_SUBAGENT_FOLDERS + 1:02d}")
+    calls = _parse_calls(monkeypatch)
+    warm, _ = _json(capsys, "stats", "--all", "--format", "json")
+    assert calls == [str(parent)]
+    assert warm["totals"]["tokens"]["input"] == 1500
+
+    fresh, _ = _json(capsys, "stats", "--all", "--no-cache", "--format", "json")
+    assert _without_run_stamps(warm) == _without_run_stamps(fresh)
 
 
 def test_fixture_paths_stay_short_enough_for_encoded_folders(isolated_settings):
