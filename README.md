@@ -9,7 +9,7 @@ server collects receipts from the whole team.
 Local Git checkpoints let you restore files from before a run, with a safety checkpoint for undo.
 
 RunLedger is fully free and open source, including the self-hosted team server.
-Version 0.6.1. Python 3.9 or later, no runtime dependencies.
+Version 0.7.0. Python 3.9 or later, no runtime dependencies.
 
 ## Quickstart
 
@@ -37,7 +37,8 @@ More in [docs/quickstart.md](docs/quickstart.md).
 - **Summaries with Claude** (`--ai`), optional. This sends session content to Anthropic. See
   [Privacy](#privacy).
 - **A CI gate:** `runledger receipt --fail-on 60` exits with code 2 when the score is 60 or more.
-- **A real-time guard** for Claude Code. It denies, asks or allows each tool call, and it can route
+- **A real-time guard** for Claude Code, Factory Droid and the Codex CLI. It denies, asks or allows
+  each tool call, a destructive MCP call asks before it runs, and it can route
   "ask" decisions to a person on the team server. See [docs/guard.md](docs/guard.md).
 - **A setup check:** `runledger doctor` reports every hook, config, approval, log, checkpoint,
   price and session detail it can read, with exit codes 0/1/2 for CI. See
@@ -72,16 +73,19 @@ The specification is in [docs/format.md](docs/format.md). Details per agent are 
 runledger checkpoint --label "Before agent run"       # prints a checkpoint id
 runledger checkpoints                               # list snapshots and differing files
 runledger rollback CHECKPOINT_ID --dry-run           # preview restored and removed files
+runledger rollback CHECKPOINT_ID --path src/app.py   # restore only this file or folder
 runledger rollback CHECKPOINT_ID                     # confirm, save safety checkpoint, restore
 runledger rollback SAFETY_CHECKPOINT_ID               # undo using the id printed by rollback
+runledger checkpoints prune --keep 50                 # or --older-than 30d
 ```
 
 Requires Git, but no Git identity setup. Ignored untracked files stay untouched.
 Rollback never changes HEAD, branches, staging, or stashes. Scripts must pass `--yes` to restore;
 use `--dry-run` to preview without restoring.
 Use `--run SESSION_ID` when creating a checkpoint to include its rollback command in the session
-receipt. `guard install` also installs automatic Claude Code session-start and pre-prompt
-checkpoints. [docs/rollback.md](docs/rollback.md) covers Droid hooks, Codex, pruning and limits.
+receipt. `guard install` also installs automatic session-start and pre-prompt
+checkpoints for Claude Code, Droid and Codex. [docs/rollback.md](docs/rollback.md) covers hooks,
+selective `--path` restores, pruning and limits.
 
 ## Team server in five steps
 
@@ -102,6 +106,8 @@ Compose setup with automatic certificates and a bare-metal setup behind nginx.
 
 ```bash
 runledger guard install                              # 1. this project: .claude/settings.json
+runledger guard install --agent droid                #    or Factory Droid: .factory/hooks.json
+runledger guard install --agent codex                #    or Codex CLI: .codex/hooks.json
 runledger guard test '{"session_id":"s1","cwd":"/work/my-app","tool_name":"Bash","tool_input":{"command":"rm -rf /"}}'   # 2. see a decision
 runledger guard install --global                     # 3. or every project: ~/.claude/settings.json
 runledger guard uninstall                            # remove it again (--global for ~/.claude)
@@ -109,7 +115,8 @@ runledger guard uninstall                            # remove it again (--global
 
 By default the guard **denies** a hardcoded secret written into a file and high-severity commands such
 as `rm -rf`, force pushes, `curl | sh`, `DROP TABLE`, `npm publish` and `kubectl apply`. It **asks**
-before `sudo`, reading a `.env` file, writing outside the project, or deleting a test. Everything else
+before `sudo`, reading a `.env` file, writing outside the project, deleting a test, or calling a
+destructive MCP tool such as `mcp__supabase__delete_project`. Everything else
 is allowed. Two settings files control it: your own `~/.runledger/config.json` may set anything, and a
 project's `.runledger.json` may only make the guard stricter. See [docs/guard.md](docs/guard.md).
 
@@ -131,7 +138,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: kodji7202-code/runledger@v0.6.1
+      - uses: kodji7202-code/runledger@v0.7.0
         with:
           fail-on: "60"                   # the job fails at 60 or above; "" never fails
 ```

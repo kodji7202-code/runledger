@@ -3,7 +3,7 @@
 # Build from the repository root:  docker build -t runledger .
 # Or use deploy/docker-compose.yml, which adds Caddy for HTTPS.
 # The image carries OCI labels; pass the version and the commit you built for real values:
-#   docker build -t runledger --build-arg RUNLEDGER_VERSION=0.6.1 \
+#   docker build -t runledger --build-arg RUNLEDGER_VERSION=0.7.0 \
 #     --build-arg RUNLEDGER_REVISION="$(git rev-parse HEAD)" .
 
 # The official Python image can also be fetched from a registry mirror when
