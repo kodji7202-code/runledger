@@ -252,8 +252,21 @@ def _json(capsys, *args, cwd=None, monkeypatch=None):
     return json.loads(out), err
 
 
-def _without_generated(data: dict) -> dict:
-    return {key: value for key, value in data.items() if key != "generated"}
+def _without_run_stamps(data: dict) -> dict:
+    """A report without the values two invocations cannot share: `generated` (the second the
+    run started) and `window` (resolved to the current minute, and its `until` is the end of
+    that minute), so two runs of the same query that straddle a minute boundary still compare
+    equal. Where the window itself is the subject, compare it with `_same_window`."""
+    return {key: value for key, value in data.items() if key not in ("generated", "window")}
+
+
+def _same_window(left: dict, right: dict) -> None:
+    """Two runs of the same query a moment apart resolve to the same window, to the minute."""
+    assert sorted(left["window"]) == sorted(right["window"])
+    for key in left["window"]:
+        first = datetime.fromisoformat(left["window"][key])
+        second = datetime.fromisoformat(right["window"][key])
+        assert abs(first - second) <= timedelta(minutes=1), (key, first, second)
 
 
 def _row(table: str, key: str) -> str:
@@ -369,12 +382,29 @@ def test_since_filters_by_session_start(capsys, fixture_a):
     assert data["totals"]["sessions"] == 3
     four_weeks, _ = _json(capsys, "stats", "--all", "--since", "4w", "--format", "json")
     twenty_eight, _ = _json(capsys, "stats", "--all", "--since", "28d", "--format", "json")
-    # The window is resolved to the minute, but `generated` carries the second the run
-    # started, so two invocations are comparable without it (as the other report checks are).
-    assert _without_generated(four_weeks) == _without_generated(twenty_eight)
+    # `generated` carries the second the run started and `window` the minute it was resolved
+    # in, so two invocations are comparable without them; the windows must still agree.
+    assert _without_run_stamps(four_weeks) == _without_run_stamps(twenty_eight)
+    _same_window(four_weeks, twenty_eight)
     one_month, _ = _json(capsys, "stats", "--all", "--since", "1m", "--format", "json")
     thirty, _ = _json(capsys, "stats", "--all", "--since", "30d", "--format", "json")
-    assert _without_generated(one_month) == _without_generated(thirty)
+    assert _without_run_stamps(one_month) == _without_run_stamps(thirty)
+    _same_window(one_month, thirty)
+
+
+def test_two_reports_a_minute_apart_are_comparable(capsys, fixture_a, monkeypatch):
+    """CI run 39377371046 (macos-latest, Python 3.13) failed the comparison above because the
+    two invocations straddled a minute boundary: `window` is resolved to the current minute and
+    its `until` is the end of that minute, so a whole-report comparison must ignore both run
+    stamps while the window itself is compared separately."""
+    clock = {"now": datetime(2026, 10, 20, 6, 4, 30)}
+    monkeypatch.setattr(stats, "local_now", lambda: clock["now"])
+    first, _ = _json(capsys, "stats", "--all", "--since", "4w", "--format", "json")
+    clock["now"] = datetime(2026, 10, 20, 6, 5, 10)
+    second, _ = _json(capsys, "stats", "--all", "--since", "4w", "--format", "json")
+    assert first["window"]["until"] != second["window"]["until"]  # a real minute apart
+    assert _without_run_stamps(first) == _without_run_stamps(second)
+    _same_window(first, second)
 
 
 def test_since_accepts_a_date_and_until_bounds_the_window(capsys, fixture_a):
@@ -771,7 +801,7 @@ def test_cache_is_written_and_a_second_run_reuses_it(capsys, fixture_a, monkeypa
     calls.clear()
     second, _ = _json(capsys, "stats", "--all", "--format", "json")
     assert calls == []
-    assert _without_generated(second) == _without_generated(first)
+    assert _without_run_stamps(second) == _without_run_stamps(first)
     assert json.loads(cache_file.read_text(encoding="utf-8"))["version"] == 1
 
 
@@ -781,7 +811,7 @@ def test_the_window_is_resolved_to_the_minute(capsys, fixture_a):
     first, _ = _json(capsys, "stats", "--all", "--format", "json")
     second, _ = _json(capsys, "stats", "--all", "--format", "json")
     assert first["window"] == second["window"]
-    assert _without_generated(first) == _without_generated(second)
+    assert _without_run_stamps(first) == _without_run_stamps(second)
     until = datetime.fromisoformat(first["window"]["until"])
     assert datetime.now() <= until <= datetime.now() + timedelta(minutes=1)
     since = datetime.fromisoformat(first["window"]["since"])
@@ -806,7 +836,7 @@ def test_rebuild_cache_parses_everything_again(capsys, fixture_a, monkeypatch):
     calls.clear()
     again, _ = _json(capsys, "stats", "--all", "--rebuild-cache", "--format", "json")
     assert len(calls) >= 3
-    assert _without_generated(again) == _without_generated(first)
+    assert _without_run_stamps(again) == _without_run_stamps(first)
     assert json.loads(cache_file.read_text(encoding="utf-8"))["version"] == 1
     calls.clear()
     assert _json(capsys, "stats", "--all", "--format", "json")[0]["totals"] == first["totals"]
@@ -905,7 +935,7 @@ def test_corrupt_or_unknown_cache_is_ignored_and_rewritten(capsys, fixture_a):
         cache_file.parent.mkdir(parents=True, exist_ok=True)
         cache_file.write_text(bad, encoding="utf-8")
         data, _ = _json(capsys, "stats", "--all", "--format", "json")
-        assert _without_generated(data) == _without_generated(reference)
+        assert _without_run_stamps(data) == _without_run_stamps(reference)
         rewritten = json.loads(cache_file.read_text(encoding="utf-8"))
         assert rewritten["version"] == 1 and rewritten["entries"]
 
@@ -1132,7 +1162,7 @@ def test_a_sidecar_that_appears_later_invalidates_the_cached_summary(
     assert after["totals"]["tokens"]["input"] == 9000
 
     fresh, _ = _json(capsys, "stats", "--all", "--no-cache", "--format", "json")
-    assert _without_generated(after) == _without_generated(fresh)
+    assert _without_run_stamps(after) == _without_run_stamps(fresh)
 
 
 def test_a_repaired_child_settings_file_invalidates_the_cached_summary(
@@ -1162,7 +1192,7 @@ def test_a_repaired_child_settings_file_invalidates_the_cached_summary(
     assert after["totals"]["cost_partial"] is False
 
     fresh, _ = _json(capsys, "stats", "--all", "--no-cache", "--format", "json")
-    assert _without_generated(after) == _without_generated(fresh)
+    assert _without_run_stamps(after) == _without_run_stamps(fresh)
 
 
 def test_a_subagent_that_appears_later_invalidates_the_cached_summary(
@@ -1182,7 +1212,7 @@ def test_a_subagent_that_appears_later_invalidates_the_cached_summary(
     assert after["totals"]["tokens"]["input"] == 1500
 
     fresh, _ = _json(capsys, "stats", "--all", "--no-cache", "--format", "json")
-    assert _without_generated(after) == _without_generated(fresh)
+    assert _without_run_stamps(after) == _without_run_stamps(fresh)
 
 
 def test_an_empty_subagent_populated_later_invalidates_the_cached_summary(
@@ -1205,7 +1235,7 @@ def test_an_empty_subagent_populated_later_invalidates_the_cached_summary(
     assert after["totals"]["tokens"]["input"] == 1500
 
     fresh, _ = _json(capsys, "stats", "--all", "--no-cache", "--format", "json")
-    assert _without_generated(after) == _without_generated(fresh)
+    assert _without_run_stamps(after) == _without_run_stamps(fresh)
 
 
 def test_grouping_by_model_keeps_a_session_with_no_model(capsys, fixture_a):
@@ -1230,7 +1260,7 @@ def test_a_record_with_malformed_request_numbers_is_reparsed(capsys, fixture_a):
     raw["entries"][key]["models"] = {"m": {"input": 1, "requests": ["nonsense"]}}
     cache_file.write_text(json.dumps(raw), encoding="utf-8")
     data, _ = _json(capsys, "stats", "--all", "--format", "json")
-    assert _without_generated(data) == _without_generated(reference)
+    assert _without_run_stamps(data) == _without_run_stamps(reference)
 
 
 def test_fixture_paths_stay_short_enough_for_encoded_folders(isolated_settings):
