@@ -369,10 +369,12 @@ def test_since_filters_by_session_start(capsys, fixture_a):
     assert data["totals"]["sessions"] == 3
     four_weeks, _ = _json(capsys, "stats", "--all", "--since", "4w", "--format", "json")
     twenty_eight, _ = _json(capsys, "stats", "--all", "--since", "28d", "--format", "json")
-    assert four_weeks == twenty_eight
+    # The window is resolved to the minute, but `generated` carries the second the run
+    # started, so two invocations are comparable without it (as the other report checks are).
+    assert _without_generated(four_weeks) == _without_generated(twenty_eight)
     one_month, _ = _json(capsys, "stats", "--all", "--since", "1m", "--format", "json")
     thirty, _ = _json(capsys, "stats", "--all", "--since", "30d", "--format", "json")
-    assert one_month == thirty
+    assert _without_generated(one_month) == _without_generated(thirty)
 
 
 def test_since_accepts_a_date_and_until_bounds_the_window(capsys, fixture_a):
