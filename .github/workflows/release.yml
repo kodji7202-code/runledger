@@ -52,7 +52,7 @@ jobs:
           python -m venv .release-smoke
           .release-smoke/bin/python -m pip install "$wheel"
           test "$(.release-smoke/bin/runledger --version)" = "runledger ${GITHUB_REF_NAME#v}"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist
           path: dist/
