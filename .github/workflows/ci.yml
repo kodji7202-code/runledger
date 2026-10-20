@@ -17,7 +17,9 @@ jobs:
   test:
     name: test (${{ matrix.os }}, Python ${{ matrix.python }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    # windows-latest runs the suite in 16-20 minutes; the v0.7.0 release saw three jobs cancelled
+    # at a 20-minute limit with all tests passed, so the budget carries headroom for them.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:

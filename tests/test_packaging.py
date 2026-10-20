@@ -297,6 +297,10 @@ def test_ci_has_timeouts_and_least_privilege():
     assert jobs, "no jobs found in ci.yml"
     for name, body in jobs.items():
         assert re.search(r"^    timeout-minutes: \d+$", body, re.M), f"{name} has no timeout-minutes"
+    # The windows-latest test jobs run the full suite in 16-20 minutes: three v0.7.0 release runs
+    # were cancelled at a 20-minute limit with every test already passed.
+    assert re.search(r"^    timeout-minutes: (3\d|[4-9]\d)$", jobs["test"], re.M), \
+        "the test matrix needs at least 30 minutes on windows-latest"
 
 
 def test_release_workflow_uses_trusted_publishing_on_version_tags():
