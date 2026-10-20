@@ -21,7 +21,7 @@
   runledger guard status [--project PATH] [--agent AGENT ...] [--json]
   runledger checkpoint [--label TEXT] [--run RUN_ID] [--cwd DIR]
   runledger checkpoints [--cwd DIR]
-  runledger checkpoints prune [--keep N] [--older-than DUR] [--cwd DIR]
+  runledger checkpoints prune [--keep N] [--older-than DUR] [--verbose] [--cwd DIR]
   runledger rollback [CHECKPOINT | --run RUN_ID | --last] [--path PATH ...] [--dry-run] [--yes] [--cwd DIR]
   runledger doctor [--project PATH] [--agent AGENT ...] [--offline] [--no-selftest] [--json] [--verbose]
   runledger stats [--project PATH | --all] [--agent AGENT] [--since WHEN] [--until WHEN]
@@ -208,6 +208,9 @@ def cmd_checkpoints(args) -> int:
             print(f"Pruned {len(removed)} checkpoint(s){detail}. "
                   f"{_prune_scope(args.keep, args.older_than)}")
             if removed:
+                if getattr(args, "verbose", False):
+                    for checkpoint in removed:
+                        print(f"  removed {checkpoint.id}")
                 print("Removed checkpoint refs only; run 'git gc --prune=now' later to reclaim "
                       "the space.")
             return 0
@@ -1110,6 +1113,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                        help="number of newest checkpoints to keep")
     prune.add_argument("--older-than", type=_duration_arg, metavar="DUR",
                        help="remove checkpoints older than DUR, like 30d, 2w or 12h")
+    prune.add_argument("--verbose", action="store_true",
+                       help="list the checkpoints that were removed")
     prune.add_argument("--cwd", default=argparse.SUPPRESS, help="Git working tree folder")
     pcs.set_defaults(func=cmd_checkpoints)
 

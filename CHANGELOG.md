@@ -160,10 +160,12 @@ change behavior, so read the entry before you upgrade.
   (`runledger.rollback`, `runledger.cli`):** `--keep N` still protects the newest N checkpoints and
   `--older-than 30d` (`2w`, `12h`) removes the checkpoints older than that; neither is required on
   its own, but giving neither is an error (`--keep or --older-than is required for prune.`, exit 1),
-  and a duration that is not a number followed by `d`, `w` or `h` is refused by the parser before
-  anything is deleted (exit 2). Giving both is conservative - a checkpoint goes only when it is
-  **both** beyond the newest N **and** older than the limit, and one exactly at the limit age is
-  kept - so the rules can never add up to a wider deletion than each one alone. The age comes from
+  and a duration that is not a number followed by `d`, `w` or `h` - or that no calendar could hold,
+  like `9999999999d` - is refused by the parser before anything is deleted (exit 2). Giving both is
+  conservative - a checkpoint goes only when it is **both** beyond the newest N **and** older than
+  the limit, and one exactly at the limit age is kept - so the rules can never add up to a wider
+  deletion than each one alone. `--verbose` adds one `removed <id>` line per checkpoint that was
+  removed, and the report without it is unchanged (`docs/rollback.md`). The age comes from
   the ref's own Git commit date (the date `GIT_COMMITTER_DATE` writes), so a repository with old
   checkpoints prunes them by how old Git says they are. Safety checkpoints are pruned like any
   other, the report names the count and how many of them were safety checkpoints, and only refs are
@@ -223,6 +225,14 @@ change behavior, so read the entry before you upgrade.
 
 ### Fixed
 
+- **Extreme retention settings no longer break the checkpoint hook (`runledger.rollback`):** a
+  user config holding an age limit no calendar can hold (`"older_than": "9999999999d"`) made
+  `load_settings()` raise `OverflowError` while the hook was decoding it, so `runledger checkpoint
+  --hook` created its checkpoint and then exited 1 with an error line instead of falling open.
+  `parse_duration` now bounds a duration to a thousand years (the same refusal applies to
+  `checkpoints prune --older-than`, exit 2, nothing deleted) and the settings are decoded inside
+  the hook's failure isolation, so an unusable policy of any kind falls back to the documented
+  defaults and the hook still exits 0 with empty stdout and its checkpoint kept.
 - **`rollback --path` reads a relative value against the invocation folder
   (`runledger.rollback`):** `--cwd REPO/sub --path a.txt` resolved `a.txt` against Git's top
   level, so it restored `REPO/a.txt` and left the intended `REPO/sub/a.txt` modified. A relative
@@ -410,6 +420,18 @@ change behavior, so read the entry before you upgrade.
   titles the text report prints (`guard log`, not `log`), and the numbers in the sample summary and
   in the `--json` example are the ones that run prints. The `log` section documents the outside-Git
   `info` status.
+
+### Security
+
+- **The size-warning marker is never written through a redirect (`runledger.rollback`):** the
+  checkpoint hook remembered its warning in `<repo>/.runledger/.size-warned` with a plain
+  `write_text`, so a repository carrying that path - or `.runledger` itself - as a symlink saw the
+  hook truncate whatever the link pointed at (verified: an unrelated working file, or a new file
+  outside the repository, replaced by the marker JSON). `.runledger` is repository content, so a
+  link or another reparse point there is now refused: the marker is neither read nor written
+  through it, the warning still reaches stderr, the hook still exits 0 with empty stdout, and the
+  target keeps its bytes. The marker is opened without following the final path and only truncated
+  once the open file is confirmed to be the marker itself, so the write cannot land elsewhere.
 
 ## [0.6.1] - 2026-10-18
 

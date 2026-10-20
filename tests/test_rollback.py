@@ -2109,7 +2109,8 @@ def test_prune_reports_the_count_and_runs_no_git_gc(repo, capsys):
     assert "Pruned 0 checkpoint(s)." in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("text", ["30x", "abc", "d30", "-1d", "1.5d"])
+@pytest.mark.parametrize("text", ["30x", "abc", "d30", "-1d", "1.5d", "9999999999d",
+                                  "999999999d", "99999999999999999999999h"])
 def test_prune_rejects_an_invalid_duration(repo, capsys, text):
     repo.create(label="only", run_id="run-1")
     with pytest.raises(SystemExit) as exc:
@@ -2119,13 +2120,42 @@ def test_prune_rejects_an_invalid_duration(repo, capsys, text):
     assert len(repo.checkpoints()) == 1
 
 
-def test_prune_help_lists_keep_and_older_than(capsys):
+def test_durations_are_bounded_and_never_raise():
+    """A duration the calendar cannot hold is a wrong value, not a crash (LOCAL-RET-02)."""
+    for text in ("999999999d", "9999999999d", "1000000000w", "90000000000h",
+                 "999999999999999999999999d"):
+        assert rollback.parse_duration(text) is None
+    assert rollback.parse_duration("3650d") == timedelta(days=3650)
+    assert rollback.parse_duration("2w") == timedelta(days=14)
+
+
+def test_prune_help_lists_keep_older_than_and_verbose(capsys):
     with pytest.raises(SystemExit) as exc:
         main(["checkpoints", "prune", "--help"])
     assert exc.value.code == 0
     text = capsys.readouterr().out
-    assert "--keep" in text and "--older-than" in text
+    assert "--keep" in text and "--older-than" in text and "--verbose" in text
     assert "required" not in text
+
+
+def test_prune_verbose_names_the_removed_checkpoints(repo, capsys):
+    made = [repo.create(label=f"cp-{index}", run_id="run-1") for index in range(3)]
+    assert main(["checkpoints", "prune", "--keep", "1", "--verbose",
+                 "--cwd", str(repo.root)]) == 0
+    out = capsys.readouterr().out
+    assert "Pruned 2 checkpoint(s)." in out
+    assert f"removed {made[0].id}" in out and f"removed {made[1].id}" in out
+    assert made[2].id not in out
+    assert refs_of(repo) == [made[2].ref]
+
+
+def test_prune_without_verbose_keeps_the_plain_report(repo, capsys):
+    made = [repo.create(label=f"cp-{index}", run_id="run-1") for index in range(2)]
+    assert main(["checkpoints", "prune", "--keep", "1", "--cwd", str(repo.root)]) == 0
+    out = capsys.readouterr().out
+    assert "Pruned 1 checkpoint(s)." in out
+    assert made[0].id not in out and made[1].id not in out
+    assert "removed" not in out
 
 
 # ---------------------------------------------------------------- auto-prune
@@ -2201,6 +2231,53 @@ def test_hook_auto_prune_failure_is_swallowed(repo, monkeypatch, capsys):
     code, captured = run_hook(repo, "s1", monkeypatch, capsys)
     assert code == 0 and captured.out == ""
     assert len(rollback.Repository(str(repo.root)).checkpoints()) == 1
+
+
+def test_hook_settings_failure_keeps_the_defaults(repo, monkeypatch, capsys):
+    """Decoding the settings runs inside the hook's failure isolation (LOCAL-RET-02)."""
+    def explode(*args, **kwargs):
+        raise RuntimeError("settings exploded")
+
+    monkeypatch.setattr(rollback, "load_settings", explode)
+    code, captured = run_hook(repo, "s1", monkeypatch, capsys)
+    assert code == 0 and captured.out == "" and captured.err == ""
+    assert len(rollback.Repository(str(repo.root)).checkpoints()) == 1
+
+
+@pytest.mark.parametrize("policy,remaining", [
+    # An age limit the calendar cannot hold is refused; the keep beside it still applies.
+    ({"keep": 5, "older_than": "9999999999d"}, 5),
+    ({"keep": 3, "older_than": "99999999999999999999999h"}, 3),
+    # Values that are not the documented shape keep the documented defaults.
+    ({"keep": "lots"}, 6),
+    ({"keep": -2}, 6),
+    ({"keep": 2.5}, 6),
+    ({"keep": True}, 6),
+    ({"keep": 10 ** 30}, 6),
+    ({"older_than": 30}, 6),
+    ({"older_than": "1.5d"}, 6),
+    ({"older_than": "999999999d"}, 6),
+])
+def test_hook_retention_settings_never_break_the_hook(repo, monkeypatch, capsys, tmp_path,
+                                                       policy, remaining):
+    """Extreme or invalid retention settings must cost the hook nothing (LOCAL-RET-02)."""
+    monkeypatch.setenv("RUNLEDGER_CONFIG",
+                       str(write_config(tmp_path, {"rollback": {"auto_prune": policy}})))
+    for index in range(6):
+        code, captured = run_hook(repo, f"s{index}", monkeypatch, capsys)
+        assert code == 0 and captured.out == "" and captured.err == ""
+    kept = rollback.Repository(str(repo.root)).checkpoints()
+    assert kept[0].run_id == "s5"  # the checkpoint the hook just made survives
+    assert len(kept) == remaining
+
+
+def test_load_settings_never_raises_for_an_unusable_policy():
+    settings = rollback.load_settings(
+        {"rollback": {"auto_prune": {"keep": "lots", "older_than": "9999999999d"},
+                      "warn_mb": "big", "warn_file_mb": 1e400}})
+    assert settings.auto_prune and settings.auto_prune_keep == 50
+    assert settings.auto_prune_older_than is None
+    assert settings.warn_mb == 500.0 and settings.warn_file_mb == 50.0
 
 
 # ---------------------------------------------------------------- size warning
@@ -2283,3 +2360,70 @@ def test_a_project_config_cannot_change_retention_or_the_warning(repo, monkeypat
         code, captured = run_hook(repo, f"s{index}", monkeypatch, capsys)
         assert code == 0 and captured.out == "" and captured.err == ""
     assert len(rollback.Repository(str(repo.root)).checkpoints()) == 3
+
+
+def warning_thresholds(tmp_path, monkeypatch):
+    monkeypatch.setenv("RUNLEDGER_CONFIG", str(write_config(
+        tmp_path, {"rollback": {"warn_mb": 5, "warn_file_mb": 3}})))
+
+
+def test_hook_never_writes_the_warning_marker_through_a_symlink(repo, monkeypatch, capsys,
+                                                                tmp_path):
+    """`.runledger/.size-warned` is repository content: a checkpoint hook must not follow a
+    symlink there and truncate whatever it points at (LOCAL-RET-01)."""
+    warning_thresholds(tmp_path, monkeypatch)
+    (repo.root / "big.bin").write_bytes(b"x" * (6 * 1024 * 1024))
+    untouched = repo.root / "unrelated.txt"
+    untouched.write_text("unrelated data must survive\n", encoding="utf-8")
+    folder = repo.root / ".runledger"
+    folder.mkdir()
+    marker = folder / ".size-warned"
+    try:
+        marker.symlink_to(untouched)
+    except OSError:
+        pytest.skip("Symlinks unavailable")
+    code, captured = run_hook(repo, "s1", monkeypatch, capsys)
+    assert code == 0 and captured.out == "" and ".gitignore" in captured.err
+    assert untouched.read_text(encoding="utf-8") == "unrelated data must survive\n"
+    assert marker.is_symlink()
+
+
+def test_hook_does_not_create_the_target_of_a_redirected_marker(repo, monkeypatch, capsys,
+                                                                tmp_path):
+    warning_thresholds(tmp_path, monkeypatch)
+    (repo.root / "big.bin").write_bytes(b"x" * (6 * 1024 * 1024))
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    targeted = outside / "created-by-the-hook.txt"
+    folder = repo.root / ".runledger"
+    folder.mkdir()
+    try:
+        (folder / ".size-warned").symlink_to(targeted)
+    except OSError:
+        pytest.skip("Symlinks unavailable")
+    code, captured = run_hook(repo, "s1", monkeypatch, capsys)
+    assert code == 0 and captured.out == ""
+    assert not targeted.exists()
+    assert list(outside.iterdir()) == []
+
+
+def test_hook_never_writes_the_marker_through_a_symlinked_folder(repo, monkeypatch, capsys,
+                                                                 tmp_path):
+    """A redirect at `.runledger` itself is refused too, so the marker cannot land outside the
+    repository (LOCAL-RET-01)."""
+    warning_thresholds(tmp_path, monkeypatch)
+    (repo.root / "big.bin").write_bytes(b"x" * (6 * 1024 * 1024))
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    untouched = outside / ".size-warned"
+    untouched.write_text("outside marker stays\n", encoding="utf-8")
+    link = repo.root / ".runledger"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("Symlinks unavailable")
+    code, captured = run_hook(repo, "s1", monkeypatch, capsys)
+    assert code == 0 and captured.out == ""
+    assert untouched.read_text(encoding="utf-8") == "outside marker stays\n"
+    assert [path.name for path in outside.iterdir()] == [".size-warned"]
+    assert link.is_symlink()
