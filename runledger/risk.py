@@ -35,6 +35,11 @@ added migration from a changed one.
 Delete tool (canonical "Delete" with file_path) is checked like rm of that path.
 Write, Edit, MultiEdit and Delete inside a .git folder are medium (git_internals).
 
+MCP tools (mcp__<server>__<tool>, or the bare <server>__<tool> names Factory Droid reports for
+connector tools) are graded by their verb (see mcp_risk): a destructive word is high, a
+state-changing word is medium, a read verb or an unknown name stays low. An execute-class call
+is graded by its SQL argument instead, and the SQL body never leaves the call.
+
 Test files: real test source (test_*.py, *.test.js, *_spec.rb, ...) deleted is high.
 Fixtures and data under a test folder (fixtures/, testdata/, __snapshots__/, or .json,
 .txt, .md and similar) deleted is low.
@@ -51,6 +56,7 @@ import posixpath
 import re
 import tempfile
 from dataclasses import dataclass
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -59,11 +65,13 @@ try:
     from . import secrets
 except Exception:  # pragma: no cover - fallback when runledger.secrets is unavailable
     secrets = None  # type: ignore[assignment]
+from .mcp_risk import classify_mcp, mcp_parts
 from .parser import Run, Step
 from .ps_writes import ps_writes, shell_kind
 from .shell_syntax import ansi_c_end, strip_heredocs as _posix_strip_heredocs
 from .shell_writes import database_writes, shell_writes
 from .testdiff import SKIP_RE, TestChange, analyze as analyze_test_diffs
+from .userconfig import user_config_path as _user_config_path
 
 SEVERITY_POINTS = {"high": 30, "medium": 15, "low": 5}
 MEDIUM_POINTS_CAP = 45  # all medium findings together add at most this many points
@@ -121,16 +129,29 @@ WRITE_TOOLS = ("Write", "Edit", "MultiEdit", "NotebookEdit")
 DELETE_TOOLS = ("Delete",)
 SHELL_TOOLS = ("Bash", "PowerShell")
 
+# The codes of findings that come from a rule the user or a project wrote down
+# (`command_rules`/`tool_rules`). `rule_deny` is high, `rule_ask` is medium, and the guard
+# always keeps both on its effective lists, so a rule hit is enforced whatever else the
+# lists say.
+RULE_ASK_CODE = "rule_ask"
+RULE_DENY_CODE = "rule_deny"
+RULE_CODES = (("deny", RULE_DENY_CODE, "high"), ("ask", RULE_ASK_CODE, "medium"))
+# A user or project rule reads at most this many characters of a command, like the SQL
+# inspection (`mcp_risk.SQL_MAX_CHARS`): even a bounded repeat cannot make the synchronous
+# guard path walk an arbitrarily long command.
+RULE_MATCH_MAX_CHARS = 20000
+
 # Shell rules shared by Bash and PowerShell steps, matched against the command text
 # with heredoc bodies, comments and text arguments removed (see _code_view).
 # Flag rules use lookaheads limited to one command (stops at ; & | newline), so the
-# flags may come in any order.
+# flags may come in any order. A shell separator ends an option list like whitespace or
+# the end of the command does, so a flag right before `;`, `&&`, `|` or a newline matches.
 DANGEROUS_CMDS: List[Tuple[str, str, str]] = [
-    (r"\brm\b(?=[^;&|\n]*\s(?:-[a-zA-Z]*[rR][a-zA-Z]*|--recursive)(?=\s|$))"
-     r"(?=[^;&|\n]*\s(?:-[a-zA-Z]*f[a-zA-Z]*|--force)(?=\s|$))",
+    (r"\brm\b(?=[^;&|\n]*\s(?:-[a-zA-Z]*[rR][a-zA-Z]*|--recursive)(?=\s|$|[;&|]))"
+     r"(?=[^;&|\n]*\s(?:-[a-zA-Z]*f[a-zA-Z]*|--force)(?=\s|$|[;&|]))",
      "high", "Recursive force delete (rm -rf)"),
-    (r"\bgit\s+push\b[^;&|\n]*?(?:(?<!\S)-[a-zA-Z]*f[a-zA-Z]*(?=\s|$)"
-     r"|--force(?:-with-lease|-if-includes)?(?=\s|$)|(?<=\s)\+\S)",
+    (r"\bgit\s+push\b[^;&|\n]*?(?:(?<!\S)-[a-zA-Z]*f[a-zA-Z]*(?=\s|$|[;&|])"
+     r"|--force(?:-with-lease|-if-includes)?(?=\s|$|[;&|])|(?<=\s)\+\S)",
      "high", "Force-pushed to a git remote"),
     (r"\bgit\s+reset\s+--hard\b", "medium", "Hard git reset (discards uncommitted work)"),
     (r"\bgit\s+clean\s+-[a-zA-Z]*f", "medium", "git clean (deletes untracked files)"),
@@ -153,6 +174,46 @@ DANGEROUS_CMDS: List[Tuple[str, str, str]] = [
     (r"\btaskkill\b(?=[^;&|\n]*\s//?im\b)(?![^;&|\n]*\s//?pid\b)",
      "medium", "Killed all processes by image name (taskkill /IM)"),
     (r"\b(curl|wget|http)\s+https?://", "low", "Made a network request from the shell"),
+    # Deleting more than the command says it does: force-deleting a branch, dropping the stash,
+    # wiping a remote branch, a container or cluster, a registry key, a device or a whole tree.
+    (r"\bgit\s+branch\b(?=[^;&|\n]*\s-[a-zA-Z]*(?-i:D)[a-zA-Z]*(?=\s|$|[;&|]))",
+     "medium", "Force-deleted a git branch (git branch -D)"),
+    (r"\bgit\s+branch\b(?=[^;&|\n]*\s--delete(?=\s|$|[;&|]))(?=[^;&|\n]*\s(?:--force|-f)(?=\s|$|[;&|]))",
+     "medium", "Force-deleted a git branch"),
+    (r"\bgit\s+push\b[^;&|\n]*?(?:\s--delete(?=\s|$|[;&|])|\s-d(?=\s|$|[;&|])|\s:[^\s:]\S*)",
+     "high", "Deleted a remote git branch or tag"),
+    (r"\bgit\s+checkout\b(?:[^;&|\n]*\s)?--\s+\.(?=\s|$|[;&|])|\bgit\s+checkout\s+\.(?=\s|$|[;&|])",
+     "medium", "Discarded all working-tree changes (git checkout .)"),
+    (r"\bgit\s+restore\b(?![^;&|\n]*\s--staged(?![^;&|\n]*\s(?:--worktree|-[a-zA-Z]*W)))"
+     r"[^;&|\n]*\s\.(?=\s|$|[;&|])",
+     "medium", "Discarded all working-tree changes (git restore .)"),
+    (r"\bgit\s+stash\s+(?:drop|clear)\b", "medium", "Dropped git stash entries"),
+    (r"\bfind\b[^;&|\n]*\s-delete\b|\bfind\b[^;&|\n]*\s-exec\s+(?:rm|unlink|shred)\b",
+     "medium", "Deleted files with find"),
+    (r"\bdd\b[^;&|\n]*\sof=/dev/(?!null\b|zero\b|stdout\b|stderr\b)\S+",
+     "high", "Wrote raw data to a device (dd of=/dev/...)"),
+    (r"\bdd\b[^;&|\n]*\sof=(?!/dev/)\S+", "medium", "Overwrote a file with dd"),
+    (r"\bdocker\s+(?:system|builder|image|container|network)\s+prune\b(?![^;&|\n]*--volumes)",
+     "medium", "Pruned Docker resources"),
+    (r"\bdocker\s+volume\s+prune\b|\bdocker\s+system\s+prune\b[^;&|\n]*--volumes",
+     "high", "Pruned Docker volumes (data loss)"),
+    (r"\baws\s+s3\s+rm\b[^;&|\n]*\s--recursive\b|\baws\s+s3\s+rb\b[^;&|\n]*\s--force\b",
+     "high", "Deleted S3 objects/buckets recursively"),
+    (r"\baws\s+s3\s+rm\b(?![^;&|\n]*\s--recursive\b)", "medium", "Deleted an S3 object"),
+    (r"\bgh\s+repo\s+delete\b", "high", "Deleted a GitHub repository"),
+    (r"\bgh\s+(?:release|issue|gist|label|secret|variable|cache|run|workflow)\s+delete\b",
+     "medium", "Deleted GitHub resources"),
+    (r"\bhelm\s+(?:uninstall|delete)\b", "high", "Uninstalled a Helm release"),
+    (r"\bdelete\s+from\s+\S+(?![^;&|\n]*\bwhere\b)", "high", "SQL DELETE without WHERE"),
+    (r"\brsync\b(?![^;&|\n]*(?:\s--dry-run\b|\s-[a-zA-Z]*(?-i:n)[a-zA-Z]*(?=\s|$)))"
+     r"[^;&|\n]*\s--(?:delete(?:-[a-z]+)?|del|remove-source-files)\b",
+     "medium", "rsync that deletes files"),
+    (r"\breg(?:\.exe)?\s+delete\b(?![^;&|\n]*\b(?:hklm|hkey_local_machine)\b)",
+     "medium", "Deleted a registry key"),
+    (r"\breg(?:\.exe)?\s+delete\b[^;&|\n]*\b(?:hklm|hkey_local_machine)\b",
+     "high", "Deleted a machine-wide registry key"),
+    (r"\b(?:rd|rmdir)\b(?=[^;&|\n]*\s/s\b)(?=[^;&|\n]*\s/q\b)",
+     "high", "Recursive quiet delete (rd /s /q)"),
 ]
 _DANGEROUS = [(re.compile(p, re.I), sev, why) for p, sev, why in DANGEROUS_CMDS]
 
@@ -160,6 +221,8 @@ _DANGEROUS = [(re.compile(p, re.I), sev, why) for p, sev, why in DANGEROUS_CMDS]
 PS_CMDS: List[Tuple[str, str, str]] = [
     (r"\b(?:remove-item|ri|del|erase|rd|rmdir)\b(?=[^;&|\n]*\s-rec\w*)(?=[^;&|\n]*\s-fo\w*)",
      "high", "Recursive force delete (Remove-Item -Recurse -Force)"),
+    (r"\b(?:remove-item|ri|del|erase|rd|rmdir)\b(?=[^;&|\n]*\s-rec\w*)(?![^;&|\n]*\s-fo\w*)",
+     "medium", "Recursive delete (Remove-Item -Recurse)"),
     (r"\b(?:iwr|irm|invoke-webrequest|invoke-restmethod|curl|wget)\b[^|;\n]*\|\s*(?:iex|invoke-expression)\b",
      "high", "Piped a downloaded script into PowerShell (iex)"),
     (r"\b(?:iex|invoke-expression)\b[^;|\n]*\(\s*(?:iwr|irm|invoke-webrequest|invoke-restmethod)\b",
@@ -813,9 +876,11 @@ def _plan(words: List[_Word], ps: bool) -> Optional[str]:
             elif w.value in _CODE_FLAGS or (name in ("perl", "ruby") and _PERL_CODE_RE.match(w.value)):
                 take = True
     if name == "find":
+        # A -name/-path pattern is a glob or regex the search matches against, never a command,
+        # so the dangerous-command rules read the pattern as text (the _code_view blanks it).
         for q, w in enumerate(rest[:-1]):
             if w.value in _FIND_PATTERN_OPTS:
-                rest[q + 1].role = "skip"
+                rest[q + 1].role = "text"
     if delete_from is None:
         for q in range(j + 1, len(plain) - 1):
             if plain[q].value in ("-exec", "-execdir", "-ok") and _name(plain[q + 1].value) in _DELETE_CMDS:
@@ -903,11 +968,30 @@ def _check_shell_word(w: _Word, name: str, cwd: Optional[str], workdir: Optional
         risks.append(Risk("low", "shell_outside", f"Shell command referenced a path outside the working folder ({shown})", step.index))
 
 
-def _code_view(text: str, comments: List[Tuple[int, int]], text_words: List[_Word]) -> str:
-    """The command text the dangerous-command rules read: comments removed, and quoted text
-    arguments (echo, git commit -m, python -c) blanked. Unquoted $VAR words are kept."""
+def _has_substitution(raw: str, ps: bool = False) -> bool:
+    """Whether `raw` carries substitution syntax at all: the two characters `$(` anywhere, and a
+    backtick for a POSIX shell. Nothing is read out of the quoting or the escapes, so a quote
+    state that desynchronises cannot blank a substitution the shell really runs: a word that only
+    looks like one - single-quoted text, or one an escape makes literal - is read as code and
+    over-reported instead (GE-017)."""
+    if "$(" in raw:
+        return True
+    return "`" in raw and not ps
+
+
+def _code_view(text: str, comments: List[Tuple[int, int]], text_words: List[_Word],
+               ps: bool = False) -> str:
+    """The command text the dangerous-command rules read: comments removed, and text
+    arguments (echo, git commit -m, python -c, a `find -name` pattern) blanked. A text word
+    carrying substitution syntax at all (`$(`, or a backtick for a POSIX shell) is not blanked:
+    whatever the shell computes there stays visible, whatever reads it. Quoting and escapes are
+    not resolved, so a word that only looks like a substitution is over-reported while one that
+    really is can never be hidden (GE-017). Unquoted $VAR words are kept."""
     spans = [(s, e, "") for s, e in comments]
     for w in text_words:
+        raw = text[w.start:w.end]
+        if _has_substitution(raw, ps):
+            continue
         if w.quoted or not w.value.startswith("$") or "$(" in w.value:
             spans.append((w.start, w.end, '""'))
     out = text
@@ -917,7 +1001,8 @@ def _code_view(text: str, comments: List[Tuple[int, int]], text_words: List[_Wor
 
 
 def _shell_risks(step: Step, cwd: Optional[str], extra: List["re.Pattern"], risks: List[Risk],
-                 default_workdir: Optional[str] = None) -> Set[str]:
+                 default_workdir: Optional[str] = None,
+                 policy: Optional[Dict[str, Any]] = None) -> Set[str]:
     """Risks for the words of a shell command. Returns the paths reported as outside this step
     (`_path_key` form), so `_shell_write_risks` does not report the same write twice."""
     cmd = str(step.input.get("command") or "")
@@ -939,7 +1024,7 @@ def _shell_risks(step: Step, cwd: Optional[str], extra: List["re.Pattern"], risk
     cmds = _simple_commands(items)
     names = [_plan(words, ps) for words in cmds]
     text_words = [w for words in cmds for w in words if w.role == "text"]
-    code = _code_view(prepared, comments, text_words)
+    code = _code_view(prepared, comments, text_words, ps)
 
     rules = list(_DANGEROUS)
     if ps:
@@ -949,6 +1034,7 @@ def _shell_risks(step: Step, cwd: Optional[str], extra: List["re.Pattern"], risk
             risks.append(Risk(sev, "command", why, step.index))
     if _SUDO_RE.search(code):
         risks.append(Risk("high", "command", "Ran a command with sudo", step.index))
+    risks.extend(command_rule_risks(cmd, code, policy, step.index))
 
     assigns: Dict[str, Optional[str]] = {}
     for words, name in zip(cmds, names):
@@ -1033,14 +1119,6 @@ _HIGH_DEFAULT_KINDS = frozenset({
 })
 
 
-def _user_config_path() -> Path:
-    override = os.environ.get("RUNLEDGER_CONFIG", "").strip()
-    if override:
-        return Path(override)
-    home = os.environ.get("HOME") or os.environ.get("USERPROFILE") or str(Path.home())
-    return Path(home) / ".runledger" / "config.json"
-
-
 def _read_json_dict(path: Path) -> Dict[str, Any]:
     try:
         data = json.loads(path.read_text(encoding="utf-8-sig"))
@@ -1103,8 +1181,14 @@ def load_policy(cwd: Optional[str]) -> Dict[str, Any]:
       checked per finding in `_apply_policy` (the project's own values are carried in
       `project_severity_overrides`).
     - `extra_secret_paths` are validated with `secrets.safe_user_regex` and capped at 20.
+    - `mcp_verbs`, `tool_rules` and `command_rules` are read from the PROJECT file only: a
+      receipt is reproducible from the repository it belongs to, so the user's own rules
+      (which the live guard does enforce) are not re-applied to an old transcript. Project
+      verbs may add `destructive`/`write` words, never `read`.
     """
-    policy: Dict[str, Any] = {"ignore": [], "severity_overrides": {}, "extra_secret_paths": []}
+    policy: Dict[str, Any] = {"ignore": [], "severity_overrides": {}, "extra_secret_paths": [],
+                              "mcp_verbs": parse_mcp_verbs({}), "tool_rules": parse_tool_rules({}),
+                              "command_rules": parse_command_rules({})[0]}
     user_data = _read_json_dict(_user_config_path())
     proj_data = _read_json_dict(Path(cwd) / POLICY_FILE) if (cwd and not paths.is_unc(cwd)) else {}
 
@@ -1146,6 +1230,9 @@ def load_policy(cwd: Optional[str]) -> Dict[str, Any]:
         if len(raw_extra) >= max_extra:
             break
     policy["extra_secret_paths"] = raw_extra
+    policy["mcp_verbs"] = parse_mcp_verbs(proj_data.get("mcp_verbs"), allow_read=False)
+    policy["tool_rules"] = parse_tool_rules(proj_data.get("tool_rules"))
+    policy["command_rules"] = parse_command_rules(proj_data.get("command_rules"), POLICY_FILE)[0]
     return policy
 
 
@@ -1153,6 +1240,128 @@ def _compiles(rx: str) -> bool:
     if secrets is not None:
         return secrets.safe_user_regex(rx) is not None
     return False
+
+
+def parse_command_rules(value: Any, source: str = "the config file"
+                        ) -> Tuple[Dict[str, List[Dict[str, Any]]], List[str]]:
+    """The `command_rules` of one config file: `{"deny": [...], "ask": [...]}`.
+
+    Each entry is a regular expression, or an object `{"pattern", "reason", "raw"}`. The
+    expression is matched case-insensitively against the quote/heredoc-blanked command; a
+    `raw: true` entry reads the whole command instead. A pattern that is not a safe regular
+    expression is dropped, and the warning names it and the file it came from."""
+    rules: Dict[str, List[Dict[str, Any]]] = {"deny": [], "ask": []}
+    warnings: List[str] = []
+    if not isinstance(value, dict):
+        return rules, warnings
+    for kind in ("deny", "ask"):
+        entries = value.get(kind)
+        for entry in entries if isinstance(entries, list) else []:
+            pattern = entry.get("pattern") if isinstance(entry, dict) else entry
+            reason = entry.get("reason") if isinstance(entry, dict) else None
+            if not isinstance(pattern, str) or not pattern.strip():
+                continue
+            compiled = secrets.safe_user_regex(pattern) if secrets is not None else None
+            if compiled is None:
+                warnings.append(f"Dropped invalid command_rules.{kind} pattern {pattern.strip()!r} in {source}: "
+                                f"it is not a safe regular expression.")
+                continue
+            rules[kind].append({"rx": compiled,
+                                "label": reason.strip() if isinstance(reason, str) and reason.strip()
+                                else pattern.strip(),
+                                "raw": bool(entry.get("raw")) if isinstance(entry, dict) else False})
+    return rules, warnings
+
+
+def parse_tool_rules(value: Any) -> Dict[str, List[str]]:
+    """The `tool_rules` of one config file: `{"deny": [...], "ask": [...]}`.
+
+    Every entry is an `fnmatch` glob on the whole tool name, matched case-sensitively."""
+    rules: Dict[str, List[str]] = {"deny": [], "ask": []}
+    if not isinstance(value, dict):
+        return rules
+    for kind in ("deny", "ask"):
+        entries = value.get(kind)
+        for entry in entries if isinstance(entries, list) else []:
+            if isinstance(entry, str) and entry.strip():
+                rules[kind].append(entry.strip())
+    return rules
+
+
+def parse_mcp_verbs(value: Any, allow_read: bool = True) -> Dict[str, List[str]]:
+    """The `mcp_verbs` of one config file: `{"destructive": [...], "write": [...], "read": [...]}`.
+
+    A project file may extend `destructive` and `write` only: with `allow_read` false its
+    `read` list is dropped, because a read word lowers a tool that carries it."""
+    verbs: Dict[str, List[str]] = {"destructive": [], "write": [], "read": []}
+    if not isinstance(value, dict):
+        return verbs
+    for key in verbs:
+        if key == "read" and not allow_read:
+            continue
+        words = value.get(key)
+        if isinstance(words, list):
+            verbs[key] = [w.strip().lower() for w in words if isinstance(w, str) and w.strip()]
+    return verbs
+
+
+def merge_mcp_verbs(*parts: Dict[str, List[str]]) -> Dict[str, List[str]]:
+    """The union of the `mcp_verbs` of several config files, each word kept once."""
+    out: Dict[str, List[str]] = {"destructive": [], "write": [], "read": []}
+    for part in parts:
+        for key in out:
+            for word in (part or {}).get(key) or []:
+                if word not in out[key]:
+                    out[key].append(word)
+    return out
+
+
+def _rule_matched_risks(kind: str, code: str, severity: str, matched: List[str], index: int) -> List[Risk]:
+    return [Risk(severity, code, f"Matched {kind} rule: {label}", index) for label in matched]
+
+
+def command_rule_risks(command: str, view: str, policy: Optional[Dict[str, Any]], index: int) -> List[Risk]:
+    """Risks for the `command_rules` of the user's file and the project's file.
+
+    `view` is the quote/heredoc-blanked command the built-in rules read; an entry with
+    `raw: true` reads `command` itself, so a rule can also match quoted text. Either way only
+    the first `RULE_MATCH_MAX_CHARS` characters are read."""
+    rules = policy.get("command_rules") if isinstance(policy, dict) else None
+    risks: List[Risk] = []
+    if not isinstance(rules, dict):
+        return risks
+    text = view[:RULE_MATCH_MAX_CHARS]
+    raw = command[:RULE_MATCH_MAX_CHARS]
+    for kind, code, severity in RULE_CODES:
+        hits = [r["label"] for r in rules.get(kind) or [] if r["rx"].search(raw if r["raw"] else text)]
+        risks.extend(_rule_matched_risks(kind, code, severity, hits, index))
+    return risks
+
+
+def _tool_rule_names(tool: str) -> List[str]:
+    """The names a `tool_rules` glob is matched against: the tool's own name and, for a bare
+    Droid connector name, its canonical `mcp__<server>__<tool>` spelling - the one receipts
+    carry - so a rule covers the same call whichever agent reports it (GE-006)."""
+    if tool.startswith("mcp__") or mcp_parts(tool) is None:
+        return [tool]
+    return [tool, "mcp__" + tool]
+
+
+def tool_rule_risks(tool: str, policy: Optional[Dict[str, Any]], index: int) -> List[Risk]:
+    """Risks for the `tool_rules` of the user's file and the project's file.
+
+    The globs match the whole name, case-sensitively, in both spellings a connector call can
+    arrive in (see `_tool_rule_names`). A tool that is on both lists carries both findings, so
+    the guard denies it: deny beats ask."""
+    rules = policy.get("tool_rules") if isinstance(policy, dict) else None
+    risks: List[Risk] = []
+    if not isinstance(rules, dict):
+        return risks
+    names = _tool_rule_names(tool)
+    for kind, code, severity in RULE_CODES:
+        hits = [p for p in rules.get(kind) or [] if any(fnmatchcase(n, p) for n in names)]
+        risks.extend(_rule_matched_risks(kind, code, severity, hits, index))
+    return risks
 
 
 def _risk_matches_key(r: Risk, key: str, allow_substring: bool = False) -> bool:
@@ -1266,11 +1475,14 @@ def assess_step(step: Step, cwd: Optional[str], policy: Optional[Dict[str, Any]]
                 risks.append(Risk("high", "secret_in_content", f"Wrote a hardcoded {kind} into {name}", step.index))
 
     if tool in SHELL_TOOLS:
-        flagged = _shell_risks(step, cwd, extra, risks, default_workdir=base)
+        flagged = _shell_risks(step, cwd, extra, risks, default_workdir=base, policy=policy)
         _shell_write_risks(step, cwd, extra, risks, default_workdir=base, flagged=flagged)
 
-    if tool.startswith("mcp__"):
-        risks.append(Risk("low", "mcp", f"Called an external MCP tool ({tool.split('__', 2)[-1]})", step.index))
+    risks.extend(tool_rule_risks(tool, policy, step.index))
+
+    if mcp_parts(tool) is not None:
+        severity, reason = classify_mcp(tool, step.input, policy)
+        risks.append(Risk(severity, "mcp", reason, step.index))
 
     # de-duplicate by (code, reason)
     seen = set()

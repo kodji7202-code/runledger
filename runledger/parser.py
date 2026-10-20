@@ -18,7 +18,22 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+# How a path a parse read or looked for beside a transcript turned out: it was read, it was not
+# there, or it was there and could not be used. `runledger stats` records the state beside the
+# path's size and modification time, so its cache record is dropped when a candidate appears
+# (a Droid settings sidecar written later), is repaired (a child settings file that was
+# malformed) or changes (a sub-agent transcript filled in).
+SOURCE_OK = "ok"
+SOURCE_MISSING = "missing"
+SOURCE_REJECTED = "rejected"
+
+# A Claude sub-agent folder tree larger than this is watched at its shallowest folders only.
+# The cap is a speed guard, and a tree that reaches it is never cached: a transcript written
+# into a folder the watch did not reach changes no watched source, so a stored record would
+# keep totals `--no-cache` disproves (LOCAL-R3-STATS-01).
+_MAX_SUBAGENT_FOLDERS = 64
 
 
 @dataclass
@@ -152,6 +167,17 @@ class Run:
     # Droid only: where cwd came from. "header" (the log), "session" (`% pwd` output or the tool
     # paths' Git work tree), "settings", "session_dir" (the encoded session folder) or "unknown"
     cwd_source: Optional[str] = None
+    # Every path this parse read or looked for beside the transcript - a Droid settings file or
+    # child settings file, each folder a Claude sub-agent transcript could live in, and the
+    # transcripts themselves - as `(path, state)`: the state is `SOURCE_OK`, `SOURCE_MISSING`
+    # or `SOURCE_REJECTED`. `runledger stats` keys its cache record on all of them, so one that
+    # appears, is repaired or changes drops the record.
+    sources: List[Tuple[str, str]] = field(default_factory=list)
+    # Whether the parse really could track every path it depends on, so nothing it read was cut
+    # short: False when a dependency tree could not be listed or its folder watch was capped.
+    # `runledger stats` then caches no record for the session - a source that was never watched
+    # cannot invalidate one - and parses it again on every run instead (LOCAL-R3-STATS-01).
+    dependencies_complete: bool = True
     safe: bool = False  # safe.make_safe rewrote paths and masked e-mails for sharing
     # safe.make_safe: the changed files computed before paths were rewritten (summarize.FileChange values)
     frozen_changes: Optional[Dict[str, Any]] = None
@@ -273,47 +299,95 @@ def _fs_str(path: str | os.PathLike) -> str:
     return s
 
 
-def _discover_subagent_files(parent_path: Path, session_id: str) -> List[Tuple[Path, bool]]:
-    """Return `[(sub_path, is_legacy), ...]` for a parent Claude Code transcript."""
-    if any(part.lower() == "subagents" for part in parent_path.parent.parts):
-        return []
-    found: List[Tuple[Path, bool]] = []
-    seen = set()
+def _subagent_roots(parent_path: Path, session_id: str) -> List[Tuple[Path, bool]]:
+    """`[(folder, is_legacy)]`: every folder a sub-agent transcript of this parent could live
+    in, whether or not it exists - `<project>/<session>/subagents/**` (nested `workflows`
+    included) and the legacy `<project>/subagents/**`."""
     parent_dir = parent_path.parent
-
-    # 1. Session-scoped layout: <project>/<session>/subagents/**/*.jsonl
-    candidates = [parent_path.stem]
+    names = [parent_path.stem]
     if (session_id and session_id != parent_path.stem
             and "/" not in session_id and "\\" not in session_id
             and session_id not in (".", "..")):
-        candidates.append(session_id)
-    for sname in candidates:
-        sub_dir = Path(_fs_str(parent_dir / sname / "subagents"))
+        names.append(session_id)
+    roots = [(Path(_fs_str(parent_dir / name / "subagents")), False) for name in names]
+    roots.append((Path(_fs_str(parent_dir / "subagents")), True))
+    return roots
+
+
+def _walk_subagents(root: Path) -> Tuple[List[Path], List[Path], bool]:
+    """`(folders, transcripts, complete)`: the folders below `root`, breadth first, and every
+    `*.jsonl` transcript in the tree - a transcript added anywhere in the tree changes the
+    modification time of the folder that holds it, so watching the folders watches the whole
+    tree, and the walk that decides what is watched also decides what is read.
+
+    The folders are listed here, one by one, instead of through `pathlib.rglob`, which hides a
+    listing error inside its own scan: an unreadable folder would look like an empty one, its
+    transcripts would be missing from the totals, and the parse would still claim to have seen
+    everything (LOCAL-R4-STATS-01). A transcript is a `*.jsonl` file, compared the way the
+    volume compares names (so `*.JSONL` counts on Windows, as it did through `glob`).
+
+    `complete` is False when the walk cannot promise it saw every folder and transcript: a tree
+    holding more folders than `_MAX_SUBAGENT_FOLDERS` is watched at its shallowest ones only (a
+    transcript written into a folder it never reached would change no watched source), and a
+    folder that cannot be listed hides whatever it holds. A parse with an incomplete walk is not
+    cached (LOCAL-R3-STATS-01)."""
+    folders = [root]
+    transcripts: List[Path] = []
+    index = 0
+    while index < len(folders):
+        folder = folders[index]
+        index += 1
         try:
-            is_dir = sub_dir.is_dir()
+            with os.scandir(folder) as listing:
+                entries = sorted(listing, key=lambda entry: entry.name)
+        except OSError:
+            return folders, transcripts, False
+        for entry in entries:
+            if os.path.normcase(entry.name).endswith(".jsonl"):
+                transcripts.append(Path(entry.path))
+            try:
+                if entry.is_dir() and not entry.is_symlink():
+                    folders.append(Path(entry.path))
+            except OSError:
+                return folders, transcripts, False
+    if len(folders) >= _MAX_SUBAGENT_FOLDERS:
+        return folders[:_MAX_SUBAGENT_FOLDERS], transcripts, False
+    return folders, transcripts, True
+
+
+def _discover_subagent_files(parent_path: Path, session_id: str
+                             ) -> Tuple[List[Tuple[Path, str]], List[Tuple[Path, bool]], bool]:
+    """`(candidates, files, complete)`: how every folder a sub-agent transcript could live in
+    turned out (a folder that is not there is a `SOURCE_MISSING` candidate, so a transcript
+    written into it later is seen), the transcripts that are there now, and whether the whole
+    tree was really read and watched. `complete` is False as soon as one folder could not be
+    listed - by the watch or by the scan for the transcripts themselves - or the folder watch
+    was capped, which is what keeps `runledger stats` from caching the parse."""
+    if any(part.lower() == "subagents" for part in parent_path.parent.parts):
+        return [], [], True
+    candidates: List[Tuple[Path, str]] = []
+    found: List[Tuple[Path, bool]] = []
+    seen = set()
+    complete = True
+    for root, is_legacy in _subagent_roots(parent_path, session_id):
+        try:
+            is_dir = root.is_dir()
         except OSError:
             is_dir = False
-        if is_dir:
-            for f in sorted(sub_dir.rglob("*.jsonl")):
-                key = str(f)
-                if key not in seen:
-                    seen.add(key)
-                    found.append((f, False))
-
-    # 2. Legacy layout: <project>/subagents/**/*.jsonl
-    legacy_dir = Path(_fs_str(parent_dir / "subagents"))
-    try:
-        is_legacy_dir = legacy_dir.is_dir()
-    except OSError:
-        is_legacy_dir = False
-    if is_legacy_dir:
-        for f in sorted(legacy_dir.rglob("*.jsonl")):
-            key = str(f)
+            complete = False
+        if not is_dir:
+            candidates.append((root, SOURCE_MISSING))
+            continue
+        folders, entries, walked = _walk_subagents(root)
+        candidates.extend((folder, SOURCE_OK) for folder in folders)
+        complete = complete and walked
+        for path in entries:
+            key = str(path)
             if key not in seen:
                 seen.add(key)
-                found.append((f, True))
+                found.append((path, is_legacy))
 
-    return found
+    return candidates, found, complete
 
 
 def _merge_subagents(
@@ -321,13 +395,21 @@ def _merge_subagents(
     session_id: str,
     msg_usage: Dict[str, Usage],
     msg_model: Dict[str, Optional[str]],
-) -> int:
+) -> Tuple[List[Tuple[str, str]], int, bool]:
     """Merge sub-agent assistant message usage into `msg_usage`/`msg_model`.
-    Returns the number of sub-agent transcripts merged."""
-    merged_files = 0
+
+    Returns `(sources, merged, complete)`: every path the merge read or looked for beside the
+    parent transcript with how it turned out, how many transcripts contributed, and whether the
+    tree really was watched in full. A transcript is a source whether or not it contributed, and
+    a folder a sub-agent transcript could live in is one whether or not it exists, so
+    `runledger stats` drops its cache record when one appears, is filled in or changes; an
+    incomplete walk leaves nothing to watch at all, so `stats` caches no record for it."""
+    candidates, files, complete = _discover_subagent_files(parent_path, session_id)
+    sources: List[Tuple[str, str]] = [(str(path), state) for path, state in candidates]
+    merged = 0
     valid_session_ids = {session_id, parent_path.stem}
 
-    for sub_path, is_legacy in _discover_subagent_files(parent_path, session_id):
+    for sub_path, is_legacy in files:
         sub_events: List[Dict[str, Any]] = []
         sub_sids = set()
         try:
@@ -348,14 +430,16 @@ def _merge_subagents(
                         if sid:
                             sub_sids.add(sid)
         except OSError:
+            sources.append((str(sub_path), SOURCE_REJECTED))
             continue
+        sources.append((str(sub_path), SOURCE_OK))
 
         if not sub_events:
             continue
         if is_legacy and sub_sids and not (sub_sids & valid_session_ids):
             continue
 
-        merged_files += 1
+        merged += 1
         for idx, ev in enumerate(sub_events):
             if ev.get("type") != "assistant":
                 continue
@@ -375,7 +459,7 @@ def _merge_subagents(
                 if not msg_model.get(mid) and model:
                     msg_model[mid] = model
 
-    return merged_files
+    return sources, merged, complete
 
 
 
@@ -476,11 +560,12 @@ def parse_session(path: str | os.PathLike) -> Run:
     if lines and not valid_events:
         raise ValueError(f"{path}: not a supported session file")
 
-    subagent_count = _merge_subagents(Path(path), session_id, msg_usage, msg_model)
+    subagent_sources, merged, watched = _merge_subagents(Path(path), session_id, msg_usage,
+                                                         msg_model)
     notes: List[str] = []
-    if subagent_count > 0:
-        suffix = "s" if subagent_count != 1 else ""
-        notes.append(f"includes {subagent_count} sub-agent transcript{suffix}")
+    if merged:
+        suffix = "s" if merged != 1 else ""
+        notes.append(f"includes {merged} sub-agent transcript{suffix}")
 
     # Attribute each assistant message's usage to the steps it issued
     # (split evenly); messages without tool calls count toward the run only.
@@ -499,6 +584,7 @@ def parse_session(path: str | os.PathLike) -> Run:
         session_id=session_id, path=path, cwd=cwd, git_branch=git_branch,
         started=started, ended=ended, prompts=prompts, steps=steps,
         final_message=final_message, usage=total, models=models, notes=notes,
+        sources=subagent_sources, dependencies_complete=watched,
     )
 
 
@@ -570,8 +656,13 @@ def peek_session(path: str | os.PathLike) -> Tuple[str, str, int, str, Optional[
 
 
 def claude_projects_dir() -> Path:
-    base = os.environ.get("CLAUDE_CONFIG_DIR")
-    return Path(base) / "projects" if base else Path.home() / ".claude" / "projects"
+    """Claude Code's project folder: `$CLAUDE_CONFIG_DIR/projects`, else `<home>/.claude/projects`.
+
+    Discovery, `guard install --global` and the doctor resolve the config directory through the
+    one resolver in `hook_targets`, so a HOME that differs from USERPROFILE cannot split them
+    (docs/agents.md)."""
+    from .hook_targets import claude_dir
+    return claude_dir() / "projects"
 
 
 _WINDOWS_ABSOLUTE = re.compile(r"^[A-Za-z]:[\\/]")

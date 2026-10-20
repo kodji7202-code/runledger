@@ -1,8 +1,11 @@
 """Claude Code sub-agent transcripts merge into parent session usage and cost (VAL-CORE-060)."""
 import json
+import os
+from pathlib import Path
 
 import pytest
 
+from runledger import parser
 from runledger.cli import main
 from runledger.parser import encode_project_path, find_sessions, parse_session
 
@@ -115,3 +118,117 @@ def test_legacy_subagents_merged_and_duplicate_message_ids_deduped(tmp_path, mon
     # Sub-agent files are never listed separately
     assert find_sessions(str(prj)) == [parent_file]
     assert find_sessions(None) == [parent_file]
+
+
+def flaky_scandir(folder, failures, real=None):
+    """The real `os.scandir`, refusing one folder the way an unreadable directory does."""
+    real = real or os.scandir
+
+    def scandir(path=None, **kwargs):
+        if isinstance(path, (str, os.PathLike)) and Path(path) == folder:
+            failures.append(str(path))
+            raise PermissionError("synthetic unlistable folder")
+        return real(path, **kwargs) if path is not None else real(**kwargs)
+
+    return scandir
+
+
+def test_folder_watch_says_whether_it_saw_the_whole_tree(tmp_path):
+    """LOCAL-R3-STATS-01: the watch is capped for speed, so it reports whether it listed every
+    folder. A capped walk means the parse cannot promise that a later transcript is seen."""
+    root = tmp_path / "subagents"
+    for index in range(parser._MAX_SUBAGENT_FOLDERS - 2):
+        (root / f"f{index:02d}").mkdir(parents=True)
+    folders, transcripts, complete = parser._walk_subagents(root)
+    assert complete is True and len(folders) == parser._MAX_SUBAGENT_FOLDERS - 1
+    assert transcripts == []
+
+    (root / "one-more").mkdir()
+    folders, _transcripts, complete = parser._walk_subagents(root)
+    assert complete is False and len(folders) >= parser._MAX_SUBAGENT_FOLDERS
+
+
+def test_the_walk_finds_every_transcript_it_walks_over(tmp_path):
+    """The same walk that decides what is watched decides what is read: the transcripts of the
+    whole tree, at any depth (the layout `rglob` used to cover)."""
+    root = tmp_path / "subagents"
+    (root / "workflows" / "wf1").mkdir(parents=True)
+    (root / "agent-1.jsonl").write_text("{}\n", encoding="utf-8")
+    (root / "workflows" / "wf1" / "agent-2.jsonl").write_text("{}\n", encoding="utf-8")
+    (root / "workflows" / "notes.txt").write_text("not a transcript\n", encoding="utf-8")
+    folders, transcripts, complete = parser._walk_subagents(root)
+    assert complete is True
+    assert sorted(path.name for path in transcripts) == ["agent-1.jsonl", "agent-2.jsonl"]
+    assert sorted(folder.name for folder in folders) == ["subagents", "wf1", "workflows"]
+
+
+def test_an_unlistable_folder_makes_the_watch_incomplete(tmp_path, monkeypatch):
+    """A folder that cannot be listed is a folder whose sub-agent transcripts are unknown, so
+    the walk reports it instead of quietly watching less than the tree holds."""
+    root = tmp_path / "subagents"
+    (root / "known").mkdir(parents=True)
+    failures = []
+    monkeypatch.setattr(os, "scandir", flaky_scandir(root / "known", failures))
+    folders, transcripts, complete = parser._walk_subagents(root)
+    assert [folder.name for folder in folders] == ["subagents", "known"]
+    assert transcripts == []
+    assert complete is False and failures
+
+
+def test_a_failed_transcript_scan_makes_the_parse_incomplete(tmp_path, monkeypatch):
+    """LOCAL-R4-STATS-01: the transcript scan is part of dependency discovery. A folder it
+    cannot list is a folder whose transcripts it never saw, so the parse is incomplete - the
+    same answer a capped folder watch gives, and what keeps `stats` from caching the totals."""
+    cfg = tmp_path / "c"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg))
+    prj, sid = "/work/scan", "scan"
+    proj_dir = cfg / "projects" / encode_project_path(prj)
+    proj_dir.mkdir(parents=True)
+    parent_file = proj_dir / f"{sid}.jsonl"
+    parent_file.write_text(
+        json.dumps({"type": "user", "sessionId": sid, "cwd": prj,
+                    "message": {"content": "run subagents"}}) + "\n"
+        + _assistant_line("msg_p1", "claude-sonnet-4-5-20250929", 1000, session_id=sid),
+        encoding="utf-8",
+    )
+    tree = proj_dir / sid / "subagents"
+    tree.mkdir(parents=True)
+    (tree / "agent-1.jsonl").write_text(
+        _assistant_line("msg_s1", "claude-sonnet-4-5-20250929", 500, session_id=sid),
+        encoding="utf-8",
+    )
+    assert parse_session(parent_file).dependencies_complete is True
+    assert parse_session(parent_file).usage.input_tokens == 1500
+
+    with monkeypatch.context() as scan_error:
+        scan_error.setattr(os, "scandir", flaky_scandir(tree, []))
+        broken = parse_session(parent_file)
+    assert broken.dependencies_complete is False
+    assert broken.usage.input_tokens == 1000  # the transcript under the folder never listed
+
+    recovered = parse_session(parent_file)
+    assert recovered.dependencies_complete is True
+    assert recovered.usage.input_tokens == 1500
+
+
+def test_a_session_whose_folder_watch_was_capped_is_not_cacheable(tmp_path, monkeypatch):
+    """The parse carries the watch's completeness, which is what `stats` refuses to cache on:
+    a session whose sub-agent tree outgrows the watch is re-parsed, never trusted to a record."""
+    cfg = tmp_path / "c"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg))
+    prj, sid = "/work/capped", "capped"
+    proj_dir = cfg / "projects" / encode_project_path(prj)
+    proj_dir.mkdir(parents=True)
+    parent_file = proj_dir / f"{sid}.jsonl"
+    parent_file.write_text(
+        json.dumps({"type": "user", "sessionId": sid, "cwd": prj,
+                    "message": {"content": "run subagents"}}) + "\n"
+        + _assistant_line("msg_p1", "claude-sonnet-4-5-20250929", 1000, session_id=sid),
+        encoding="utf-8",
+    )
+    assert parse_session(parent_file).dependencies_complete is True
+
+    tree = proj_dir / sid / "subagents"
+    for index in range(parser._MAX_SUBAGENT_FOLDERS):
+        (tree / f"workflow-{index:02d}").mkdir(parents=True)
+    assert parse_session(parent_file).dependencies_complete is False

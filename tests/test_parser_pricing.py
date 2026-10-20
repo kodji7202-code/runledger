@@ -1,12 +1,14 @@
 import json
 import os
 import re
+from datetime import date
 from pathlib import Path
 
 import pytest
 
-from runledger import pricing
-from runledger.parser import Run, Usage, encode_project_path, find_sessions, parse_session
+from runledger import doctor, hook_targets, pricing
+from runledger.parser import (Run, Usage, claude_projects_dir, encode_project_path, find_sessions,
+                              parse_session)
 from runledger.pricing import cost_of, load_prices, model_key, price_for, unknown_models
 from runledger.receipt import render
 
@@ -52,6 +54,30 @@ def test_find_sessions_uses_encoded_folder(tmp_path, monkeypatch):
     assert find_sessions("D:\\runledger") == [session]
     assert find_sessions("D:/runledger") == [session]
     assert find_sessions("D:\\missing") == []
+
+
+def test_claude_projects_dir_is_the_one_resolver_discovery_and_the_doctor_share(tmp_path, monkeypatch):
+    """GE-001 class / docs/agents.md: with HOME != USERPROFILE and no CLAUDE_CONFIG_DIR,
+    discovery, `guard install --global` and the doctor resolve one Claude Code directory."""
+    env_home = tmp_path / "env-home"
+    env_profile = tmp_path / "env-profile"
+    monkeypatch.setenv("HOME", str(env_home))
+    monkeypatch.setenv("USERPROFILE", str(env_profile))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+
+    assert claude_projects_dir() == hook_targets.claude_dir() / "projects"
+    assert claude_projects_dir() == env_home / ".claude" / "projects"
+    assert doctor._agent_home("claude-code", str(tmp_path)) == str(env_home / ".claude")
+
+    folder = env_home / ".claude" / "projects" / encode_project_path("/work/demo")
+    folder.mkdir(parents=True)
+    session = folder / "one.jsonl"
+    session.write_text("", encoding="utf-8")
+    other = env_profile / ".claude" / "projects" / encode_project_path("/work/demo")
+    other.mkdir(parents=True)
+    (other / "profile.jsonl").write_text("", encoding="utf-8")
+
+    assert find_sessions("/work/demo") == [session]
 
 
 def test_multi_tool_message_usage_split_keeps_integer_remainders(tmp_path):
@@ -165,6 +191,29 @@ def test_defaults_load_from_prices_json(monkeypatch):
     assert table == pricing.PRICES
 
 
+def test_prices_checked_reports_the_packaged_date():
+    raw = json.loads(Path(pricing.__file__).with_name("prices.json").read_text(encoding="utf-8"))
+    assert pricing.prices_checked() == date.fromisoformat(raw["checked"])
+
+
+@pytest.mark.parametrize("value", [None, "", "not-a-date", "2026-13-01", 123])
+def test_prices_checked_is_none_when_the_packaged_key_is_unusable(monkeypatch, value):
+    monkeypatch.setitem(pricing._DEFAULT_RAW, "checked", value)
+    assert pricing.prices_checked() is None
+
+
+def test_prices_checked_ignores_a_user_files_own_checked_date(tmp_path, monkeypatch):
+    """The 120-day staleness note and the doctor check read the bundled table: a `checked`
+    key in a user prices file is informational only (docs/agents.md)."""
+    override = tmp_path / "prices.json"
+    override.write_text(json.dumps({
+        "checked": "2020-01-01",
+        "newfam:1": {"input": 1.0, "output": 2.0, "cache_read": 0.1},
+    }), encoding="utf-8")
+    monkeypatch.setenv(pricing.PRICES_ENV, str(override))
+    assert pricing.prices_checked() == date.fromisoformat(pricing.CHECKED)
+
+
 def test_env_override_merges_over_defaults(tmp_path, monkeypatch):
     override = tmp_path / "my-prices.json"
     override.write_text(json.dumps({
@@ -273,6 +322,18 @@ def test_default_user_file_and_env_precedence(tmp_path, monkeypatch):
     assert load_prices(user)[("gpt", "6.1-sol")] == (3, 4, 0)
     monkeypatch.setenv("RUNLEDGER_PRICES", "~/.runledger/prices.json")
     assert load_prices()[("gpt", "6.1-sol")] == (3, 4, 0)
+
+
+def test_a_prices_file_with_a_utf8_bom_is_read(tmp_path, monkeypatch, capsys):
+    """A file written by a Windows editor or `Set-Content -Encoding UTF8` carries a BOM; the
+    rest of RunLedger's config readers tolerate one, and so does the price table."""
+    path = tmp_path / "prices.json"
+    path.write_bytes(json.dumps({
+        "gpt:6.1-sol": {"input": 5, "output": 6, "cache_read": 0},
+    }).encode("utf-8-sig"))
+    monkeypatch.setenv("RUNLEDGER_PRICES", str(path))
+    assert load_prices()[("gpt", "6.1-sol")] == (5, 6, 0)
+    assert capsys.readouterr().err == ""
 
 
 def test_custom_non_claude_prices_normalize_and_apply(tmp_path, monkeypatch):
