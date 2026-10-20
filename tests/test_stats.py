@@ -3,18 +3,42 @@ rules and the parse cache. Every test runs against an isolated HOME, so the mach
 sessions and agent configs are never read."""
 import json
 import os
+import shutil
+import subprocess
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
+from conftest import ISOLATED_ENV_VARS
 from runledger import adapters, gitinfo, pricing, stats
 from runledger.cli import build, main
 from runledger.parser import encode_project_path
 
 MODEL = "claude-sonnet-4-5-20250929"
+HAIKU = "claude-haiku-5-5"          # the priced model with a long-context tier
 CODEX_MODEL = "gpt-5.2-codex"
 UNPRICED = "mystery-model-9"
+
+
+@pytest.fixture
+def isolated_settings(monkeypatch):
+    """The shared HOME/USERPROFILE isolation, with a short home.
+
+    Claude encodes the project path into its session folder name and Droid encodes the
+    working folder, so a home under the pytest tmp path grows both names. With a longer
+    `--basetemp` (for example `$env:TEMP\\rlt-scr-local`, which pytest-xdist extends with
+    `popen-gwN`) the fixtures then exceeded the Windows path limit and their setup failed
+    with WinError 206. A short `%TEMP%\\rlsXXXXXX` home keeps every fixture path well under
+    it; `tests/test_isolation.py` pins the shared fixture's own location."""
+    home = Path(tempfile.mkdtemp(prefix="rls", dir=tempfile.gettempdir()))
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    for var in ISOLATED_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+    yield home
+    shutil.rmtree(home, ignore_errors=True)
 
 
 # ---------------------------------------------------------------- fixture writers
@@ -81,28 +105,98 @@ def codex_session(home: Path, project: Path, session_id: str, started: datetime,
 
 
 def droid_session(home: Path, project: Path, session_id: str, started: datetime, *,
-                  model: str = MODEL, command: str = "pytest -q", usage=(100, 40, 0, 20)):
-    """A Factory Droid transcript with per-message usage and its settings file."""
+                  model: str = MODEL, command: str = "pytest -q", usage=(100, 40, 0, 20),
+                  message_usage: bool = True):
+    """A Factory Droid transcript with per-message usage and its settings file. With
+    `message_usage=False` the messages carry no usage, so the settings file's cumulative
+    `tokenUsage` is the only source (the sidecar a cache record must depend on)."""
+    call = {"type": "message", "id": "call", "timestamp": _stamp(started + timedelta(seconds=1)),
+            "message": {"role": "assistant", "modelId": model, "content": [
+                {"type": "tool_use", "id": "call-1", "name": "Execute",
+                 "input": {"command": command}}]}}
+    if message_usage:
+        call["message"]["usage"] = {"input_tokens": usage[0], "output_tokens": usage[1],
+                                    "cache_creation_input_tokens": usage[2],
+                                    "cache_read_input_tokens": usage[3]}
     rows = [
         {"type": "session_start", "id": session_id, "cwd": str(project), "version": 1},
         {"type": "message", "id": "request", "timestamp": _stamp(started),
          "message": {"role": "user", "content": [{"type": "text", "text": "Run the tests."}]}},
-        {"type": "message", "id": "call", "timestamp": _stamp(started + timedelta(seconds=1)),
-         "message": {"role": "assistant", "modelId": model, "content": [
-             {"type": "tool_use", "id": "call-1", "name": "Execute", "input": {"command": command}}],
-             "usage": {"input_tokens": usage[0], "output_tokens": usage[1],
-                       "cache_creation_input_tokens": usage[2],
-                       "cache_read_input_tokens": usage[3]}}},
+        call,
         {"type": "message", "id": "answer", "timestamp": _stamp(started + timedelta(seconds=2)),
          "message": {"role": "assistant", "openaiPhase": "final_answer",
                      "content": [{"type": "text", "text": "Tests passed."}]}},
     ]
-    folder = home / ".factory" / "sessions" / str(project).replace("\\", "-").replace("/", "-")
-    path = _write(folder / f"{session_id}.jsonl", rows)
-    (path.parent / f"{session_id}.settings.json").write_text(
-        json.dumps({"model": model, "tokenUsage": {"inputTokens": usage[0],
-                                                   "outputTokens": usage[1]}}), encoding="utf-8")
+    path = _write(_droid_folder(home, project) / f"{session_id}.jsonl", rows)
+    droid_settings(path, model, usage)
     return path
+
+
+def _droid_folder(home: Path, project: Path) -> Path:
+    return home / ".factory" / "sessions" / str(project).replace("\\", "-").replace("/", "-")
+
+
+def droid_settings(path: Path, model: str, usage) -> Path:
+    """Write the sibling `.settings.json` beside a Droid transcript (rewriting it is how a
+    test edits only the sidecar)."""
+    settings = path.parent / f"{path.stem}.settings.json"
+    settings.write_text(json.dumps({"model": model, "tokenUsage": {
+        "inputTokens": usage[0], "outputTokens": usage[1]}}), encoding="utf-8")
+    return settings
+
+
+def droid_relative_session(home: Path, project: Path, session_id: str, started: datetime, *,
+                           model: str = MODEL) -> Path:
+    """A `droid exec --cwd .` transcript: the header records `.` and the only tool path is
+    absolute, in a session folder name that decodes to nothing. The working folder can only
+    come from the tool paths, which is the recovery that used to ask Git."""
+    rows = [
+        {"type": "session_start", "id": session_id, "cwd": ".", "version": 1},
+        {"type": "message", "id": "request", "timestamp": _stamp(started),
+         "message": {"role": "user", "content": [{"type": "text", "text": "Read the file."}]}},
+        {"type": "message", "id": "call", "timestamp": _stamp(started + timedelta(seconds=1)),
+         "message": {"role": "assistant", "modelId": model, "content": [
+             {"type": "tool_use", "id": "call-1", "name": "Read",
+              "input": {"file_path": str(project / "a.py")}}],
+             "usage": {"input_tokens": 100, "output_tokens": 20}}},
+    ]
+    return _write(home / ".factory" / "sessions" / "relative" / f"{session_id}.jsonl", rows)
+
+
+def claude_mixed_session(home: Path, project: Path, session_id: str, started: datetime,
+                         messages):
+    """A Claude transcript whose assistant messages name different models, one per
+    `(model, usage)` pair: a session that used several models."""
+    folder = home / ".claude" / "projects" / encode_project_path(str(project))
+    rows = [{"cwd": str(project), "sessionId": session_id, "version": "2.1.0", "gitBranch": "main",
+             "timestamp": _stamp(started), "type": "user",
+             "message": {"role": "user", "content": "Please change a.py"}}]
+    for i, (model, usage) in enumerate(messages):
+        rows.append({
+            "cwd": str(project), "sessionId": session_id, "version": "2.1.0", "gitBranch": "main",
+            "timestamp": _stamp(started + timedelta(seconds=i + 1)), "type": "assistant",
+            "message": {"id": f"msg_{i}", "role": "assistant", "model": model,
+                        "content": [{"type": "tool_use", "id": f"toolu_{i}", "name": "Read",
+                                     "input": {"file_path": f"f{i}.py"}}],
+                        "usage": {"input_tokens": usage[0], "output_tokens": usage[1],
+                                  "cache_creation_input_tokens": usage[2],
+                                  "cache_read_input_tokens": usage[3]}}})
+    return _write(folder / f"{session_id}.jsonl", rows)
+
+
+def claude_subagent(parent: Path, name: str, started: datetime, messages) -> Path:
+    """A sub-agent transcript of a Claude session: `<project>/<session>/subagents/<name>.jsonl`,
+    one assistant message per `(model, usage)` pair, merged into the parent's usage."""
+    folder = parent.parent / parent.stem / "subagents"
+    rows = [{"cwd": str(parent.parent), "sessionId": parent.stem, "version": "2.1.0",
+             "timestamp": _stamp(started + timedelta(seconds=i + 1)), "type": "assistant",
+             "message": {"id": f"{name}-{i}", "role": "assistant", "model": model,
+                         "content": [{"type": "text", "text": "Looking into it."}],
+                         "usage": {"input_tokens": usage[0], "output_tokens": usage[1],
+                                   "cache_creation_input_tokens": usage[2],
+                                   "cache_read_input_tokens": usage[3]}}}
+            for i, (model, usage) in enumerate(messages)]
+    return _write(folder / f"{name}.jsonl", rows)
 
 
 def guard_log(project: Path, rows) -> Path:
@@ -845,3 +939,205 @@ def test_docs_stats_md_matches_the_command(capsys):
     for needed in ("n/a", ">=", "cache", "stats-v1.json", "exit", "table", "json", "md"):
         assert needed in text
     assert "read-only" in text.lower() or "read only" in text.lower()
+
+
+# ---------------------------------------------------------------- round-1 fixes
+
+def _no_process_spy(monkeypatch) -> list:
+    """Every way RunLedger could start a child process, made fatal: `stats` is a pure local
+    reader, so no `git`, no shell and no helper may be spawned by any of its paths."""
+    started = []
+
+    def boom(*args, **kwargs):
+        started.append(str(args[0]) if args else "?")
+        raise AssertionError("stats must not start a process")
+
+    for name in ("run", "Popen", "call", "check_call", "check_output"):
+        if hasattr(subprocess, name):
+            monkeypatch.setattr(subprocess, name, boom)
+    for name in ("system", "popen", "spawnv", "spawnl", "execv"):
+        if hasattr(os, name):
+            monkeypatch.setattr(os, name, boom)
+    return started
+
+
+def test_request_tiered_cost_matches_the_receipt_cold_and_warm(capsys, isolated_settings,
+                                                               monkeypatch):
+    """Two individually short 60000-token Haiku requests cost $0.012, the same figure
+    `runledger receipt` reports: each request stays under the long-context threshold, so
+    pricing the session's aggregate 120000 tokens as one request would report $0.06."""
+    project = isolated_settings / "tiered"
+    project.mkdir()
+    session = claude_session(isolated_settings, project, "tiered", _started(1), model=HAIKU,
+                             usage=(60000, 0, 0, 0),
+                             calls=(("Read", {"file_path": "a.py"}),
+                                    ("Read", {"file_path": "b.py"})))
+    assert pricing.has_long_context(HAIKU), "the fixture model needs a long-context tier"
+    run, _, _, _, _ = build(str(session))
+    assert run.cost == pytest.approx(0.012, abs=1e-9)
+
+    cold, _ = _json(capsys, "stats", "--all", "--format", "json")
+    assert cold["totals"]["tokens"]["input"] == 120000
+    assert cold["totals"]["cost"] == pytest.approx(0.012, abs=1e-9)
+    assert cold["totals"]["cost_partial"] is False
+
+    calls = _parse_calls(monkeypatch)
+    warm, _ = _json(capsys, "stats", "--all", "--format", "json")
+    assert calls == []  # the second run came from the cache
+    assert warm["totals"] == cold["totals"]
+
+
+def test_stats_starts_no_process_for_a_relative_droid_cwd(capsys, isolated_settings, monkeypatch):
+    started = _no_process_spy(monkeypatch)
+    project = isolated_settings / "relative"
+    (project / ".git").mkdir(parents=True)
+    (project / "a.py").write_text("x = 1\n", encoding="utf-8")
+    session = droid_relative_session(isolated_settings, project, "relative", _started(1))
+
+    data, _ = _json(capsys, "stats", "--all", "--format", "json")
+    assert started == []
+    assert data["totals"]["sessions"] == 1
+    assert [g["key"] for g in data["groups"]] == ["droid"]
+
+    run = adapters.get("droid").parse(session, git_root=False)
+    assert (run.cwd_source, os.path.normcase(run.cwd or "")) == (
+        "session", os.path.normcase(str(project)))
+    assert os.path.normcase(stats.summarize(session).cwd or "") == os.path.normcase(str(project))
+    by_project, _ = _json(capsys, "stats", "--all", "--by", "project", "--format", "json")
+    assert [os.path.normcase(g["key"]) for g in by_project["groups"]] == \
+        [os.path.normcase(str(project))]
+
+
+def test_stats_starts_no_process_for_explicit_aider_discovery(capsys, isolated_settings,
+                                                              monkeypatch):
+    started = _no_process_spy(monkeypatch)
+    project = isolated_settings / "aider-project"
+    sub = project / "src"
+    sub.mkdir(parents=True)
+
+    rc, out, err = _run(capsys, "stats", "--agent", "aider", "--project", str(sub))
+    assert started == []
+    assert rc == 1 and out == "" and "No Aider sessions found" in err
+
+    history = project / ".aider.chat.history.md"
+    history.write_text("# aider chat started at 2026-10-18 10:00:00\n", encoding="utf-8")
+    assert started == []
+    assert stats.discover(str(project), "aider") == [history]
+    assert stats.discover(str(sub), "aider") == []  # no walk up to the Git top level
+
+
+def test_grouping_by_model_splits_a_mixed_model_session(capsys, isolated_settings, monkeypatch):
+    """A session that used two models contributes to both rows: 2000 Sonnet tokens and
+    1000 Haiku tokens are two groups, each priced as its own model, and the totals are
+    still the sum of the rows."""
+    project = isolated_settings / "mixed-models"
+    project.mkdir()
+    session = claude_mixed_session(isolated_settings, project, "mixed", _started(1),
+                                   [(MODEL, (2000, 0, 0, 0)), (HAIKU, (1000, 0, 0, 0))])
+    run, _, _, _, _ = build(str(session))
+    per_model = {model: pricing.cost_of(usage, model) for model, usage in run.models.items()}
+    assert set(per_model) == {MODEL, HAIKU}
+
+    data, _ = _json(capsys, "stats", "--all", "--by", "model", "--format", "json")
+    groups = {group["key"]: group for group in data["groups"]}
+    assert sorted(groups) == sorted([MODEL, HAIKU])
+    assert groups[MODEL]["tokens"]["input"] == 2000
+    assert groups[HAIKU]["tokens"]["input"] == 1000
+    assert groups[MODEL]["cost"] == pytest.approx(per_model[MODEL], abs=1e-9)
+    assert groups[HAIKU]["cost"] == pytest.approx(per_model[HAIKU], abs=1e-9)
+    assert data["totals"]["cost"] == pytest.approx(sum(per_model.values()), abs=1e-9)
+    assert sum(group["cost"] for group in data["groups"]) == pytest.approx(
+        data["totals"]["cost"], abs=1e-9)
+    assert sum(group["tokens"]["input"] for group in data["groups"]) == \
+        data["totals"]["tokens"]["input"] == 3000
+    assert sum(group["sessions"] for group in data["groups"]) == data["totals"]["sessions"] == 1
+    assert sum(group["steps"] for group in data["groups"]) == data["totals"]["steps"] == 2
+
+    calls = _parse_calls(monkeypatch)
+    warm, _ = _json(capsys, "stats", "--all", "--by", "model", "--format", "json")
+    assert calls == []
+    assert warm["groups"] == data["groups"]
+
+
+def test_a_sidecar_change_invalidates_the_cached_summary(capsys, isolated_settings, monkeypatch):
+    """The Droid settings file contributes the session's usage, so editing only it must
+    invalidate the cached record (a warm run used to keep the old totals)."""
+    project = isolated_settings / "sidecar"
+    project.mkdir()
+    session = droid_session(isolated_settings, project, "sidecar", _started(1), model=MODEL,
+                            usage=(1000, 0, 0, 0), message_usage=False)
+    cold, _ = _json(capsys, "stats", "--all", "--format", "json")
+    assert cold["totals"]["tokens"]["input"] == 1000
+    assert cold["totals"]["cost"] == pytest.approx(0.003, abs=1e-9)
+
+    calls = _parse_calls(monkeypatch)
+    warm, _ = _json(capsys, "stats", "--all", "--format", "json")
+    assert calls == [] and warm["totals"] == cold["totals"]
+
+    droid_settings(session, MODEL, (9000, 0, 0, 0))
+    calls.clear()
+    after, _ = _json(capsys, "stats", "--all", "--format", "json")
+    assert calls == [str(session)]
+    assert after["totals"]["tokens"]["input"] == 9000
+    assert after["totals"]["cost"] == pytest.approx(0.027, abs=1e-9)
+
+    fresh, _ = _json(capsys, "stats", "--all", "--no-cache", "--format", "json")
+    assert fresh["totals"] == after["totals"]
+
+
+def test_a_subagent_change_invalidates_the_cached_summary(capsys, isolated_settings, monkeypatch):
+    """A Claude session's totals include its sub-agent transcripts, so changing one of
+    those files (not the transcript) must invalidate the cached record."""
+    project = isolated_settings / "subagents"
+    project.mkdir()
+    parent = claude_session(isolated_settings, project, "parent", _started(1))
+    claude_subagent(parent, "agent-1", _started(1), [(MODEL, (500, 0, 0, 0))])
+    cold, _ = _json(capsys, "stats", "--all", "--format", "json")
+    assert cold["totals"]["tokens"]["input"] == 1000 + 500
+
+    calls = _parse_calls(monkeypatch)
+    warm, _ = _json(capsys, "stats", "--all", "--format", "json")
+    assert calls == [] and warm["totals"] == cold["totals"]
+
+    claude_subagent(parent, "agent-1", _started(1),
+                    [(MODEL, (500, 0, 0, 0)), (MODEL, (250, 0, 0, 0))])
+    calls.clear()
+    after, _ = _json(capsys, "stats", "--all", "--format", "json")
+    assert calls == [str(parent)]
+    assert after["totals"]["tokens"]["input"] == 1000 + 750
+
+
+def test_grouping_by_model_keeps_a_session_with_no_model(capsys, fixture_a):
+    """A session that holds no usage at all keeps a row of its own under `--by model`."""
+    folder = fixture_a["home"] / ".claude" / "projects" / encode_project_path(str(fixture_a["p1"]))
+    (folder / "header-only.jsonl").write_text(
+        json.dumps({"cwd": str(fixture_a["p1"]), "sessionId": "header-only",
+                    "timestamp": _stamp(_started(1))}) + "\n", encoding="utf-8")
+    data, _ = _json(capsys, "stats", "--all", "--since", "30d", "--by", "model", "--format", "json")
+    groups = {group["key"]: group for group in data["groups"]}
+    assert groups["(no model)"]["sessions"] == 1
+    assert groups["(no model)"]["cost"] is None
+    assert sum(group["sessions"] for group in data["groups"]) == data["totals"]["sessions"] == 4
+
+
+def test_a_record_with_malformed_request_numbers_is_reparsed(capsys, fixture_a):
+    """A record whose request numbers are not readable is dropped, never priced."""
+    cache_file = fixture_a["home"] / ".runledger" / "cache" / "stats-v1.json"
+    reference, _ = _json(capsys, "stats", "--all", "--format", "json")
+    raw = json.loads(cache_file.read_text(encoding="utf-8"))
+    key = next(iter(raw["entries"]))
+    raw["entries"][key]["models"] = {"m": {"input": 1, "requests": ["nonsense"]}}
+    cache_file.write_text(json.dumps(raw), encoding="utf-8")
+    data, _ = _json(capsys, "stats", "--all", "--format", "json")
+    assert _without_generated(data) == _without_generated(reference)
+
+
+def test_fixture_paths_stay_short_enough_for_encoded_folders(isolated_settings):
+    """Claude encodes the project path into its session folder name and Droid encodes the
+    working folder, so the fixtures must not live under a long pytest tmp path (a longer
+    `--basetemp` used to make their setup fail with WinError 206)."""
+    project = isolated_settings / "projects" / "p1"
+    project.mkdir(parents=True)
+    claude = claude_session(isolated_settings, project, "short", _started(1))
+    droid = droid_session(isolated_settings, project, "short", _started(1))
+    assert max(len(str(claude)), len(str(droid))) < 220

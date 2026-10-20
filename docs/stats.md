@@ -102,20 +102,27 @@ The `*` footnote lists how many sessions are not fully priced and which models h
 `n/a` is never a silent zero. Add the model's rates to `~/.runledger/prices.json` (see
 [agents.md](agents.md#user-prices)) and the next run prices it.
 
+Every figure is computed exactly the way `runledger receipt` computes it for the same session,
+request by request: a session of several short requests is not priced as one long request, so a
+model with a long-context tier is charged that tier only for the requests that crossed its
+threshold. Cached and uncached runs report the same cost.
+
 ## Grouping
 
 | `--by` | One row per | `key` |
 | --- | --- | --- |
 | `agent` (default) | agent | `claude-code`, `codex`, `droid`, `aider`, `native` |
-| `model` | session, under the model that used most of its tokens | the model name, `unattributed` or `(no model)` |
+| `model` | model used by the counted sessions | the model name, `unattributed` or `(no model)` |
 | `day` | local calendar day | `2026-05-14` |
 | `week` | ISO week | `2026-W20` |
 | `project` | session working folder | the folder path, or `(unknown)` |
 
 Each row carries its session count, step count, token totals (input / output / cache read) and
-cost. The **top models** line below the table is separate from `--by model`: it sums tokens per
-model across every counted session, so a session that used several models contributes to each of
-them there.
+cost. With `--by model`, a session that used several models contributes its tokens and cost to
+each of their rows, priced per model the way `receipt` prices it; its session and step counts
+stay in the row of the model that used most of its tokens, so every column still sums to the
+`total` row. The **top models** line below the table is separate from `--by model`: it sums
+tokens per model across every counted session, most expensive first.
 
 ## JSON
 
@@ -179,18 +186,25 @@ way. A session that parses but holds no step (an abandoned session, say) is stil
 
 ## The parse cache
 
-`stats` is read-only and never runs Git, a network request or an AI model. To stay fast on a large
-history it caches one small record per session file in `~/.runledger/cache/stats-v1.json`:
+`stats` is read-only and never runs Git, a network request or an AI model. Aider history files
+are only looked for in the project folder itself (the search that walks up to the Git top level
+would run Git), and a Droid session whose log records a relative `cwd` is recovered without a Git
+lookup. To stay fast on a large history it caches one small record per session file in
+`~/.runledger/cache/stats-v1.json`:
 
-- The key is the session file's path. A record is valid while the file's size and modification
-  time are unchanged, the record format is the current one, and the risk policy signature is the
-  same. The signature covers `~/.runledger/config.json` and the project's `.runledger.json`, so
-  editing either one re-scores the sessions on the next run.
-- A record holds tokens **per model**, the risk score, level and code counts, the quality grade
-  and the recommendation kinds. Cost is recomputed from the current price table on every run, so
-  a new price or a new `~/.runledger/prices.json` takes effect without invalidating anything.
+- The key is the session file's path. A record is valid while that file's size and modification
+  time are unchanged, every file the parse read beside it is unchanged (a Droid
+  `<id>.settings.json` sidecar, Claude sub-agent transcripts), the record format is the current
+  one, and the risk policy signature is the same. The signature covers `~/.runledger/config.json`
+  and the project's `.runledger.json`, so editing either one re-scores the sessions on the next
+  run.
+- A record holds tokens **per model** together with the per-request token numbers pricing needs
+  (never a prompt or a command), the risk score, level and code counts, the quality grade and the
+  recommendation kinds. Cost is recomputed from the current price table on every run, so a new
+  price or a new `~/.runledger/prices.json` takes effect without invalidating anything.
 - The cache holds no prompts, no commands and no file contents: only counts, model names, the
-  session id, the working folder, the start time and the file's own metadata.
+  session id, the working folder, the start time, and the paths, sizes and modification times of
+  the files it read.
 - A missing, unreadable or corrupt cache file is ignored and rebuilt. The file is written
   atomically, and the oldest records are dropped when it grows past its bound.
 - `--no-cache` parses everything and writes nothing; `--rebuild-cache` ignores what is there and

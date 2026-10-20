@@ -147,9 +147,13 @@ change behavior, so read the entry before you upgrade.
   Exit codes are 0 (a report), 1 (no sessions for the scope, or none in the window, with the reason
   on stderr) and 2 (usage error). The window is resolved from the current minute, so two runs in the
   same minute agree. The command is read-only and runs no Git, no network request and
-  no AI: it parses each session once and caches tokens per model, the risk result, the grade and the
-  recommendation kinds in `~/.runledger/cache/stats-v1.json`, keyed by path + mtime + size and
-  invalidated by a change to the user config or the project's `.runledger.json`. The cache holds no
+  no AI: it parses each session once and caches the tokens per model together with the
+  per-request token numbers pricing needs, the risk result, the grade and the recommendation
+  kinds in `~/.runledger/cache/stats-v1.json`, keyed by path + mtime + size and invalidated by a
+  change to the user config, to the project's `.runledger.json` or to any file the parse read
+  beside the transcript (a Droid `<id>.settings.json` sidecar, sub-agent transcripts). Aider
+  history files are looked for in the project folder only, because the search that walks up to
+  the Git top level would run Git. The cache holds no
   prompts, commands or file contents, and a corrupt session file is listed in `skipped` instead of
   stopping the run (`docs/stats.md`).
 - **`runledger checkpoints prune` takes `--older-than DUR` and needs only one of the two options
@@ -219,6 +223,29 @@ change behavior, so read the entry before you upgrade.
 
 ### Fixed
 
+- **`runledger stats` prices a session exactly as `receipt` does (`runledger.stats`):** the
+  cached token buckets keep the per-request boundaries the pricing path reads, so a session of
+  several short requests is no longer charged a long-context tier for its total: two 60,000-token
+  Haiku requests cost $0.012 in `stats`, cold and warm, exactly as in `runledger receipt`, instead
+  of the $0.06 a single aggregate request would cost. Only token and request-tier numbers are
+  cached - never a prompt or a command - and a price-table change still needs no invalidation.
+- **`runledger stats` never runs Git on any path (`runledger.stats`, `runledger.adapters.droid`):**
+  two paths still started `git rev-parse`: a Droid transcript that records a relative `cwd` and can
+  only be placed by its tool paths, and `--agent aider`, which used the full Aider search that walks
+  up to the Git top level. The Aider search now stays in the project folder for every invocation
+  (the walk up is Git), and a relative Droid `cwd` is recovered from the nearest ancestor holding
+  `.git` without starting a process, so `stats` starts no child process at all.
+- **`--by model` splits a mixed-model session (`runledger.stats`):** a session that used several
+  models contributes its tokens and cost to each of their rows, priced per model, instead of the
+  whole session being credited to the model that used the most tokens; a 2000-token Sonnet and
+  1000-token Haiku session now reports two groups whose cost matches `receipt`. Its session and
+  step counts stay with the dominant model, so every column still sums to the `total` row
+  (`docs/stats.md`).
+- **A stats cache record watches every file the parse read (`runledger.stats`, `runledger.parser`,
+  `runledger.adapters.droid`):** the record was invalidated by the transcript alone, so editing only
+  a Droid `.settings.json` sidecar or a Claude sub-agent transcript left warm stats reporting the
+  old tokens and cost while `--no-cache` saw the new ones. Both files are now recorded with their
+  size and modification time and re-parse the session when they change.
 - **A prices file with a UTF-8 BOM is read (`runledger.pricing`):** `~/.runledger/prices.json`
   and a `RUNLEDGER_PRICES` file written by a Windows editor or by `Set-Content -Encoding UTF8`
   start with a byte-order mark, which the JSON reader rejected, so the whole override was
