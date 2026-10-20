@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from runledger import adapters
+from runledger import adapters, doctor, hook_targets
 from runledger.adapters import codex
 from runledger.parser import Usage
 from runledger.pricing import apply_costs, cost_of, unknown_models
@@ -173,6 +173,196 @@ def test_local_shell_call_maps_to_shell_tool(tmp_path):
     assert step.tool == "PowerShell"
     assert step.input == {"command": "git log -1"}
     assert step.result_text == "commit abc123"
+
+
+# ---------------------------------------------------------------- code-mode exec
+
+def _exec_call(script, call_id="ctc1"):
+    return _line("response_item", {"type": "custom_tool_call", "name": "exec", "call_id": call_id,
+                                   "id": "ctc_" + call_id, "status": "completed", "input": script})
+
+
+def test_code_mode_exec_unwraps_the_shell_command_it_runs(tmp_path):
+    """Codex 0.163 sends shell calls through code mode: a `custom_tool_call` named `exec` whose
+    input is JavaScript around `tools.exec_command({cmd: ..., shell: ...})`. The hook payload and
+    the risk engine both see the plain command, so the step carries that command too - without it
+    the receipt shows a nameless `exec` step the guard decision cannot be linked to. The script
+    below is the real one from a recorded run (`\\` stays a backslash inside the JSON string, `\\n`
+    is a newline in the command)."""
+    script = ("const r = await tools.exec_command({cmd:\"$target = (Resolve-Path -LiteralPath "
+              "'C:\\\\work\\\\proj\\\\victim' -ErrorAction Stop).Path\\n$root = (Resolve-Path "
+              "-LiteralPath 'C:\\\\work\\\\proj' -ErrorAction Stop).Path\\nif (-not "
+              "$target.StartsWith($root + [IO.Path]::DirectorySeparatorChar, "
+              "[StringComparison]::OrdinalIgnoreCase)) { throw 'Target is not a child of the "
+              "intended workspace.' }\\nRemove-Item -LiteralPath $target -Recurse -Force\","
+              "\"shell\":\"powershell\",\"login\":false,\"yield_time_ms\":10000,"
+              "\"max_output_tokens\":2000}); text(r.output);")
+    run = _parse_items(tmp_path, [
+        _meta_line(),
+        _exec_call(script),
+        _line("response_item", {"type": "custom_tool_call_output", "call_id": "ctc1",
+                                "output": [{"type": "input_text", "text": "Script error: blocked"}]}),
+    ])
+    step = run.steps[0]
+    assert step.tool == "PowerShell"
+    assert step.tool_use_id == "ctc1"
+    assert step.result_text == "Script error: blocked"
+    assert step.input["command"].startswith("$target = (Resolve-Path -LiteralPath 'C:\\work\\proj\\victim'")
+    assert step.input["command"].endswith("Remove-Item -LiteralPath $target -Recurse -Force")
+    assert "\nRemove-Item" in step.input["command"] and "\\\\work" not in step.input["command"]
+
+
+def test_code_mode_exec_decodes_escapes_and_argv_commands(tmp_path):
+    script = ('const a = await tools.exec_command({cmd:"echo one\\ntwo",shell:"bash"});\n'
+              'const b = await tools.exec_command({cmd:["bash","-lc","make test"],shell:"bash"});\n'
+              'text(a.output); text(b.output);')
+    run = _parse_items(tmp_path, [_meta_line(), _exec_call(script)])
+    assert [(s.tool, s.input) for s in run.steps] == [
+        ("Bash", {"command": "echo one\ntwo"}),
+        ("Bash", {"command": "make test"}),
+    ]
+
+
+def test_code_mode_exec_script_without_a_shell_call_stays_one_step(tmp_path):
+    run = _parse_items(tmp_path, [_meta_line(), _exec_call("const x = 1; text(x);")])
+    assert run.steps[0].tool == "exec"
+    assert run.steps[0].input == {"input": "const x = 1; text(x);"}
+
+
+def test_code_mode_exec_output_text_blocks_are_joined(tmp_path):
+    """The code-mode result is a list of text blocks; the receipt shows the text, not the JSON."""
+    run = _parse_items(tmp_path, [
+        _meta_line(),
+        _exec_call("const r = await tools.exec_command({cmd:\"echo hi\",shell:\"bash\"});"),
+        _line("response_item", {"type": "custom_tool_call_output", "call_id": "ctc1",
+                                "output": [{"type": "input_text", "text": "hi"},
+                                           {"type": "input_text", "text": "exit code: 0"}]}),
+    ])
+    assert run.steps[0].result_text == "hi\nexit code: 0"
+
+
+def test_code_mode_exec_decodes_single_quotes_and_static_templates(tmp_path):
+    """Code-mode input is JavaScript, not JSON: single-quoted and backtick values are ordinary
+    string literals, so the call is read like its double-quoted form (GE-008)."""
+    script = ("const a = await tools.exec_command({cmd:'rm -rf victim',shell:'bash'});\n"
+              "const b = await tools.exec_command({cmd:`make test`, shell:`powershell`});\n"
+              "text(a.output); text(b.output);")
+    run = _parse_items(tmp_path, [_meta_line(), _exec_call(script)])
+    assert [(s.tool, s.input) for s in run.steps] == [
+        ("Bash", {"command": "rm -rf victim"}),
+        ("PowerShell", {"command": "make test"}),
+    ]
+
+
+def test_code_mode_exec_dynamic_template_call_stays_opaque(tmp_path):
+    """A template that interpolates a variable is not a static value: the call is left out and
+    the script keeps its single opaque `exec` step."""
+    script = "const r = await tools.exec_command({cmd:`rm -rf ${target}`,shell:'bash'});"
+    run = _parse_items(tmp_path, [_meta_line(), _exec_call(script)])
+    assert run.steps[0].tool == "exec"
+    assert run.steps[0].input == {"input": script}
+
+
+def test_code_mode_exec_ignores_calls_in_comments_and_strings(tmp_path):
+    """A shell call written in a comment or in a string literal is text: a receipt must not
+    report a shell operation the script never ran (GE-009)."""
+    script = ("// tools.exec_command({cmd:\"rm -rf victim\"})\n"
+              "/* text(); tools.exec_command({cmd:\"rm -rf victim\"}) */\n"
+              "text('Example: tools.exec_command({cmd:\"rm -rf victim\"})');")
+    run = _parse_items(tmp_path, [_meta_line(), _exec_call(script)])
+    assert len(run.steps) == 1
+    assert run.steps[0].tool == "exec"
+    assert run.steps[0].input == {"input": script}
+
+
+def test_code_mode_exec_reads_the_real_call_after_quoted_text(tmp_path):
+    """Only the text is skipped: a real call next to comments and string examples is still read."""
+    script = ("// tools.exec_command({cmd:\"echo fake\"})\n"
+              "text('run tools.exec_command({cmd:\"echo fake\"})');\n"
+              "const r = await tools.exec_command({cmd:'rm -rf victim',shell:'bash'});\n")
+    run = _parse_items(tmp_path, [_meta_line(), _exec_call(script)])
+    assert [(s.tool, s.input) for s in run.steps] == [("Bash", {"command": "rm -rf victim"})]
+    _, _, risks = assess(run)
+    assert any(r.step == 1 and r.severity == "high" for r in risks)
+
+
+def test_code_mode_exec_reads_the_call_after_a_regex_with_a_quote(tmp_path):
+    """A regex literal is one of the slashes the scanner does not classify: the source is
+    searched as raw text instead, so the call after `/"\\/` is still read and keeps its deletion
+    risk and its guard decision (GE-018)."""
+    script = ('const stripQuotes = /\\"/g;\n'
+              'const r = await tools.exec_command({cmd:"rm -rf victim",shell:"bash"});\n'
+              'text(r.output);')
+    run = _parse_items(tmp_path, [_meta_line(), _exec_call(script)])
+    assert [(s.tool, s.input) for s in run.steps] == [("Bash", {"command": "rm -rf victim"})]
+    _, _, risks = assess(run)
+    assert [r.code for r in risks if r.step == 1] == ["command"]
+    assert risks[0].severity == "high"
+
+
+@pytest.mark.parametrize("prefix", [
+    'const re = /[\\/"\']+/g;\n',                 # a character class holding both quote kinds
+    'const ratio = total / count;\n',             # a division, not a regex start
+    'const re = /`/;\n',                          # a backtick inside a regex
+    'return_value = a / b / c;\n',
+])
+def test_code_mode_exec_reads_the_call_after_a_regex_or_a_division(tmp_path, prefix):
+    """Whether the slash opens a regex literal or divides is the one part of the scan that stays
+    uncertain, so the raw text is searched: neither a pattern's quotes nor its slashes can hide
+    the call that follows (GE-018)."""
+    script = prefix + 'const r = await tools.exec_command({cmd:"rm -rf victim",shell:"bash"});\n'
+    run = _parse_items(tmp_path, [_meta_line(), _exec_call(script)])
+    assert [(s.tool, s.input) for s in run.steps] == [("Bash", {"command": "rm -rf victim"})]
+
+
+def test_code_mode_exec_reads_the_call_after_a_postfix_increment(tmp_path):
+    """GE-018 round-3: `n++ / (...) / 2` is a division, not a regex literal - but the reader no
+    longer tries to tell them apart. A `/` that opens neither `//` nor `/*` leaves the scan
+    uncertain and the raw text is searched, so the shell call behind it keeps its step and its
+    deletion risk instead of vanishing into a misread pattern."""
+    script = ('let n = 1;\n'
+              'n++ / (await tools.exec_command({cmd:"rm -rf victim",shell:"bash"})).exit_code / 2;\n')
+    run = _parse_items(tmp_path, [_meta_line(), _exec_call(script)])
+    assert [(s.tool, s.input) for s in run.steps] == [("Bash", {"command": "rm -rf victim"})]
+    _, _, risks = assess(run)
+    assert [r.code for r in risks if r.step == 1] == ["command"]
+    assert risks[0].severity == "high"
+
+
+def test_code_mode_exec_with_a_division_searches_the_raw_text(tmp_path):
+    """The precise scan is used only for a script with no non-comment `/`. One division is
+    enough to make the reader uncertain, and the raw text is searched instead: a call written in
+    a comment next to it is reported as well. That over-report is the accepted side of the
+    trade (a reported call is safer than a hidden one)."""
+    script = ('const ratio = total / count;\n'
+              '// tools.exec_command({cmd:"rm -rf victim",shell:"bash"})\n'
+              'const r = await tools.exec_command({cmd:"echo hello",shell:"bash"});\n')
+    run = _parse_items(tmp_path, [_meta_line(), _exec_call(script)])
+    assert [(s.tool, s.input) for s in run.steps] == [
+        ("Bash", {"command": "rm -rf victim"}),
+        ("Bash", {"command": "echo hello"}),
+    ]
+
+
+def test_code_mode_exec_comment_slashes_alone_keep_the_precise_scan(tmp_path):
+    """A script whose only slashes open comments is still read precisely, so a call written in a
+    comment stays an example rather than becoming a step (GE-018 round-3)."""
+    script = ('// tools.exec_command({cmd:"rm -rf victim",shell:"bash"})\n'
+              'text("done");')
+    run = _parse_items(tmp_path, [_meta_line(), _exec_call(script)])
+    assert len(run.steps) == 1
+    assert run.steps[0].tool == "exec"
+    assert run.steps[0].input == {"input": script}
+
+
+def test_code_mode_exec_unreadable_source_falls_back_to_the_raw_call(tmp_path):
+    """A script the scanner cannot finish cleanly (an unterminated literal) is read leniently:
+    the raw text is searched for calls instead, so a call that is there is reported rather
+    than hidden (GE-018)."""
+    script = ('const broken = "unterminated\n'
+              'const r = await tools.exec_command({cmd:"rm -rf victim",shell:"bash"});\n')
+    run = _parse_items(tmp_path, [_meta_line(), _exec_call(script)])
+    assert [(s.tool, s.input) for s in run.steps] == [("Bash", {"command": "rm -rf victim"})]
 
 
 def test_mcp_and_unknown_tool_names(tmp_path):
@@ -423,6 +613,27 @@ def test_find_sessions_missing_root_returns_empty(tmp_path, monkeypatch):
 def test_codex_home_defaults_to_user_profile(monkeypatch):
     monkeypatch.delenv("CODEX_HOME", raising=False)
     assert codex.codex_home() == Path.home() / ".codex"
+
+
+def test_codex_home_is_the_one_resolver_discovery_and_the_doctor_share(tmp_path, monkeypatch):
+    """GE-001 class / docs/agents.md: with HOME != USERPROFILE and no CODEX_HOME, discovery,
+    `guard install --global` and the doctor resolve one Codex directory."""
+    env_home = tmp_path / "env-home"
+    env_profile = tmp_path / "env-profile"
+    monkeypatch.setenv("HOME", str(env_home))
+    monkeypatch.setenv("USERPROFILE", str(env_profile))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+
+    assert codex.codex_home() == hook_targets.codex_dir() == env_home / ".codex"
+    assert doctor._agent_home("codex", str(tmp_path)) == str(env_home / ".codex")
+
+    mine = _rollout(env_home / ".codex" / "sessions" / "2026" / "10" / "19",
+                    [_meta_line(cwd="/work/demo")], name="rollout-2026-10-19T10-00-00-home.jsonl")
+    _rollout(env_profile / ".codex" / "sessions" / "2026" / "10" / "19",
+             [_meta_line(cwd="/work/demo")], name="rollout-2026-10-19T10-00-00-profile.jsonl")
+
+    assert codex.find_sessions("/work/demo") == [mine]
+    assert adapters.find_sessions(project="/work/demo", agent="codex") == [mine]
 
 
 # ---------------------------------------------------------------- robustness and old format

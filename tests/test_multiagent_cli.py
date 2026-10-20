@@ -191,6 +191,39 @@ def test_receipt_latest_honours_agent(tmp_path, capsys):
     assert "Claude Code sessions found" in capsys.readouterr().err
 
 
+def _droid_session(factory: Path, project: Path, session_id: str) -> Path:
+    """One scratch Droid session in the config dir `factory`, under the folder name droid
+    uses for the project (drive colon written as a dash, separators as dashes)."""
+    text = str(project)
+    if len(text) > 1 and text[1] == ":":
+        text = text[0] + "-" + text[2:]
+    folder = factory / "sessions" / text.replace("\\", "-").replace("/", "-")
+    folder.mkdir(parents=True)
+    path = folder / f"{session_id}.jsonl"
+    path.write_text(json.dumps({"type": "session_start", "id": session_id, "cwd": str(project)}) + "\n",
+                    encoding="utf-8")
+    path.with_suffix(".settings.json").write_text("{}", encoding="utf-8")
+    return path
+
+
+def test_droid_discovery_follows_factory_home_override(tmp_path, monkeypatch, capsys):
+    """VAL-AGENT-028: FACTORY_HOME_OVERRIDE is a HOME, so droid sessions live in
+    `<override>/.factory/sessions`, and both list and receipt find them there."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    monkeypatch.delenv("FACTORY_HOME", raising=False)
+    monkeypatch.setenv("FACTORY_HOME_OVERRIDE", str(tmp_path / "override"))
+    _droid_session(tmp_path / "override" / ".factory", project, "droidhome1")
+
+    assert main(["list", "--agent", "droid", "--all"]) == 0
+    assert "droidhom" in capsys.readouterr().out
+
+    assert main(["receipt", "--agent", "droid", "--project", str(project),
+                 "--format", "json", "-o", "-"]) == 0
+    data = _json_out(capsys)
+    assert (data["agent_id"], data["session_id"]) == ("droid", "droidhome1")
+
+
 def test_receipt_defaults_to_the_current_folder(tmp_path, monkeypatch, capsys):
     project = _project(tmp_path, "demo.runledger.json", source=FIX_NATIVE)
     monkeypatch.chdir(project)

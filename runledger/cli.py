@@ -14,14 +14,19 @@
   runledger key rotate ID [--db runledger.db]
   runledger push [SESSION | --latest] [--project PATH] [--agent AGENT] [--server URL] [--key KEY] [--user NAME]
                  [--review] [--review-model MODEL] [--safe | --no-safe]
-  runledger guard                       Claude Code PreToolUse hook (reads the event on stdin)
-  runledger guard install [--project PATH | --global]
-  runledger guard uninstall [--project PATH | --global]
-  runledger guard test 'EVENT_JSON'
+  runledger guard [--agent claude-code|droid|codex]   PreToolUse hook (reads the event on stdin)
+  runledger guard install [--agent claude-code|droid|codex|all] [--project PATH | --global]
+  runledger guard uninstall [--agent claude-code|droid|codex|all] [--project PATH | --global]
+  runledger guard test [--agent claude-code|droid|codex] 'EVENT_JSON'
+  runledger guard status [--project PATH] [--agent AGENT ...] [--json]
   runledger checkpoint [--label TEXT] [--run RUN_ID] [--cwd DIR]
   runledger checkpoints [--cwd DIR]
-  runledger checkpoints prune --keep N [--cwd DIR]
-  runledger rollback [CHECKPOINT | --run RUN_ID | --last] [--dry-run] [--yes] [--cwd DIR]
+  runledger checkpoints prune [--keep N] [--older-than DUR] [--verbose] [--cwd DIR]
+  runledger rollback [CHECKPOINT | --run RUN_ID | --last] [--path PATH ...] [--dry-run] [--yes] [--cwd DIR]
+  runledger doctor [--project PATH] [--agent AGENT ...] [--offline] [--no-selftest] [--json] [--verbose]
+  runledger stats [--project PATH | --all] [--agent AGENT] [--since WHEN] [--until WHEN]
+                  [--by agent|model|day|week|project] [--top N] [--format table|json|md]
+                  [--limit N] [--no-cache | --rebuild-cache]
 
 SESSION is a session file of any supported agent; the agent is detected from the file.
 AGENT is one of claude-code, codex, droid, aider, native (the RunLedger format, docs/format.md).
@@ -29,6 +34,7 @@ AGENT is one of claude-code, codex, droid, aider, native (the RunLedger format, 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sqlite3
@@ -41,6 +47,7 @@ from urllib.parse import quote
 
 from . import __version__
 from . import adapters
+from . import hook_targets
 from .gitinfo import current_branch, file_diffs, repo_context, session_base, toplevel, working_changes
 from .guard import load_user_config, redact
 from .guard_receipt import load_guard_decisions
@@ -55,6 +62,8 @@ from .review import DEFAULT_REVIEW_MODEL, ai_review
 from .summarize import DEFAULT_AI_MODEL, ai_summaries, apply_templates, file_changes
 
 AGENTS = ("claude-code", "codex", "droid", "aider", "native")
+GUARD_AGENTS = hook_targets.AGENTS                 # the agents the guard can hook
+GUARD_AGENT_CHOICES = hook_targets.AGENT_CHOICES   # `guard install|uninstall --agent`
 
 
 def build(session_path: str, use_ai: bool = False, ai_model: str = DEFAULT_AI_MODEL,
@@ -160,26 +169,50 @@ def _run(args) -> int:
 
 
 def cmd_checkpoint(args) -> int:
-    from .rollback import CheckpointError, Repository, hook_main
+    from .rollback import CheckpointError, Repository, hook_main, load_settings
     if args.hook:
         return hook_main()
     try:
+        repo = Repository(args.cwd)
         run_id = args.run or os.environ.get("RUNLEDGER_RUN_ID") or os.environ.get("RUNLEDGER_SESSION_ID")
-        checkpoint = Repository(args.cwd).create(label=args.label or "", run_id=run_id)
+        checkpoint = repo.create(label=args.label or "", run_id=run_id)
         print(checkpoint.id)
+        warning = repo.size_warning(checkpoint.tree, load_settings())
+        if warning:
+            print(warning, file=sys.stderr)
         return 0
     except (CheckpointError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
 
+def _prune_scope(keep, older_than) -> str:
+    """What the prune command kept, in the words the user typed."""
+    if keep is not None and older_than:
+        return f"Kept the newest {keep} and everything younger than {older_than}."
+    if keep is not None:
+        return f"Kept the newest {keep}."
+    return f"Removed only checkpoints older than {older_than}."
+
+
 def cmd_checkpoints(args) -> int:
-    from .rollback import CheckpointError, Repository
+    from .rollback import CheckpointError, Repository, parse_duration
     try:
         repo = Repository(args.cwd)
         if args.checkpoints_cmd == "prune":
-            removed = repo.prune(args.keep)
-            print(f"Pruned {len(removed)} checkpoint(s). Kept the newest {args.keep}.")
+            older_than = parse_duration(args.older_than) if args.older_than else None
+            removed = repo.prune(args.keep, older_than)
+            safety = sum(1 for checkpoint in removed if checkpoint.kind == "safety")
+            detail = (f", including {safety} safety checkpoint" + ("" if safety == 1 else "s")
+                      if safety else "")
+            print(f"Pruned {len(removed)} checkpoint(s){detail}. "
+                  f"{_prune_scope(args.keep, args.older_than)}")
+            if removed:
+                if getattr(args, "verbose", False):
+                    for checkpoint in removed:
+                        print(f"  removed {checkpoint.id}")
+                print("Removed checkpoint refs only; run 'git gc --prune=now' later to reclaim "
+                      "the space.")
             return 0
         checkpoints = repo.checkpoints()
         if not checkpoints:
@@ -203,21 +236,50 @@ def cmd_checkpoints(args) -> int:
         return 1
 
 
+def _changed_bytes(repo, plan, failure) -> int:
+    """The bytes a preview would write: the checkpoint blobs for restores, the current blobs for
+    removals. A tree that cannot be read gives -1, and the caller then omits the size."""
+    try:
+        sizes = repo.tree_sizes(plan.current_tree) if plan.remove else {}
+        sizes.update(repo.tree_sizes(plan.checkpoint.tree))
+    except failure:
+        return -1
+    return sum(sizes.get(name, 0) for name in list(plan.restore) + list(plan.remove))
+
+
 def cmd_rollback(args) -> int:
     from .rollback import CheckpointError, Repository
     try:
         repo = Repository(args.cwd)
         checkpoint = repo.select(args.checkpoint, run_id=args.run)
-        plan = repo.plan(checkpoint)
+        plan = repo.plan(checkpoint, paths=args.path)
         print(f"Rollback to {checkpoint.id} in {str(repo.root)!r}")
-        for path in plan.restore:
-            print(f"  restore {path!r}")
-        for path in plan.remove:
-            print(f"  remove  {path!r}")
-        for path in plan.keep_ignored:
-            print(f"  keep ignored {path!r}")
-        print(f"{len(plan.restore)} restore, {len(plan.remove)} remove. "
-              "HEAD, branch, and index stay unchanged.")
+        if plan.paths:
+            print(f"  scope: {', '.join(plan.paths)}")
+            for path in plan.restore:
+                print(f"  restore  {path!r}")
+            for path in plan.remove:
+                print(f"  delete   {path!r}  (not in checkpoint)")
+            if not (plan.restore or plan.remove):
+                print(f"Nothing to restore for {', '.join(plan.paths)} "
+                      f"(already matches {checkpoint.id}).")
+                return 0
+            count = len(plan.restore) + len(plan.remove)
+            size = _changed_bytes(repo, plan, CheckpointError)
+            detail = f" ({size} bytes)" if size >= 0 else ""
+            print(f"{count} file(s) would change{detail}. "
+                  "Everything outside the scope is untouched. Run with --yes to apply.")
+        else:
+            for path in plan.restore:
+                print(f"  restore {path!r}")
+            for path in plan.remove:
+                print(f"  remove  {path!r}")
+            for path in plan.keep_ignored:
+                print(f"  keep ignored {path!r}")
+            size = _changed_bytes(repo, plan, CheckpointError)
+            detail = f" ({size} bytes)" if size >= 0 else ""
+            print(f"{len(plan.restore)} restore, {len(plan.remove)} remove{detail}. "
+                  "HEAD, branch, and index stay unchanged.")
         if args.dry_run:
             print("Dry run. No files restored and no safety checkpoint created.")
             return 0
@@ -776,31 +838,121 @@ def cmd_push(args) -> int:
 def print_guard_help() -> None:
     """Print the `runledger guard` help text (used when stdin is an interactive TTY)."""
     p = argparse.ArgumentParser(prog="runledger guard",
-                                description="Real-time policy guard and checkpoint hooks for Claude Code.")
-    gsub = p.add_subparsers(dest="guard_cmd", metavar="{install,uninstall,test}")
-    gsub.add_parser("install", help="add guard and automatic checkpoint hooks to Claude Code")
-    gsub.add_parser("uninstall", help="remove the guard hook from Claude Code settings.json")
+                                description="Real-time policy guard and checkpoint hooks for Claude Code, "
+                                            "Factory Droid and Codex CLI.")
+    p.add_argument("--agent", metavar="AGENT", default=None,
+                   help="the agent this hook belongs to: claude-code (default), droid or codex")
+    gsub = p.add_subparsers(dest="guard_cmd", metavar="{install,uninstall,test,status}")
+    gsub.add_parser("install", help="add guard and checkpoint hooks for one agent, or for every "
+                                    "agent that has a config folder (`--agent all`)")
+    gsub.add_parser("uninstall", help="remove the RunLedger hooks from one agent's hook file "
+                                      "(or from every agent's)")
     gsub.add_parser("test", help="print the decision for one PreToolUse event (JSON)")
+    gsub.add_parser("status", help="the compact guard-only view: hook state per agent, config, "
+                                   "approval server, log and the effective guard mode")
     p.print_help()
 
 
 def cmd_guard(args) -> int:
     from . import guard
 
+    agent = getattr(args, "agent", None)
     if args.guard_cmd == "install":
         return guard.cmd_install(args.project, args.global_scope,
-                                 portable=getattr(args, "portable", False))
+                                 portable=getattr(args, "portable", False), agent=agent)
     if args.guard_cmd == "uninstall":
-        return guard.cmd_uninstall(args.project, args.global_scope)
+        return guard.cmd_uninstall(args.project, args.global_scope, agent=agent)
     if args.guard_cmd == "test":
-        return guard.cmd_test(args.event)
+        return guard.cmd_test(args.event, agent)
+    if args.guard_cmd == "status":
+        from . import doctor
+
+        return doctor.cmd_guard_status(args)
     if sys.stdin is not None and sys.stdin.isatty():
         if hasattr(args, "_guard_parser"):
             args._guard_parser.print_help()
         else:
             print_guard_help()
         return 2
-    return guard.main()
+    return guard.main(agent)
+
+
+def cmd_doctor(args) -> int:
+    from . import doctor
+
+    return doctor.cmd_doctor(args)
+
+
+def cmd_stats(args) -> int:
+    from . import stats
+
+    now = stats.window_now()
+    try:
+        since = stats.parse_since(args.since, now) if args.since else stats.default_since(now)
+        until = stats.parse_until(args.until, now) if args.until else stats.default_until(now)
+    except stats.SinceError as exc:  # argparse already checked; keep the exit code honest
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    project = None if args.all else (args.project or os.getcwd())
+    try:
+        files = stats.discover(project, args.agent)
+    except KeyError as exc:  # the agent's adapter is not installed
+        print(f"error: {exc.args[0]}", file=sys.stderr)
+        return 1
+    if not files:
+        kind = f"{adapters.label(args.agent)} " if args.agent else ""
+        where = "any project" if args.all else project
+        print(f"No {kind}sessions found for {where}.", file=sys.stderr)
+        return 1
+    if args.no_cache:
+        cache = None
+    elif args.rebuild_cache:
+        cache = stats.StatsCache()
+    else:
+        cache = stats.StatsCache.load()
+    summaries, skipped, found = stats.collect(files, since, until, cache, limit=args.limit)
+    for entry in skipped:
+        print(f"stats: skipped {entry['path']}: {entry['reason']}", file=sys.stderr)
+    if not summaries:
+        print(stats.no_sessions_note(since, until), file=sys.stderr)
+        return 1
+    if found > len(summaries):
+        print(f"stats: {found} sessions in the window; counting the newest {len(summaries)} "
+              f"(--limit {args.limit}).", file=sys.stderr)
+    guard = stats.guard_counts([summary.cwd for summary in summaries], since, until)
+    agg = stats.aggregate(summaries, by=args.by, top=args.top,
+                          scope={"project": project, "agent": args.agent},
+                          window=(since, until), skipped=skipped, guard=guard)
+    render = {"by": args.by, "agents": len({summary.agent for summary in summaries}),
+              "models": stats.model_blocks(summaries), "top": args.top,
+              "label": stats.window_label(args.since, args.until, since, until)}
+    if args.format == "json":
+        _write_stdout(json.dumps(agg, indent=2) + "\n")
+    elif args.format == "md":
+        print(stats.render_md(agg, **render))
+    else:
+        print(stats.render_table(agg, **render))
+    return 0
+
+
+def _since_arg(raw: str) -> str:
+    """`--since`/`--until` values are checked here, so a bad one is an argparse usage error
+    (exit code 2) naming the value and the accepted forms."""
+    from .stats import SinceError, parse_since
+    try:
+        parse_since(raw)
+    except SinceError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+    return raw
+
+
+def _until_arg(raw: str) -> str:
+    from .stats import SinceError, parse_until
+    try:
+        parse_until(raw)
+    except SinceError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+    return raw
 
 
 def _positive_int(raw: str) -> int:
@@ -821,6 +973,16 @@ def _non_negative_int(raw: str) -> int:
     if val < 0:
         raise argparse.ArgumentTypeError("must be 0 or a positive integer")
     return val
+
+
+def _duration_arg(raw: str) -> str:
+    """`--older-than` accepts the same `30d`/`2w`/`12h` spellings as the user config, and is
+    checked by argparse so a wrong one fails before anything is deleted."""
+    from .rollback import parse_duration
+    if parse_duration(raw) is None:
+        raise argparse.ArgumentTypeError(
+            f"invalid duration {raw!r}: use a number with d, w or h, like 30d, 2w or 12h")
+    return raw
 
 
 def _agent_arg(parser: argparse.ArgumentParser) -> None:
@@ -947,7 +1109,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     pcs.add_argument("--cwd", help="Git working tree folder (default: current folder)")
     cssub = pcs.add_subparsers(dest="checkpoints_cmd")
     prune = cssub.add_parser("prune", help="delete old checkpoint refs, including safety checkpoints")
-    prune.add_argument("--keep", type=_non_negative_int, required=True, help="number of newest checkpoints to keep")
+    prune.add_argument("--keep", type=_non_negative_int,
+                       help="number of newest checkpoints to keep")
+    prune.add_argument("--older-than", type=_duration_arg, metavar="DUR",
+                       help="remove checkpoints older than DUR, like 30d, 2w or 12h")
+    prune.add_argument("--verbose", action="store_true",
+                       help="list the checkpoints that were removed")
     prune.add_argument("--cwd", default=argparse.SUPPRESS, help="Git working tree folder")
     pcs.set_defaults(func=cmd_checkpoints)
 
@@ -956,26 +1123,99 @@ def main(argv: Optional[List[str]] = None) -> int:
     target.add_argument("checkpoint", nargs="?", help="checkpoint id (default: latest, including safety checkpoints)")
     target.add_argument("--run", help="restore the earliest checkpoint for a run/session id")
     target.add_argument("--last", action="store_true", help="restore the latest checkpoint, including safety checkpoints")
+    prb.add_argument("--path", action="append", metavar="PATH",
+                     help="restore only this file or folder (repeatable; matched literally)")
     prb.add_argument("--dry-run", action="store_true", help="preview without restoring files or creating a ref")
     prb.add_argument("--yes", action="store_true", help="confirm restoration without a terminal prompt")
-    prb.add_argument("--cwd", help="Git working tree folder (default: current folder)")
+    prb.add_argument("--cwd", help="Git working tree folder and base for relative --path values "
+                                   "(default: current folder)")
     prb.set_defaults(func=cmd_rollback)
 
-    pg = sub.add_parser("guard", help="real-time policy guard and checkpoint hooks for Claude Code")
+    pg = sub.add_parser("guard", help="real-time policy guard and checkpoint hooks for Claude Code, "
+                                      "Factory Droid and Codex CLI")
+    pg.add_argument("--agent", metavar="AGENT", default=None,
+                    help="the agent this hook belongs to: claude-code (default), droid or codex; "
+                         "an unknown value is reported on stderr and never blocks the call")
     gsub = pg.add_subparsers(dest="guard_cmd", metavar="{install,uninstall,test}")
-    pgi = gsub.add_parser("install", help="add guard and automatic checkpoint hooks to Claude Code")
+    pgi = gsub.add_parser("install", help="add the guard and checkpoint hooks for one agent "
+                                          "(or for every agent with a config folder)")
+    pgi.add_argument("--agent", choices=GUARD_AGENT_CHOICES, default="claude-code",
+                     help="the agent to install for: claude-code (default), droid, codex, or all "
+                          "of them (each only where its config folder exists)")
     scope = pgi.add_mutually_exclusive_group()
-    scope.add_argument("--project", metavar="PATH", help="project folder: writes PATH/.claude/settings.json (default: current folder)")
-    scope.add_argument("--global", dest="global_scope", action="store_true", help="writes ~/.claude/settings.json")
+    scope.add_argument("--project", metavar="PATH", help="project folder: writes PATH/.claude/settings.json, "
+                                                         "PATH/.factory/hooks.json or PATH/.codex/hooks.json "
+                                                         "(default: current folder)")
+    scope.add_argument("--global", dest="global_scope", action="store_true",
+                       help="writes the agent's own hook file (~/.claude/settings.json, ~/.factory/hooks.json, "
+                            "~/.codex/hooks.json, or the folder its environment variable names)")
     pgi.add_argument("--portable", action="store_true",
                      help="write bare 'runledger ...' hook commands instead of the current Python interpreter path")
-    pgu = gsub.add_parser("uninstall", help="remove the guard hook from Claude Code settings.json")
+    pgu = gsub.add_parser("uninstall", help="remove the RunLedger hooks from one agent's hook file")
+    pgu.add_argument("--agent", choices=GUARD_AGENT_CHOICES, default="claude-code",
+                     help="the agent to remove the hooks for: claude-code (default), droid, codex or all")
     uscope = pgu.add_mutually_exclusive_group()
-    uscope.add_argument("--project", metavar="PATH", help="project folder: edits PATH/.claude/settings.json (default: current folder)")
-    uscope.add_argument("--global", dest="global_scope", action="store_true", help="edits ~/.claude/settings.json")
+    uscope.add_argument("--project", metavar="PATH", help="project folder: edits that agent's hook file there "
+                                                          "(default: current folder)")
+    uscope.add_argument("--global", dest="global_scope", action="store_true",
+                        help="edits the agent's own hook file, resolved the same way as for install")
     pgt = gsub.add_parser("test", help="print the decision for one PreToolUse event (JSON)")
     pgt.add_argument("event", help="the event as a JSON object")
+    pgt.add_argument("--agent", metavar="AGENT", choices=GUARD_AGENTS,
+                     help="read the event as that agent's payload (default: inferred from the payload)")
+    pgs = gsub.add_parser("status", help="check the installed guard hooks, the config files, the "
+                                         "approval server and the guard log, and show the effective "
+                                         "guard mode")
+    pgs.add_argument("--project", metavar="PATH",
+                     help="project folder to check (default: the project root of the current folder)")
+    pgs.add_argument("--agent", metavar="AGENT", choices=GUARD_AGENTS, action="append",
+                     help="check only this agent (repeatable): claude-code, droid or codex")
+    pgs.add_argument("--json", dest="as_json", action="store_true",
+                     help="print one JSON object instead of the text report")
     pg.set_defaults(func=cmd_guard, _guard_parser=pg)
+
+    pdoc = sub.add_parser("doctor", help="check the install, the guard hooks, the config files, "
+                                         "the approval server, the log, the checkpoints, the prices "
+                                         "and session discovery")
+    pdoc.add_argument("--project", metavar="PATH",
+                      help="project folder to check (default: the project root of the current folder)")
+    pdoc.add_argument("--agent", metavar="AGENT", choices=GUARD_AGENTS, action="append",
+                      help="check only this agent (repeatable): claude-code, droid or codex")
+    pdoc.add_argument("--offline", action="store_true",
+                      help="skip the approval server /health request")
+    pdoc.add_argument("--no-selftest", dest="no_selftest", action="store_true",
+                      help="skip the hook command self-test (no hook subprocess is started)")
+    pdoc.add_argument("--json", dest="as_json", action="store_true",
+                      help="print one JSON object instead of the text report")
+    pdoc.add_argument("--verbose", action="store_true", help="add detail lines")
+    pdoc.set_defaults(func=cmd_doctor)
+
+    pstats = sub.add_parser("stats", help="summarize the sessions of a folder or of every "
+                                          "project: sessions, steps, tokens, cost, risk, "
+                                          "quality and guard decisions")
+    stats_scope = pstats.add_mutually_exclusive_group()
+    stats_scope.add_argument("--project", metavar="PATH",
+                             help="project folder (default: current folder)")
+    stats_scope.add_argument("--all", action="store_true", help="sessions from every project")
+    _agent_arg(pstats)
+    pstats.add_argument("--since", type=_since_arg, metavar="WHEN",
+                        help="window start: 7d, 4w, 1m or YYYY-MM-DD (default: 30d)")
+    pstats.add_argument("--until", type=_until_arg, metavar="WHEN",
+                        help="window end: a date (whole day) or 7d back from now (default: now)")
+    pstats.add_argument("--by", choices=["agent", "model", "day", "week", "project"],
+                        default="agent", help="group the rows (default: agent)")
+    pstats.add_argument("--top", type=_positive_int, default=5,
+                        help="how many top codes, recommendations and models to list (default: 5)")
+    pstats.add_argument("--format", choices=["table", "json", "md"], default="table",
+                        help="output format (default: table)")
+    pstats.add_argument("--limit", type=_positive_int, default=500,
+                        help="how many of the newest sessions in the window to count (default: 500)")
+    stats_cache = pstats.add_mutually_exclusive_group()
+    stats_cache.add_argument("--no-cache", dest="no_cache", action="store_true",
+                             help="parse every session and neither read nor write the parse cache")
+    stats_cache.add_argument("--rebuild-cache", dest="rebuild_cache", action="store_true",
+                             help="ignore the parse cache and parse every session again")
+    pstats.set_defaults(func=cmd_stats)
 
     args = p.parse_args(argv)
     _tolerant_console()

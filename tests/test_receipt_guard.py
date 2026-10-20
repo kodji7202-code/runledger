@@ -254,6 +254,238 @@ def test_guard_text_is_redacted_and_escaped_in_receipts(session):
     assert secret not in run.guard[0]["reason"]
 
 
+# ---------------------------------------------------------------- native agents
+
+DROID_SESSION_ID = "a96d6f95-c82e-463d-947c-e0cf04eb7fac"
+CODEX_SESSION_ID = "01a148d0-fad4-7553-891d-c68363b89cf2"
+
+
+def _write_log(project, rows):
+    log = Path(project) / ".runledger" / "guard.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+    return log
+
+
+def _droid_run(tmp_path, command="Remove-Item -Recurse -Force .\\victim"):
+    """A Droid transcript: the call is `Execute`, the step the adapter builds is `Bash`."""
+    from runledger.adapters import droid as droid_adapter
+
+    project = tmp_path / "droid-proj"
+    project.mkdir()
+    lines = [
+        {"type": "session_start", "id": DROID_SESSION_ID, "title": "Delete the victim folder",
+         "cwd": str(project), "hostId": "host-example", "version": 1},
+        {"type": "message", "id": "request", "timestamp": "2026-10-19T10:00:00Z",
+         "message": {"role": "user", "content": [{"type": "text", "text": "Delete the victim folder."}]}},
+        {"type": "message", "id": "call", "timestamp": "2026-10-19T10:00:01Z",
+         "message": {"role": "assistant", "modelId": "claude-haiku-4-5", "content": [
+             {"type": "tool_use", "id": "call-droid-1", "name": "Execute",
+              "input": {"command": command, "summary": "Delete the victim folder", "riskLevel": "high"}}]}},
+        {"type": "message", "id": "result", "timestamp": "2026-10-19T10:00:02Z",
+         "message": {"role": "user", "content": [
+             {"type": "tool_result", "tool_use_id": "call-droid-1", "is_error": True,
+              "content": "Blocked by RunLedger guard: Recursive force delete (Remove-Item -Recurse -Force)"}]}},
+        {"type": "message", "id": "answer", "timestamp": "2026-10-19T10:00:03Z",
+         "message": {"role": "assistant", "openaiPhase": "final_answer",
+                     "content": [{"type": "text", "text": "Blocked by the guard."}]}},
+    ]
+    session = project / (DROID_SESSION_ID + ".jsonl")
+    session.write_text("\n".join(json.dumps(x) for x in lines) + "\n", encoding="utf-8")
+    return droid_adapter.parse(session), project
+
+
+def _codex_run(tmp_path, command="Remove-Item -Recurse -Force victim", call_id="exec-1"):
+    """A Codex rollout: on Windows the shell call is a PowerShell argv, and the hook sees
+    the tool name `Bash`."""
+    from runledger.adapters import codex as codex_adapter
+
+    project = tmp_path / "codex-proj"
+    project.mkdir()
+    lines = [
+        {"timestamp": "2026-10-19T11:00:00.000Z", "type": "session_meta",
+         "payload": {"id": CODEX_SESSION_ID, "cwd": str(project), "model": "gpt-6-luna"}},
+        {"timestamp": "2026-10-19T11:00:01.000Z", "type": "response_item",
+         "payload": {"type": "function_call", "name": "shell", "call_id": call_id,
+                     "arguments": json.dumps({"command": ["powershell.exe", "-Command", command]})}},
+        {"timestamp": "2026-10-19T11:00:02.000Z", "type": "response_item",
+         "payload": {"type": "function_call_output", "call_id": call_id,
+                     "output": json.dumps({"output": "blocked by RunLedger guard", "metadata": {"exit_code": 1}})}},
+    ]
+    session = project / ("rollout-2026-10-19T11-00-00-" + CODEX_SESSION_ID + ".jsonl")
+    session.write_text("\n".join(json.dumps(x) for x in lines) + "\n", encoding="utf-8")
+    return codex_adapter.parse(session), project
+
+
+def test_droid_execute_row_links_the_bash_step(tmp_path, capsys):
+    run, project = _droid_run(tmp_path)
+    _write_log(project, [{
+        "ts": "2026-10-19T10:00:01Z", "session_id": DROID_SESSION_ID, "tool_use_id": "",
+        "tool": "Execute", "agent": "droid", "canonical_tool": "Bash",
+        "decision": "deny", "policy_decision": "deny", "codes": ["command"],
+        "summary": "Remove-Item -Recurse -Force .\\victim",
+        "reason": "Blocked by RunLedger guard: Recursive force delete (Remove-Item -Recurse -Force)",
+    }])
+    assert [s.tool for s in run.steps] == ["Bash"]
+    decision, = load_guard_decisions(run)
+    assert decision["step"] == 1 and decision["decision"] == "deny"
+    assert decision["outcome"] == "Blocked by Guard"
+
+    run.guard = load_guard_decisions(run)
+    data = json.loads(render(run, 0, "Low", [], "json"))
+    assert data["guard"][0]["step"] == 1
+    assert data["totals"]["guard"]["blocked"] == 1
+    text = render(run, 0, "Low", [], "md")
+    assert "Guard decisions" in text and "Blocked by Guard" in text
+
+
+def test_codex_bash_row_links_the_powershell_step(tmp_path):
+    run, project = _codex_run(tmp_path)
+    _write_log(project, [{
+        "ts": "2026-10-19T11:00:01Z", "session_id": CODEX_SESSION_ID,
+        "tool_use_id": "exec-2f4c", "tool": "Bash", "agent": "codex", "canonical_tool": "Bash",
+        "decision": "deny", "policy_decision": "deny", "codes": ["command"],
+        "summary": "Remove-Item -Recurse -Force victim",
+        "reason": "Blocked by RunLedger guard: Recursive force delete (Remove-Item -Recurse -Force)",
+    }])
+    assert [s.tool for s in run.steps] == ["PowerShell"]
+    decision, = load_guard_decisions(run)
+    assert decision["step"] == 1 and decision["outcome"] == "Blocked by Guard"
+
+
+def test_codex_row_links_by_the_recorded_tool_use_id(tmp_path):
+    run, project = _codex_run(tmp_path, call_id="exec-same-id")
+    _write_log(project, [{
+        "ts": "2026-10-19T11:00:01Z", "session_id": CODEX_SESSION_ID,
+        "tool_use_id": "exec-same-id", "tool": "Bash", "agent": "codex", "canonical_tool": "Bash",
+        "decision": "allow", "policy_decision": "ask", "approval": "approved",
+        "summary": "a differently truncated summary",
+    }])
+    decision, = load_guard_decisions(run)
+    assert decision["step"] == 1 and decision["outcome"] == "Approved by approval server"
+
+
+def _codex_code_mode_run(tmp_path, command="rm -rf victim", call_id="ctc-1", script=None):
+    """A Codex code-mode `exec` call whose script scans a regular expression holding a quote
+    before it really calls `tools.exec_command`."""
+    from runledger.adapters import codex as codex_adapter
+
+    project = tmp_path / "codex-code-proj"
+    project.mkdir()
+    if script is None:
+        script = ('const stripQuotes = /\\"/g;\n'
+                  'const r = await tools.exec_command({cmd:"' + command + '",shell:"bash"});\n'
+                  'text(r.output);')
+    lines = [
+        {"timestamp": "2026-10-19T13:00:00.000Z", "type": "session_meta",
+         "payload": {"id": CODEX_SESSION_ID, "cwd": str(project), "model": "gpt-6-luna"}},
+        {"timestamp": "2026-10-19T13:00:01.000Z", "type": "response_item",
+         "payload": {"type": "custom_tool_call", "name": "exec", "call_id": call_id,
+                     "id": "ctc_" + call_id, "status": "completed", "input": script}},
+        {"timestamp": "2026-10-19T13:00:02.000Z", "type": "response_item",
+         "payload": {"type": "custom_tool_call_output", "call_id": call_id,
+                     "output": [{"type": "input_text", "text": "blocked by RunLedger guard"}]}},
+    ]
+    session = project / ("rollout-2026-10-19T13-00-00-" + CODEX_SESSION_ID + ".jsonl")
+    session.write_text("\n".join(json.dumps(x) for x in lines) + "\n", encoding="utf-8")
+    return codex_adapter.parse(session), project
+
+
+def test_codex_code_mode_row_links_the_step_behind_a_regex_literal(tmp_path):
+    """GE-018: a quote inside a regex literal before the real call cannot hide the shell step,
+    so the guard decision that blocked it still links to that step."""
+    run, project = _codex_code_mode_run(tmp_path)
+    assert [(s.tool, s.input) for s in run.steps] == [("Bash", {"command": "rm -rf victim"})]
+    _write_log(project, [{
+        "ts": "2026-10-19T13:00:01Z", "session_id": CODEX_SESSION_ID,
+        "tool_use_id": "ctc-1", "tool": "Bash", "agent": "codex", "canonical_tool": "Bash",
+        "decision": "deny", "policy_decision": "deny", "codes": ["command"],
+        "summary": "rm -rf victim",
+        "reason": "Blocked by RunLedger guard: Recursive force delete (rm -rf)",
+    }])
+    decision, = load_guard_decisions(run)
+    assert decision["step"] == 1 and decision["outcome"] == "Blocked by Guard"
+
+
+def test_codex_code_mode_row_links_the_step_behind_a_postfix_increment(tmp_path):
+    """GE-018 round-3: a division after `n++` used to be read as a regex literal, which swallowed
+    the shell call and left the blocked row with no step. The uncertain scan is searched as raw
+    text now, so the deletion keeps its step and the guard row keeps linking to it."""
+    run, project = _codex_code_mode_run(tmp_path, script=(
+        'let n = 1;\n'
+        'n++ / (await tools.exec_command({cmd:"rm -rf victim",shell:"bash"})).exit_code / 2;\n'))
+    assert [(s.tool, s.input) for s in run.steps] == [("Bash", {"command": "rm -rf victim"})]
+    _write_log(project, [{
+        "ts": "2026-10-19T13:00:01Z", "session_id": CODEX_SESSION_ID,
+        "tool_use_id": "ctc-1", "tool": "Bash", "agent": "codex", "canonical_tool": "Bash",
+        "decision": "deny", "policy_decision": "deny", "codes": ["command"],
+        "summary": "rm -rf victim",
+        "reason": "Blocked by RunLedger guard: Recursive force delete (rm -rf)",
+    }])
+    decision, = load_guard_decisions(run)
+    assert decision["step"] == 1 and decision["outcome"] == "Blocked by Guard"
+
+
+def _codex_shell_switch_run(tmp_path, command="Get-Content .env"):
+    """A Codex rollout where the same command ran twice, first through PowerShell, then Bash:
+    a code-mode retry after a block. The hook sees `Bash` for both calls."""
+    from runledger.adapters import codex as codex_adapter
+
+    project = tmp_path / "codex-switch-proj"
+    project.mkdir()
+    lines = [
+        {"timestamp": "2026-10-19T12:00:00.000Z", "type": "session_meta",
+         "payload": {"id": CODEX_SESSION_ID, "cwd": str(project), "model": "gpt-6-luna"}},
+        {"timestamp": "2026-10-19T12:00:01.000Z", "type": "response_item",
+         "payload": {"type": "function_call", "name": "shell", "call_id": "call-1",
+                     "arguments": json.dumps({"command": ["powershell.exe", "-Command", command]})}},
+        {"timestamp": "2026-10-19T12:00:02.000Z", "type": "response_item",
+         "payload": {"type": "function_call", "name": "shell", "call_id": "call-2",
+                     "arguments": json.dumps({"command": command})}},
+    ]
+    session = project / ("rollout-2026-10-19T12-00-00-" + CODEX_SESSION_ID + ".jsonl")
+    session.write_text("\n".join(json.dumps(x) for x in lines) + "\n", encoding="utf-8")
+    return codex_adapter.parse(session), project
+
+
+def test_repeated_command_across_shells_keeps_block_and_approval_in_order(tmp_path):
+    """The cross-shell fallback takes the oldest matching step, not the first nonempty shell
+    queue: the blocked first call keeps step 1 (PowerShell) and its later retry step 2 (Bash),
+    even though both hook rows name Bash (GE-007)."""
+    run, project = _codex_shell_switch_run(tmp_path)
+    assert [(s.index, s.tool) for s in run.steps] == [(1, "PowerShell"), (2, "Bash")]
+    _write_log(project, [
+        {"ts": "2026-10-19T12:00:01Z", "session_id": CODEX_SESSION_ID,
+         "tool_use_id": "exec-hook-1", "tool": "Bash", "agent": "codex", "canonical_tool": "Bash",
+         "decision": "deny", "policy_decision": "deny", "codes": ["command"],
+         "summary": "Get-Content .env", "reason": "Blocked by RunLedger guard: secret file (.env)"},
+        {"ts": "2026-10-19T12:00:02Z", "session_id": CODEX_SESSION_ID,
+         "tool_use_id": "exec-hook-2", "tool": "Bash", "agent": "codex", "canonical_tool": "Bash",
+         "decision": "allow", "policy_decision": "ask", "approval": "approved",
+         "summary": "Get-Content .env", "reason": "Approved for this once"},
+    ])
+    assert [(d["step"], d["outcome"]) for d in load_guard_decisions(run)] == [
+        (1, "Blocked by Guard"),
+        (2, "Approved by approval server"),
+    ]
+
+
+def test_rows_without_an_agent_keep_the_strict_tool_match(session):
+    """v0.6.0 rows keep matching exactly; only rows that name their agent may cross the
+    shell tool names the adapters use."""
+    path, log = session
+    run = parse_session(path)
+    command = "Remove-Item -Recurse -Force victim"
+    run.steps[0].tool = "PowerShell"
+    run.steps[0].input = {"command": command}
+    log.write_text("\n".join(json.dumps(r) for r in [
+        dict({"tool": "Bash", "summary": command, "decision": "deny"}, session_id=run.session_id),
+        dict({"tool": "Bash", "summary": command, "decision": "deny", "agent": "codex"},
+             session_id=run.session_id),
+    ]) + "\n", encoding="utf-8")
+    assert [d["step"] for d in load_guard_decisions(run)] == [None, 1]
+
+
 def test_receipt_reads_root_and_legacy_subfolder_guard_logs_with_dedup(tmp_path, capsys):
     from runledger import guard
 

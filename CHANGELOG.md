@@ -7,6 +7,512 @@ change behavior, so read the entry before you upgrade.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-20
+
+### Added
+
+- **Selective restore with `runledger rollback <id> --path P` (`runledger.rollback`):** the option
+  (repeatable) restores only the named file or folder and leaves everything else exactly as it is.
+  A value is read against `--cwd` or may be an absolute path inside the repository; matching is
+  literal, so `src` restores `src/x.txt` but never `src2/y.txt`, and names with `[` or `*` behave.
+  Directories restore their whole subtree, including the deletion of files created after the
+  checkpoint (labelled `delete`, not in checkpoint); a value that is already identical prints
+  `Nothing to restore for <path> (already matches <id>).` and exits 0. Paths outside the
+  repository, `.git` and its contents, empty values and values present in neither the checkpoint
+  nor the working tree are refused with a one-line error before anything is written. All the
+  whole-tree safety stays in place: one safety checkpoint of the whole tree is still created
+  first (so `runledger rollback <safety-id>` undoes a partial restore), the stale-preview check
+  still covers the whole tree, and the symlink, junction, `.git` overlap, reserved-name and
+  case-collision refusals apply to an in-scope path exactly as before. `--path` combines with a
+  checkpoint id, `--run`, `--last`, `--dry-run` and `--yes`, and the preview lists the scope, each
+  change, and a summary with the number of files and the bytes to restore. `--path .` is the same
+  as a whole-tree rollback, which is unchanged without the option.
+- **Droid discovery follows `FACTORY_HOME_OVERRIDE` (`runledger.adapters.droid`):** the variable
+  is read as a HOME, so the Factory config directory becomes `<FACTORY_HOME_OVERRIDE>/.factory`,
+  and that is where sessions, settings files and a global hook file are looked for.
+  `FACTORY_HOME`, which names the config directory itself, still wins over it; without either,
+  the directory is `~/.factory`.
+- **MCP calls are graded by their verb (`runledger.mcp_risk`, new; used by `runledger.risk`):** a
+  destructive tool (`delete_project`, `drop_table`, `reset_branch`, `purge_bucket`) is a **high**
+  `mcp` finding with the reason `Called a destructive MCP tool (<server>: <tool>)`, a
+  state-changing tool (`create_post`, `send_message`, `deploy`) is medium, and a read-only or
+  unknown name keeps the previous low finding and its wording. Words are matched exactly and case
+  insensitively, so `deleted_items` and `undelete_items` stay low while camelCase and kebab names
+  (`deleteBranch`, `delete-branch`) split into words; a leaf whose first word is a read verb
+  (`get_delete_policy`) never escalates. Both name shapes agents report are understood:
+  `mcp__<server>__<tool>` (Claude Code, Codex) and the bare connector name
+  (`supabase__delete_project`, Factory Droid).
+- **The SQL argument of an execute-class MCP tool is inspected (`runledger.mcp_risk`, new):** a
+  call whose name carries `sql`, `query`, `statement` or `execute`, or that carries a
+  `query`/`sql`/`statement` argument that opens like a statement, is graded by that statement
+  instead of its verb: `DROP`, `TRUNCATE`, a `DELETE` or `UPDATE` without a `WHERE` and
+  `ALTER TABLE ... DROP` are high, any other data-changing statement is medium, read-only SQL
+  keeps the low finding, and a call with no SQL the guard can read is medium. Strings and comments
+  are blanked before matching, so `select 'DROP TABLE x'` stays low. The SQL body is never copied
+  into a reason, `guard.log`, an approval request or a receipt, and an argument of up to 2 MB is
+  capped at 20 000 characters before any pattern runs.
+- **Twenty-two more dangerous-command rules (`runledger.risk`):** force-deleting a git branch
+  (`git branch -D`, `git branch --delete --force`), discarding all working-tree changes
+  (`git checkout .`, `git restore .`), `git stash drop`/`clear`, `git push --delete` and
+  `git push origin :branch` (high), `find ... -delete` and `find ... -exec rm|unlink|shred`,
+  `docker system|builder|image|container|network prune`, `gh <resource> delete`, `aws s3 rm` of a
+  single object, `rsync --delete`, `dd of=<file>` and `reg delete` of a user key (medium),
+  `helm uninstall`, `gh repo delete`, `docker volume prune` and `docker system prune --volumes`,
+  `aws s3 rm --recursive`, `aws s3 rb --force`, `dd of=/dev/...`, `rd /s /q`, a shell
+  `DELETE FROM` without a `WHERE` and `reg delete` of a machine-wide key (high), plus PowerShell
+  `Remove-Item -Recurse` without `-Force` (medium; the existing `-Force` rule stays high and does
+  not also report it). Every rule is confined to one command (the lookahead stops at `;`, `&`, `|`
+  and newlines) and runs on the quote-, comment- and heredoc-blanked view, so a commit message or a
+  string that mentions `git branch -D` is not flagged.
+- **Rules you write yourself (`command_rules`, `tool_rules`, `mcp_verbs`):** the user file
+  (`~/.runledger/config.json`) and a project's `.runledger.json` may now carry three top-level
+  keys. `command_rules.deny`/`.ask` take regular expressions, or objects with `pattern`, an
+  optional `reason` and `raw`; they are searched case-insensitively against the same
+  quote- and heredoc-blanked view the built-in command rules use, and `raw: true` reads the whole
+  command instead. `tool_rules.deny`/`.ask` take `fnmatch` globs matched against the whole tool
+  name, case-sensitively, for any tool (`Edit`, `mcp__vercel__*`); a tool on both lists is denied.
+  `mcp_verbs.destructive`/`.write`/`.read` add words to the MCP verb vocabularies, so a server
+  whose destructive tool is named something else is graded as expected. Hits are `rule_deny`
+  (high) and `rule_ask` (medium) findings whose reason names the entry. A rule hit is always
+  decided: replacing the default deny list keeps it, and no `!` exclusion can drop it. Both files
+  only add, so a project can tighten with rules but never remove one of yours; a project
+  `mcp_verbs.read` list, a project exclusion aimed at a rule hit and a pattern that is not a safe
+  regular expression are ignored and logged as warnings. Receipts: a receipt re-runs the rules with
+  the project's file only, so a rule that lives in your user file is enforced live but does not
+  appear in a receipt built from an older session (`docs/guard.md`).
+- **The guard reads Claude Code, Factory Droid and Codex payloads (`runledger.guard`):** the hook
+  command carries `--agent claude-code|droid|codex` (without the flag the agent is inferred from the
+  payload, and Claude Code is the default, so existing hooks are unchanged), so a Droid `Execute`
+  is decided as the shell call it is, `Create`/`Edit` as writes and edits, `ApplyPatch`/`apply_patch`
+  as one step per file the patch touches (one bad file denies the whole call, and the log lists the
+  paths, never the bodies), its searches as `Search` and `FetchUrl` as `WebFetch`; MCP names keep
+  both shapes (`mcp__server__tool` and Droid's bare `server__tool`). The log keeps the agent's own
+  tool name and adds `agent` and `canonical_tool` (`Execute` becomes `Bash`), and `session_id` stays
+  the agent's own session id, so a receipt can match the decisions to the session. Codex cannot
+  prompt from a hook, so an ask becomes a **deny** there with a reason that names the rule and how
+  to proceed (`guard.codex_ask: "allow"` in the user file opts out; a project file cannot set it),
+  while Claude Code and Droid keep asking. PowerShell commands sent under `Bash` (Codex) or
+  `Execute` (Droid) are analysed as PowerShell. An unknown `--agent`, a malformed payload or an
+  internal error never blocks a call: the hook exits 0, keeps the fail-open/fail-closed semantics
+  and reports a bad agent on stderr. A hook command stored with `--agent` is recognised as
+  RunLedger's own by `install`, `uninstall` and the install-time self-test, `guard test --agent X`
+  reads a native payload, and the hook stays fast and offline (`docs/guard.md`).
+- **One `guard install` for Claude Code, Droid and Codex (`runledger.hook_targets`, new;
+  `runledger.guard`):** `runledger guard install|uninstall [--agent claude-code|droid|codex|all]
+  [--project PATH | --global]` writes each agent's own file. Claude Code keeps
+  `<project>/.claude/settings.json` / `~/.claude/settings.json` (the unchanged default); Factory
+  Droid gets `<project>/.factory/hooks.json` / `<FACTORY_HOME>/hooks.json` (or
+  `<FACTORY_HOME_OVERRIDE>/.factory`), keyed by event with **no** `hooks` wrapper and never its
+  `settings.json`; Codex gets `<project>/.codex/hooks.json` / `<CODEX_HOME>/hooks.json`, with the
+  events wrapped in `hooks`, matcher `.*` and `config.toml` never touched. The guard command carries
+  the agent (`"<python>" -m runledger guard --agent droid|codex`; `--portable` keeps the bare form),
+  the checkpoint hooks stay `runledger checkpoint --hook` for all three, and `install` runs the
+  stored command once. Installs are idempotent (one guard entry per file, `<file>.bak` written once
+  and never rewritten), keep every foreign hook and key, refuse a malformed or wrongly shaped file
+  untouched (exit 1, nothing written, no `.bak`/`.tmp`) and accept an empty or BOM-prefixed one;
+  `uninstall` removes only RunLedger's entries plus the groups, events and `hooks` object they
+  emptied, and an agent without a hook file is reported without creating one. `--agent all` installs
+  in a project for all three and, globally, only for agents whose config folder already exists (it
+  never creates `~/.factory` or `~/.codex`, and names each skipped agent with the reason). `guard
+  test --agent droid|codex` prints the decision and that agent's hook output, and the install output
+  says what each agent still needs: Droid snapshots its hooks at startup (restart or `/hooks`), and
+  Codex runs only hooks you trust and turns an ask into a deny (`guard.codex_ask`) - neither message
+  claims the hook is verified inside the agent, which only a real session shows
+  (`docs/guard.md`, `docs/agents.md`, `docs/rollback.md`).
+- **`runledger doctor` and `runledger guard status` (`runledger.doctor`, new):** nine checks in one
+  report, with `--json`, `--agent`, `--project`, `--offline`, `--no-selftest` and `--verbose`, and
+  exit codes 0 (ok/info/skip), 1 (a warning) and 2 (a failure). It reports the install (version,
+  Python, how the CLI is reached), the guard hook of every agent and scope (`info` when nothing is
+  installed, `ok` with the entries found, `warn` for a missing checkpoint entry, a duplicate guard
+  entry, a hook timeout shorter than the approval wait or a `--portable` command whose `runledger`
+  is not on `PATH`, `fail` for unreadable JSON - with the line - or a missing interpreter), the
+  Codex trust and Droid restart notes, a real self-test that runs the installed command string
+  through the shell in a temporary folder with a temporary HOME (deny JSON for `rm -rf /`, silence
+  for `ls`, elapsed time in the detail; `--no-selftest` starts no subprocess), both config files
+  (invalid JSON and project keys that try to loosen the guard are named), the approval server
+  (unauthenticated `GET /health`, 3 s, `--offline` makes no request; the key is reported only as
+  set or not set), the guard log (size, last decision, error rows of the last 7 days, `.gitignore`
+  coverage; never its contents), the checkpoints (Git version, count, newest tree size, a warning
+  above 100), the bundled prices (120-day staleness, `fail` when the table is unreadable) and the
+  sessions per agent with the home directory each one was read from. `guard status` is the compact
+  guard-only view - hooks, notes, config, approval, log and the effective mode with `fail_closed` -
+  and runs no self-test. Both commands are read-only: no hook file, config, log, checkpoint ref or
+  cache is written, and no secret is printed (`docs/doctor.md`).
+- **`runledger stats` (`runledger.stats`, new):** one report over the local sessions - sessions,
+  steps, tokens and cost per group, the risk and quality distributions, the most common risk codes
+  and advisor recommendations, and the guard decisions in the window. `--project PATH` or `--all`,
+  `--agent`, `--since 7d|4w|1m|YYYY-MM-DD` (default `30d`), `--until`, `--by agent|model|day|week|
+  project` (default `agent`), `--top 5`, `--format table|json|md`, `--limit 500` (newest sessions in
+  the window, with a stderr note when it truncates), `--no-cache` and `--rebuild-cache`. Cost stays
+  honest: a model with no price gives `n/a`, a session that mixes priced and unpriced tokens gives a
+  `>=` lower bound with a footnote naming the unknown models, and no figure is ever a fake `$0.00`.
+  Exit codes are 0 (a report), 1 (no sessions for the scope, or none in the window, with the reason
+  on stderr) and 2 (usage error). The window is resolved from the current minute, so two runs in the
+  same minute agree. The command is read-only and runs no Git, no network request and
+  no AI: it parses each session once and caches the tokens per model together with the
+  per-request token numbers pricing needs, the risk result, the grade and the recommendation
+  kinds in `~/.runledger/cache/stats-v1.json`, keyed by path + mtime + size and invalidated by a
+  change to the user config, to the project's `.runledger.json` or to any file the parse read
+  beside the transcript (a Droid `<id>.settings.json` sidecar, sub-agent transcripts). Aider
+  history files are looked for in the project folder only, because the search that walks up to
+  the Git top level would run Git. The cache holds no
+  prompts, commands or file contents, and a corrupt session file is listed in `skipped` instead of
+  stopping the run (`docs/stats.md`).
+- **`runledger checkpoints prune` takes `--older-than DUR` and needs only one of the two options
+  (`runledger.rollback`, `runledger.cli`):** `--keep N` still protects the newest N checkpoints and
+  `--older-than 30d` (`2w`, `12h`) removes the checkpoints older than that; neither is required on
+  its own, but giving neither is an error (`--keep or --older-than is required for prune.`, exit 1),
+  and a duration that is not a number followed by `d`, `w` or `h` - or that no calendar could hold,
+  like `9999999999d` - is refused by the parser before anything is deleted (exit 2). Giving both is
+  conservative - a checkpoint goes only when it is **both** beyond the newest N **and** older than
+  the limit, and one exactly at the limit age is kept - so the rules can never add up to a wider
+  deletion than each one alone. `--verbose` adds one `removed <id>` line per checkpoint that was
+  removed, and the report without it is unchanged (`docs/rollback.md`). The age comes from
+  the ref's own Git commit date (the date `GIT_COMMITTER_DATE` writes), so a repository with old
+  checkpoints prunes them by how old Git says they are. Safety checkpoints are pruned like any
+  other, the report names the count and how many of them were safety checkpoints, and only refs are
+  deleted: the commits stay readable until Git reclaims them, and `git gc --prune=now` is mentioned
+  as text only, never run (`docs/rollback.md`).
+- **The checkpoint hooks prune automatically (`runledger.rollback`):** after the checkpoint of a
+  `SessionStart` or `UserPromptSubmit` hook exists, retention runs under the user's own
+  `~/.runledger/config.json` settings - on by default, keeping the newest 50 checkpoints with no age
+  limit, tunable with `{"rollback": {"auto_prune": {"keep": N, "older_than": "30d"}}}` and
+  switchable off with `"auto_prune": false`. The checkpoint just created and every checkpoint of the
+  session in progress are never removed, so `rollback` and `rollback --run` always reach the run the
+  agent is in; an unusable config keeps the documented default instead of guessing, and a failure
+  inside auto-prune is swallowed - a hook never blocks the agent or loses the checkpoint it just
+  made. Only refs are deleted, and nothing is written to stdout, where Droid and Codex turn hook
+  output into agent context.
+- **A size warning for large checkpoints (`runledger.rollback`, `runledger.cli`):** `runledger
+  checkpoint` and the checkpoint hooks measure the snapshot (`git ls-tree -r -l`, one call) and
+  print one `warning:` line to stderr when it exceeds `rollback.warn_mb` (default 500 MB of content)
+  or `rollback.warn_file_mb` (default 50 MB for a single file, `0` switches a threshold off), naming
+  the total, the file count, the largest file and its size, and pointing at `.gitignore`, which is
+  the real fix because a checkpoint takes the whole non-ignored tree. The manual command warns every
+  time and never puts the text on stdout; the hooks warn on stderr only, at most once per session
+  per 24 hours (marker file `<repo>/.runledger/.size-warned`), so a huge tree does not repeat the
+  message on every prompt. A tree above 200,000 entries skips the scan instead of costing every
+  hook, and both thresholds at `0` skip it entirely.
+- **A project `.runledger.json` cannot change checkpoint retention (`runledger.guard`):**
+  `rollback.auto_prune`, `rollback.warn_mb` and `rollback.warn_file_mb` are read from the user's own
+  config file only, and a project file that sets them is ignored with a warning from the guard and
+  from `runledger guard test` (`Ignored rollback.auto_prune in .runledger.json: a project file
+  cannot change checkpoint retention or the size warning, ...`), so a cloned repository can neither
+  delete the user's checkpoints nor silence the size warning.
+
+### Changed
+
+- **A `--global` Claude Code install follows `CLAUDE_CONFIG_DIR` (`runledger.guard`):** the user
+  settings file is `$CLAUDE_CONFIG_DIR/settings.json` when that variable is set - the file Claude
+  Code itself reads - instead of always `~/.claude/settings.json`.
+- **Destructive MCP calls ask by default (`runledger.guard`):** a high `mcp` finding now matches the
+  default `ask: ["severity:high"]`, so `mcp__supabase__delete_project`, and an execute-class call
+  whose SQL drops or rewrites rows, wait for confirmation instead of running. Nothing is denied by
+  default (`mcp:high` must be added to a `deny` list), and a user file can soften it again with
+  `severity_overrides` or `ignore`. The new command rules can turn a previously allowed call into a
+  deny (`git push origin --delete x`, `docker volume prune`, `helm uninstall`, `gh repo delete`) or
+  add a finding to it (`git branch -D x`, `rsync --delete`, `Remove-Item -Recurse`).
+- **`nuke` is deliberately not one of the built-in destructive MCP words (`runledger.mcp_risk`):**  a tool whose name carries it stays low until you add it to `mcp_verbs.destructive`. The rest of
+  the vocabulary (`delete`, `drop`, `destroy`, `reset`, `purge`, `terminate`, `force`, `revoke`
+  and the other words) is unchanged, and users who never set `mcp_verbs` see the difference only
+  for names built on `nuke`.
+- **The user's config file is read in one place (`runledger.userconfig`, new):** `RUNLEDGER_CONFIG`
+  or `~/.runledger/config.json` is resolved and parsed by one module, which the guard, the risk
+  policy and the new `rollback.load_settings()` consume, so a missing or broken file is handled the
+  same way everywhere. `rollback.load_settings()` returns the documented `rollback` settings with
+  their defaults (auto-prune on, keeping the newest 50 checkpoints, no age limit; size warnings at
+  500 MB in total or 50 MB for one file, 0 switches a warning off), and `pricing.prices_checked()`
+  exposes the bundled `prices.json` verification date as a `date` (or `None` when the packaged
+  table carries no usable `checked` value) for the price-staleness checks.
+
+### Fixed
+
+- **Extreme retention settings no longer break the checkpoint hook (`runledger.rollback`):** a
+  user config holding an age limit no calendar can hold (`"older_than": "9999999999d"`) made
+  `load_settings()` raise `OverflowError` while the hook was decoding it, so `runledger checkpoint
+  --hook` created its checkpoint and then exited 1 with an error line instead of falling open.
+  `parse_duration` now bounds a duration to a thousand years (the same refusal applies to
+  `checkpoints prune --older-than`, exit 2, nothing deleted) and the settings are decoded inside
+  the hook's failure isolation, so an unusable policy of any kind falls back to the documented
+  defaults and the hook still exits 0 with empty stdout and its checkpoint kept.
+- **`rollback --path` reads a relative value against the invocation folder
+  (`runledger.rollback`):** `--cwd REPO/sub --path a.txt` resolved `a.txt` against Git's top
+  level, so it restored `REPO/a.txt` and left the intended `REPO/sub/a.txt` modified. A relative
+  value is now read against the folder the command was invoked with (`--cwd`, or the current
+  folder without it), and a value that only exists relative to the top level is refused with
+  `no such path` instead of being restored from there.
+- **A folder selection folds case on a case-insensitive volume (`runledger.rollback`):** only the
+  file entries carried a case-folded alias, so `--path SUB` on Windows selected nothing and left
+  `sub/c.txt` modified, and a deleted folder named with a different case was reported absent.
+  Folder names are part of the same spelling table now, so a value selects the repository's own
+  spelling for a file or a folder, existing or deleted.
+- **Case folding happens only where the volume folds case (`runledger.rollback`):** the retry ran
+  on every platform, so on a case-sensitive Linux volume an absent `--path README.md` selected and
+  restored an existing `readme.md` the value never named. Whether a volume folds case is decided
+  once per repository (Windows path rules, or asking the folder for a different case), so a
+  case-sensitive volume keeps every value literal and refuses the absent path (`docs/rollback.md`).
+- **A blocker outside a `--path` selection no longer stops the restore (`runledger.rollback`):**
+  the whole-tree snapshot refused any unignored junction in the repository, so one unrelated
+  junction made `rollback <id> --path a.txt` fail with "Windows junctions and other non-symlink
+  reparse points are not supported". The reparse-point scan now covers the selection and the way
+  to it, while an in-scope junction is still refused by name before anything is written; the
+  whole-tree refusal, the whole-tree stale-preview check and the safety checkpoint are unchanged.
+- **The full-tree rollback preview reports the bytes it would change (`runledger.cli`):** a
+  `--dry-run` without `--path` printed its restore and remove counts without the byte total the
+  scoped preview already had. The summary line carries it now (`1 restore, 0 remove (42 bytes).`);
+  restoring is unchanged.
+- **`runledger stats` prices a session exactly as `receipt` does (`runledger.stats`):** the
+  cached token buckets keep the per-request boundaries the pricing path reads, so a session of
+  several short requests is no longer charged a long-context tier for its total: two 60,000-token
+  Haiku requests cost $0.012 in `stats`, cold and warm, exactly as in `runledger receipt`, instead
+  of the $0.06 a single aggregate request would cost. Only token and request-tier numbers are
+  cached - never a prompt or a command - and a price-table change still needs no invalidation.
+- **`runledger stats` never runs Git on any path (`runledger.stats`, `runledger.adapters.droid`):**
+  two paths still started `git rev-parse`: a Droid transcript that records a relative `cwd` and can
+  only be placed by its tool paths, and `--agent aider`, which used the full Aider search that walks
+  up to the Git top level. The Aider search now stays in the project folder for every invocation
+  (the walk up is Git), and a relative Droid `cwd` is recovered from the nearest ancestor holding
+  `.git` without starting a process, so `stats` starts no child process at all.
+- **`--by model` splits a mixed-model session (`runledger.stats`):** a session that used several
+  models contributes its tokens and cost to each of their rows, priced per model, instead of the
+  whole session being credited to the model that used the most tokens; a 2000-token Sonnet and
+  1000-token Haiku session now reports two groups whose cost matches `receipt`. Its session and
+  step counts stay with the dominant model, so every column still sums to the `total` row
+  (`docs/stats.md`).
+- **A stats cache record watches every file the parse read (`runledger.stats`, `runledger.parser`,
+  `runledger.adapters.droid`):** the record was invalidated by the transcript alone, so editing only
+  a Droid `.settings.json` sidecar or a Claude sub-agent transcript left warm stats reporting the
+  old tokens and cost while `--no-cache` saw the new ones. Both files are now recorded with their
+  size and modification time and re-parse the session when they change.
+- **A stats record is only built from a parse that tracked every dependency (`runledger.stats`,
+  `runledger.parser`, `runledger.adapters.droid`):** the sub-agent folder watch is capped for
+  speed, and past the cap the record simply did not mention the folders the walk never reached, so
+  a transcript added to one of them changed no watched source and warm stats kept its old totals
+  (1000 tokens against the 1500 `--no-cache` reported). A parse now reports whether it could track
+  everything it depends on - False when the folder watch hit its cap, when a folder could not be
+  listed, or when the Droid settings lookup could not scan its folder - and no record is stored for
+  such a session: an older record for it is dropped and it is parsed again on every run, so a warm
+  report always equals `--no-cache`. The record format is version 4, so an older cache is rebuilt
+  once (`docs/stats.md`).
+- **A prices file with a UTF-8 BOM is read (`runledger.pricing`):** `~/.runledger/prices.json`
+  and a `RUNLEDGER_PRICES` file written by a Windows editor or by `Set-Content -Encoding UTF8`
+  start with a byte-order mark, which the JSON reader rejected, so the whole override was
+  ignored with a warning. The file is now decoded as `utf-8-sig`, like the user config and the
+  project's `.runledger.json` already were. A file that is still not valid UTF-8 (or not valid
+  JSON) is ignored with the same warning as before.
+- **Claude Code and Codex discovery resolve one home directory (`runledger.parser`,
+  `runledger.adapters.codex`):** with `CLAUDE_CONFIG_DIR` and `CODEX_HOME` unset, session
+  discovery used Python's home (`USERPROFILE` on Windows) while `guard install --global` and
+  `runledger doctor` used `HOME`, so `runledger list` and `runledger receipt` read a different
+  agent folder than the one a global install wrote to and the doctor named. Both now resolve the
+  directory through the same helper the Droid adapter uses - the user home is `HOME`, then
+  `USERPROFILE`, then Python's own home - which `docs/agents.md` documents.
+- **`runledger doctor` inspects what the agents actually run (`runledger.doctor`):** the self-test
+  no longer executes a foreign PreToolUse hook. A project that stores its own hook (an `echo hi`
+  preflight, say) but nothing of RunLedger's is neither run nor reported as a RunLedger failure,
+  and that hook no longer hides a genuine global install: doctor keeps looking through the scopes
+  and self-tests the RunLedger entry it finds. Ownership is decided per command, not per file: a
+  foreign PreToolUse command stored beside a RunLedger checkpoint (a project guard entry that was
+  deleted or replaced) is reported - the `guard.hooks` entry warns and names it - and never run,
+  and it cannot shadow the real global guard. A guard command that was hand-edited into something
+  else is reported as the `fail` (exit 2) it is, with the reason the command was not run, instead
+  of being executed to observe it. For Codex, the `commandWindows` copy - the command Codex runs on
+  Windows - is the value doctor inspects and self-tests, so a stale or broken override is a `fail`
+  even when the plain `command` is healthy (on the other platforms `command` stays the one that
+  counts); an override RunLedger does not own is likewise reported, never run. The hook-timeout
+  comparison uses the project's `guard.approval.timeout_s` for a global hook as well, because that
+  hook reads the project policy when it runs: a 135 s global hook in a project that sets
+  `timeout_s: 300` is now a `warn` (exit 1) instead of `ok`.
+- **`doctor` fails cleanly on a broken config or approval URL (`runledger.doctor`):** a config file
+  that is empty or holds only whitespace is a `config` failure (exit 2) instead of a silently valid
+  empty file, and a config that is not UTF-8 JSON - a UTF-16 `~/.runledger/config.json` written by
+  an ordinary PowerShell redirection - names the encoding instead of ending the run in an uncaught
+  `UnicodeDecodeError`. A malformed approval server URL such as `approver.example` (no scheme) is
+  a `warn` that names the unusable server and the `on_timeout` fallback, in the text report, in
+  `--json` and in `guard status`, instead of aborting the whole report with a generic error.
+- **A tracked `guard.log` warns even after an ignore rule (`runledger.doctor`):** the `log` check
+  now asks the Git index as well, so a `guard.log` that was committed before `.runledger/` was
+  added to `.gitignore` is reported as tracked - its command summaries stay in the repository and
+  would be published - with `git rm --cached` as the fix. `git check-ignore` alone reported that
+  file as safely ignored. An untracked log under an ignore rule stays `ok`.
+- **Droid discovery and global installation resolve one Factory directory (`runledger.adapters.droid`):**
+  with `FACTORY_HOME` and `FACTORY_HOME_OVERRIDE` unset, session discovery used Python's home
+  (`USERPROFILE` on Windows) while `guard install --global --agent droid` and `runledger doctor`
+  used `HOME`, so a customized `HOME` was handed a global hook outside the folder `runledger list`
+  and `runledger receipt` read. All three now resolve the directory through the same helper - the
+  user home is `HOME`, then `USERPROFILE`, then Python's own home - which `docs/agents.md` documents.
+- **Droid connector names match the canonical `tool_rules` (`runledger.risk`):** a `tool_rules`
+  entry written as `mcp__supabase__execute_query` or `mcp__vercel__*` now also decides the bare
+  `supabase__execute_query` / `vercel__get_project` events Droid reports - the spelling a receipt
+  already reads - so the live guard and a receipt agree on the same call. A rule written in the
+  bare spelling keeps working, and the log still records the agent's own tool name
+  (`docs/guard.md`).
+- **Codex runs the installed hook on Windows (`runledger.guard`):** Codex starts a hook command
+  itself instead of handing the string to a shell, and the `"<python>" -m runledger guard --agent
+  codex` form never started there - the quotes were read as part of the program name - so a real
+  Codex session left `guard.log` empty and created no lifecycle checkpoint. Every Codex entry now
+  also stores `commandWindows`, the same command as `cmd /c "<command>"`, the copy Codex reads on
+  Windows: for the guard hook and for both checkpoint hooks. `install` writes it, repairs an entry
+  that lacks or has a stale one in place, and leaves the files of Claude Code and Droid (whose own
+  hook runners do start the quoted path) unchanged. Measured with codex 0.163.0: the destructive
+  command is denied by the hook, a benign one runs, and `SessionStart`/`UserPromptSubmit` create
+  their checkpoints (`docs/guard.md`).
+- **Droid and Codex guard decisions reach their receipt (`runledger.guard_receipt`):** records are
+  linked in two passes - every record whose `tool_use_id` the transcript knows takes that step
+  first, then the rest match the logged tool and summary in transcript order. That second pass is
+  what links a Droid call (its payload carries no id, and the log tool `Execute` faces a `Bash`
+  step), a Codex call (the hook's `exec-...` id is not the rollout's `call_id`) and a legacy
+  no-id row, using the canonical tool name and the `Bash`/`PowerShell` pair the adapters choose
+  between. The equivalent shell queues are compared by transcript position, not by tool name, so a
+  command repeated across a shell switch (the same `Get-Content .env` run through PowerShell, then
+  Bash) keeps its blocked call on the first step and its approved retry on the second. Rows without
+  an `agent` (v0.6.0) keep matching their tool name exactly, and a decision
+  that fits no step stays visible in the receipt as unmatched.
+- **A Codex code-mode `exec` script becomes the shell step it ran (`runledger.adapters.codex`):**
+  current Codex versions send shell calls as a `custom_tool_call` named `exec` whose input is
+  JavaScript around `tools.exec_command({cmd: ..., shell: ...})`. RunLedger read that as one
+  nameless `exec` step, so the command was invisible to the risk rules and the guard's decision on
+  it had no step to link to. Each call inside the script is now one `Bash` or `PowerShell` step
+  carrying its `cmd`, and a code-mode result's text blocks are shown as their text instead of raw
+  JSON. Calls are located in the JavaScript itself, so the same text in a comment, in a string or
+  in a regular-expression literal is an example, never a step: the quote in `const r = /\"/;`
+  cannot hide the call that follows, and the division in
+  `n++ / (await tools.exec_command({...})).exit_code / 2` is not read as a pattern. Telling the two
+  apart is the one part of the reading that stays uncertain, so it no longer guesses: a script
+  carrying any `/` that opens neither `//` nor `/*` is searched as raw text instead, and the call
+  it names is reported even when it was written in a comment - a reported call beats a hidden one.
+  `cmd`, `command` and `shell`/`program` values are read from double-quoted, single-quoted and
+  static template literals, while a template that interpolates a variable leaves the script as its
+  single step under `exec`; an unterminated string, template or comment is searched as raw text
+  the same way.
+- **A quoted SQL name is an identifier (`runledger.mcp_risk`):** single-quoted string literals are
+  still blanked before the statement is matched, but a double-quoted or backtick name keeps an
+  identifier placeholder. `DELETE FROM "users"` and `UPDATE "users" SET admin = true` are high
+  like their unquoted forms, and `DELETE FROM "users" WHERE id = 1` stays medium: it used to be
+  read as `DELETE FROM WHERE id = 1` and graded high.
+- **A separator ends a delete option (`runledger.risk`):** the 0.7.0 rules accepted only a space or
+  the end of the command after a flag, so `git push origin feature --delete; echo done` (and the
+  same with `&&`, `|` or a newline, and `-d`, `git branch -D`, `git branch --delete --force`)
+  carried only the generic medium `git push` finding or none at all. A shell separator now ends the
+  option list, so the high `Deleted a remote git branch or tag` finding fires there too. The
+  older flag rules had the same gap: `rm ./x -rf; echo done` and
+  `git push origin main --force; echo done` now carry the finding their end-of-command forms had.
+- **A `find -name` pattern is not a command (`runledger.risk`):** find's pattern options are read
+  as text in the blanked view, so `find . -name 'helm uninstall web' -print` no longer produces the
+  high `Uninstalled a Helm release` finding - the same for any other destructive name in a `-name`,
+  `-path`, `-iname` or related pattern. A real command in the expression, such as
+  `find . -name x -exec helm uninstall web \;`, still matches. Only a pattern whose own text holds
+  no substitution syntax is blanked: a word carrying `$(` anywhere, or a backtick for a POSIX shell,
+  is kept whole as the code it is, so the shell runs it before `find` starts and
+  `find . -name "$(rm -rf ./victim)"`, ``find . -name `helm uninstall web` `` and a pattern with a
+  nested or escaped backtick (``find . -name "`echo \`rm -rf ./victim\``"``) are all denied. No
+  quote state is read at all - quoting and escapes are not resolved - so a quoted region can never
+  cover a substitution the shell really runs: the escaped double quote in
+  `find . -name \"'"'"$(rm -rf ./victim)" -print` no longer desynchronises the reading and hides the
+  deletion. The reading is deliberately coarse, and the price is a finding for text that never
+  runs: a `$(` or backtick in single-quoted or escaped text is read as code too, so
+  `find . -name '$(rm -rf ./victim)' -print` is denied as well, although the shell substitutes
+  nothing there.
+- **A command rule that can backtrack catastrophically is dropped (`runledger.secrets`):** the
+  safe-regex check rejects a repeat of any kind inside a repeat (`(?:a{1,32}){1,32}b`,
+  `(?:a?){40}b`, `(a+)+`) and an alternation inside one (`(a|a)*b`, `(a|aa)+b`), so a user or
+  project `command_rules` entry (or an `extra_secret_paths` pattern) with one is dropped with the
+  existing `Dropped invalid command_rules.deny pattern ...` warning instead of stalling the guard
+  hook or a receipt. A user or project rule also reads at most the first 20 000 characters of a
+  command, like the SQL inspection, so no rule can make the synchronous guard path walk an
+  arbitrarily long command.
+- **The `log` check is `info` outside a Git work tree (`runledger.doctor`):** the ignore rule can
+  only be verified inside a Git repository, so an existing `.runledger/guard.log` in a plain folder
+  no longer prints an `ok` line that reads as if the rule had been checked. The line still carries
+  the log's size, its last decision time and its 7-day error count, never its contents, and the
+  status change does not touch the exit code; recent error rows still warn (fail-open), and every
+  other status is unchanged - ignored `ok`, not ignored `warn`, tracked `warn`, no log `info`.
+- **`docs/doctor.md` shows the report the CLI really prints (`docs/doctor.md`):** the text samples
+  no longer label an uninstalled hook `[ok]` (the CLI reports it as `info`), they use the check
+  titles the text report prints (`guard log`, not `log`), and the numbers in the sample summary and
+  in the `--json` example are the ones that run prints. The `log` section documents the outside-Git
+  `info` status.
+- **A `stats` record is dropped when a watched dependency appears or is repaired (`runledger.stats`,
+  `runledger.parser`, `runledger.adapters.droid`):** the parse cache only watched the files a parse
+  had actually read, so a Droid `<id>.settings.json` sidecar written later, a child settings file
+  repaired after a malformed write, or a Claude sub-agent transcript added to (or filled in under) a
+  folder that held none left the warm report at its old tokens and cost while `--no-cache` showed
+  the new ones. Every dependency candidate is now recorded with how it turned out - `ok`, `missing`
+  or `rejected`, with its size and modification time - and a record is dropped when any candidate's
+  existence, size or time changes, so a warm run reports what `--no-cache` reports. The cache record
+  format changed, so an older cache is rebuilt once instead of being reused.
+- **`rollback.auto_prune.keep` is bounded (`runledger.rollback`):** a value above 100000 is
+  unusable like a negative one and keeps the documented default of 50, so a typo in
+  `~/.runledger/config.json` can no longer silently retain an unbounded number of checkpoints
+  (`keep: 10**30` used to keep everything on the branch). `docs/rollback.md` documents the bound.
+- **A junction outside a `--path` selection is no longer followed (`runledger.rollback`):** the
+  scoped pass-through stopped the reparse-point refusal but not the whole-tree `git add -A`
+  behind the stale-preview tree and the safety checkpoint, so on Windows an unrelated junction to
+  a folder outside the repository put that folder's files into Git objects - on a `--dry-run`
+  too - and pinned them in the safety checkpoint, although the preview never listed them. Staging
+  now prunes Git's own walk with a pathspec exclusion for every reparse point the selection does
+  not cover, and the entries under it are compared before and after, so contents reached through
+  a junction are neither read into the snapshot nor written as objects; a path the junction
+  shadows keeps the repository's own blob. An in-scope junction is still refused by name.
+- **A `--path` value never widens through Unicode casefolding (`runledger.rollback`):** the folded
+  retry used `str.casefold`, which is wider than the case-insensitive comparison NTFS and APFS
+  use, so with both `Straße` and `Strasse` in one repository `--path Straße` restored the files of
+  `Strasse` too and overwrote an unselected file. The retry now applies the volume's own simple
+  case mapping, after the exact match, and a spelling two names share is left to the exact match
+  instead of being guessed, so `Straße` and `Strasse` stay two folders and a junction inside one
+  no longer blocks a restore of the other (`docs/rollback.md`).
+- **A resolved `--path` scope is applied literally (`runledger.rollback`):** picking the
+  repository's spelling for the value was only the first half - every entry the exact match did
+  not cover was folded again, and Python maps `K` (U+212A KELVIN SIGN) and `K` to the same name
+  while this NTFS volume keeps them apart, so `rollback --path K --yes` restored the selected
+  folder *and* overwrote `K/b.txt` outside the scope. Folding now happens only where a value is
+  resolved to the repository's own spelling (the exact match first, the volume's simple case
+  mapping second), and the selection is then applied literally - exact equality or the canonical
+  prefix plus `/` - to the restored and removed entries and to the reparse-point scan, so two
+  folders that only a Python case mapping confuses never select each other's files. A
+  case-insensitive volume still resolves `--path SUB` to `sub/...` (`docs/rollback.md`).
+- **A sub-agent transcript scan that fails is never cached (`runledger.parser`, `runledger.stats`):**
+  the transcripts were found with `pathlib.rglob`, which swallows a listing error inside its own
+  walk, so an unreadable sub-agent folder looked like an empty one: the parse reported complete
+  dependency tracking, a record was stored, and warm stats kept the truncated totals (1000 tokens
+  against the 1300 `--no-cache` reported) after the folder was readable again. The watch and the
+  transcript scan are now one explicit breadth-first walk that reports every folder it could not
+  list, and any such failure makes the parse incomplete - the same answer the capped watch gives -
+  so no record is stored and the session is parsed again on every run (`docs/stats.md`).
+- **A `--path` value the checkpoint does not hold is resolved against the working tree too
+  (`runledger.rollback`):** canonicalizing the value against the checkpoint tree alone left a
+  current-only folder spelled as the user typed it, so with a junction at `sub` that appeared after
+  the checkpoint `rollback <id> --path SUB` reported `Nothing to restore for SUB` and exited 0,
+  while the exact `--path sub` refused the junction. A value that matches no checkpoint entry is
+  now resolved against the working tree as well (the same exact-then-simple-case-mapping retry,
+  one component at a time, and a key two names share is still left to the exact match), and the one
+  canonical scope that comes out of it is what the reparse-point safety scan, the snapshot and the
+  entry filters all apply literally, so both spellings refuse an in-scope junction
+  (`docs/rollback.md`).
+
+### Security
+
+- **The size-warning marker is never written through a redirect (`runledger.rollback`):** the
+  checkpoint hook remembered its warning in `<repo>/.runledger/.size-warned` with a plain
+  `write_text`, so a repository carrying that path - or `.runledger` itself - as a symlink saw the
+  hook truncate whatever the link pointed at (verified: an unrelated working file, or a new file
+  outside the repository, replaced by the marker JSON). `.runledger` is repository content, so a
+  link or another reparse point there is now refused: the marker is neither read nor written
+  through it, the warning still reaches stderr, the hook still exits 0 with empty stdout, and the
+  target keeps its bytes. The marker is opened without following the final path and only truncated
+  once the open file is confirmed to be the marker itself, so the write cannot land elsewhere.
+- **The guard log is never written through a redirect (`runledger.guard`, `runledger.redirects`):**
+  the guard appended each decision to `<project>/.runledger/guard.log` with a plain
+  `open(..., "a")` after `mkdir`, so a repository that ships `.runledger` - or `guard.log` itself -
+  as a symlink, a Windows junction or another reparse point got the hook's records (tool names,
+  command summaries, reasons) appended to any file the user can write, such as a shell startup
+  file; a dangling `guard.log` link made the hook create the file it pointed at. Both paths are
+  now refused before the open, and the file is opened without following its last part and written
+  only once it is confirmed to be the log itself, so nothing can land elsewhere. The decision, the
+  stdout JSON and the exit code are unchanged, the hook still never fails, and at most one line is
+  printed on stderr. The redirect check and the no-follow open are shared with the checkpoint
+  hook's size-warning marker in the new `runledger.redirects` module.
+
 ## [0.6.1] - 2026-10-18
 
 ### Changed
@@ -1045,7 +1551,8 @@ First working prototype (MVP).
   override them.
 - No runtime dependencies; Python 3.9 and later.
 
-[Unreleased]: https://github.com/kodji7202-code/runledger/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/kodji7202-code/runledger/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/kodji7202-code/runledger/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/kodji7202-code/runledger/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/kodji7202-code/runledger/compare/v0.5.2...v0.6.0
 [0.5.2]: https://github.com/kodji7202-code/runledger/compare/v0.5.1...v0.5.2

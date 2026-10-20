@@ -552,7 +552,11 @@ def _write_policy(tmp_path, data, raw=None, bom=False):
     (tmp_path / ".runledger.json").write_bytes(payload)
 
 
-DEFAULTS = {"ignore": [], "severity_overrides": {}, "extra_secret_paths": []}
+DEFAULTS = {"ignore": [], "severity_overrides": {}, "extra_secret_paths": [],
+            # v0.7.0: the rule keys a receipt reads, from the project file only.
+            "mcp_verbs": {"destructive": [], "write": [], "read": []},
+            "tool_rules": {"deny": [], "ask": []},
+            "command_rules": {"deny": [], "ask": []}}
 
 
 def test_load_policy_missing_file_gives_defaults(tmp_path):
@@ -789,7 +793,8 @@ EXPECTED = {
     "robocopy_switches": [("low", "shell_outside")],
     "sed_expression": [],
     "ps_remove_recurse_force": [("high", "command")],
-    "ps_remove_recurse_outside": [("high", "shell_outside")],
+    # v0.7.0: a recursive delete without -Force is a medium command risk (VAL-RULES-015).
+    "ps_remove_recurse_outside": [("high", "shell_outside"), ("medium", "command")],
     "ps_printed_env_secret": [("medium", "command")],
     "ps_download_to_file": [],
     "ps_remove_test_file": [("high", "test_deleted")],
@@ -986,6 +991,12 @@ def test_public_key_and_normal_paths_are_not_secret(public_path):
     "(x+x+)+y",
     r"(\w+\.)+com",
     "(a+){2,}",
+    "(?:a{1,32}){1,32}b",
+    "(ab{1,3}){2,}x",
+    "(?:a?){40}b",
+    "(?:a?){12}b",
+    "(a|a)*b",
+    "(a|aa)+b",
     r"(a+)\1",
     "a" * 201,
 ])

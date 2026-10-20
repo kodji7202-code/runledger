@@ -14,6 +14,12 @@ from typing import Any, Dict, Tuple
 CACHE_VERSION = 1
 
 
+def _disabled() -> bool:
+    """`RUNLEDGER_NO_SESSION_CACHE=1` makes discovery read-only: `runledger doctor` counts the
+    sessions without writing or reading the cache, so it changes nothing on disk."""
+    return os.environ.get("RUNLEDGER_NO_SESSION_CACHE", "").strip().lower() in ("1", "true", "yes")
+
+
 def cache_path() -> Path:
     home = os.environ.get("HOME") or os.environ.get("USERPROFILE") or str(Path.home())
     return Path(home) / ".runledger" / "cache" / "sessions.json"
@@ -55,6 +61,8 @@ def load() -> Tuple[Dict[str, Dict[str, Any]], bool]:
     `needs_rewrite` is True when a cache file existed on disk but was corrupt
     or had an incompatible structure, so callers can rewrite a clean file.
     """
+    if _disabled():
+        return {}, False
     path = cache_path()
     try:
         st = os.stat(str(path))
@@ -81,6 +89,8 @@ def load() -> Tuple[Dict[str, Dict[str, Any]], bool]:
 
 def save(entries: Dict[str, Dict[str, Any]]) -> None:
     """Persist `entries` atomically to `~/.runledger/cache/sessions.json`."""
+    if _disabled():
+        return
     path = cache_path()
     payload = json.dumps({"version": CACHE_VERSION, "entries": entries}, separators=(",", ":")).encode("utf-8")
     try:

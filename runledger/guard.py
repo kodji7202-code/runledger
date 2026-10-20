@@ -1,9 +1,23 @@
-"""Real-time policy guard: a Claude Code PreToolUse hook.
+"""Real-time policy guard: the PreToolUse hook of Claude Code, Factory Droid and Codex CLI.
 
-Claude Code runs `runledger guard` before each tool call and writes the call to
+The agent runs `runledger guard` before each tool call and writes the call to
 stdin as JSON. The guard scores the call with the rules in risk.py, decides
 allow / ask / deny, can ask a team approval server, and appends each decision to
-<cwd>/.runledger/guard.log.
+<cwd>/.runledger/guard.log. That folder and that file are repository content, so
+a link or another reparse point there is refused (see runledger.redirects): the
+decision and the hook output are unchanged and nothing is written.
+
+The installed hook carries its agent in `--agent claude-code|droid|codex`, so the call is
+read with the right tool vocabulary (Droid `Execute`/`Create`/`Edit`/`ApplyPatch`, Codex
+`apply_patch`, the MCP names of both) and answered in the shape the agent understands.
+Without the flag the agent is inferred from the payload's own fields. Codex cannot prompt
+from a hook, so an ask becomes a deny there with the reason why (the user's own file may
+opt out with `"codex_ask": "allow"`).
+
+`runledger guard install|uninstall --agent claude-code|droid|codex|all` writes one file per
+agent (hook_targets.py: `.claude/settings.json`, `.factory/hooks.json` with its events at the
+top level, `.codex/hooks.json` with them under `hooks`), project-scoped by default and under
+the agent's own config directory with `--global`.
 
 Two settings files, not equal:
   ~/.runledger/config.json  the user's own file. It may set everything.
@@ -47,11 +61,25 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from . import hook_targets
 from . import labels
 from . import paths as _paths
+from . import redirects as _redirects
 from . import risk as _risk
+from .hook_targets import (
+    AGENT_ALL,
+    AGENT_CLAUDE,
+    AGENT_CODEX,
+    AGENT_DROID,
+    AGENTS,
+    HookTarget,
+    InstallError,
+)
+from .mcp_risk import mcp_parts
 from .parser import Step
-from .risk import POLICY_FILE, SEVERITY_POINTS, Risk, assess_step
+from .risk import POLICY_FILE, RULE_ASK_CODE, RULE_DENY_CODE, SEVERITY_POINTS, Risk, assess_step
+# The user's own file has one reader for every consumer (guard, risk, rollback, doctor).
+from .userconfig import USER_CONFIG_DIR, USER_CONFIG_FILE, load_user_config, user_config_path
 
 try:
     from . import secrets as _secrets
@@ -67,12 +95,28 @@ HOOK_COMMAND = "runledger guard"
 HOOK_MARGIN_S = 15             # the hook entry allows the approval wait plus this many seconds
 PROJECT_DIR_ENV_VARS = ("CLAUDE_PROJECT_DIR", "FACTORY_PROJECT_DIR", "DROID_PROJECT_DIR")
 
+# The agent's own tool name -> the canonical name every risk rule keys on. A native tool
+# that is not in the table keeps its own name (it is logged with `canonical_tool: null`).
+_DROID_TOOLS = {
+    "Execute": "Bash",
+    "Create": "Write",
+    "Edit": "Edit",
+    "Read": "Read",
+    "LS": "Search",
+    "Glob": "Search",
+    "Grep": "Search",
+    "Task": "Task",
+    "FetchUrl": "WebFetch",
+    "WebSearch": "WebSearch",
+    "ApplyPatch": "ApplyPatch",
+}
+_CODEX_TOOLS = {"Bash": "Bash", "apply_patch": "ApplyPatch"}
+_PATCH_TOOLS = ("ApplyPatch", "apply_patch")
+
 LOG_DIR = ".runledger"
 LOG_FILE = "guard.log"
 KEY_ENV_DEFAULT = "RUNLEDGER_API_KEY"
 SERVER_ENV = "RUNLEDGER_SERVER"
-USER_CONFIG_DIR = ".runledger"
-USER_CONFIG_FILE = "config.json"
 PROJECT_APPROVAL_KEYS = ("server", "api_key_env")  # a project file may never set these
 TIMEOUT_DEFAULT_S = 120.0
 TIMEOUT_MAX_S = 3600.0
@@ -134,8 +178,9 @@ class ApprovalError(Exception):
     """The approval server gave no usable answer. The guard then asks locally."""
 
 
-class InstallError(Exception):
-    """settings.json cannot be merged safely. The file is left untouched."""
+# InstallError (a hook file that cannot be merged safely, left untouched) is defined in
+# hook_targets, next to the readers and writers that raise it; `guard.InstallError` is the
+# same class.
 
 
 # ---------------------------------------------------------------- redaction
@@ -262,24 +307,6 @@ def read_policy(cwd: str, *, _resolved: bool = False) -> Dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def user_config_path() -> Path:
-    """`RUNLEDGER_CONFIG` when set, else `~/.runledger/config.json`."""
-    override = os.environ.get("RUNLEDGER_CONFIG", "").strip()
-    if override:
-        return Path(override)
-    base = os.environ.get("HOME") or os.environ.get("USERPROFILE")
-    return (Path(base) if base else Path.home()) / USER_CONFIG_DIR / USER_CONFIG_FILE
-
-
-def load_user_config() -> Dict[str, Any]:
-    """The user's config file as a dict, or {} when missing or invalid. Never raises."""
-    try:
-        data = json.loads(user_config_path().read_text(encoding="utf-8-sig"))
-    except Exception:
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
 def trusted_approval_settings(user: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
     """The approval server and the name of the variable that holds the key. Only the
     environment (RUNLEDGER_SERVER) and the user's file are trusted. The project file is
@@ -296,11 +323,24 @@ def trusted_approval_settings(user: Optional[Dict[str, Any]] = None) -> Dict[str
 
 def _project_key_warnings(project: Dict[str, Any]) -> List[str]:
     approval = _section(_section(project, "guard"), "approval")
-    return [
+    warnings = [
         f"Ignored approval.{key} in {POLICY_FILE}: a project file cannot set the approval server or key. "
         f"Use {SERVER_ENV} / {KEY_ENV_DEFAULT} or {USER_CONFIG_DIR}/{USER_CONFIG_FILE} in your home folder."
         for key in PROJECT_APPROVAL_KEYS if key in approval
     ]
+    read_words = _section(project, "mcp_verbs").get("read")
+    if isinstance(read_words, list) and any(isinstance(w, str) and w.strip() for w in read_words):
+        warnings.append(f"Ignored mcp_verbs.read in {POLICY_FILE}: a read word in this list would lower a "
+                        f"destructive MCP tool, so a project may add destructive and write words only.")
+    retention = [key for key in ("auto_prune", "warn_mb", "warn_file_mb")
+                 if key in _section(project, "rollback")]
+    if retention:
+        warnings.append("Ignored " + ", ".join(f"rollback.{key}" for key in retention)
+                        + f" in {POLICY_FILE}: a project file cannot change checkpoint retention "
+                          f"or the size warning, because a cloned repository must not be able to "
+                          f"delete the user's checkpoints. Use "
+                          f"{USER_CONFIG_DIR}/{USER_CONFIG_FILE} in your home folder.")
+    return warnings
 
 
 # ---------------------------------------------------------------- rules
@@ -341,6 +381,14 @@ def _parse_rules(value: Any, default: List[str]) -> List[Dict[str, Any]]:
     return out
 
 
+def _rule_entry(code: str) -> Optional[Dict[str, Any]]:
+    """The entry that keeps a user or project rule hit decided, added to every effective list."""
+    rule = _parse_rule(code)
+    if rule is not None:
+        rule["raw"] = code
+    return rule
+
+
 def _rule_matches(rule: Dict[str, Any], risk: Risk) -> bool:
     kind = rule["kind"]
     if kind == "severity":
@@ -353,9 +401,14 @@ def _rule_matches(rule: Dict[str, Any], risk: Risk) -> bool:
 
 
 def _matches_list(rules: List[Dict[str, Any]], risk: Risk) -> bool:
-    """True when some positive entry matches and no `!` exclusion in the same list matches."""
+    """True when some positive entry matches and no `!` exclusion in the same list matches.
+
+    A `rule_deny`/`rule_ask` hit is never excluded: the rule it comes from must be removed
+    from the config instead, so one list entry cannot quietly switch a rule off."""
     if not any(_rule_matches(r, risk) for r in rules if not r["negate"]):
         return False
+    if risk.code in (RULE_DENY_CODE, RULE_ASK_CODE):
+        return True
     return not any(_rule_matches(r, risk) for r in rules if r["negate"])
 
 
@@ -399,8 +452,14 @@ def _effective_guard(project: Dict[str, Any], user: Dict[str, Any], trusted: Dic
         warnings.append(f"Ignored fail_closed false in {POLICY_FILE}: a project cannot turn fail_closed off.")
 
     # Lists: the user's (or default) list plus the project's. Each keeps its own exclusions.
+    # Both lists end with the code of the findings a user or project rule produced, so a rule
+    # hit is decided even when the user replaced the list the defaults would have come from.
     user_deny = _parse_rules(u.get("deny"), DEFAULT_DENY)
     user_ask = _parse_rules(u.get("ask"), DEFAULT_ASK)
+    for rules, code in ((user_deny, RULE_DENY_CODE), (user_ask, RULE_ASK_CODE)):
+        entry = _rule_entry(code)
+        if entry is not None:
+            rules.append(entry)
     project_deny = _parse_rules(p.get("deny"), [])
     project_ask = _parse_rules(p.get("ask"), [])
 
@@ -417,6 +476,13 @@ def _effective_guard(project: Dict[str, Any], user: Dict[str, Any], trusted: Dic
         warnings.append(f"Ignored on_timeout ask in {POLICY_FILE}: it would loosen deny. "
                         f"Only {USER_CONFIG_DIR}/{USER_CONFIG_FILE} can set it.")
 
+    # Codex has no way to prompt from a hook, so an ask is denied there unless the user's own
+    # file chooses to allow it. A project file may not make that choice.
+    codex_ask = "allow" if u.get("codex_ask") == "allow" else "deny"
+    if "codex_ask" in p:
+        warnings.append(f"Ignored codex_ask in {POLICY_FILE}: Codex cannot prompt from a hook, so only "
+                        f"{USER_CONFIG_DIR}/{USER_CONFIG_FILE} can decide what an ask means there.")
+
     cfg = {
         "mode": mode,
         "fail_closed": u.get("fail_closed") is True or p.get("fail_closed") is True,
@@ -426,6 +492,7 @@ def _effective_guard(project: Dict[str, Any], user: Dict[str, Any], trusted: Dic
         "project_deny": project_deny,
         "user_ask": user_ask,
         "project_ask": project_ask,
+        "codex_ask": codex_ask,
         "approval": {"server": trusted["server"], "api_key_env": trusted["api_key_env"],
                      "timeout_s": timeout, "on_timeout": on_timeout},
     }
@@ -487,22 +554,37 @@ def _valid_extra(value: Any) -> List[str]:
 
 
 def _risk_settings(project: Dict[str, Any], user: Dict[str, Any]) -> Dict[str, Any]:
-    """`assess` is what risk.py gets: the user's ignore and severity overrides, and the
-    union of secret-path patterns. The project's ignore and severity overrides come
-    back separately, for the tighten-only checks."""
+    """`assess` is what risk.py gets: the user's ignore and severity overrides, the
+    union of secret-path patterns, and the user's rules plus the project's (a project may
+    add rules, never remove one). The project's ignore and severity overrides come back
+    separately, for the tighten-only checks."""
     user_extra, user_extra_warnings = _valid_extra_with_warnings(user.get("extra_secret_paths"))
     proj_extra, proj_extra_warnings = _valid_extra_with_warnings(
         project.get("extra_secret_paths"), existing_count=len(user_extra)
     )
+    user_commands, user_command_warnings = _risk.parse_command_rules(
+        user.get("command_rules"), f"{USER_CONFIG_DIR}/{USER_CONFIG_FILE}")
+    proj_commands, proj_command_warnings = _risk.parse_command_rules(
+        project.get("command_rules"), POLICY_FILE)
+    user_tools = _risk.parse_tool_rules(user.get("tool_rules"))
+    proj_tools = _risk.parse_tool_rules(project.get("tool_rules"))
     return {
         "assess": {
             "ignore": _valid_ignore(user.get("ignore")),
             "severity_overrides": _valid_overrides(user.get("severity_overrides")),
             "extra_secret_paths": user_extra + proj_extra,
+            "mcp_verbs": _risk.merge_mcp_verbs(
+                _risk.parse_mcp_verbs(user.get("mcp_verbs")),
+                _risk.parse_mcp_verbs(project.get("mcp_verbs"), allow_read=False)),
+            "tool_rules": {"deny": user_tools["deny"] + proj_tools["deny"],
+                           "ask": user_tools["ask"] + proj_tools["ask"]},
+            "command_rules": {"deny": user_commands["deny"] + proj_commands["deny"],
+                              "ask": user_commands["ask"] + proj_commands["ask"]},
         },
         "project_ignore": _valid_ignore(project.get("ignore")),
         "project_severity": _valid_overrides(project.get("severity_overrides")),
-        "extra_warnings": user_extra_warnings + proj_extra_warnings,
+        "extra_warnings": (user_extra_warnings + proj_extra_warnings
+                           + user_command_warnings + proj_command_warnings),
     }
 
 
@@ -555,6 +637,104 @@ def _exclusion_warnings(user_rules: List[Dict[str, Any]], project_rules: List[Di
     return warnings
 
 
+# ---------------------------------------------------------------- agents
+
+def normalize_agent(value: Any) -> Optional[str]:
+    """The canonical name of the agent a `--agent` value names, or None for anything else."""
+    if not isinstance(value, str):
+        return None
+    name = value.strip().lower()
+    return name if name in AGENTS else None
+
+
+def infer_agent(event: Any) -> str:
+    """The agent a payload came from, read from the payload's own shape. Used only when the
+    hook command has no (or an unknown) `--agent`: Codex sends `turn_id`, Droid a
+    `permission_mode` of off/spec/auto-*, and everything else is Claude Code."""
+    if not isinstance(event, dict):
+        return AGENT_CLAUDE
+    if "turn_id" in event:
+        return AGENT_CODEX
+    mode = event.get("permission_mode")
+    if isinstance(mode, str) and (mode in ("off", "spec") or mode.startswith("auto-")):
+        return AGENT_DROID
+    return AGENT_CLAUDE
+
+
+def canonical_tool(agent: str, tool: str) -> Optional[str]:
+    """The canonical name a tool is assessed and logged under, or None for a name this
+    agent's vocabulary does not know. Claude Code names are canonical already; a Droid
+    connector name gets the `mcp__` prefix the receipts use (the classifier reads both)."""
+    if agent == AGENT_CLAUDE:
+        return tool
+    mapped = (_DROID_TOOLS if agent == AGENT_DROID else _CODEX_TOOLS).get(tool)
+    if mapped is not None:
+        return mapped
+    if mcp_parts(tool) is not None:
+        return tool if tool.startswith("mcp__") else "mcp__" + tool
+    return None
+
+
+def _patch_text(tool_input: Any) -> str:
+    """The body of an ApplyPatch/apply_patch call. Codex sends it as `command`, Droid as
+    `input` or `patch`; a client that sends the text itself is accepted too."""
+    if isinstance(tool_input, str):
+        return tool_input
+    if isinstance(tool_input, dict):
+        for key in ("command", "input", "patch"):
+            value = tool_input.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+    return ""
+
+
+def _patch_steps(text: str) -> List[Tuple[str, Dict[str, Any]]]:
+    """One canonical step per file the patch touches (the same parser the Codex and Droid
+    adapters use). A body that cannot be parsed becomes one Edit with no path, so its text
+    is still scanned for secret content."""
+    from .adapters.codex import patch_to_steps
+    try:
+        steps = patch_to_steps(text)
+    except Exception:
+        steps = []
+    return steps or [("Edit", {"old_string": "", "new_string": text})]
+
+
+def _droid_steps(tool: str, raw_input: Any) -> List[Tuple[str, Dict[str, Any]]]:
+    if tool in _PATCH_TOOLS:
+        return _patch_steps(_patch_text(raw_input))
+    tool_input = raw_input if isinstance(raw_input, dict) else {}
+    if tool == "Edit":
+        # Droid names the Edit fields old_str/new_str; the rules read old_string/new_string.
+        mapped = dict(tool_input)
+        if "old_string" not in mapped and isinstance(mapped.get("old_str"), str):
+            mapped["old_string"] = mapped["old_str"]
+        if "new_string" not in mapped and isinstance(mapped.get("new_str"), str):
+            mapped["new_string"] = mapped["new_str"]
+        return [("Edit", mapped)]
+    return [(_DROID_TOOLS.get(tool, tool), tool_input)]
+
+
+def normalize_event(event: dict, agent: str) -> Tuple[str, Dict[str, Any], List[Tuple[str, Dict[str, Any]]]]:
+    """(the agent's own tool name, its tool_input, the canonical steps to assess).
+
+    Claude Code names are canonical, so its event is one step unchanged. Droid's `Execute`
+    becomes a `Bash`, `Create` a `Write`, `Edit` an `Edit` with `old_string`/`new_string`,
+    its searches a `Search`, `FetchUrl` a `WebFetch`, and `ApplyPatch` one step per file.
+    Codex's `apply_patch` likewise becomes one step per file. MCP tool names are passed
+    through unchanged: the classifier understands `mcp__server__tool` and Droid's bare
+    `server__tool` alike. Any other name keeps its own, so the guard never decides on a
+    tool it does not understand."""
+    tool = str(event.get("tool_name") or "?")
+    raw_input = event.get("tool_input")
+    tool_input = raw_input if isinstance(raw_input, dict) else {}
+    if agent == AGENT_DROID:
+        return tool, tool_input, _droid_steps(tool, raw_input)
+    if agent == AGENT_CODEX and tool == "apply_patch":
+        return tool, tool_input, _patch_steps(_patch_text(raw_input))
+    return tool, tool_input, [(tool, tool_input)]
+
+
 # ---------------------------------------------------------------- decision
 
 def _event_cwd(event: Any) -> str:
@@ -567,11 +747,19 @@ def _summary(tool: str, tool_input: Dict[str, Any]) -> str:
     file tools. Write/Edit bodies and MCP arguments are never included."""
     if tool in ("Bash", "PowerShell"):
         text = tool_input.get("command")
-    elif tool in ("Write", "Edit", "MultiEdit", "Read", "NotebookEdit"):
+    elif tool in ("Write", "Edit", "MultiEdit", "Read", "Delete", "NotebookEdit"):
         text = tool_input.get("file_path") or tool_input.get("path") or tool_input.get("notebook_path")
     else:
         text = None
     return clean(text, 200) if isinstance(text, str) else ""
+
+
+def _steps_summary(steps: List[Tuple[str, Dict[str, Any]]]) -> str:
+    """The summary of a call: the single step's own summary, or the comma list of the paths
+    a patch touches. File bodies never appear."""
+    if len(steps) == 1:
+        return _summary(steps[0][0], steps[0][1])
+    return clean(", ".join(s for s in (_summary(t, i) for t, i in steps) if s), 200)
 
 
 def _reasons_text(risks: List[Risk], limit: int = 300) -> str:
@@ -632,8 +820,12 @@ class _DecisionDict(dict):
         return str(self.get("policy_decision") or self.get("decision") or "allow")
 
 
-def decide(event: dict, policy: Optional[dict] = None, approver: Optional[ApproverFn] = None) -> _DecisionDict:
+def decide(event: dict, policy: Optional[dict] = None, approver: Optional[ApproverFn] = None,
+           agent: Optional[str] = None) -> _DecisionDict:
     """Decide one PreToolUse event.
+
+    `agent` is the installed hook's agent (`claude-code`, `droid` or `codex`). Without it,
+    or with a name the guard does not know, the agent comes from the payload's own shape.
 
     `policy` is the project's .runledger.json dict. The user's ~/.runledger/config.json
     is loaded here. The effective settings are the user's, tightened by the project's
@@ -642,12 +834,13 @@ def decide(event: dict, policy: Optional[dict] = None, approver: Optional[Approv
     (`http_approver`). It is used only when the decision is "ask" and an approval server
     is configured, or when an approver is passed in.
 
-    Returns a dict with: decision (allow|deny|ask, after monitor mode and approval),
-    policy_decision (before them), mode, tool, tool_use_id, session_id, cwd, reason, codes,
-    risks [{severity, code, reason}], approval (None or the server status), summary,
-    and warnings (project settings that were ignored). Nothing here touches the log
-    or stdout."""
+    Returns a dict with: decision (allow|deny|ask, after monitor mode, the approval and the
+    agent's own rules), policy_decision (before them), mode, agent, tool, canonical_tool,
+    tool_use_id, session_id, cwd, reason, codes, risks [{severity, code, reason}], approval
+    (None or the server status), summary, and warnings (project settings that were ignored).
+    Nothing here touches the log or stdout."""
     event = event if isinstance(event, dict) else {}
+    agent = normalize_agent(agent) or infer_agent(event)
     event_cwd = _event_cwd(event)
     cwd = project_root(event)
     project = policy if isinstance(policy, dict) else read_policy(cwd, _resolved=True)
@@ -655,23 +848,24 @@ def decide(event: dict, policy: Optional[dict] = None, approver: Optional[Approv
     cfg, warnings = _effective_guard(project, user, trusted_approval_settings(user))
     warnings = _project_key_warnings(project) + warnings
 
-    tool = str(event.get("tool_name") or "?")
-    raw_input = event.get("tool_input")
-    tool_input = raw_input if isinstance(raw_input, dict) else {}
+    tool, tool_input, steps = normalize_event(event, agent)
     session_id = str(event.get("session_id") or "")
+    tool_use_id = str(event.get("tool_use_id") or "")
 
     rs = _risk_settings(project, user)
     warnings += rs.get("extra_warnings", [])
-    step = Step(index=1, tool=tool, input=tool_input,
-                tool_use_id=str(event.get("tool_use_id") or ""), model=None, timestamp=None)
-    risks = assess_step(step, cwd, rs["assess"], workdir=event_cwd)
+    risks: List[Risk] = []
+    for index, (step_tool, step_input) in enumerate(steps, start=1):
+        step = Step(index=index, tool=step_tool, input=step_input,
+                    tool_use_id=tool_use_id, model=None, timestamp=None)
+        risks.extend(assess_step(step, cwd, rs["assess"], workdir=event_cwd))
     warnings += _apply_project_severity(risks, rs["project_severity"])
     warnings += _ignore_warnings(risks, rs["project_ignore"])
     warnings += _exclusion_warnings(cfg["user_deny"], cfg["project_deny"], risks, "deny")
     warnings += _exclusion_warnings(cfg["user_ask"], cfg["project_ask"], risks, "ask")
 
     policy_decision, drivers = _evaluate(risks, cfg)
-    summary = _summary(tool, tool_input)
+    summary = _steps_summary(steps)
     # Everything decided above used the shell's own words; the label is the whole spaced drive
     # path in the reason text this decision shows. The label names what the command said, so it
     # goes on before the redaction and the truncation of that output copy, never after them: a
@@ -697,13 +891,17 @@ def decide(event: dict, policy: Optional[dict] = None, approver: Optional[Approv
         request = {"session_id": session_id, "tool": tool, "summary": summary,
                    "risks": risks_out, "cwd": cwd}
         final, approval, reason = _ask_approver(request, cfg, approver, drivers, reason)
+    if agent == AGENT_CODEX and policy_decision == "ask" and final != "allow":
+        final, reason = _codex_ask_outcome(cfg, drivers, approval, reason)
 
     return _DecisionDict({
         "decision": final,
         "policy_decision": policy_decision,
         "mode": cfg["mode"],
+        "agent": agent,
         "tool": tool,
-        "tool_use_id": step.tool_use_id,
+        "canonical_tool": canonical_tool(agent, tool),
+        "tool_use_id": tool_use_id,
         "session_id": session_id,
         "cwd": cwd,
         "reason": clean(labels.show_reason(reason, shown), 500),
@@ -715,18 +913,49 @@ def decide(event: dict, policy: Optional[dict] = None, approver: Optional[Approv
     })
 
 
-def evaluate(event: dict, policy: Optional[dict] = None, approver: Optional[ApproverFn] = None) -> _DecisionDict:
+def _codex_ask_outcome(cfg: Dict[str, Any], drivers: List[Risk], approval: Optional[str],
+                       reason: str) -> Tuple[str, str]:
+    """Codex cannot prompt from a hook and would silently continue on an ask, so an ask
+    becomes a deny there that names the rule and the way forward. The user's own file can
+    choose to allow it instead (`"codex_ask": "allow"`); an approval answer from the server
+    always wins over that, and its own wording is kept in the reason."""
+    text = _reasons_text(drivers)
+    if cfg.get("codex_ask") == "allow" and approval is None:
+        return "allow", (f"RunLedger guard needs confirmation ({text}) but Codex cannot prompt from a hook; "
+                         f"allowed because guard.codex_ask is allow in {USER_CONFIG_DIR}/{USER_CONFIG_FILE}.")
+    if approval is not None:
+        # The approval server's own answer is the story; add what Codex can and cannot do about it.
+        return "deny", (f"{reason} Codex cannot prompt from a hook, so the call is denied: approve it in the "
+                        f"RunLedger approval server or adjust the rules, then re-run.")
+    return "deny", (f"RunLedger guard needs confirmation but Codex cannot prompt from a hook, so this call is "
+                    f"denied: {text}. Approve it in the RunLedger approval server or adjust the rules, "
+                    f"then re-run.")
+
+
+def evaluate(event: dict, policy: Optional[dict] = None, approver: Optional[ApproverFn] = None,
+             agent: Optional[str] = None) -> _DecisionDict:
     """Evaluate a PreToolUse event and write warnings + the decision record to `.runledger/guard.log`."""
-    decision = decide(event, policy=policy, approver=approver)
+    decision = decide(event, policy=policy, approver=approver, agent=agent)
     _log_quietly(lambda: _log_warnings_and_decision(decision))
     return decision
 
 
-def hook_output(decision: dict) -> Optional[dict]:
-    """The JSON Claude Code expects on stdout, or None for "print nothing"."""
+def hook_output(decision: dict, agent: Optional[str] = None) -> Optional[dict]:
+    """The JSON the agent expects on stdout, or None for "print nothing".
+
+    Claude Code and Droid read the same `hookSpecificOutput.permissionDecision` object and
+    both support "ask". Codex only blocks on "deny" (an ask would let the call run), so it
+    never gets an ask here: a deny prints the same JSON object. A plain allow prints
+    nothing for every agent, so the agent's own permission rules still apply: the guard is
+    meant to restrict, not to grant."""
+    if agent is None:
+        agent = decision.get("agent")
+    agent = normalize_agent(agent) or AGENT_CLAUDE
     final = decision.get("decision")
+    if agent == AGENT_CODEX:
+        return _deny_output(str(decision.get("reason") or "")) if final == "deny" else None
     if final == "allow" and decision.get("approval") != "approved":
-        return None  # no opinion: Claude Code's own permission rules decide
+        return None  # no opinion: the agent's own permission rules decide
     if final not in ("allow", "deny", "ask"):
         return None
     return {"hookSpecificOutput": {
@@ -815,8 +1044,12 @@ def http_approver(request: Dict[str, Any], approval: Dict[str, Any]) -> str:
 def _append_logs(cwd: str, records: List[Dict[str, Any]]) -> None:
     if not cwd or not records or _paths.is_unc(cwd):
         return
-    path = Path(cwd) / LOG_DIR / LOG_FILE
-    path.parent.mkdir(parents=True, exist_ok=True)
+    folder = Path(cwd) / LOG_DIR
+    path = folder / LOG_FILE
+    if _redirects.is_redirect(folder) or _redirects.is_redirect(path):
+        _warn(f"{LOG_DIR}/{LOG_FILE} is a link or another reparse point: "
+              "the decision was not logged.")
+        return
     ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
     lines: List[str] = []
     for fields in records:
@@ -824,8 +1057,23 @@ def _append_logs(cwd: str, records: List[Dict[str, Any]]) -> None:
         for k, v in fields.items():
             rec[k] = clean(v, 200) if isinstance(v, str) else v
         lines.append(json.dumps(rec, ensure_ascii=False) + "\n")
-    with path.open("a", encoding="utf-8") as fh:
-        fh.writelines(lines)
+    if not folder.is_dir():
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return
+        if _redirects.is_redirect(folder):
+            return
+    fd = _redirects.open_without_following(
+        path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o666)
+    if fd is None:
+        return
+    try:
+        os.write(fd, "".join(lines).encode("utf-8"))
+    except (OSError, ValueError):
+        return
+    finally:
+        os.close(fd)
 
 
 def _append_log(cwd: str, fields: Dict[str, Any]) -> None:
@@ -834,7 +1082,9 @@ def _append_log(cwd: str, fields: Dict[str, Any]) -> None:
 
 def _decision_record(decision: dict) -> Dict[str, Any]:
     return {
-        "session_id": decision["session_id"], "tool": decision["tool"], "mode": decision["mode"],
+        "session_id": decision["session_id"], "tool": decision["tool"],
+        "agent": decision.get("agent"), "canonical_tool": decision.get("canonical_tool"),
+        "mode": decision["mode"],
         "tool_use_id": decision.get("tool_use_id", ""),
         "decision": decision["decision"], "policy_decision": decision["policy_decision"],
         "codes": decision["codes"], "approval": decision["approval"],
@@ -870,26 +1120,31 @@ def _log_quietly(fn: Callable[[], None]) -> None:
 
 # ---------------------------------------------------------------- hook entry point
 
-def handle(raw: str) -> Optional[dict]:
+def handle(raw: str, agent: Optional[str] = None) -> Optional[dict]:
     """Hook input (JSON text) to hook output dict, or None to print nothing.
-    Never raises."""
+    Never raises. `agent` is the installed hook's `--agent` value; without it, or with a
+    value the guard does not know, the agent comes from the payload's own shape."""
     event: Any = None
     policy: Dict[str, Any] = {}
+    resolved = normalize_agent(agent)
     try:
         event = json.loads(raw)
         if not isinstance(event, dict):
             raise ValueError("hook input is not a JSON object")
         if not event:
             return None
+        if resolved is None:
+            resolved = infer_agent(event)
         policy = read_policy(project_root(event), _resolved=True)
-        decision = decide(event, policy)
+        decision = decide(event, policy, agent=resolved)
     except Exception as exc:
-        return _on_error(event, policy, exc)
+        return _on_error(event, policy, exc, agent=resolved)
     _log_quietly(lambda: _log_warnings_and_decision(decision))
-    return hook_output(decision)
+    return hook_output(decision, resolved)
 
 
-def _on_error(event: Any, policy: Dict[str, Any], exc: BaseException) -> Optional[dict]:
+def _on_error(event: Any, policy: Dict[str, Any], exc: BaseException,
+              agent: Optional[str] = None) -> Optional[dict]:
     try:
         cwd = project_root(event)
         if not policy:
@@ -902,9 +1157,10 @@ def _on_error(event: Any, policy: Dict[str, Any], exc: BaseException) -> Optiona
     if isinstance(event, dict):
         tool = str(event.get("tool_name") or "?")
         session = str(event.get("session_id") or "")
+        resolved = agent or normalize_agent(infer_agent(event))
         _log_quietly(lambda: _append_log(cwd, {
-            "session_id": session, "tool": tool, "mode": cfg["mode"], "decision": "error",
-            "tool_use_id": str(event.get("tool_use_id") or ""),
+            "session_id": session, "tool": tool, "agent": resolved, "mode": cfg["mode"],
+            "decision": "error", "tool_use_id": str(event.get("tool_use_id") or ""),
             "codes": [], "reason": msg}))
     if cfg["mode"] == "monitor":
         return None
@@ -913,9 +1169,11 @@ def _on_error(event: Any, policy: Dict[str, Any], exc: BaseException) -> Optiona
     return None
 
 
-def main() -> int:
+def main(agent: Optional[str] = None) -> int:
     """Entry point for `runledger guard` as a hook: stdin JSON in, stdout JSON out.
-    When stdin is an interactive terminal (TTY), print the guard help and exit 2."""
+    `agent` is the installed hook's `--agent` value; an unknown one is reported on stderr
+    and never blocks, because a blocking argument error would stop every tool call. When
+    stdin is an interactive terminal (TTY), print the guard help and exit 2."""
     try:
         if sys.stdin is not None and sys.stdin.isatty():
             from .cli import print_guard_help
@@ -923,12 +1181,16 @@ def main() -> int:
             return 2
     except Exception:
         pass
+    resolved = normalize_agent(agent)
+    if agent and resolved is None:
+        _warn(f"unknown --agent {agent!r}: reading the agent from the payload instead. "
+              f"Known agents: {', '.join(AGENTS)}.")
     try:
         raw = sys.stdin.buffer.read().decode("utf-8", errors="replace")
     except Exception:
         raw = ""
     try:
-        out = handle(raw)
+        out = handle(raw, resolved)
     except Exception:
         out = None
     if out is not None:
@@ -940,10 +1202,20 @@ def main() -> int:
     return 0
 
 
+def _warn(message: str) -> None:
+    """A note for the human reading the hook's stderr. Never raises."""
+    try:
+        sys.stderr.write(f"runledger guard: {message}\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------- CLI helpers
 
-def cmd_test(event_json: str) -> int:
-    """`runledger guard test '<json event>'`: print the decision. Writes no log."""
+def cmd_test(event_json: str, agent: Optional[str] = None) -> int:
+    """`runledger guard test '<json event>' [--agent X]`: print the decision and the hook
+    output for that agent. Writes no log."""
     try:
         event = json.loads(event_json)
     except ValueError as exc:
@@ -952,12 +1224,13 @@ def cmd_test(event_json: str) -> int:
     if not isinstance(event, dict):
         print("error: event must be a JSON object", file=sys.stderr)
         return 1
+    resolved = normalize_agent(agent)
     try:
-        decision = decide(event, read_policy(project_root(event)))
+        decision = decide(event, read_policy(project_root(event)), agent=resolved)
     except Exception as exc:
         print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
-    print(json.dumps({"decision": decision, "hook_output": hook_output(decision)}, indent=2))
+    print(json.dumps({"decision": decision, "hook_output": hook_output(decision, resolved)}, indent=2))
     return 0
 
 
@@ -965,9 +1238,10 @@ def settings_path(project: Optional[str] = None, global_scope: bool = False,
                   home: Optional[Path] = None) -> Path:
     """The Claude Code settings file this install writes: `~/.claude/settings.json` for a
     global install, else `<project>/.claude/settings.json`. Without `--project` the folder
-    is the project root (nearest ancestor with `.runledger.json` or `.git`), not the cwd."""
+    is the project root (nearest ancestor with `.runledger.json` or `.git`), not the cwd.
+    `CLAUDE_CONFIG_DIR` moves the global file, as it does for Claude Code itself."""
     if global_scope:
-        return (Path(home) if home is not None else Path.home()) / ".claude" / "settings.json"
+        return hook_targets.claude_dir(home) / "settings.json"
     base = Path(project) if project else Path(project_root())
     return base / ".claude" / "settings.json"
 
@@ -980,10 +1254,52 @@ def hook_timeout_for(approval_timeout_s: Optional[float] = None) -> int:
     return int(math.ceil(base)) + HOOK_MARGIN_S
 
 
-def guard_hook_command(portable: bool = False) -> str:
-    """The hook command written to settings.json: `"<sys.executable>" -m runledger guard`
-    by default, or bare `runledger guard` when `portable=True`."""
-    return HOOK_COMMAND if portable else f'"{sys.executable}" -m runledger guard'
+def guard_hook_command(portable: bool = False, agent: Optional[str] = None) -> str:
+    """The hook command the installer writes: `"<sys.executable>" -m runledger guard` by
+    default, or bare `runledger guard` when `portable=True`. Droid and Codex append the
+    explicit `--agent`, so the hook never has to guess the payload shape; Claude Code keeps
+    the command it has always had."""
+    base = HOOK_COMMAND if portable else f'"{sys.executable}" -m runledger guard'
+    if agent in (AGENT_DROID, AGENT_CODEX):
+        return f"{base} --agent {agent}"
+    return base
+
+
+def windows_hook_command(command: str) -> str:
+    """The `cmd /c` copy of a hook command, for Codex on Windows.
+
+    Codex starts hook commands itself instead of handing the string to a shell, and on Windows
+    the quoted interpreter path of `"C:\\...\\python.exe" -m runledger guard` comes out as a
+    program name with the quotes in it, so the hook never starts (measured with codex 0.163.0:
+    the same path unquoted, or wrapped in `cmd /c`, fires). Codex reads this field on Windows
+    only, so storing it never affects the other platforms."""
+    return f'cmd /c "{command}"'
+
+
+def command_handler(command: str, timeout: int, agent: Optional[str] = None) -> Dict[str, Any]:
+    """One stored hook handler: the command, its timeout, and the Windows copy Codex runs."""
+    handler: Dict[str, Any] = {"type": "command", "command": command, "timeout": timeout}
+    if agent == AGENT_CODEX:
+        handler["commandWindows"] = windows_hook_command(command)
+    return handler
+
+
+def _sync_handler(handler: Dict[str, Any], command: str, timeout: int,
+                  agent: Optional[str]) -> bool:
+    """Bring one stored handler in line with the command and timeout we write. True if it changed."""
+    changed = False
+    if handler.get("command") != command:
+        handler["command"] = command
+        changed = True
+    if agent == AGENT_CODEX:
+        windows = windows_hook_command(command)
+        if handler.get("commandWindows") != windows:
+            handler["commandWindows"] = windows
+            changed = True
+    if handler.get("timeout") != timeout:
+        handler["timeout"] = timeout
+        changed = True
+    return changed
 
 
 def checkpoint_hook_command(portable: bool = False) -> str:
@@ -993,20 +1309,29 @@ def checkpoint_hook_command(portable: bool = False) -> str:
     return checkpoint_command if portable else f'"{sys.executable}" -m runledger checkpoint --hook'
 
 
-def hook_entry(hook_seconds: int, portable: bool = False) -> Dict[str, Any]:
-    return {"matcher": "*", "hooks": [{"type": "command", "command": guard_hook_command(portable=portable), "timeout": hook_seconds}]}
+def hook_entry(hook_seconds: int, portable: bool = False, agent: Optional[str] = None,
+               matcher: str = "*") -> Dict[str, Any]:
+    return {"matcher": matcher,
+            "hooks": [command_handler(guard_hook_command(portable=portable, agent=agent),
+                                      hook_seconds, agent=agent)]}
 
 
 def _owned_command_parts(command: Any) -> Optional[List[str]]:
     """The words of a complete RunLedger guard hook command, else None.
 
-    Only the two forms the installer writes count: bare `runledger guard` (optionally with a
+    Only the forms the installer writes count: bare `runledger guard` (optionally with a
     path or `.exe`) and `"<interpreter>" -m runledger guard`, for every interpreter it can write
     (`sys.executable` itself, whatever the file is called, plus `python3.13t.exe` and the other
-    interpreter names). A foreign hook that merely mentions the words (`echo runledger guard`,
-    `other.sh && runledger guard`, a pipeline, a redirection, a command with an attached shell
-    operator) is not ours and must never be replaced or removed."""
-    return _paths.owned_hook_command(command, ("guard",))
+    interpreter names), each optionally followed by `--agent <agent>`. A foreign hook that
+    merely mentions the words (`echo runledger guard`, `other.sh && runledger guard`, a
+    pipeline, a redirection, a command with an attached shell operator) is not ours and must
+    never be replaced or removed."""
+    tails = [("guard",)] + [("guard", "--agent", agent) for agent in AGENTS]
+    for tail in tails:
+        parts = _paths.owned_hook_command(command, tail)
+        if parts is not None:
+            return parts
+    return None
 
 
 def _is_guard_hook(h: Any) -> bool:
@@ -1020,30 +1345,30 @@ def _group_has_guard(group: Any) -> bool:
     return any(_is_guard_hook(h) for h in (hooks if isinstance(hooks, list) else []))
 
 
-def install_hook(path: Path, approval_timeout_s: Optional[float] = None,
+def install_into(target: HookTarget, approval_timeout_s: Optional[float] = None,
                  portable: bool = False) -> Tuple[bool, Optional[Path]]:
-    """Add the guard and lifecycle checkpoint entries, keeping everything else.
+    """Add the guard and lifecycle checkpoint entries to one agent's hook file, keeping
+    everything else.
 
-    The entry's "timeout" is hook_timeout_for(approval_timeout_s). An existing guard
-    hook (any matcher) gets its command and timeout updated in place; a second entry is
-    never added.
+    The guard entry's "timeout" is hook_timeout_for(approval_timeout_s) and its command
+    carries the agent. An existing guard hook (any matcher) gets its command and timeout
+    updated in place; a second entry is never added. A wrapped file keeps its events under
+    `hooks`; Droid's file keeps them at the top level.
 
-    Returns (changed, backup). The original is copied to `settings.json.bak` before
-    any change; a file that is already up to date is not written. Raises InstallError
-    (and writes nothing) if the file is not a JSON object."""
-    path = Path(path)
+    Returns (changed, backup). The original is copied to `<file>.bak` before any change;
+    a file that is already up to date is not written. Raises InstallError (and writes
+    nothing) if the file is not a JSON object or an event it must touch is not a list."""
+    path = Path(target.path)
     want = hook_timeout_for(approval_timeout_s)
-    want_cmd = guard_hook_command(portable=portable)
+    want_cmd = guard_hook_command(portable=portable, agent=target.agent)
     want_cp_cmd = checkpoint_hook_command(portable=portable)
+    prefix = f"{target.wrap_key}." if target.wrap_key else ""
     existed, settings = _read_settings(path)
-    hooks = settings.get("hooks")
-    hooks = {} if hooks is None else hooks
-    if not isinstance(hooks, dict):
-        raise InstallError(f"'hooks' in {path} must be an object. Nothing was changed.")
+    hooks = _events_of(settings, target, path)
     pre = hooks.get("PreToolUse")
     pre = [] if pre is None else pre
     if not isinstance(pre, list):
-        raise InstallError(f"'hooks.PreToolUse' in {path} must be a list. Nothing was changed.")
+        raise InstallError(f"'{prefix}PreToolUse' in {path} must be a list. Nothing was changed.")
 
     changed = False
     found = False
@@ -1053,21 +1378,16 @@ def install_hook(path: Path, approval_timeout_s: Optional[float] = None,
         found = True
         for h in group["hooks"]:
             if _is_guard_hook(h):
-                if h.get("command") != want_cmd:
-                    h["command"] = want_cmd
-                    changed = True
-                if h.get("timeout") != want:
-                    h["timeout"] = want
-                    changed = True
+                changed = _sync_handler(h, want_cmd, want, target.agent) or changed
     if not found:
-        pre.append(hook_entry(want, portable=portable))
+        pre.append(hook_entry(want, portable=portable, agent=target.agent, matcher=target.matcher))
         changed = True
     from .rollback import HOOK_EVENTS, is_checkpoint_hook
     for event in HOOK_EVENTS:
         groups = hooks.get(event)
         groups = [] if groups is None else groups
         if not isinstance(groups, list):
-            raise InstallError(f"'hooks.{event}' in {path} must be a list. Nothing was changed.")
+            raise InstallError(f"'{prefix}{event}' in {path} must be a list. Nothing was changed.")
         found_checkpoint = False
         for group in groups:
             entries = group.get("hooks") if isinstance(group, dict) else None
@@ -1075,39 +1395,46 @@ def install_hook(path: Path, approval_timeout_s: Optional[float] = None,
                 if is_checkpoint_hook(h):
                     if group.get("matcher") in (None, "", "*"):
                         found_checkpoint = True
-                        if h.get("command") != want_cp_cmd:
-                            h["command"] = want_cp_cmd
-                            changed = True
+                        changed = _sync_handler(h, want_cp_cmd, 120, target.agent) or changed
                     if h.get("timeout") != 120:
                         h["timeout"] = 120
                         changed = True
         if not found_checkpoint:
-            groups.append({"hooks": [{"type": "command", "command": want_cp_cmd, "timeout": 120}]})
+            groups.append({"hooks": [command_handler(want_cp_cmd, 120, agent=target.agent)]})
             changed = True
         hooks[event] = groups
     if not changed:
         return False, None
 
     hooks["PreToolUse"] = pre
-    settings["hooks"] = hooks
+    if target.wrap_key:
+        settings[target.wrap_key] = hooks
     return True, _write_settings(path, settings, existed)
 
 
-def uninstall_hook(path: Path) -> Tuple[bool, Optional[Path]]:
-    """Remove guard and checkpoint hooks from settings.json, keeping everything else.
+def uninstall_into(target: HookTarget) -> Tuple[bool, Optional[Path]]:
+    """Remove the RunLedger guard and checkpoint hooks from one agent's hook file, keeping
+    everything else.
 
     Other hooks in the same PreToolUse group stay. A group left with no hooks is removed,
-    then an empty PreToolUse list and an empty hooks object. Returns (changed, backup);
-    the original is copied to `settings.json.bak` first, and a file without the hook is
-    not written. Raises InstallError (and writes nothing) if the file is not a JSON object."""
-    path = Path(path)
+    then an empty PreToolUse list, an empty event and an empty `hooks` object. Returns
+    (changed, backup); the original is copied to `<file>.bak` first, and a file without
+    our hooks is not written. Raises InstallError (and writes nothing) if the file is not a
+    JSON object or an event it must touch is not a list."""
+    path = Path(target.path)
+    prefix = f"{target.wrap_key}." if target.wrap_key else ""
     existed, settings = _read_settings(path)
-    hooks = settings.get("hooks")
-    if not isinstance(hooks, dict):
+    if target.wrap_key is not None and target.wrap_key not in settings:
         return False, None
+    hooks = _events_of(settings, target, path)
     from .rollback import HOOK_EVENTS, is_checkpoint_hook
+    events = ("PreToolUse", *HOOK_EVENTS)
+    for event in events:
+        groups = hooks.get(event)
+        if groups is not None and not isinstance(groups, list):
+            raise InstallError(f"'{prefix}{event}' in {path} must be a list. Nothing was changed.")
     removed = False
-    for event in ("PreToolUse", *HOOK_EVENTS):
+    for event in events:
         groups = hooks.get(event)
         if not isinstance(groups, list):
             continue
@@ -1131,39 +1458,48 @@ def uninstall_hook(path: Path) -> Tuple[bool, Optional[Path]]:
             del hooks[event]
     if not removed:
         return False, None
-    if not hooks:
-        del settings["hooks"]
+    if target.wrap_key and not hooks:
+        del settings[target.wrap_key]
     return True, _write_settings(path, settings, existed)
+
+
+def _events_of(settings: Dict[str, Any], target: HookTarget, path: Path) -> Dict[str, Any]:
+    """The mapping the events live in: the file itself for Droid, its `hooks` object for
+    Claude Code and Codex. A wrapper of the wrong type is refused, not overwritten."""
+    if target.wrap_key is None:
+        return settings
+    events = settings.get(target.wrap_key)
+    if events is None:
+        events = {}
+        settings[target.wrap_key] = events
+    if not isinstance(events, dict):
+        raise InstallError(f"'{target.wrap_key}' in {path} must be an object. Nothing was changed.")
+    return events
+
+
+def install_hook(path: Path, approval_timeout_s: Optional[float] = None,
+                 portable: bool = False) -> Tuple[bool, Optional[Path]]:
+    """The Claude Code path, kept for callers that know the settings file: add the guard and
+    lifecycle checkpoint entries to it, keeping everything else."""
+    return install_into(hook_targets.target_at(AGENT_CLAUDE, path), approval_timeout_s,
+                        portable=portable)
+
+
+def uninstall_hook(path: Path) -> Tuple[bool, Optional[Path]]:
+    """The Claude Code path, kept for callers that know the settings file: remove the guard
+    and checkpoint hooks from it, keeping everything else."""
+    return uninstall_into(hook_targets.target_at(AGENT_CLAUDE, path))
 
 
 def _read_settings(path: Path) -> Tuple[bool, Dict[str, Any]]:
     """(existed, settings). A missing or empty file gives {}. Raises InstallError if the
     file is not a JSON object."""
-    if not path.exists():
-        return False, {}
-    text = path.read_text(encoding="utf-8-sig")
-    if not text.strip():
-        return True, {}
-    try:
-        settings = json.loads(text)
-    except ValueError as exc:
-        raise InstallError(f"{path} is not valid JSON ({exc}); fix or move it. Nothing was changed.") from None
-    if not isinstance(settings, dict):
-        raise InstallError(f"{path} must contain a JSON object. Nothing was changed.")
-    return True, settings
+    return hook_targets.read_settings(path)
 
 
 def _write_settings(path: Path, settings: Dict[str, Any], existed: bool) -> Optional[Path]:
-    """Write atomically, after copying an existing file to `settings.json.bak`. Returns the backup."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    backup = None
-    if existed:
-        backup = path.with_name(path.name + ".bak")
-        shutil.copy2(path, backup)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(settings, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
-    return backup
+    """Write atomically, after copying an existing file to `<name>.bak`. Returns the backup."""
+    return hook_targets.write_settings(path, settings, existed)
 
 
 def verify_hook_command(command: str, cwd: Optional[str] = None) -> Tuple[bool, str]:
@@ -1203,56 +1539,102 @@ def verify_hook_command(command: str, cwd: Optional[str] = None) -> Tuple[bool, 
     return True, f"Verified hook command: {command} (exit 0)"
 
 
+def _agent_value(agent: Optional[str]) -> str:
+    """The `--agent` value of `guard install|uninstall`: a known agent, `all`, or the default
+    (claude-code) when the flag is absent or names nothing the guard knows."""
+    if isinstance(agent, str) and agent.strip().lower() == AGENT_ALL:
+        return AGENT_ALL
+    return normalize_agent(agent) or AGENT_CLAUDE
+
+
 def cmd_install(project: Optional[str] = None, global_scope: bool = False,
-                home: Optional[Path] = None, portable: bool = False) -> int:
-    """Install or update the hook. The hook timeout follows the approval wait: the project's
-    timeout_s for a project install, the user's or the default for a global install. Without
-    `--project` the settings file is written at the project root, so installing from a
-    subfolder configures the whole project."""
+                home: Optional[Path] = None, portable: bool = False,
+                agent: Optional[str] = None) -> int:
+    """Install or update the hook for one agent, or for every agent that has one (`all`).
+
+    The hook timeout follows the approval wait: the project's timeout_s for a project
+    install, the user's or the default for a global install. Without `--project` the hook
+    file is written at the project root, so installing from a subfolder configures the whole
+    project. `all` never creates an agent's global config directory from nothing: an agent
+    whose directory is missing is reported and skipped. Exit 0 when every target was written
+    or already up to date, 1 on an error."""
+    value = _agent_value(agent)
     project_dir = None if global_scope else (Path(project) if project else Path(project_root()))
-    target = settings_path(project, global_scope, home)
+    targets, skipped = hook_targets.plan_targets(value, project_dir, global_scope, home)
     project_policy = {} if global_scope else read_policy(str(project_dir))
     timeout_s = approval_timeout(project_policy)
+    failed = False
+    for target in targets:
+        failed = _install_target(target, timeout_s, portable, project_dir, home, global_scope) or failed
+    for skipped_agent, reason in skipped:
+        print(f"Skipped {hook_targets.LABEL[skipped_agent]}: {reason}")
+    return 1 if failed else 0
+
+
+def _install_target(target: HookTarget, timeout_s: float, portable: bool, project_dir: Any,
+                    home: Optional[Path], global_scope: bool) -> bool:
+    """Write one agent's hook file, report it, and run the stored command once. True on error."""
+    path = Path(target.path)
     try:
-        changed, backup = install_hook(target, timeout_s, portable=portable)
+        changed, backup = install_into(target, timeout_s, portable=portable)
     except InstallError as exc:
         print(f"error: {exc}", file=sys.stderr)
-        return 1
+        return True
     except OSError as exc:
-        print(f"error: cannot update {target}: {exc}", file=sys.stderr)
-        return 1
+        print(f"error: cannot update {path}: {exc}", file=sys.stderr)
+        return True
     hook_s = hook_timeout_for(timeout_s)
-    cmd = guard_hook_command(portable=portable)
     if changed:
-        print(f"Installed or updated the RunLedger guard hook and checkpoint hooks in {target} (hook timeout {hook_s} s)")
+        print(f"Installed or updated the RunLedger guard hook and checkpoint hooks in {path} (hook timeout {hook_s} s)")
         if backup is not None:
             print(f"Backup of the previous file: {backup}")
     else:
-        print(f"The RunLedger guard hook and checkpoint hooks in {target} are already up to date (hook timeout {hook_s} s). Nothing changed.")
-    verify_cwd = str(Path(home) if home is not None else Path.home()) if global_scope else str(project_dir)
+        print(f"The RunLedger guard hook and checkpoint hooks in {path} are already up to date (hook timeout {hook_s} s). Nothing changed.")
+    if target.agent == AGENT_DROID:
+        print("Restart droid, or review the hooks in /hooks: Droid snapshots its hooks at startup.")
+    elif target.agent == AGENT_CODEX:
+        print("Codex runs only hooks you trust: open `codex`, run /hooks and trust the RunLedger entries.")
+        print("Note: Codex cannot prompt from a hook, so an action the guard would ask about becomes "
+              'a deny instead (set guard.codex_ask to "allow" in the user config to change that).')
+    verify_cwd = str(home if home is not None else Path.home()) if global_scope else str(project_dir)
+    cmd = guard_hook_command(portable=portable, agent=target.agent)
     ok, verify_msg = verify_hook_command(cmd, cwd=verify_cwd)
-    print(verify_msg)
-    return 0
+    if ok and target.agent != AGENT_CLAUDE:
+        print(f"Hook command self-test: {cmd} exited 0 (this shows the command runs; the agent "
+              "still has to load it).")
+    else:
+        print(verify_msg)
+    return False
 
 
 def cmd_uninstall(project: Optional[str] = None, global_scope: bool = False,
-                  home: Optional[Path] = None) -> int:
-    """Remove the hook from the project's or the user's Claude Code settings. Without
-    `--project` the settings file is the project root's, exactly as for `install`."""
-    target = settings_path(project, global_scope, home)
-    try:
-        changed, backup = uninstall_hook(target)
-    except InstallError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
-    except OSError as exc:
-        print(f"error: cannot update {target}: {exc}", file=sys.stderr)
-        return 1
-    if not changed:
-        print(f"No RunLedger guard or checkpoint hooks in {target}. Nothing changed.")
-        return 0
-    print(f"Removed the RunLedger guard hook and checkpoint hooks from {target}")
-    if backup is not None:
-        print(f"Backup of the previous file: {backup}")
-    print("Policy files (.runledger.json, ~/.runledger/config.json) and .runledger/guard.log were left as they are.")
-    return 0
+                  home: Optional[Path] = None, agent: Optional[str] = None) -> int:
+    """Remove the RunLedger hooks from one agent's file, or from every agent's (`all`).
+    Without `--project` the file is the project root's, exactly as for `install`. An agent
+    without a hook file is reported and skipped; nothing is created. Exit 0 when every file
+    is clean, 1 on an error."""
+    value = _agent_value(agent)
+    agents = AGENTS if value == AGENT_ALL else (value,)
+    project_dir = None if global_scope else (Path(project) if project else Path(project_root()))
+    failed = False
+    for name in agents:
+        target = hook_targets.target_for(name, project_dir, global_scope, home)
+        path = Path(target.path)
+        try:
+            changed, backup = uninstall_into(target)
+        except InstallError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            failed = True
+            continue
+        except OSError as exc:
+            print(f"error: cannot update {path}: {exc}", file=sys.stderr)
+            failed = True
+            continue
+        if not changed:
+            print(f"No RunLedger guard or checkpoint hooks in {path}. Nothing changed.")
+            continue
+        print(f"Removed the RunLedger guard hook and checkpoint hooks from {path}")
+        if backup is not None:
+            print(f"Backup of the previous file: {backup}")
+        print("Policy files (.runledger.json, ~/.runledger/config.json) and .runledger/guard.log were left as they are.")
+    return 1 if failed else 0

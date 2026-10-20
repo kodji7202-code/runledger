@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from runledger import adapters
+from runledger import adapters, hook_targets
 from runledger.adapters import droid
 from runledger.cli import main
 from runledger.client import build_payload
@@ -300,7 +300,9 @@ def test_unsafe_session_ids_are_never_used_to_search(tmp_path, monkeypatch, sid)
     path = tmp_path / "s.jsonl"
     path.write_text(json.dumps({"type": "session_start", "id": sid, "cwd": "/demo"}) + "\n",
                     encoding="utf-8")
-    assert droid._settings_path(path, droid._header(path)) is None
+    found, candidates, complete = droid._settings_lookup(path, droid._header(path))
+    assert found is None and complete
+    assert candidates == [path.with_suffix(".settings.json")]  # no glob was built from `sid`
 
 
 def test_missing_settings_show_na_and_a_note_and_no_cost(tmp_path, monkeypatch, capsys):
@@ -452,6 +454,54 @@ def test_factory_home_default_expansion_and_missing_root(tmp_path, monkeypatch):
     assert droid.find_sessions() == []
     monkeypatch.setenv("FACTORY_HOME", "~/example-factory")
     assert droid.factory_home() == Path.home() / "example-factory"
+
+
+def test_factory_home_override_is_a_home_and_discovers_its_sessions(tmp_path, monkeypatch):
+    """The real droid binary reads FACTORY_HOME_OVERRIDE as a HOME: its config dir is
+    `<override>/.factory`, which is where sessions and settings live (VAL-AGENT-028)."""
+    override = tmp_path / "override"
+    monkeypatch.setenv("FACTORY_HOME_OVERRIDE", str(override))
+    assert droid.factory_home() == override / ".factory"
+
+    session = _discovered(override / ".factory", "/demo/widget", "over.jsonl", 100)
+    session.with_suffix(".settings.json").write_text("{}", encoding="utf-8")
+    assert droid.find_sessions() == [session]
+    assert droid.find_sessions("/demo/widget") == [session]
+    assert adapters.find_sessions(agent="droid") == [session]
+
+
+def test_factory_home_wins_over_the_override(tmp_path, monkeypatch):
+    legacy = tmp_path / "legacy"
+    override = tmp_path / "override"
+    monkeypatch.setenv("FACTORY_HOME", str(legacy))
+    monkeypatch.setenv("FACTORY_HOME_OVERRIDE", str(override))
+    legacy_session = _discovered(legacy, "/demo/widget", "legacy.jsonl", 100)
+    _discovered(override / ".factory", "/demo/widget", "over.jsonl", 200)
+
+    assert droid.factory_home() == legacy
+    assert droid.find_sessions() == [legacy_session]
+
+
+def test_factory_home_override_expands_user_and_falls_back_to_the_home_directory(tmp_path, monkeypatch):
+    monkeypatch.setenv("FACTORY_HOME_OVERRIDE", "~/example-home")
+    assert droid.factory_home() == Path.home() / "example-home" / ".factory"
+    monkeypatch.setenv("FACTORY_HOME_OVERRIDE", "")
+    assert droid.factory_home() == Path.home() / ".factory"
+
+
+def test_factory_home_is_the_one_resolver_discovery_and_the_installer_share(tmp_path, monkeypatch):
+    """GE-001 / VAL-AGENT-028: with both Factory overrides unset and HOME != USERPROFILE,
+    discovery, `guard install --global` (hook_targets) and the doctor resolve one directory."""
+    env_home = tmp_path / "env-home"
+    env_profile = tmp_path / "env-profile"
+    monkeypatch.setenv("HOME", str(env_home))
+    monkeypatch.setenv("USERPROFILE", str(env_profile))
+    assert droid.factory_home() == hook_targets.factory_dir() == env_home / ".factory"
+
+    found = _discovered(env_home / ".factory", "/demo/widget", "env-home.jsonl", 100)
+    _discovered(env_profile / ".factory", "/demo/widget", "profile.jsonl", 200)
+    assert droid.find_sessions() == [found]
+    assert adapters.find_sessions(agent="droid") == [found]
 
 
 def test_relative_project_discovery(tmp_path, monkeypatch):

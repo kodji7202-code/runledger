@@ -8,13 +8,19 @@ way for every agent.
 | --- | --- | --- | --- |
 | Claude Code | `claude-code` | Stable | `~/.claude/projects/<encoded project folder>/<session>.jsonl` |
 | Codex CLI | `codex` | Beta | `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl` (default `~/.codex`) |
-| Factory Droid | `droid` | Beta | `$FACTORY_HOME/sessions/<encoded project folder>/<session>.jsonl` (default `~/.factory`) |
+| Factory Droid | `droid` | Beta | `$FACTORY_HOME/sessions/<encoded project folder>/<session>.jsonl` (default `~/.factory`; `FACTORY_HOME_OVERRIDE` names the home instead) |
 | Aider | `aider` | Beta | `.aider.chat.history.md` in the project folder |
 | Any other agent | `native` | Open format | `<project>/.runledger/runs/*.runledger.json` or `*.runledger.jsonl` |
 
 Any agent can write the RunLedger format, so an agent does not need an adapter to get receipts,
 risk scores and pushes. The format is specified in [format.md](format.md), with a Python and a
 Node example.
+
+**Home directories.** Every default that lives under a user home (`~/.claude`, `~/.factory`,
+`~/.codex`, `~/.runledger`) resolves that home the same way: `HOME`, else `USERPROFILE`, else the
+home Python itself reports. On Windows the two variables can name different folders (a shell can
+set `HOME`); RunLedger follows `HOME` in every consumer, so session discovery,
+`guard install --global` and `runledger doctor` always name the same folder.
 
 ## Choosing sessions
 
@@ -75,6 +81,20 @@ which has no envelope on each line.
 
 - **Matching.** A session belongs to a folder when the working directory recorded in the session
   equals that folder.
+- **Shell calls.** Recent Codex versions send shell calls through code mode: a `custom_tool_call`
+  named `exec` whose input is JavaScript around `tools.exec_command({cmd: ..., shell: ...})`.
+  RunLedger reads each of those calls as one `Bash` or `PowerShell` step carrying the `cmd` it
+  runs, so the command is scored and the guard's decision on it links to that step. When the script
+  carries no `/` other than the one that opens a comment, the reading is exact: the same text in a
+  comment, inside a string or inside a regular expression (`/.../`) is an example, not a step.
+  Any other `/` is a regular expression or a division, the one thing the reader does not try to
+  tell apart: such a script is searched as raw text instead, so a call that is there is reported
+  rather than hidden (a call written in a comment beside a division is reported too). `cmd`,
+  `command` and `shell`/`program` values may be double-quoted, single-quoted or a template literal
+  without interpolation; a value that interpolates a variable (`${...}`) cannot be read, and a
+  script with no readable call stays one step under its own name, with the result's text blocks
+  shown as their text. An unterminated string, template or comment is searched as raw text the same
+  way.
 - **Usage.** The run total is the last cumulative token count in the session. Each model call's
   usage is split evenly across the steps issued since the previous count.
 - **Cost.** Estimated from list prices. Codex does not report its own cost.
@@ -88,7 +108,13 @@ Droid writes a JSONL transcript and a sibling settings file:
 ~/.factory/sessions/<cwd-with-path-separators-replaced-by-dashes>/<session-id>.settings.json
 ```
 
-- **Config directory.** `FACTORY_HOME` overrides `~/.factory`.
+- **Config directory.** `FACTORY_HOME` names the Factory config directory, overriding the default
+  `~/.factory`. `FACTORY_HOME_OVERRIDE` names a *home* directory instead: the config directory
+  becomes `<FACTORY_HOME_OVERRIDE>/.factory`, which is how the droid binary itself reads it.
+  When both are set, `FACTORY_HOME` wins. Without either, the directory is the `.factory` folder of
+  the user home resolved as described above, and session discovery,
+  `guard install --global --agent droid` and the doctor's `sessions` check all resolve it through
+  the same helper, so they never name different folders.
 - **Relative `cwd`.** `droid exec --cwd .` records `cwd` as `.`. RunLedger recovers the real folder
   from, in order: the session's own `% pwd` context, a folder field in the settings file, the Git
   work tree that a majority of the absolute tool paths lie in, and the encoded session folder name.
@@ -120,7 +146,7 @@ Droid writes a JSONL transcript and a sibling settings file:
   than the session's own usage is ignored.
 - **Settings file lookup.** RunLedger reads the sibling `<name>.settings.json` first. If the
   transcript was copied or renamed without it, RunLedger looks for `<session-id>.settings.json`
-  under `$FACTORY_HOME/sessions/`, preferring the folder for the session's `cwd`.
+  under the config directory's `sessions/` folder, preferring the folder for the session's `cwd`.
 - **Where usage came from.** JSON receipts include `totals.usage_source`: `messages` (per-message
   usage), `settings` (the settings file's total) or `missing`, and `tokens_estimated` on each step
   that received an even split. Markdown and HTML receipts add a footer note for estimated
@@ -170,12 +196,30 @@ push without any code in RunLedger.
 
 The field-by-field specification is [format.md](format.md).
 
-## Checkpoints across agents
+## Guard and checkpoints across agents
 
-`checkpoint`, `checkpoints` and `rollback` work with every agent in a Git working tree.
-`guard install` adds automatic Claude Code session-start and pre-prompt checkpoints. Droid can
-use the same lifecycle command in `.factory/hooks.json`. Codex and other agents can use manual
-commands or their own wrappers. See [rollback.md](rollback.md) for examples and safety limits.
+`runledger guard install` writes each agent's own hook file, so the real-time guard and the
+automatic session-start and pre-prompt checkpoints work natively for Claude Code, Factory Droid and
+Codex CLI:
+
+```bash
+runledger guard install --agent claude-code     # <project>/.claude/settings.json (the default)
+runledger guard install --agent droid           # <project>/.factory/hooks.json
+runledger guard install --agent codex           # <project>/.codex/hooks.json
+runledger guard install --agent all             # every agent that can be installed
+```
+
+Add `--global` for the agent's own file, `--portable` for bare `runledger ...` commands, and
+`--project PATH` for another folder. Droid must be restarted (or the hooks reviewed in `/hooks`)
+before it loads them, and Codex runs only hooks you trust (`/hooks` in `codex`). The installer
+explains both. Every Codex entry also stores a `commandWindows` copy (`cmd /c "<command>"`),
+because Codex starts the stored command itself on Windows and does not accept a quoted interpreter
+path there; `install` writes and repairs both fields. `docs/guard.md` has the file locations, the
+commands and the per-agent behaviour.
+
+`checkpoint`, `checkpoints` and `rollback` work with every agent in a Git working tree; any other
+agent can use the manual commands or its own wrappers. See [rollback.md](rollback.md) for examples
+and safety limits.
 
 Associate a checkpoint with the transcript's session id using `checkpoint --run SESSION_ID`;
 the matching receipt then includes a local rollback command. Checkpoint contents are not uploaded.

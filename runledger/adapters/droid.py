@@ -1,8 +1,11 @@
 """Factory Droid JSONL sessions and their sibling .settings.json metadata.
 
-FACTORY_HOME defaults to ~/.factory. Project folders under sessions replace
-path separators with dashes. Messages carry modelId and tool_use/tool_result
-blocks; settings.tokenUsage holds cumulative counts, not per-call usage.
+FACTORY_HOME names the Factory config dir; FACTORY_HOME_OVERRIDE names a home whose config
+dir is `<override>/.factory`; the default is the user home's `.factory` (HOME, else
+USERPROFILE, else the home Python reports - the rule every other agent home follows too).
+Project folders under sessions replace path separators with dashes. Messages carry modelId
+and tool_use/tool_result blocks; settings.tokenUsage holds cumulative counts, not per-call
+usage.
 """
 from __future__ import annotations
 
@@ -15,7 +18,8 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
-from ..parser import Run, Step, Usage, _split_usage
+from ..parser import (SOURCE_MISSING, SOURCE_OK, SOURCE_REJECTED, Run, Step, Usage,
+                      _split_usage)
 from ..paths import _norm as _norm_style, join as _join
 from ..pricing import UNATTRIBUTED
 from .codex import patch_to_steps
@@ -37,8 +41,14 @@ _MAX_DECODE_PROBES = 2000
 
 
 def factory_home() -> Path:
-    base = os.environ.get("FACTORY_HOME")
-    return Path(base).expanduser() if base else Path.home() / ".factory"
+    """The Factory config directory: `FACTORY_HOME` names that directory directly (the
+    long-standing RunLedger meaning), `FACTORY_HOME_OVERRIDE` names a HOME whose config dir is
+    `<override>/.factory`, and without either one it is the user home's `.factory`.
+
+    Discovery, `guard install --global` and the doctor resolve it through the one resolver in
+    `hook_targets`, so a HOME that differs from USERPROFILE cannot split them (GE-001)."""
+    from ..hook_targets import factory_dir
+    return factory_dir()
 
 
 def _header(path: Path) -> Dict[str, Any]:
@@ -266,49 +276,71 @@ def _tools(name: str, inp: Dict[str, Any], depth: int = 0) -> List[Tuple[str, Di
     return [(name, inp)]
 
 
-def _settings_path(path: Path, header: Dict[str, Any]) -> Optional[Path]:
-    """The sibling settings file, or the one Droid keeps for this session id under FACTORY_HOME.
-    The fallback covers transcripts that were copied or renamed without their settings file."""
+def _settings_lookup(path: Path, header: Dict[str, Any]
+                     ) -> Tuple[Optional[Path], List[Path], bool]:
+    """`(settings file, every path the lookup considered, complete)`.
+
+    The candidates are what `stats` watches: a sidecar written later invalidates its record.
+    The sibling file is read first; the fallback covers transcripts that were copied or renamed
+    without it, and the folder that fallback scans is a candidate of its own.
+
+    `complete` is False when the folder that fallback scans could not be listed: the sidecar may
+    be there without the lookup seeing it, so a parse that is missing it must not be cached
+    (LOCAL-R3-STATS-01)."""
     sibling = path.with_suffix(".settings.json")
     if sibling.is_file():
-        return sibling
-    sid = header.get("id")
-    if not isinstance(sid, str) or not _SESSION_ID.fullmatch(sid):
-        return None
-    name = f"{sid}.settings.json"
+        return sibling, [sibling], True
+    candidates = [sibling]
+    session_id = header.get("id")
+    if not isinstance(session_id, str) or not _SESSION_ID.fullmatch(session_id):
+        return None, candidates, True
+    name = f"{session_id}.settings.json"
     root = factory_home() / "sessions"
     cwd = header.get("cwd")
     folder = _encode(cwd) if isinstance(cwd, str) else ""
     if folder not in ("", ".", ".."):
         preferred = root / folder / name
+        candidates.append(preferred)
         if preferred.is_file():
-            return preferred
+            return preferred, candidates, True
+    candidates.append(root)
     try:
         for candidate in sorted(root.glob(f"*/{name}")):
             if candidate.is_file():
-                return candidate
+                return candidate, candidates, True
     except OSError:
-        pass
-    return None
+        return None, candidates, False
+    return None, candidates, True
 
 
 def _minus(a: Usage, b: Usage) -> Usage:
     return Usage(*(max(0, getattr(a, f) - getattr(b, f)) for f in _USAGE_FIELDS))
 
 
-def _child_model(settings_path: Optional[Path], child_id: Any) -> Optional[str]:
+def _child_model(settings_path: Optional[Path], child_id: Any,
+                 sources: List[Tuple[str, str]]) -> Optional[str]:
+    """The model of one child session, from its own settings file. The path is recorded as a
+    source whether the file is missing, unreadable or usable, so a child settings file that is
+    created or repaired later drops the cache record instead of leaving its usage unattributed."""
     if settings_path is None or not isinstance(child_id, str) or not _SESSION_ID.fullmatch(child_id):
         return None
+    child = settings_path.parent / f"{child_id}.settings.json"
+    if not child.is_file():
+        sources.append((str(child), SOURCE_MISSING))
+        return None
     try:
-        child = json.loads((settings_path.parent / f"{child_id}.settings.json").read_text(encoding="utf-8-sig"))
+        data = json.loads(child.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError, RecursionError):
+        data = None
+    if not isinstance(data, dict):
+        sources.append((str(child), SOURCE_REJECTED))
         return None
-    if not isinstance(child, dict):
-        return None
-    return _text(child.get("model")) or None
+    sources.append((str(child), SOURCE_OK))
+    return _text(data.get("model")) or None
 
 
-def _child_usage(settings: Dict[str, Any], own: Usage, settings_path: Optional[Path]) -> Dict[str, Usage]:
+def _child_usage(settings: Dict[str, Any], own: Usage, settings_path: Optional[Path],
+                 sources: List[Tuple[str, str]]) -> Dict[str, Usage]:
     """Sub-agent usage: inclusiveTokenUsage minus the session's own tokenUsage. Each child
     session is credited to the model in its own settings file when that file is found;
     the rest is unattributed, never priced as the parent's model. Every child total is a
@@ -326,7 +358,7 @@ def _child_usage(settings: Dict[str, Any], own: Usage, settings_path: Optional[P
     out: Dict[str, Usage] = {}
     by_child = settings.get("childInclusiveTokenUsageBySessionId")
     for child_id, child_raw in (by_child.items() if isinstance(by_child, dict) else []):
-        model = _child_model(settings_path, child_id)
+        model = _child_model(settings_path, child_id, sources)
         if not model or not isinstance(child_raw, dict):
             continue
         share = Usage(*(min(getattr(_usage(child_raw), f), getattr(extra, f)) for f in _USAGE_FIELDS))
@@ -374,8 +406,23 @@ def _decode_folder(name: str) -> Optional[str]:
     return walk(root, 0)
 
 
-def _tool_root(steps: List[Step]) -> Optional[str]:
-    """The Git work tree that most absolute tool paths lie in, when it holds a majority of them."""
+def _work_tree(folder: str) -> Optional[str]:
+    """The nearest ancestor of `folder` holding a `.git` entry: the work tree, read from the
+    filesystem instead of by running `git rev-parse --show-toplevel`."""
+    current = os.path.abspath(folder)
+    while True:
+        if os.path.exists(os.path.join(current, ".git")):
+            return current
+        parent = os.path.dirname(current)
+        if parent == current:
+            return None
+        current = parent
+
+
+def _tool_root(steps: List[Step], git_root: bool = True) -> Optional[str]:
+    """The Git work tree that most absolute tool paths lie in, when it holds a majority of
+    them. With `git_root=False` the work tree is read from the filesystem instead of by
+    running git, which is what `runledger stats` needs: it never starts a process."""
     from ..gitinfo import toplevel
     paths = [step.input.get(k) for step in steps for k in _PATH_KEYS]
     paths = [p for p in paths if isinstance(p, str) and _is_absolute(p)]
@@ -391,7 +438,8 @@ def _tool_root(steps: List[Step]) -> Optional[str]:
             folder = key
             while folder and not os.path.isdir(folder) and os.path.dirname(folder) != folder:
                 folder = os.path.dirname(folder)  # a file the run deleted, or a new folder
-            roots[key] = toplevel(folder) if os.path.isdir(folder) else None
+            roots[key] = (toplevel(folder) if git_root else _work_tree(folder)) \
+                if os.path.isdir(folder) else None
         top = roots.get(key)
         if top:
             votes[top] = votes.get(top, 0) + 1
@@ -412,7 +460,7 @@ def _resolve(base: str, relative: str) -> str:
 
 
 def _recover_cwd(run: Run, recorded: str, pwd: Optional[str], settings: Dict[str, Any],
-                 folder_name: str) -> Tuple[Optional[str], str]:
+                 folder_name: str, git_root: bool = True) -> Tuple[Optional[str], str]:
     """(cwd, source) for a log that records a relative working folder. Sources, in order:
     the session's own `% pwd` output, a settings field, the Git work tree of the tool paths,
     then the encoded session folder name. Nothing is resolved against RunLedger's own folder."""
@@ -422,7 +470,7 @@ def _recover_cwd(run: Run, recorded: str, pwd: Optional[str], settings: Dict[str
         value = settings.get(key)
         if isinstance(value, str) and _is_absolute(value):
             return _resolve(value, recorded), "settings"
-    root = _tool_root(run.steps)
+    root = _tool_root(run.steps, git_root)
     if root:
         return _resolve(root, recorded), "session"
     decoded = _decode_folder(folder_name)
@@ -431,15 +479,24 @@ def _recover_cwd(run: Run, recorded: str, pwd: Optional[str], settings: Dict[str
     return recorded or None, "unknown"
 
 
-def parse(path: Path) -> Run:
+def parse(path: Path, git_root: bool = True) -> Run:
+    """Parse one Droid transcript. `git_root=False` recovers a relative `cwd` without
+    running git, which is what `runledger stats` parses with."""
     p = Path(path)
-    settings_path = _settings_path(p, _header(p))
-    try:
-        settings = json.loads(settings_path.read_text(encoding="utf-8-sig")) if settings_path else {}
-    except (OSError, ValueError, RecursionError):
-        settings = {}
-    if not isinstance(settings, dict):
-        settings = {}
+    settings_path, candidates, lookup_complete = _settings_lookup(p, _header(p))
+    settings: Dict[str, Any] = {}
+    state = SOURCE_REJECTED if settings_path is not None else SOURCE_MISSING
+    if settings_path is not None:
+        try:
+            raw_settings = json.loads(settings_path.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError, RecursionError):
+            raw_settings = None
+        if isinstance(raw_settings, dict):
+            settings = raw_settings
+            state = SOURCE_OK
+    sources: List[Tuple[str, str]] = [
+        (str(candidate), state if candidate == settings_path else SOURCE_MISSING)
+        for candidate in candidates]
     default_model = _text(settings.get("model")) or "unknown"
     run = Run(p.stem, str(p), None, None, None, None, [], [], "", Usage(), {}, agent=NAME)
     calls: Dict[str, List[Step]] = {}
@@ -514,7 +571,8 @@ def parse(path: Path) -> Run:
     if run.cwd and _is_absolute(run.cwd):
         run.cwd_source = "header"
     else:
-        run.cwd, run.cwd_source = _recover_cwd(run, run.cwd or "", pwd, settings, p.parent.name)
+        run.cwd, run.cwd_source = _recover_cwd(run, run.cwd or "", pwd, settings, p.parent.name,
+                                               git_root)
     for call_id, steps in calls.items():
         if call_id in results:
             for step in steps:
@@ -550,7 +608,7 @@ def parse(path: Path) -> Run:
                     step.usage = share
                     step.usage_estimated = from_settings
                     step.usage_known = from_settings
-        children = _child_usage(settings, own, settings_path)
+        children = _child_usage(settings, own, settings_path, sources)
         for model, usage in children.items():
             if usage.total:
                 usage._cumulative_only = True
@@ -564,4 +622,6 @@ def parse(path: Path) -> Run:
         run.usage_file = settings_path.name if settings_path else None
     else:
         run.usage_source = "messages"
+    run.sources = sources
+    run.dependencies_complete = lookup_complete
     return run

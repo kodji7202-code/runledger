@@ -6,11 +6,13 @@ settings.json installer. Every file lives in tmp_path; nothing touches the real
 import json
 import os
 import socket
+import stat
 import subprocess
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -549,6 +551,138 @@ def test_clean_limits_length_and_flattens_lines():
     assert "\n" not in guard.clean("line1\nline2\r\nline3")
 
 
+# ---------------------------------------------------------------- a redirected project log
+
+def run_guard_hook(cwd, event):
+    """One real `runledger guard` hook invocation in `cwd`, the way an agent runs it."""
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(PROJECT_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+    return subprocess.run([sys.executable, "-m", "runledger", "guard"],
+                          input=json.dumps(event).encode("utf-8"), capture_output=True,
+                          cwd=str(cwd), env=env, timeout=60)
+
+
+def linked_project(tmp_path):
+    """A project root the guard logs in: an empty `.git` puts the root at the payload's cwd."""
+    root = tmp_path / "repo"
+    (root / ".git").mkdir(parents=True)
+    return root
+
+
+def symlink_or_skip(link, target, target_is_directory=False):
+    try:
+        link.symlink_to(target, target_is_directory=target_is_directory)
+    except (OSError, NotImplementedError):
+        pytest.skip("Symlinks unavailable")
+    return link
+
+
+def marked_junction(monkeypatch, path):
+    """Report `path` as a non-symlink reparse point (a Windows junction), as tests/test_rollback
+    does, so the branch is covered without the privilege a real junction takes."""
+    target = os.path.normcase(os.path.realpath(os.fspath(path)))
+    real_lstat = Path.lstat
+
+    def lstat(candidate, *args, **kwargs):
+        info = real_lstat(candidate, *args, **kwargs)
+        if os.path.normcase(os.path.realpath(os.fspath(candidate))) == target:
+            return SimpleNamespace(st_mode=info.st_mode,
+                                   st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT)
+        return info
+
+    monkeypatch.setattr(Path, "lstat", lstat)
+
+
+def guard_decision(result):
+    return json.loads(result.stdout.decode("utf-8"))["hookSpecificOutput"]["permissionDecision"]
+
+
+def test_hook_never_appends_through_a_symlinked_log_file(tmp_path):
+    """`.runledger/guard.log` is repository content: a repository that ships the log as a
+    symlink must not get the hook's command summaries appended to whatever it points at."""
+    root = linked_project(tmp_path)
+    untouched = root / "startup.sh"
+    untouched.write_bytes(b"export PATH=$PATH\n")
+    folder = root / ".runledger"
+    folder.mkdir()
+    symlink_or_skip(folder / "guard.log", untouched)
+
+    result = run_guard_hook(root, bash_event(root, "rm -rf /"))
+
+    assert result.returncode == 0 and guard_decision(result) == "deny"
+    assert untouched.read_bytes() == b"export PATH=$PATH\n"
+    assert (folder / "guard.log").is_symlink()
+    note = result.stderr.decode("utf-8").strip().splitlines()
+    assert len(note) == 1 and ".runledger" in note[0]
+
+
+def test_hook_does_not_create_the_target_of_a_dangling_log_link(tmp_path):
+    """A dangling `guard.log` link names a file that does not exist yet: opening it for
+    append would create it, so the hook must refuse before the open."""
+    root = linked_project(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    missing = outside / "shell-startup"
+    folder = root / ".runledger"
+    folder.mkdir()
+    symlink_or_skip(folder / "guard.log", missing)
+
+    result = run_guard_hook(root, bash_event(root, "rm -rf /"))
+
+    assert result.returncode == 0 and guard_decision(result) == "deny"
+    assert not missing.exists() and list(outside.iterdir()) == []
+    assert (folder / "guard.log").is_symlink()
+
+
+def test_hook_never_appends_through_a_symlinked_runledger_folder(tmp_path):
+    """A redirect at `.runledger` itself is refused too, so no record can land outside the
+    project."""
+    root = linked_project(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    untouched = outside / "guard.log"
+    untouched.write_bytes(b"outside log stays\n")
+    symlink_or_skip(root / ".runledger", outside, target_is_directory=True)
+
+    result = run_guard_hook(root, bash_event(root, "rm -rf /"))
+
+    assert result.returncode == 0 and guard_decision(result) == "deny"
+    assert untouched.read_bytes() == b"outside log stays\n"
+    assert [path.name for path in outside.iterdir()] == ["guard.log"]
+    assert (root / ".runledger").is_symlink()
+
+
+def test_hook_refuses_a_junction_at_the_runledger_folder(tmp_path, monkeypatch):
+    """A junction is not a symlink, so it is refused from its own attributes; the decision
+    and the hook output are the ones a plain folder gets."""
+    root = linked_project(tmp_path)
+    folder = root / ".runledger"
+    folder.mkdir()
+    marked_junction(monkeypatch, folder)
+
+    decision = guard.handle(json.dumps(bash_event(root, "rm -rf /")))
+
+    assert decision["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert not (folder / "guard.log").exists()
+
+
+def test_log_keeps_the_records_already_there(tmp_path):
+    """The refusal must not turn the append into a rewrite: earlier records stay."""
+    root = linked_project(tmp_path)
+    folder = root / ".runledger"
+    folder.mkdir()
+    log = folder / "guard.log"
+    log.write_text('{"ts": "2026-01-01T00:00:00+00:00", "decision": "allow"}\n', encoding="utf-8")
+
+    result = run_guard_hook(root, bash_event(root, "ls"))
+
+    assert result.returncode == 0 and result.stdout == b""
+    lines = log.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2
+    assert json.loads(lines[0])["decision"] == "allow"
+    assert json.loads(lines[1])["summary"] == "ls"
+
+
 # ---------------------------------------------------------------- installer
 
 def test_install_merges_and_keeps_every_existing_setting(tmp_path):
@@ -1006,6 +1140,18 @@ def test_project_adds_secret_paths_only(tmp_path):
     ev = {"session_id": "s", "cwd": str(tmp_path), "tool_name": "Read",
           "tool_input": {"file_path": str(tmp_path / "vault.txt")}}
     assert _decide_with_project(tmp_path, tool_input=ev)["decision"] == "ask"
+
+
+def test_project_cannot_change_checkpoint_retention_or_the_size_warning(tmp_path):
+    """The rollback keys live in the user's own file: a cloned repository must not be able to
+    delete the user's checkpoints or silence the size warning."""
+    write_project(tmp_path, {"rollback": {"auto_prune": {"keep": 1}, "warn_mb": 1,
+                                          "warn_file_mb": 1}})
+    d = _decide_with_project(tmp_path, command="ls")
+    warning = next(w for w in d["warnings"] if "rollback" in w)
+    for key in ("rollback.auto_prune", "rollback.warn_mb", "rollback.warn_file_mb"):
+        assert key in warning
+    assert ".runledger.json" in warning and "home folder" in warning
 
 
 def test_malicious_repo_with_every_loosening_trick(tmp_path):

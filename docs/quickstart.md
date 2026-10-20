@@ -169,15 +169,18 @@ file paths.
 
 ## 6. The real-time guard (optional)
 
-The guard is a Claude Code `PreToolUse` hook. It checks each tool call before it runs and answers
-allow, ask or deny.
+The guard is a `PreToolUse` hook for Claude Code, Factory Droid and the Codex CLI. It checks each
+tool call before it runs and answers allow, ask or deny.
 
 ```bash
-runledger guard install                   # this project: .claude/settings.json (undo: guard uninstall)
+runledger guard install                   # this project, Claude Code: .claude/settings.json
+runledger guard install --agent droid     # Factory Droid: .factory/hooks.json (restart droid afterwards)
+runledger guard install --agent codex     # Codex CLI: .codex/hooks.json (trust the entries with /hooks)
 runledger guard test '{"session_id":"s1","cwd":"/work/my-app","tool_name":"Bash","tool_input":{"command":"rm -rf /"}}'
 ```
 
-The second command prints `"permissionDecision": "deny"` for the `rm -rf` call. Everything about
+The last command prints `"permissionDecision": "deny"` for the `rm -rf` call, and a destructive
+MCP call such as `mcp__supabase__delete_project` asks before it runs. Everything about
 policy files, approvals, fail-open and fail-closed, monitor mode and the log is in
 [guard.md](guard.md).
 
