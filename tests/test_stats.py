@@ -31,8 +31,12 @@ def isolated_settings(monkeypatch):
     `--basetemp` (for example `$env:TEMP\\rlt-scr-local`, which pytest-xdist extends with
     `popen-gwN`) the fixtures then exceeded the Windows path limit and their setup failed
     with WinError 206. A short `%TEMP%\\rlsXXXXXX` home keeps every fixture path well under
-    it; `tests/test_isolation.py` pins the shared fixture's own location."""
-    home = Path(tempfile.mkdtemp(prefix="rls", dir=tempfile.gettempdir()))
+    it; `tests/test_isolation.py` pins the shared fixture's own location.
+
+    The folder is resolved the way pytest resolves its own temp root: on macOS the temp
+    folder is reached through `/var`, a symlink to `/private/var`, and the working folder the
+    CLI reads back from `os.getcwd()` is the resolved one."""
+    home = Path(tempfile.mkdtemp(prefix="rls", dir=tempfile.gettempdir())).resolve()
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("USERPROFILE", str(home))
     for var in ISOLATED_ENV_VARS:
