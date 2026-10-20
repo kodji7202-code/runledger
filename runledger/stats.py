@@ -3,8 +3,9 @@
 No Git, no network and no AI: every session is parsed, costed, risk-assessed and
 quality-scored with the same rule code a receipt uses, then grouped by agent, model, day,
 week or project. The parsed facts are cached in `~/.runledger/cache/stats-v1.json`, keyed
-by session path + mtime + size plus every file the parse read beside it (a Droid settings
-sidecar, Claude sub-agent transcripts), so a second run only reads what changed. Costs are
+by session path + mtime + size plus every path the parse read or looked for beside it (a Droid
+settings sidecar or child settings file, the folders a Claude sub-agent transcript could live in
+and the transcripts themselves), so a second run only reads what changed. Costs are
 recomputed from the cached token and per-request numbers on every run, so a price-table
 change needs no invalidation and the figures match `runledger receipt`. The cache holds
 counts, model ids, token counts, session ids and cwd paths: never prompts, commands, risk
@@ -28,13 +29,14 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from . import adapters, pricing
 from .guard import LOG_DIR, LOG_FILE, POLICY_FILE
-from .parser import Run, Usage, _ts, mtime
+from .parser import (SOURCE_MISSING, SOURCE_OK, SOURCE_REJECTED, Run, Usage, _ts,
+                     mtime)
 from .quality import analyze
 from .risk import assess
 from .userconfig import user_config_path
 
 CACHE_VERSION = 1
-RECORD_VERSION = 2
+RECORD_VERSION = 3
 CACHE_FILE = "stats-v1.json"
 DEFAULT_DAYS = 30
 DEFAULT_LIMIT = 500
@@ -216,9 +218,10 @@ def _write_atomic(path: Path, data: bytes) -> None:
 class SessionSummary:
     """What one session contributes to the summary: counts, tokens and scores, no text.
 
-    `sources` are the files the parse read beside the transcript itself (a Droid settings
-    sidecar, Claude sub-agent transcripts), each as `[path, mtime_ns, size]`, so the cache
-    can watch them too."""
+    `sources` are the paths the parse read or looked for beside the transcript itself (a Droid
+    settings sidecar, its child settings files, the folders a Claude sub-agent transcript could
+    live in and the transcripts), each as `[path, mtime_ns, size, state]` - `state` is `ok`,
+    `missing` or `rejected` - so the cache can watch them too."""
     path: str
     agent: str
     session_id: str
@@ -246,8 +249,10 @@ class SessionSummary:
 class StatsCache:
     """The on-disk parse cache, keyed by session path.
 
-    A record is valid while the session file's `(mtime_ns, size)`, every file the parse read
-    beside it, the record version and the policy files it was scored with are unchanged."""
+    A record is valid while the session file's `(mtime_ns, size)`, every path the parse read or
+    looked for beside it is still in the state the record was built from (a path that was
+    missing then must still be missing, so one that appears drops the record), the record
+    version and the policy files it was scored with are unchanged."""
 
     def __init__(self, entries: Optional[Dict[str, Dict[str, Any]]] = None,
                  path: Optional[Path] = None, dirty: bool = False):
@@ -329,37 +334,50 @@ def _record(stat_result: os.stat_result, summary: SessionSummary) -> Dict[str, A
     }
 
 
-def _source_entries(paths: Iterable[str]) -> List[List[Any]]:
-    """`[path, mtime_ns, size]` for every file a parse read beside the transcript itself. A
-    file that cannot be stat'ed is recorded with nulls, so it invalidates the record as soon
-    as it appears or changes."""
+def _source_entries(sources: Iterable[Tuple[str, str]]) -> List[List[Any]]:
+    """`[path, mtime_ns, size, marker]` for every path a parse read or looked for beside the
+    transcript. A path the parse did not find is recorded as `missing` with nulls, so the
+    record is dropped as soon as it appears; one that was there keeps its size and time, so
+    repairing or filling it in drops the record too."""
     out: List[List[Any]] = []
-    for raw in paths:
+    for raw, state in sources:
         path = str(raw)
+        if state == SOURCE_MISSING:
+            out.append([path, None, None, SOURCE_MISSING])
+            continue
         try:
             stat = os.stat(path)
         except OSError:
-            out.append([path, None, None])
-        else:
-            out.append([path, stat.st_mtime_ns, stat.st_size])
+            out.append([path, None, None, SOURCE_MISSING])
+            continue
+        out.append([path, stat.st_mtime_ns, stat.st_size,
+                    SOURCE_REJECTED if state == SOURCE_REJECTED else SOURCE_OK])
     return out
 
 
 def _sources_valid(sources: Any) -> bool:
-    """True while every file a parse read still has the size and modification time the
-    record was built from. A file that was unreadable then and is unreadable now is fine;
-    anything else invalidates the record, so the session is parsed again."""
+    """True while every path a parse read or looked for beside the transcript is in the state
+    the record was built from. A path recorded as missing must still be missing, so a sidecar
+    or sub-agent transcript that appears later drops the record; one recorded with a size and
+    modification time must still have them. A file that was unreadable then and is unreadable
+    now is fine; anything else invalidates the record, so the session is parsed again."""
     if not isinstance(sources, list):
         return False
     for entry in sources:
-        if not isinstance(entry, list) or len(entry) != 3 or not isinstance(entry[0], str):
+        if not (isinstance(entry, list) and len(entry) in (3, 4)
+                and isinstance(entry[0], str)):
             return False
+        missing = entry[1] is None and entry[2] is None
+        if len(entry) == 4 and entry[3] == SOURCE_MISSING:
+            missing = True
         try:
             stat = os.stat(entry[0])
         except OSError:
-            if entry[1] is not None or entry[2] is not None:
-                return False
-            continue
+            if missing:
+                continue
+            return False
+        if missing:  # the path was not there when the record was built, and now it is
+            return False
         if entry[1] != stat.st_mtime_ns or entry[2] != stat.st_size:
             return False
     return True
@@ -420,7 +438,7 @@ def summarize(path: Path) -> SessionSummary:
         codes=_counted(risk.code for risk in risks),
         grade=str((run.quality or {}).get("grade") or ""),
         rec_kinds=_counted(rec.get("kind") for rec in run.recommendations),
-        sources=_source_entries(run.source_files),
+        sources=_source_entries(run.sources),
     )
 
 

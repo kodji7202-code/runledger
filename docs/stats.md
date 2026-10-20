@@ -193,9 +193,13 @@ lookup. To stay fast on a large history it caches one small record per session f
 `~/.runledger/cache/stats-v1.json`:
 
 - The key is the session file's path. A record is valid while that file's size and modification
-  time are unchanged, every file the parse read beside it is unchanged (a Droid
-  `<id>.settings.json` sidecar, Claude sub-agent transcripts), the record format is the current
-  one, and the risk policy signature is the same. The signature covers `~/.runledger/config.json`
+  time are unchanged, every path the parse read or looked for beside it is still in the state the
+  record was built from, the record format is the current one, and the risk policy signature is
+  the same. Those paths are the Droid `<id>.settings.json` sidecar and the child settings files it
+  names, each folder a Claude sub-agent transcript could live in, and the transcripts themselves;
+  a sidecar or transcript that was not there when the record was built, was empty, or could not be
+  read drops the record as soon as it appears, is filled in or is repaired, so a warm run reports
+  what `--no-cache` reports. The signature covers `~/.runledger/config.json`
   and the project's `.runledger.json`, so editing either one re-scores the sessions on the next
   run.
 - A record holds tokens **per model** together with the per-request token numbers pricing needs

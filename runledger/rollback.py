@@ -27,6 +27,9 @@ HOOK_EVENTS = ("SessionStart", "UserPromptSubmit")
 DURATION_RE = re.compile(r"(\d+)([dwh])\Z", re.I)
 DURATION_SECONDS = {"d": 86400, "w": 604800, "h": 3600}
 DURATION_LIMIT_SECONDS = 365000 * 86400  # a thousand years: past this a value is a typo
+# The largest `keep` the hook accepts: past this the value is a typo rather than a retention
+# policy, and the documented default applies instead (LOCAL-R2-RET-01).
+MAX_PRUNE_KEEP = 100000
 TZ_RE = re.compile(r"[+-][0-9]{4}\Z")
 
 
@@ -61,7 +64,10 @@ class Settings:
 
 
 def _positive_int(value: Any) -> Optional[int]:
-    if isinstance(value, int) and not isinstance(value, bool) and value >= 1:
+    """A whole number the hook can act on: at least 1 and at most `MAX_PRUNE_KEEP`. Anything
+    else - a wrong type, a negative value or one past the ceiling - is unusable and keeps the
+    documented default instead of silently retaining an arbitrary number of checkpoints."""
+    if isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= MAX_PRUNE_KEEP:
         return value
     return None
 
