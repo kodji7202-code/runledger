@@ -469,6 +469,24 @@ change behavior, so read the entry before you upgrade.
   prefix plus `/` - to the restored and removed entries and to the reparse-point scan, so two
   folders that only a Python case mapping confuses never select each other's files. A
   case-insensitive volume still resolves `--path SUB` to `sub/...` (`docs/rollback.md`).
+- **A sub-agent transcript scan that fails is never cached (`runledger.parser`, `runledger.stats`):**
+  the transcripts were found with `pathlib.rglob`, which swallows a listing error inside its own
+  walk, so an unreadable sub-agent folder looked like an empty one: the parse reported complete
+  dependency tracking, a record was stored, and warm stats kept the truncated totals (1000 tokens
+  against the 1300 `--no-cache` reported) after the folder was readable again. The watch and the
+  transcript scan are now one explicit breadth-first walk that reports every folder it could not
+  list, and any such failure makes the parse incomplete - the same answer the capped watch gives -
+  so no record is stored and the session is parsed again on every run (`docs/stats.md`).
+- **A `--path` value the checkpoint does not hold is resolved against the working tree too
+  (`runledger.rollback`):** canonicalizing the value against the checkpoint tree alone left a
+  current-only folder spelled as the user typed it, so with a junction at `sub` that appeared after
+  the checkpoint `rollback <id> --path SUB` reported `Nothing to restore for SUB` and exited 0,
+  while the exact `--path sub` refused the junction. A value that matches no checkpoint entry is
+  now resolved against the working tree as well (the same exact-then-simple-case-mapping retry,
+  one component at a time, and a key two names share is still left to the exact match), and the one
+  canonical scope that comes out of it is what the reparse-point safety scan, the snapshot and the
+  entry filters all apply literally, so both spellings refuse an in-scope junction
+  (`docs/rollback.md`).
 
 ### Security
 

@@ -314,34 +314,45 @@ def _subagent_roots(parent_path: Path, session_id: str) -> List[Tuple[Path, bool
     return roots
 
 
-def _folders_under(root: Path) -> Tuple[List[Path], bool]:
-    """`(folders, complete)`: `root` and the folders below it, breadth first - a transcript
-    added anywhere in the tree changes the modification time of the folder that holds it, so
-    watching the folders watches the whole tree.
+def _walk_subagents(root: Path) -> Tuple[List[Path], List[Path], bool]:
+    """`(folders, transcripts, complete)`: the folders below `root`, breadth first, and every
+    `*.jsonl` transcript in the tree - a transcript added anywhere in the tree changes the
+    modification time of the folder that holds it, so watching the folders watches the whole
+    tree, and the walk that decides what is watched also decides what is read.
 
-    `complete` is False when the walk cannot promise it saw every folder: a tree holding more
-    folders than `_MAX_SUBAGENT_FOLDERS` is watched at its shallowest ones only (a transcript
-    written into a folder it never reached would change no watched source), and a folder that
-    cannot be listed hides whatever it holds. A parse with an incomplete walk is not cached
-    (LOCAL-R3-STATS-01)."""
+    The folders are listed here, one by one, instead of through `pathlib.rglob`, which hides a
+    listing error inside its own scan: an unreadable folder would look like an empty one, its
+    transcripts would be missing from the totals, and the parse would still claim to have seen
+    everything (LOCAL-R4-STATS-01). A transcript is a `*.jsonl` file, compared the way the
+    volume compares names (so `*.JSONL` counts on Windows, as it did through `glob`).
+
+    `complete` is False when the walk cannot promise it saw every folder and transcript: a tree
+    holding more folders than `_MAX_SUBAGENT_FOLDERS` is watched at its shallowest ones only (a
+    transcript written into a folder it never reached would change no watched source), and a
+    folder that cannot be listed hides whatever it holds. A parse with an incomplete walk is not
+    cached (LOCAL-R3-STATS-01)."""
     folders = [root]
+    transcripts: List[Path] = []
     index = 0
     while index < len(folders):
-        if len(folders) >= _MAX_SUBAGENT_FOLDERS:
-            return folders, False
         folder = folders[index]
         index += 1
         try:
-            entries = sorted(folder.iterdir())
+            with os.scandir(folder) as listing:
+                entries = sorted(listing, key=lambda entry: entry.name)
         except OSError:
-            return folders, False
+            return folders, transcripts, False
         for entry in entries:
+            if os.path.normcase(entry.name).endswith(".jsonl"):
+                transcripts.append(Path(entry.path))
             try:
                 if entry.is_dir() and not entry.is_symlink():
-                    folders.append(entry)
+                    folders.append(Path(entry.path))
             except OSError:
-                return folders, False
-    return folders, True
+                return folders, transcripts, False
+    if len(folders) >= _MAX_SUBAGENT_FOLDERS:
+        return folders[:_MAX_SUBAGENT_FOLDERS], transcripts, False
+    return folders, transcripts, True
 
 
 def _discover_subagent_files(parent_path: Path, session_id: str
@@ -349,9 +360,9 @@ def _discover_subagent_files(parent_path: Path, session_id: str
     """`(candidates, files, complete)`: how every folder a sub-agent transcript could live in
     turned out (a folder that is not there is a `SOURCE_MISSING` candidate, so a transcript
     written into it later is seen), the transcripts that are there now, and whether the whole
-    tree was really watched. `complete` is False as soon as one folder could not be listed or
-    the folder watch was capped, which is what keeps `runledger stats` from caching the
-    parse."""
+    tree was really read and watched. `complete` is False as soon as one folder could not be
+    listed - by the watch or by the scan for the transcripts themselves - or the folder watch
+    was capped, which is what keeps `runledger stats` from caching the parse."""
     if any(part.lower() == "subagents" for part in parent_path.parent.parts):
         return [], [], True
     candidates: List[Tuple[Path, str]] = []
@@ -367,14 +378,9 @@ def _discover_subagent_files(parent_path: Path, session_id: str
         if not is_dir:
             candidates.append((root, SOURCE_MISSING))
             continue
-        folders, folders_complete = _folders_under(root)
+        folders, entries, walked = _walk_subagents(root)
         candidates.extend((folder, SOURCE_OK) for folder in folders)
-        complete = complete and folders_complete
-        try:
-            entries = sorted(root.rglob("*.jsonl"))
-        except OSError:
-            entries = []
-            complete = False
+        complete = complete and walked
         for path in entries:
             key = str(path)
             if key not in seen:

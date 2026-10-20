@@ -151,10 +151,13 @@ Run with --yes to apply.
   the value literal, so an absent `README.md` is refused instead of selecting the `readme.md` next
   to it. A value that matches exactly is used exactly, and the retry never expands a name the way
   a Unicode casefold would: on NTFS and APFS `--path Straße` selects `Straße` only and leaves the
-  `Strasse` beside it alone. The retry resolves the value to the repository's own spelling once,
-  and the selection is then applied literally: a `K` folder (U+212A KELVIN SIGN) and a `K` beside
-  it, which a plain lowercase maps to the same name, never select each other's files, even on a
-  volume that holds both.
+  `Strasse` beside it alone. The retry resolves the value to the repository's own spelling once -
+  against the checkpoint's entries and, for a name only the working tree has (a folder or junction
+  created after the checkpoint, say), against the folder on disk - and the selection is then
+  applied literally: a `K` folder (U+212A KELVIN SIGN) and a `K` beside it, which a plain lowercase
+  maps to the same name, never select each other's files, even on a volume that holds both. The
+  same one spelling goes to the snapshot and to the safety scan, so `--path SUB` refuses a junction
+  at `sub` exactly as `--path sub` does.
 - **What is refused.** A value outside the repository (`..\outside.txt`, or an absolute path
   outside the root), `.git` or anything under it, an empty value, and a value that exists in
   neither the checkpoint nor the working tree end the command with one error line (`error: ...`)
