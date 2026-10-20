@@ -569,6 +569,13 @@ JSON object:
 - A line with `"decision": "error"` records an evaluation error.
 - Every decision is logged, including plain allows, server approvals and monitor-mode
   decisions. Receipts omit plain allows; the audit log retains them.
+- `.runledger` and the log are repository content, so they are never written through a
+  redirect: when `<project>/.runledger` or `<project>/.runledger/guard.log` is a symlink, a
+  Windows junction or another reparse point, the guard writes nothing and prints one line on
+  stderr. The decision, the hook output and the exit code are unchanged, so a repository cannot
+  silence a block, and a dangling `guard.log` link does not make the hook create the file it
+  points at. The log is also opened without following its last part, so a path swapped in while
+  the hook runs cannot receive a record either.
 
 ### Guard decisions in receipts
 

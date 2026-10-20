@@ -432,6 +432,17 @@ change behavior, so read the entry before you upgrade.
   through it, the warning still reaches stderr, the hook still exits 0 with empty stdout, and the
   target keeps its bytes. The marker is opened without following the final path and only truncated
   once the open file is confirmed to be the marker itself, so the write cannot land elsewhere.
+- **The guard log is never written through a redirect (`runledger.guard`, `runledger.redirects`):**
+  the guard appended each decision to `<project>/.runledger/guard.log` with a plain
+  `open(..., "a")` after `mkdir`, so a repository that ships `.runledger` - or `guard.log` itself -
+  as a symlink, a Windows junction or another reparse point got the hook's records (tool names,
+  command summaries, reasons) appended to any file the user can write, such as a shell startup
+  file; a dangling `guard.log` link made the hook create the file it pointed at. Both paths are
+  now refused before the open, and the file is opened without following its last part and written
+  only once it is confirmed to be the log itself, so nothing can land elsewhere. The decision, the
+  stdout JSON and the exit code are unchanged, the hook still never fails, and at most one line is
+  printed on stderr. The redirect check and the no-follow open are shared with the checkpoint
+  hook's size-warning marker in the new `runledger.redirects` module.
 
 ## [0.6.1] - 2026-10-18
 

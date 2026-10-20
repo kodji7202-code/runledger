@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
+from . import redirects
 from .paths import is_abs, owned_hook_command
 from .userconfig import load_user_config
 
@@ -210,23 +211,13 @@ def _case_insensitive_volume(folder: Path) -> bool:
 
 def _unsupported_reparse_point(path: Path, info: os.stat_result) -> bool:
     """Detect directory junctions without following them, on old and new Python versions."""
-    if stat.S_ISLNK(info.st_mode):
-        return False  # Git can save symlinks; callers must still avoid walking through them.
-    if (getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
-            or getattr(info, "st_reparse_tag", 0)):
-        return True
-    is_junction = getattr(os.path, "isjunction", None)  # Python 3.12+, absent on 3.9
-    return bool(is_junction and is_junction(path))
+    return redirects.unsupported_reparse_point(path, info)
 
 
 def _redirects(path: Path) -> bool:
     """Whether `path` itself is a link or another reparse point. A checkpoint hook owns no part
     of the working tree, so bookkeeping must never read or write through one of those."""
-    try:
-        info = path.lstat()
-    except OSError:
-        return False
-    return stat.S_ISLNK(info.st_mode) or _unsupported_reparse_point(path, info)
+    return redirects.is_redirect(path)
 
 
 def _read_warn_marker(marker: Path) -> Dict[str, Any]:
@@ -255,13 +246,10 @@ def _write_warn_marker(marker: Path, text: str) -> None:
             return
         if _redirects(folder):
             return
-    try:
-        fd = os.open(marker, os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
-    except OSError:
+    fd = redirects.open_without_following(marker, os.O_WRONLY | os.O_CREAT, 0o600)
+    if fd is None:
         return
     try:
-        if not os.path.samestat(os.fstat(fd), marker.lstat()):
-            return
         os.ftruncate(fd, 0)
         os.write(fd, text.encode("utf-8"))
     except (OSError, ValueError):

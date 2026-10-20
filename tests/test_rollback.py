@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from runledger import guard, rollback
+from runledger import guard, redirects, rollback
 from runledger.cli import build, main
 from runledger.receipt import render
 
@@ -211,6 +211,7 @@ def junction_probe(request, monkeypatch):
     local_os.path = SimpleNamespace(**vars(os.path))
     local_os.path.isjunction = None
     monkeypatch.setattr(rollback, "os", local_os)
+    monkeypatch.setattr(redirects, "os", local_os)
 
     def mark(junction):
         target = normalized_path(junction)

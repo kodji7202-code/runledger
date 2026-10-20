@@ -3,7 +3,9 @@
 The agent runs `runledger guard` before each tool call and writes the call to
 stdin as JSON. The guard scores the call with the rules in risk.py, decides
 allow / ask / deny, can ask a team approval server, and appends each decision to
-<cwd>/.runledger/guard.log.
+<cwd>/.runledger/guard.log. That folder and that file are repository content, so
+a link or another reparse point there is refused (see runledger.redirects): the
+decision and the hook output are unchanged and nothing is written.
 
 The installed hook carries its agent in `--agent claude-code|droid|codex`, so the call is
 read with the right tool vocabulary (Droid `Execute`/`Create`/`Edit`/`ApplyPatch`, Codex
@@ -62,6 +64,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from . import hook_targets
 from . import labels
 from . import paths as _paths
+from . import redirects as _redirects
 from . import risk as _risk
 from .hook_targets import (
     AGENT_ALL,
@@ -1041,8 +1044,12 @@ def http_approver(request: Dict[str, Any], approval: Dict[str, Any]) -> str:
 def _append_logs(cwd: str, records: List[Dict[str, Any]]) -> None:
     if not cwd or not records or _paths.is_unc(cwd):
         return
-    path = Path(cwd) / LOG_DIR / LOG_FILE
-    path.parent.mkdir(parents=True, exist_ok=True)
+    folder = Path(cwd) / LOG_DIR
+    path = folder / LOG_FILE
+    if _redirects.is_redirect(folder) or _redirects.is_redirect(path):
+        _warn(f"{LOG_DIR}/{LOG_FILE} is a link or another reparse point: "
+              "the decision was not logged.")
+        return
     ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
     lines: List[str] = []
     for fields in records:
@@ -1050,8 +1057,23 @@ def _append_logs(cwd: str, records: List[Dict[str, Any]]) -> None:
         for k, v in fields.items():
             rec[k] = clean(v, 200) if isinstance(v, str) else v
         lines.append(json.dumps(rec, ensure_ascii=False) + "\n")
-    with path.open("a", encoding="utf-8") as fh:
-        fh.writelines(lines)
+    if not folder.is_dir():
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return
+        if _redirects.is_redirect(folder):
+            return
+    fd = _redirects.open_without_following(
+        path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o666)
+    if fd is None:
+        return
+    try:
+        os.write(fd, "".join(lines).encode("utf-8"))
+    except (OSError, ValueError):
+        return
+    finally:
+        os.close(fd)
 
 
 def _append_log(cwd: str, fields: Dict[str, Any]) -> None:
