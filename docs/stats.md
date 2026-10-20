@@ -211,9 +211,10 @@ lookup. To stay fast on a large history it caches one small record per session f
   the files it read.
 - A parse that could not track every one of those paths is not cached at all. That happens when a
   sub-agent folder tree holds more folders than the watch covers (the watch is capped for speed)
-  or when a folder cannot be listed, because a transcript written into a folder nobody watched
-  changes no watched source. Such a session is parsed again on every run, so a warm report still
-  equals `--no-cache`; the rest of the history keeps its records.
+  or when a folder cannot be listed - by the watch or by the scan that finds the transcripts - because
+  a transcript written into a folder nobody listed changes no watched source. Such a session is
+  parsed again on every run, so a warm report still equals `--no-cache`; the rest of the history
+  keeps its records.
 - A missing, unreadable or corrupt cache file is ignored and rebuilt. The file is written
   atomically, and the oldest records are dropped when it grows past its bound.
 - `--no-cache` parses everything and writes nothing; `--rebuild-cache` ignores what is there and

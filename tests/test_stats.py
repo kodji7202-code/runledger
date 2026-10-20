@@ -1302,6 +1302,35 @@ def test_a_subagent_tree_beyond_the_watch_cap_is_never_cached(capsys, isolated_s
     assert _without_run_stamps(warm) == _without_run_stamps(fresh)
 
 
+def test_a_failed_transcript_scan_is_never_cached(capsys, isolated_settings, monkeypatch):
+    """LOCAL-R4-STATS-01: a transcript scan that could not list a folder leaves the parse
+    incomplete, so no record is stored and a later warm run re-parses. `pathlib.rglob` swallowed
+    the listing error, the record looked valid, and the warm report kept the truncated totals
+    (1000 tokens against 1300 with --no-cache) after the folder was listable again."""
+    project = isolated_settings / "scan-error"
+    project.mkdir()
+    parent = claude_session(isolated_settings, project, "scan", _started(1), usage=(1000, 0, 0, 0))
+    tree = parent.parent / parent.stem / "subagents"
+    claude_subagent(parent, "agent-early", _started(1), [(MODEL, (300, 0, 0, 0))])
+    real_scandir = os.scandir
+
+    def flaky_scandir(path=None, **kwargs):
+        if isinstance(path, (str, os.PathLike)) and Path(path) == tree:
+            raise PermissionError("synthetic failed listing inside the transcript scan")
+        return real_scandir(path, **kwargs) if path is not None else real_scandir(**kwargs)
+
+    with monkeypatch.context() as scan_error:
+        scan_error.setattr(os, "scandir", flaky_scandir)
+        cold, _ = _json(capsys, "stats", "--all", "--format", "json")
+    assert cold["totals"]["tokens"]["input"] == 1000  # the transcript under the unlistable folder
+    assert _cache_records(isolated_settings) == {}    # a truncated record is never stored
+
+    warm, _ = _json(capsys, "stats", "--all", "--format", "json")
+    assert warm["totals"]["tokens"]["input"] == 1300
+    fresh, _ = _json(capsys, "stats", "--all", "--no-cache", "--format", "json")
+    assert _without_run_stamps(warm) == _without_run_stamps(fresh)
+
+
 def test_fixture_paths_stay_short_enough_for_encoded_folders(isolated_settings):
     """Claude encodes the project path into its session folder name and Droid encodes the
     working folder, so the fixtures must not live under a long pytest tmp path (a longer

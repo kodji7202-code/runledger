@@ -2301,6 +2301,80 @@ def test_path_junction_in_a_sharp_s_sibling_folder_does_not_block_the_restore(
     assert (repo.root / "Stra\u00dfe" / "a.txt").read_text(encoding="utf-8") == "one\n"
 
 
+# --------------------------------------- round-4 scrutiny regressions (LOCAL-R4-RB-01)
+
+def test_path_scope_resolution_asks_the_working_tree_too(scoped_repo, monkeypatch):
+    """LOCAL-R4-RB-01: a value the checkpoint tree does not hold is resolved against the working
+    tree as well, so the scope the safety scan is handed is one spelling the repository really
+    has - a `sub` folder that appeared after the checkpoint, for instance. Before the fix only
+    the entry filters saw the working tree, so the scan was given the value as typed and counted
+    a junction there as out of scope (the CLI test below)."""
+    repo = scoped_repo
+    _write(repo.root, "a.txt", "one\n")
+    checkpoint = repo.create()
+    _write(repo.root, "a.txt", "modified\n")
+    _write(repo.root, "sub/late.txt", "appeared after the checkpoint\n")
+    monkeypatch.setattr(repo, "folded", True)
+    target = repo.entries(checkpoint.tree)
+    assert repo._selected(["SUB"], (target,)) == ("sub",)
+    plan = repo.plan(checkpoint, paths=["SUB"])
+    assert plan.paths == ("sub",)
+    assert plan.restore == []
+    assert plan.remove == ["sub/late.txt"]
+
+
+def test_working_tree_spelling_never_widens_through_a_shared_key(scoped_repo, monkeypatch):
+    """Two working-tree folders Python maps to one key give no canonical spelling, so the value
+    stays as typed and selects nothing: the working-tree retry follows the same rule as the
+    checkpoint retry (LOCAL-R3-RB-01) instead of picking one of the two folders."""
+    repo = scoped_repo
+    if not _kelvin_folders_stay_apart(repo.root.parent):
+        pytest.skip("this volume folds \u212a and K into one name")
+    _write(repo.root, "\u212a/late.txt", "one\n")
+    _write(repo.root, "K/late.txt", "one\n")
+    monkeypatch.setattr(repo, "folded", True)
+    assert repo._disk_spelling("k") is None
+    assert repo._disk_spelling("gone") is None
+    assert repo._disk_spelling("\u212a") == "\u212a"
+    assert repo._disk_spelling("K") == "K"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="NTFS junctions are Windows-only")
+def test_path_current_only_junction_refuses_both_case_spellings(scoped_repo, tmp_path, capsys):
+    """LOCAL-R4-RB-01: a junction the checkpoint never held is resolved to the working tree's own
+    spelling, so `SUB` reaches `sub` and the literal in-scope safety scan refuses it, exactly as
+    the exact `sub` does. Before the fix `SUB` stayed as typed, the scan counted the junction as
+    out of scope, and the plan reported `Nothing to restore` with exit 0."""
+    repo = scoped_repo
+    _write(repo.root, "a.txt", "one\n")
+    checkpoint = repo.create()
+    _write(repo.root, "a.txt", "modified\n")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    payload = b"synthetic outside-repository marker, never a real secret\n"
+    marker = outside / "marker.txt"
+    marker.write_bytes(payload)
+    link = repo.root / "sub"
+    _make_junction(link, outside)
+    try:
+        refs = git(repo.root, "for-each-ref", rollback.PREFIX)
+        for value in ("SUB", "sub"):
+            assert main(["rollback", checkpoint.id, "--path", value, "--dry-run",
+                         "--cwd", str(repo.root)]) == 1
+            assert "Windows junctions and other non-symlink reparse points" in \
+                capsys.readouterr().err
+            assert main(["rollback", checkpoint.id, "--path", value, "--yes",
+                         "--cwd", str(repo.root)]) == 1
+            assert "Windows junctions and other non-symlink reparse points" in \
+                capsys.readouterr().err
+        assert git(repo.root, "for-each-ref", rollback.PREFIX) == refs
+        assert _blobs_holding(repo, payload) == []
+        assert (repo.root / "a.txt").read_text(encoding="utf-8") == "modified\n"
+        assert marker.read_bytes() == payload
+    finally:
+        _remove_junction(link)
+
+
 # ---------------------------------------------------------------- retention
 
 def refs_of(repo):

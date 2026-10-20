@@ -800,7 +800,9 @@ class Repository:
         here, so `Stra\u00dfe` never reaches a `Strasse` beside it (LOCAL-R2-RB-02) and a
         `U+212A KELVIN SIGN` folder never reaches the `K` that Python maps to the same key
         (LOCAL-R3-RB-01). `--path SUB` still selects `sub/...`, because the retry that made
-        `sub` out of `SUB` happens in `_selected`, before this filter runs."""
+        `sub` out of `SUB` happens in `_selected`, before this filter runs - against the
+        checkpoint tree, the working tree, or the disk for a name only the working tree has
+        (LOCAL-R4-RB-01)."""
         return _within(name, scope)
 
     def _blocks_scope(self, name: str, scope: Tuple[str, ...]) -> bool:
@@ -810,19 +812,47 @@ class Repository:
         (LOCAL-R3-RB-01)."""
         return _on_the_way(name, scope)
 
+    def _disk_spelling(self, name: str) -> Optional[str]:
+        """The working tree's own spelling of a repo-relative path that is on disk, resolved one
+        component at a time: each part is looked up in the folder above it and the folder's own
+        entry is what comes back, so `SUB` becomes `sub` when that is the name the volume holds.
+        Every lookup is exact first and folded second, through the same table the checkpoint
+        retry uses - a key two entries share gives no spelling at all - and a part that is not
+        there gives None, which leaves the value as the user typed it. A name the checkpoint
+        tree does not hold, such as a folder or junction that appeared since, still resolves to
+        one spelling the snapshot and the safety scan can both see (LOCAL-R4-RB-01)."""
+        folder = self.root
+        resolved: List[str] = []
+        for part in name.split("/"):
+            try:
+                with os.scandir(folder) as listing:
+                    names = sorted(entry.name for entry in listing)
+            except OSError:
+                return None
+            picked = part if part in names else _folded_spellings(names).get(_fold_case(part))
+            if picked is None:
+                return None
+            resolved.append(picked)
+            folder = folder / picked
+        return "/".join(resolved)
+
     def _selected(self, paths: List[str], trees: Tuple[Dict[str, Tuple[str, str]], ...]) -> Tuple[str, ...]:
         """The repository's own spelling for every `--path` value, which every later step then
         filters with literally. A value must be a file or folder either tree holds, or something
         that exists on disk. Spellings are matched exactly first and folded second, and only on
         a case-insensitive volume, which is the single place a case mapping is used: a
         case-sensitive volume keeps the value literal, so an absent `README.md` is refused
-        instead of selecting the `readme.md` next to it."""
+        instead of selecting the `readme.md` next to it. A value no tree holds is resolved
+        against the working tree as well, so the scope is one spelling the safety scan and the
+        snapshot both work with (LOCAL-R4-RB-01)."""
         known = self._spellings(trees)
         folded = _folded_spellings(known) if self.folded else {}
         selected = []
         for raw in paths:
             name = self._resolve(raw)
             spelling = name if name in known else folded.get(_fold_case(name))
+            if spelling is None and name and self.folded:
+                spelling = self._disk_spelling(name)
             if name and spelling is None:
                 # A folder that no entry starts with, and that is not on disk either, is
                 # simply absent. (A folder whose entries are in a tree is a valid selection.)
@@ -840,7 +870,10 @@ class Repository:
         inside those selections (literal file or folder prefixes) are restored or removed;
         every other entry stays untouched and the stale-preview check still covers the whole
         tree, so a change anywhere is caught. The Windows reparse-point refusal covers the
-        selection alone: a blocker outside it must not stop a scoped restore."""
+        selection alone: a blocker outside it must not stop a scoped restore. The selection is
+        resolved once, against the checkpoint tree and the working tree, and that one canonical
+        tuple is what the refusal, the entry filters and the later re-scan all apply literally
+        (LOCAL-R4-RB-01)."""
         if not paths:
             current_tree = current_tree or self.snapshot_tree()
             current, target = self.entries(current_tree), self.entries(checkpoint.tree)
@@ -849,18 +882,15 @@ class Repository:
             ignored = self._ignored(sorted(extra))
             return Plan(checkpoint, current_tree, restore, sorted(extra - ignored), sorted(ignored))
         target = self.entries(checkpoint.tree)
-        # Resolve the values to the repository's spelling first: the reparse-point scan and the
-        # entry filter both use the scope literally, so the one folded retry happens here.
         scope = self._selected(paths, (target,))
         current_tree = current_tree or self.snapshot_tree(scope=scope)
         current = self.entries(current_tree)
-        selected = self._selected(paths, (target, current))
         restore = [p for p in sorted(target) if current.get(p) != target[p]
-                   and self._selects(p, selected)]
-        extra = [p for p in sorted(current) if p not in target and self._selects(p, selected)]
+                   and self._selects(p, scope)]
+        extra = [p for p in sorted(current) if p not in target and self._selects(p, scope)]
         ignored = self._ignored(extra)
         return Plan(checkpoint, current_tree, restore, [p for p in extra if p not in ignored],
-                    [], selected)
+                    [], scope)
 
     def _preflight(self, plan: Plan, current: Dict[str, Tuple[str, str]]) -> List[str]:
         removing = set(plan.remove) | (set(plan.restore) & set(current))
