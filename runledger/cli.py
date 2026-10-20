@@ -273,7 +273,9 @@ def cmd_rollback(args) -> int:
                 print(f"  remove  {path!r}")
             for path in plan.keep_ignored:
                 print(f"  keep ignored {path!r}")
-            print(f"{len(plan.restore)} restore, {len(plan.remove)} remove. "
+            size = _changed_bytes(repo, plan, CheckpointError)
+            detail = f" ({size} bytes)" if size >= 0 else ""
+            print(f"{len(plan.restore)} restore, {len(plan.remove)} remove{detail}. "
                   "HEAD, branch, and index stay unchanged.")
         if args.dry_run:
             print("Dry run. No files restored and no safety checkpoint created.")
@@ -1120,7 +1122,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                      help="restore only this file or folder (repeatable; matched literally)")
     prb.add_argument("--dry-run", action="store_true", help="preview without restoring files or creating a ref")
     prb.add_argument("--yes", action="store_true", help="confirm restoration without a terminal prompt")
-    prb.add_argument("--cwd", help="Git working tree folder (default: current folder)")
+    prb.add_argument("--cwd", help="Git working tree folder and base for relative --path values "
+                                   "(default: current folder)")
     prb.set_defaults(func=cmd_rollback)
 
     pg = sub.add_parser("guard", help="real-time policy guard and checkpoint hooks for Claude Code, "
