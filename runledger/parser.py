@@ -29,7 +29,10 @@ SOURCE_OK = "ok"
 SOURCE_MISSING = "missing"
 SOURCE_REJECTED = "rejected"
 
-# A Claude sub-agent folder tree deeper than this is watched at its roots only.
+# A Claude sub-agent folder tree larger than this is watched at its shallowest folders only.
+# The cap is a speed guard, and a tree that reaches it is never cached: a transcript written
+# into a folder the watch did not reach changes no watched source, so a stored record would
+# keep totals `--no-cache` disproves (LOCAL-R3-STATS-01).
 _MAX_SUBAGENT_FOLDERS = 64
 
 
@@ -170,6 +173,11 @@ class Run:
     # or `SOURCE_REJECTED`. `runledger stats` keys its cache record on all of them, so one that
     # appears, is repaired or changes drops the record.
     sources: List[Tuple[str, str]] = field(default_factory=list)
+    # Whether the parse really could track every path it depends on, so nothing it read was cut
+    # short: False when a dependency tree could not be listed or its folder watch was capped.
+    # `runledger stats` then caches no record for the session - a source that was never watched
+    # cannot invalidate one - and parses it again on every run instead (LOCAL-R3-STATS-01).
+    dependencies_complete: bool = True
     safe: bool = False  # safe.make_safe rewrote paths and masked e-mails for sharing
     # safe.make_safe: the changed files computed before paths were rewritten (summarize.FileChange values)
     frozen_changes: Optional[Dict[str, Any]] = None
@@ -306,61 +314,74 @@ def _subagent_roots(parent_path: Path, session_id: str) -> List[Tuple[Path, bool
     return roots
 
 
-def _folders_under(root: Path) -> List[Path]:
-    """`root` and the folders below it, breadth first: a transcript added anywhere in the tree
-    changes the modification time of the folder that holds it, so watching the folders watches
-    the whole tree. A tree holding more folders than `_MAX_SUBAGENT_FOLDERS` is watched at its
-    shallowest ones only."""
+def _folders_under(root: Path) -> Tuple[List[Path], bool]:
+    """`(folders, complete)`: `root` and the folders below it, breadth first - a transcript
+    added anywhere in the tree changes the modification time of the folder that holds it, so
+    watching the folders watches the whole tree.
+
+    `complete` is False when the walk cannot promise it saw every folder: a tree holding more
+    folders than `_MAX_SUBAGENT_FOLDERS` is watched at its shallowest ones only (a transcript
+    written into a folder it never reached would change no watched source), and a folder that
+    cannot be listed hides whatever it holds. A parse with an incomplete walk is not cached
+    (LOCAL-R3-STATS-01)."""
     folders = [root]
     index = 0
-    while index < len(folders) and len(folders) < _MAX_SUBAGENT_FOLDERS:
+    while index < len(folders):
+        if len(folders) >= _MAX_SUBAGENT_FOLDERS:
+            return folders, False
         folder = folders[index]
         index += 1
         try:
             entries = sorted(folder.iterdir())
         except OSError:
-            continue
+            return folders, False
         for entry in entries:
-            if len(folders) >= _MAX_SUBAGENT_FOLDERS:
-                break
             try:
                 if entry.is_dir() and not entry.is_symlink():
                     folders.append(entry)
             except OSError:
-                continue
-    return folders
+                return folders, False
+    return folders, True
 
 
 def _discover_subagent_files(parent_path: Path, session_id: str
-                             ) -> Tuple[List[Tuple[Path, str]], List[Tuple[Path, bool]]]:
-    """`(candidates, files)`: how every folder a sub-agent transcript could live in turned out
-    (a folder that is not there is a `SOURCE_MISSING` candidate, so a transcript written into
-    it later is seen), and the transcripts that are there now."""
+                             ) -> Tuple[List[Tuple[Path, str]], List[Tuple[Path, bool]], bool]:
+    """`(candidates, files, complete)`: how every folder a sub-agent transcript could live in
+    turned out (a folder that is not there is a `SOURCE_MISSING` candidate, so a transcript
+    written into it later is seen), the transcripts that are there now, and whether the whole
+    tree was really watched. `complete` is False as soon as one folder could not be listed or
+    the folder watch was capped, which is what keeps `runledger stats` from caching the
+    parse."""
     if any(part.lower() == "subagents" for part in parent_path.parent.parts):
-        return [], []
+        return [], [], True
     candidates: List[Tuple[Path, str]] = []
     found: List[Tuple[Path, bool]] = []
     seen = set()
+    complete = True
     for root, is_legacy in _subagent_roots(parent_path, session_id):
         try:
             is_dir = root.is_dir()
         except OSError:
             is_dir = False
+            complete = False
         if not is_dir:
             candidates.append((root, SOURCE_MISSING))
             continue
-        candidates.extend((folder, SOURCE_OK) for folder in _folders_under(root))
+        folders, folders_complete = _folders_under(root)
+        candidates.extend((folder, SOURCE_OK) for folder in folders)
+        complete = complete and folders_complete
         try:
             entries = sorted(root.rglob("*.jsonl"))
         except OSError:
             entries = []
+            complete = False
         for path in entries:
             key = str(path)
             if key not in seen:
                 seen.add(key)
                 found.append((path, is_legacy))
 
-    return candidates, found
+    return candidates, found, complete
 
 
 def _merge_subagents(
@@ -368,15 +389,16 @@ def _merge_subagents(
     session_id: str,
     msg_usage: Dict[str, Usage],
     msg_model: Dict[str, Optional[str]],
-) -> Tuple[List[Tuple[str, str]], int]:
+) -> Tuple[List[Tuple[str, str]], int, bool]:
     """Merge sub-agent assistant message usage into `msg_usage`/`msg_model`.
 
-    Returns `(sources, merged)`: every path the merge read or looked for beside the parent
-    transcript with how it turned out, and how many transcripts contributed. A transcript is a
-    source whether or not it contributed, and a folder a sub-agent transcript could live in is
-    one whether or not it exists, so `runledger stats` drops its cache record when one appears,
-    is filled in or changes."""
-    candidates, files = _discover_subagent_files(parent_path, session_id)
+    Returns `(sources, merged, complete)`: every path the merge read or looked for beside the
+    parent transcript with how it turned out, how many transcripts contributed, and whether the
+    tree really was watched in full. A transcript is a source whether or not it contributed, and
+    a folder a sub-agent transcript could live in is one whether or not it exists, so
+    `runledger stats` drops its cache record when one appears, is filled in or changes; an
+    incomplete walk leaves nothing to watch at all, so `stats` caches no record for it."""
+    candidates, files, complete = _discover_subagent_files(parent_path, session_id)
     sources: List[Tuple[str, str]] = [(str(path), state) for path, state in candidates]
     merged = 0
     valid_session_ids = {session_id, parent_path.stem}
@@ -431,7 +453,7 @@ def _merge_subagents(
                 if not msg_model.get(mid) and model:
                     msg_model[mid] = model
 
-    return sources, merged
+    return sources, merged, complete
 
 
 
@@ -532,7 +554,8 @@ def parse_session(path: str | os.PathLike) -> Run:
     if lines and not valid_events:
         raise ValueError(f"{path}: not a supported session file")
 
-    subagent_sources, merged = _merge_subagents(Path(path), session_id, msg_usage, msg_model)
+    subagent_sources, merged, watched = _merge_subagents(Path(path), session_id, msg_usage,
+                                                         msg_model)
     notes: List[str] = []
     if merged:
         suffix = "s" if merged != 1 else ""
@@ -555,7 +578,7 @@ def parse_session(path: str | os.PathLike) -> Run:
         session_id=session_id, path=path, cwd=cwd, git_branch=git_branch,
         started=started, ended=ended, prompts=prompts, steps=steps,
         final_message=final_message, usage=total, models=models, notes=notes,
-        sources=subagent_sources,
+        sources=subagent_sources, dependencies_complete=watched,
     )
 
 

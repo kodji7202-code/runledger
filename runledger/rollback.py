@@ -182,17 +182,20 @@ def _unsafe_path(name: str) -> bool:
 
 
 def _fold_case(name: str) -> str:
-    """The case mapping a volume compares names with, used for the folded retry only: the
-    simple `lower` mapping, never `casefold`. NTFS and APFS keep `Stra\u00dfe` apart from
-    `Strasse`, so the wider Unicode folding would restore files in a folder the value never
-    named."""
+    """The case mapping a volume compares names with, used by the folded retry in `_selected`
+    and nowhere else: that retry turns what the user typed into one spelling the repository
+    holds, and every entry filter afterwards compares the result literally. The simple `lower`
+    mapping, never `casefold`: NTFS and APFS keep `Stra\u00dfe` apart from `Strasse`, so the
+    wider Unicode folding would offer a spelling the value never named (LOCAL-R2-RB-02)."""
     return name.lower()
 
 
 def _folded_spellings(names: Iterable[str]) -> Dict[str, str]:
-    """The repository's own spelling per folded key, for the folded retry. A key two different
-    names share gives no canonical spelling, so it is left out: a scoped restore that cannot
-    tell the two apart refuses the value instead of widening it to both."""
+    """The repository's own spelling per folded key, the table the folded retry in `_selected`
+    resolves through. A key two different names share gives no canonical spelling, so it is
+    left out: a scoped restore that cannot tell the two apart refuses the value instead of
+    widening it to both, which is what keeps a `U+212A KELVIN SIGN` folder and a `K` apart
+    (LOCAL-R3-RB-01)."""
     folded: Dict[str, str] = {}
     ambiguous = set()
     for name in sorted(names):
@@ -487,9 +490,11 @@ class Repository:
         """Capture tracked and non-ignored untracked files using only a temporary index.
         `scope` limits the Windows reparse-point refusal to the selected paths, so a junction
         outside a `rollback --path` selection cannot stop a scoped restore; None refuses any
-        unignored reparse point, which is the whole-tree behaviour. A reparse point a selection
-        passes over stays out of the snapshot entirely: Git's own walk follows a junction, and
-        the target's contents would be pinned in the checkpoint (LOCAL-R2-RB-01)."""
+        unignored reparse point, which is the whole-tree behaviour. A scope passed here is the
+        repository's own spelling (`plan` resolves it first) and is matched literally: a reparse
+        point a selection passes over stays out of the snapshot entirely, because Git's own walk
+        follows a junction and the target's contents would be pinned in the checkpoint
+        (LOCAL-R2-RB-01)."""
         with self._index() as index:
             blocked = self._check_reparse_points(index, scope) if os.name == "nt" else ()
             tracked = self._git("ls-files", "-z", index=index).stdout
@@ -789,29 +794,29 @@ class Repository:
         return known
 
     def _selects(self, name: str, scope: Tuple[str, ...]) -> bool:
-        """Whether an entry is inside one of the selected prefixes. The literal prefix is asked
-        first; the folded retry uses the volume's own simple case mapping and only on a
-        case-insensitive volume, so `--path SUB` selects `sub/...` while an exact `Stra\u00dfe`
-        never reaches a `Strasse` beside it (LOCAL-R2-RB-02)."""
-        if _within(name, scope):
-            return True
-        return self.folded and _within(_fold_case(name),
-                                       tuple(_fold_case(prefix) for prefix in scope))
+        """Whether an entry is inside one of the selected prefixes. The scope holds the
+        repository's own spelling - `_selected` resolved what the user typed into it - so the
+        filter is literal: exact equality, or the prefix followed by `/`. Nothing folds case
+        here, so `Stra\u00dfe` never reaches a `Strasse` beside it (LOCAL-R2-RB-02) and a
+        `U+212A KELVIN SIGN` folder never reaches the `K` that Python maps to the same key
+        (LOCAL-R3-RB-01). `--path SUB` still selects `sub/...`, because the retry that made
+        `sub` out of `SUB` happens in `_selected`, before this filter runs."""
+        return _within(name, scope)
 
     def _blocks_scope(self, name: str, scope: Tuple[str, ...]) -> bool:
         """Whether a reparse point is part of the selection: inside it, or on the way to it.
-        The fold is the volume's simple one, so a folder next to the selection is never counted
-        as being on the way to it."""
-        if _on_the_way(name, scope):
-            return True
-        return self.folded and _on_the_way(_fold_case(name),
-                                           tuple(_fold_case(prefix) for prefix in scope))
+        Literal, like `_selects`: the scope is the repository's own spelling, so a folder next
+        to the selection is never counted as being on the way to it, whatever the volume folds
+        (LOCAL-R3-RB-01)."""
+        return _on_the_way(name, scope)
 
     def _selected(self, paths: List[str], trees: Tuple[Dict[str, Tuple[str, str]], ...]) -> Tuple[str, ...]:
-        """The repository's own spelling for every `--path` value. A value must be a file or
-        folder either tree holds, or something that exists on disk. Spellings are matched
-        exactly first and case-insensitively second, and only on a case-insensitive volume:
-        a case-sensitive one must treat `README.md` literally."""
+        """The repository's own spelling for every `--path` value, which every later step then
+        filters with literally. A value must be a file or folder either tree holds, or something
+        that exists on disk. Spellings are matched exactly first and folded second, and only on
+        a case-insensitive volume, which is the single place a case mapping is used: a
+        case-sensitive volume keeps the value literal, so an absent `README.md` is refused
+        instead of selecting the `readme.md` next to it."""
         known = self._spellings(trees)
         folded = _folded_spellings(known) if self.folded else {}
         selected = []
@@ -843,9 +848,12 @@ class Repository:
             extra = set(current) - set(target)
             ignored = self._ignored(sorted(extra))
             return Plan(checkpoint, current_tree, restore, sorted(extra - ignored), sorted(ignored))
-        scope = tuple(self._resolve(raw) for raw in paths)
+        target = self.entries(checkpoint.tree)
+        # Resolve the values to the repository's spelling first: the reparse-point scan and the
+        # entry filter both use the scope literally, so the one folded retry happens here.
+        scope = self._selected(paths, (target,))
         current_tree = current_tree or self.snapshot_tree(scope=scope)
-        current, target = self.entries(current_tree), self.entries(checkpoint.tree)
+        current = self.entries(current_tree)
         selected = self._selected(paths, (target, current))
         restore = [p for p in sorted(target) if current.get(p) != target[p]
                    and self._selects(p, selected)]
