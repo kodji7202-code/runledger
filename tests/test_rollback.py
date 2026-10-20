@@ -1993,7 +1993,212 @@ def test_path_case_sensitive_volume_never_selects_a_differently_cased_file(scope
     err = capsys.readouterr().err
     assert "no such path" in err and "README.md" in err
     assert (repo.root / "readme.md").read_text(encoding="utf-8") == "modified\n"
-    assert git(repo.root, "for-each-ref", rollback.PREFIX) == refs
+
+# --------------------------------------- round-2 scrutiny regressions (LOCAL-R2-RB-01/02)
+
+def _make_junction(link, target):
+    """A real NTFS directory junction: the one shape Git's own directory walk follows."""
+    result = subprocess.run(["cmd.exe", "/c", "mklink", "/J", str(link), str(target)],
+                            capture_output=True)
+    if result.returncode:
+        pytest.skip(f"Junctions unavailable: {result.stderr.decode('utf-8', 'replace').strip()}")
+
+
+def _remove_junction(link):
+    os.rmdir(link)  # a junction is a directory entry; removing it never touches its target
+
+
+def _blobs_holding(repo, payload):
+    """Every blob in the object store whose bytes contain `payload`. Staging that follows a
+    junction writes one for the target's file, and `git add -A` writes it even for a dry run."""
+    listing = git(repo.root, "cat-file", "--batch-all-objects",
+                  "--batch-check=%(objectname) %(objecttype)").decode("ascii")
+    return [oid for oid, _, kind in (line.partition(" ") for line in listing.splitlines())
+            if kind == "blob" and payload in git(repo.root, "cat-file", "blob", oid)]
+
+
+def _tree_names(repo, tree):
+    return git(repo.root, "ls-tree", "-r", "--name-only", tree).decode("utf-8").splitlines()
+
+
+def _sharp_s_folders_stay_apart(folder):
+    """Whether this volume keeps `Straße` and `Strasse` apart, as NTFS and APFS do. A volume
+    that folds them into one name cannot hold the scenario at all."""
+    first, second = folder / "Stra\u00dfe", folder / "Strasse"
+    try:
+        first.mkdir()
+        second.mkdir()
+        if os.path.samefile(first, second):
+            return False
+        (first / "probe.txt").write_text("one\n", encoding="utf-8")
+        (second / "probe.txt").write_text("two\n", encoding="utf-8")
+        return ((first / "probe.txt").read_text(encoding="utf-8") == "one\n"
+                and (second / "probe.txt").read_text(encoding="utf-8") == "two\n")
+    except OSError:
+        return False
+    finally:
+        for path in (first / "probe.txt", second / "probe.txt", first, second):
+            try:
+                path.unlink() if path.is_file() else path.rmdir()
+            except OSError:
+                pass
+
+
+@pytest.mark.skipif(os.name != "nt", reason="NTFS junctions are Windows-only")
+def test_scoped_snapshot_never_captures_an_out_of_scope_junction_target(
+        scoped_repo, tmp_path, capsys):
+    """LOCAL-R2-RB-01: passing an out-of-scope junction through must not mean following it. The
+    whole-tree snapshot behind the stale-preview tree and the safety checkpoint has to stay out
+    of the target, or its outside contents land in Git objects and in the checkpoint."""
+    repo = scoped_repo
+    _write(repo.root, "a.txt", "one\n")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    payload = b"synthetic outside-repository marker, never a real secret\n"
+    marker = outside / "private-marker.txt"
+    marker.write_bytes(payload)
+    checkpoint = repo.create()
+    _write(repo.root, "a.txt", "modified\n")
+    link = repo.root / "elsewhere"
+    _make_junction(link, outside)
+    try:
+        assert main(["rollback", checkpoint.id, "--path", "a.txt", "--dry-run",
+                     "--cwd", str(repo.root)]) == 0
+        assert _blobs_holding(repo, payload) == []
+        assert main(["rollback", checkpoint.id, "--path", "a.txt", "--yes",
+                     "--cwd", str(repo.root)]) == 0
+        assert link.is_dir() and (link / "private-marker.txt").read_bytes() == payload
+        refs = git(repo.root, "for-each-ref", rollback.PREFIX)
+        assert main(["rollback", checkpoint.id, "--path", "elsewhere", "--dry-run",
+                     "--cwd", str(repo.root)]) == 1
+        assert "Windows junctions and other non-symlink reparse points" in capsys.readouterr().err
+        assert git(repo.root, "for-each-ref", rollback.PREFIX) == refs
+    finally:
+        _remove_junction(link)
+    safety = repo.select()
+    assert safety.kind == "safety"
+    assert not [name for name in _tree_names(repo, safety.tree) if name.startswith("elsewhere")]
+    assert _blobs_holding(repo, payload) == []
+    assert (repo.root / "a.txt").read_text(encoding="utf-8") == "one\n"
+    assert marker.read_bytes() == payload
+
+
+@pytest.mark.skipif(os.name != "nt", reason="NTFS junctions are Windows-only")
+def test_scoped_snapshot_keeps_the_repository_entry_a_junction_shadows(scoped_repo, tmp_path):
+    """A junction standing where the repository has a path must not become that path's content:
+    the entry keeps its own blob and the target's bytes stay out of the object store."""
+    repo = scoped_repo
+    _write(repo.root, "elsewhere/shadowed.txt", "repository content\n")
+    _write(repo.root, "a.txt", "one\n")
+    git(repo.root, "add", "elsewhere/shadowed.txt")
+    checkpoint = repo.create()
+    _write(repo.root, "a.txt", "modified\n")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    payload = b"synthetic outside-repository shadow, never a real secret\n"
+    (outside / "shadowed.txt").write_bytes(payload)
+    (repo.root / "elsewhere" / "shadowed.txt").unlink()
+    (repo.root / "elsewhere").rmdir()
+    link = repo.root / "elsewhere"
+    _make_junction(link, outside)
+    try:
+        assert main(["rollback", checkpoint.id, "--path", "a.txt", "--yes",
+                     "--cwd", str(repo.root)]) == 0
+    finally:
+        _remove_junction(link)
+    safety = repo.select()
+    assert safety.kind == "safety"
+    assert repo.entries(safety.tree)["elsewhere/shadowed.txt"] == \
+        repo.entries(checkpoint.tree)["elsewhere/shadowed.txt"]
+    assert _blobs_holding(repo, payload) == []
+    assert (outside / "shadowed.txt").read_bytes() == payload
+
+
+def test_blocked_reparse_entries_guard_refuses_a_traversed_junction():
+    """The snapshot re-reads the staged entries under a blocked reparse point, so a Git walk
+    that followed it anyway is a refusal, not a silently pinned copy of the target."""
+    staged = b"100644 0123456789012345678901234567890123456789 0\telsewhere/marker.txt\0"
+    rollback._reparse_entries_unchanged(b"", b"")        # nothing blocked, nothing to check
+    rollback._reparse_entries_unchanged(staged, staged)  # the index kept its own entry
+    with pytest.raises(rollback.CheckpointError, match="junction outside the selection"):
+        rollback._reparse_entries_unchanged(b"", staged)
+
+
+def test_folded_spelling_table_never_widens_through_unicode_casefolding():
+    """LOCAL-R2-RB-02: the folded retry uses the case mapping a volume compares names with.
+    `Straße` and `Strasse` are two folders on NTFS and APFS; `casefold` folds them into one
+    key, the simple mapping does not, and a key two names share keeps no spelling at all."""
+    assert rollback._fold_case("Stra\u00dfe") == "stra\u00dfe"
+    folded = rollback._folded_spellings({"Stra\u00dfe", "Strasse", "Stra\u00dfe/a.txt",
+                                         "sub", "Sub"})
+    assert folded["stra\u00dfe"] == "Stra\u00dfe"
+    assert folded["stra\u00dfe/a.txt"] == "Stra\u00dfe/a.txt"
+    assert folded["strasse"] == "Strasse"
+    assert "sub" not in folded
+
+
+@pytest.mark.parametrize("scope, restored", [
+    ("Stra\u00dfe", "Stra\u00dfe/a.txt"),
+    ("Strasse", "Strasse/b.txt"),
+])
+def test_path_exact_directory_selection_never_restores_a_casefolded_sibling(
+        scoped_repo, monkeypatch, scope, restored):
+    """LOCAL-R2-RB-02: a value that matches a folder exactly selects that folder and nothing a
+    Python casefold happens to fold onto it, so the sibling keeps its modified file."""
+    repo = scoped_repo
+    monkeypatch.setattr(repo, "folded", True)
+    after = {"Stra\u00dfe/a.txt": "sharp-s after\n", "Strasse/b.txt": "unselected after\n"}
+    for name in after:
+        _write(repo.root, name, "one\n")
+    checkpoint = repo.create()
+    for name, text in after.items():
+        _write(repo.root, name, text)
+    plan = repo.plan(checkpoint, paths=[scope])
+    assert plan.paths == (scope,)
+    assert plan.restore == [restored]
+    repo.rollback(plan)
+    for name, text in after.items():
+        expected = "one\n" if name == restored else text
+        assert repo.root.joinpath(*name.split("/")).read_text(encoding="utf-8") == expected
+
+
+def test_path_sharp_s_directory_scope_through_the_real_volume(scoped_repo, capsys):
+    """The same request through the real CLI, on whichever volume CI gives us: NTFS, APFS and an
+    ext4 runner all keep the two folders apart, and only the named one is restored."""
+    repo = scoped_repo
+    if not _sharp_s_folders_stay_apart(repo.root.parent):
+        pytest.skip("this volume folds Stra\u00dfe and Strasse into one name")
+    _write(repo.root, "Stra\u00dfe/a.txt", "one\n")
+    _write(repo.root, "Strasse/b.txt", "one\n")
+    checkpoint = repo.create()
+    _write(repo.root, "Stra\u00dfe/a.txt", "modified\n")
+    _write(repo.root, "Strasse/b.txt", "unselected after\n")
+    assert main(["rollback", checkpoint.id, "--cwd", str(repo.root), "--path", "Stra\u00dfe",
+                 "--yes"]) == 0
+    capsys.readouterr()
+    assert (repo.root / "Stra\u00dfe" / "a.txt").read_text(encoding="utf-8") == "one\n"
+    assert (repo.root / "Strasse" / "b.txt").read_text(encoding="utf-8") == "unselected after\n"
+
+
+def test_path_junction_in_a_sharp_s_sibling_folder_does_not_block_the_restore(
+        scoped_repo, junction_probe, monkeypatch):
+    """The blocker scan asks the volume's own case question, so a junction inside `Straße` is
+    not on the way to `Strasse` and a scoped restore of `Strasse` still runs."""
+    monkeypatch.setattr(rollback.os, "name", "nt")
+    repo = scoped_repo
+    monkeypatch.setattr(repo, "folded", True)
+    _write(repo.root, "Stra\u00dfe/a.txt", "one\n")
+    _write(repo.root, "Strasse/b.txt", "one\n")
+    junction = repo.root / "Stra\u00dfe" / "junc"
+    junction.mkdir()
+    (junction / "child.txt").write_text("through the junction\n", encoding="utf-8")
+    checkpoint = repo.create()
+    _write(repo.root, "Strasse/b.txt", "modified\n")
+    junction_probe(junction)
+    assert main(["rollback", checkpoint.id, "--path", "Strasse", "--yes",
+                 "--cwd", str(repo.root)]) == 0
+    assert (repo.root / "Strasse" / "b.txt").read_text(encoding="utf-8") == "one\n"
+    assert (repo.root / "Stra\u00dfe" / "a.txt").read_text(encoding="utf-8") == "one\n"
 
 
 # ---------------------------------------------------------------- retention

@@ -181,6 +181,40 @@ def _unsafe_path(name: str) -> bool:
                p.split(".")[0].casefold() in reserved for p in parts)
 
 
+def _fold_case(name: str) -> str:
+    """The case mapping a volume compares names with, used for the folded retry only: the
+    simple `lower` mapping, never `casefold`. NTFS and APFS keep `Stra\u00dfe` apart from
+    `Strasse`, so the wider Unicode folding would restore files in a folder the value never
+    named."""
+    return name.lower()
+
+
+def _folded_spellings(names: Iterable[str]) -> Dict[str, str]:
+    """The repository's own spelling per folded key, for the folded retry. A key two different
+    names share gives no canonical spelling, so it is left out: a scoped restore that cannot
+    tell the two apart refuses the value instead of widening it to both."""
+    folded: Dict[str, str] = {}
+    ambiguous = set()
+    for name in sorted(names):
+        key = _fold_case(name)
+        if key in folded:
+            ambiguous.add(key)
+        else:
+            folded[key] = name
+    for key in ambiguous:
+        del folded[key]
+    return folded
+
+
+def _reparse_entries_unchanged(before: bytes, after: bytes) -> None:
+    """The staged entries under a reparse point a scoped snapshot skips must be exactly the ones
+    the index already had: a difference means staging read through the point and wrote what it
+    found outside the repository, so the snapshot is refused instead of being pinned."""
+    if after != before:
+        raise CheckpointError("Staging read through a junction outside the selection. "
+                              "Nothing was restored.")
+
+
 def _within(name: str, prefixes: Tuple[str, ...]) -> bool:
     """A path is selected by itself, or by a folder above it. Literal (no globs), prefix-safe:
     `src` never selects `src2`. An empty prefix (the repository root, `--path .`) selects all."""
@@ -453,27 +487,47 @@ class Repository:
         """Capture tracked and non-ignored untracked files using only a temporary index.
         `scope` limits the Windows reparse-point refusal to the selected paths, so a junction
         outside a `rollback --path` selection cannot stop a scoped restore; None refuses any
-        unignored reparse point, which is the whole-tree behaviour."""
+        unignored reparse point, which is the whole-tree behaviour. A reparse point a selection
+        passes over stays out of the snapshot entirely: Git's own walk follows a junction, and
+        the target's contents would be pinned in the checkpoint (LOCAL-R2-RB-01)."""
         with self._index() as index:
-            if os.name == "nt":
-                self._check_reparse_points(index, scope)
+            blocked = self._check_reparse_points(index, scope) if os.name == "nt" else ()
             tracked = self._git("ls-files", "-z", index=index).stdout
             if tracked:
                 self._git("update-index", "--no-assume-unchanged", "-z", "--stdin",
                           index=index, data=tracked)
                 self._git("update-index", "--no-skip-worktree", "-z", "--stdin",
                           index=index, data=tracked)
-            self._git("add", "-A", "--", ".", index=index)
+            self._stage_worktree(index, blocked)
             tree = self._git("write-tree", index=index).stdout.decode("ascii").strip()
         self.entries(tree)  # reject submodules and unsafe names before publishing any ref
         return tree
 
-    def _check_reparse_points(self, index: str, scope: Optional[Tuple[str, ...]] = None) -> None:
-        # Git may traverse NTFS junctions as directories. Refuse them before staging contents.
-        # With a selection the refusal covers the selected paths and their parents only.
+    def _stage_worktree(self, index: str, blocked: Tuple[str, ...]) -> None:
+        """`git add -A` over the working tree, with Git's own directory walk kept out of every
+        reparse point a scoped snapshot has to pass over. `add` alone follows a Windows junction
+        and stages what it finds outside the repository, so a pathspec exclusion prunes the walk
+        and the entries under the point are read back and compared (LOCAL-R2-RB-01)."""
+        if not blocked:
+            self._git("add", "-A", "--", ".", index=index)
+            return
+        skipped = [f":(exclude,literal){path}" for path in blocked]
+        literals = [f":(literal){path}" for path in blocked]
+        before = self._git("ls-files", "-s", "-z", "--", *literals, index=index).stdout
+        self._git("add", "-A", "--", ".", *skipped, index=index)
+        after = self._git("ls-files", "-s", "-z", "--", *literals, index=index).stdout
+        _reparse_entries_unchanged(before, after)
+
+    def _check_reparse_points(self, index: str,
+                              scope: Optional[Tuple[str, ...]] = None) -> Tuple[str, ...]:
+        """Git may traverse NTFS junctions as directories. Refuse them before staging contents.
+        With a selection the refusal covers the selected paths and their parents only; every
+        other reparse point comes back as a path the staging walk must skip, so passing one over
+        never means following it (LOCAL-R2-RB-01)."""
         names = self._git("ls-files", "--cached", "--others", "--exclude-standard", "-z",
                           index=index).stdout
         checked = set()
+        blocked: List[str] = []
         for raw in names.split(b"\0"):
             if not raw:
                 continue
@@ -493,10 +547,13 @@ class Repository:
                 if _unsupported_reparse_point(candidate, mode):
                     relative = candidate.relative_to(self.root).as_posix()
                     if scope is not None and not self._blocks_scope(relative, scope):
+                        if relative not in blocked:
+                            blocked.append(relative)
                         continue
                     raise CheckpointError("Windows junctions and other non-symlink reparse points "
                                           "are not supported.")
                 checked.add(candidate)
+        return tuple(blocked)
 
     def _path(self, name: str) -> Path:
         parts = name.split("/")
@@ -732,19 +789,23 @@ class Repository:
         return known
 
     def _selects(self, name: str, scope: Tuple[str, ...]) -> bool:
-        """Whether an entry is inside one of the selected prefixes. Case is folded only on a
-        case-insensitive volume, where `--path SUB` and `sub/...` are the same folder."""
+        """Whether an entry is inside one of the selected prefixes. The literal prefix is asked
+        first; the folded retry uses the volume's own simple case mapping and only on a
+        case-insensitive volume, so `--path SUB` selects `sub/...` while an exact `Stra\u00dfe`
+        never reaches a `Strasse` beside it (LOCAL-R2-RB-02)."""
         if _within(name, scope):
             return True
-        return self.folded and _within(name.casefold(),
-                                       tuple(prefix.casefold() for prefix in scope))
+        return self.folded and _within(_fold_case(name),
+                                       tuple(_fold_case(prefix) for prefix in scope))
 
     def _blocks_scope(self, name: str, scope: Tuple[str, ...]) -> bool:
-        """Whether a reparse point is part of the selection: inside it, or on the way to it."""
+        """Whether a reparse point is part of the selection: inside it, or on the way to it.
+        The fold is the volume's simple one, so a folder next to the selection is never counted
+        as being on the way to it."""
         if _on_the_way(name, scope):
             return True
-        return self.folded and _on_the_way(name.casefold(),
-                                           tuple(prefix.casefold() for prefix in scope))
+        return self.folded and _on_the_way(_fold_case(name),
+                                           tuple(_fold_case(prefix) for prefix in scope))
 
     def _selected(self, paths: List[str], trees: Tuple[Dict[str, Tuple[str, str]], ...]) -> Tuple[str, ...]:
         """The repository's own spelling for every `--path` value. A value must be a file or
@@ -752,14 +813,11 @@ class Repository:
         exactly first and case-insensitively second, and only on a case-insensitive volume:
         a case-sensitive one must treat `README.md` literally."""
         known = self._spellings(trees)
-        folded: Dict[str, str] = {}
-        if self.folded:
-            for name in sorted(known):
-                folded.setdefault(name.casefold(), name)
+        folded = _folded_spellings(known) if self.folded else {}
         selected = []
         for raw in paths:
             name = self._resolve(raw)
-            spelling = name if name in known else folded.get(name.casefold())
+            spelling = name if name in known else folded.get(_fold_case(name))
             if name and spelling is None:
                 # A folder that no entry starts with, and that is not on disk either, is
                 # simply absent. (A folder whose entries are in a tree is a valid selection.)

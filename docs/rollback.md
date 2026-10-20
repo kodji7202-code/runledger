@@ -146,9 +146,12 @@ Run with --yes to apply.
   but never `src2/y.txt`, and a name with `[`, `*` or `?` is matched as written. A folder selects
   everything under it, on any depth, including files created after the checkpoint (`delete`).
   On a case-insensitive volume (Windows, macOS) a value that matches nothing exactly is retried
-  case-insensitively, for a folder as well as a file (`--path SUB` selects `sub/...`), and the
-  preview shows the repository's own spelling; a case-sensitive volume keeps the value literal,
-  so an absent `README.md` is refused instead of selecting the `readme.md` next to it.
+  with the volume's own case mapping, for a folder as well as a file (`--path SUB` selects
+  `sub/...`), and the preview shows the repository's own spelling; a case-sensitive volume keeps
+  the value literal, so an absent `README.md` is refused instead of selecting the `readme.md` next
+  to it. A value that matches exactly is used exactly, and the retry never expands a name the way
+  a Unicode casefold would: on NTFS and APFS `--path Straße` selects `Straße` only and leaves the
+  `Strasse` beside it alone.
 - **What is refused.** A value outside the repository (`..\outside.txt`, or an absolute path
   outside the root), `.git` or anything under it, an empty value, and a value that exists in
   neither the checkpoint nor the working tree end the command with one error line (`error: ...`)
@@ -163,8 +166,8 @@ Run with --yes to apply.
   confirmation, the rollback is refused even when the change is outside the selection. Symlinks,
   Windows junctions, `.git` overlaps, reserved names and case-colliding checkpoint entries are
   refused exactly as they are without `--path` when they are in the selection or on the way to
-  it; a blocker outside the selection is ignored, so a scoped restore is not stopped by an
-  unrelated junction elsewhere in the tree.
+  it; a junction outside the selection is left out of the snapshot entirely, so its target's
+  contents never enter a Git object or the safety checkpoint.
 - `--path .` selects the whole tree, which is the same as running `rollback` without `--path`.
   Without `--path` everything above is unchanged.
 

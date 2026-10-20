@@ -433,6 +433,22 @@ change behavior, so read the entry before you upgrade.
   unusable like a negative one and keeps the documented default of 50, so a typo in
   `~/.runledger/config.json` can no longer silently retain an unbounded number of checkpoints
   (`keep: 10**30` used to keep everything on the branch). `docs/rollback.md` documents the bound.
+- **A junction outside a `--path` selection is no longer followed (`runledger.rollback`):** the
+  scoped pass-through stopped the reparse-point refusal but not the whole-tree `git add -A`
+  behind the stale-preview tree and the safety checkpoint, so on Windows an unrelated junction to
+  a folder outside the repository put that folder's files into Git objects - on a `--dry-run`
+  too - and pinned them in the safety checkpoint, although the preview never listed them. Staging
+  now prunes Git's own walk with a pathspec exclusion for every reparse point the selection does
+  not cover, and the entries under it are compared before and after, so contents reached through
+  a junction are neither read into the snapshot nor written as objects; a path the junction
+  shadows keeps the repository's own blob. An in-scope junction is still refused by name.
+- **A `--path` value never widens through Unicode casefolding (`runledger.rollback`):** the folded
+  retry used `str.casefold`, which is wider than the case-insensitive comparison NTFS and APFS
+  use, so with both `Straße` and `Strasse` in one repository `--path Straße` restored the files of
+  `Strasse` too and overwrote an unselected file. The retry now applies the volume's own simple
+  case mapping, after the exact match, and a spelling two names share is left to the exact match
+  instead of being guessed, so `Straße` and `Strasse` stay two folders and a junction inside one
+  no longer blocks a restore of the other (`docs/rollback.md`).
 
 ### Security
 
