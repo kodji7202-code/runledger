@@ -760,7 +760,9 @@ def test_agent_is_stored_listed_filtered_and_summed_by_stats(env):
     assert ids("?agent=%25") == []                       # "%" is literal
     assert ids("?agent=nothing") == []
 
-    stats = _json(_http(base, "GET", "/api/stats", headers=_auth(admin))[2])
+    # days=3650: the fixture session is hard-dated 2026-10-08, and the window's width
+    # is not this test's subject; the default 30 days would hide the pushed runs.
+    stats = _json(_http(base, "GET", "/api/stats?days=3650", headers=_auth(admin))[2])
     by_agent = {row["agent"]: row for row in stats["by_agent"]}
     assert by_agent["Claude Code"]["runs"] == 1 and by_agent["Codex CLI"]["runs"] == 1
     assert by_agent["Claude Code"]["cost_usd"] == pytest.approx(one["receipt"]["totals"]["cost_usd"], rel=1e-4)
@@ -774,7 +776,7 @@ def test_a_receipt_without_an_agent_is_stored_as_null_and_counted_as_unknown(env
     assert _http(base, "POST", "/api/runs", body=payload, headers=_auth(admin))[0] == 201
     run = _json(_http(base, "GET", f"/api/runs/{SESSION_ID}", headers=_auth(admin))[2])["run"]
     assert run["agent"] is None
-    stats = _json(_http(base, "GET", "/api/stats", headers=_auth(admin))[2])
+    stats = _json(_http(base, "GET", "/api/stats?days=3650", headers=_auth(admin))[2])
     assert [row["agent"] for row in stats["by_agent"]] == ["unknown"]
 
 
