@@ -75,11 +75,29 @@ def _json(raw):
     return json.loads(raw.decode("utf-8"))
 
 
-def _stored(payload, run_id, *, steps=4, ended="2026-10-15T10:05:00Z", cost=0.1, risk=20, **extra):
-    """A receipt for `run_id` with a chosen step count, end time, cost and risk."""
+def _iso_days_ago(days: float) -> str:
+    """A UTC timestamp `days` before now, in the payload format. Fixture dates are
+    relative on purpose: the server resolves its stats windows from the real clock,
+    so a hard-coded session date falls out of the default 30-day window a month
+    after it is written and the suite starts failing for calendar reasons alone."""
+    return (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _iso_minutes_later(stamp: str, minutes: int) -> str:
+    parsed = datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ")
+    return (parsed + timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _stored(payload, run_id, *, steps=4, ended=None, cost=0.1, risk=20, **extra):
+    """A receipt for `run_id` with a chosen step count, end time, cost and risk.
+    Without an explicit `started` the run is dated yesterday, so it always sits
+    inside the default stats window; an explicit `started=None` stays None."""
     body = copy.deepcopy(payload)
     body["session_id"] = run_id
-    body["started"] = extra.pop("started", "2026-10-15T10:00:00Z")
+    started = extra.pop("started", _iso_days_ago(1))
+    body["started"] = started
+    if ended is None and started:
+        ended = _iso_minutes_later(started, 5)
     body["ended"] = ended
     body["totals"] = dict(body["totals"], steps=steps, cost_usd=cost)
     body["models"] = {"claude-sonnet-4-5-20250929": {"tokens": 1000, "cost_usd": cost}}
@@ -134,7 +152,10 @@ def test_push_then_list_get_and_stats(env):
     assert run["receipt"]["session_id"] == SESSION_ID
     assert {"secret_file", "test_deleted"} <= {r["code"] for r in run["risks"]}
 
-    status, _, raw = _http(base, "GET", "/api/stats?days=30", headers=_auth(key))
+    # days=3650: the fixture session is hard-dated 2026-10-08, and the window's width
+    # is not this test's subject (window semantics are covered by
+    # test_sort_at_drives_the_list_order_and_the_window).
+    status, _, raw = _http(base, "GET", "/api/stats?days=3650", headers=_auth(key))
     stats = _json(raw)
     assert status == 200
     assert stats["team"] == "alpha"
@@ -604,7 +625,8 @@ def test_a_droid_session_without_recorded_usage_leaves_its_model_unpriced(env, t
         encoding="utf-8",
     )
     payload = client.build_payload(session, user="dev@example.com")
-    payload["started"], payload["ended"] = "2026-10-15T10:00:00Z", "2026-10-15T10:05:00Z"
+    payload["started"] = _iso_days_ago(1)
+    payload["ended"] = _iso_minutes_later(payload["started"], 5)
     assert payload["totals"]["usage_source"] == "missing"
     assert payload["models"] == {"claude-sonnet-4-5": {"tokens": 0, "cost_usd": None}}
     assert _push(base, key, payload)[0] == 201
@@ -983,7 +1005,9 @@ def test_user_names_are_escaped_in_served_data(env):
     assert b"\\u003cscript\\u003e" in raw
     assert _json(raw)["runs"][0]["user"] == XSS  # the value itself round-trips intact
 
-    stats_raw = _http(base, "GET", "/api/stats", headers=_auth(key))[2]
+    # days=3650, as in test_push_then_list_get_and_stats: the fixture session is
+    # hard-dated, and the default 30-day window would hide the pushed run.
+    stats_raw = _http(base, "GET", "/api/stats?days=3650", headers=_auth(key))[2]
     assert b"<script" not in stats_raw
     assert _json(stats_raw)["by_user"][0]["user"] == XSS
 
