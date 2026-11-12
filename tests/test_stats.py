@@ -394,13 +394,22 @@ def test_since_filters_by_session_start(capsys, fixture_a):
     _same_window(one_month, thirty)
 
 
-def test_two_reports_a_minute_apart_are_comparable(capsys, fixture_a, monkeypatch):
+def test_two_reports_a_minute_apart_are_comparable(capsys, isolated_settings, monkeypatch):
     """CI run 39377371046 (macos-latest, Python 3.13) failed the comparison above because the
     two invocations straddled a minute boundary: `window` is resolved to the current minute and
     its `until` is the end of that minute, so a whole-report comparison must ignore both run
-    stamps while the window itself is compared separately."""
+    stamps while the window itself is compared separately.
+
+    The test writes its own sessions, dated against the frozen clock: fixture dates
+    resolved from the real clock (as fixture set A does) drift out of a window that
+    ends at the frozen minute, and the report comes back empty."""
     clock = {"now": datetime(2026, 10, 20, 6, 4, 30)}
     monkeypatch.setattr(stats, "local_now", lambda: clock["now"])
+    home = isolated_settings
+    project = home / "projects" / "p1"
+    project.mkdir(parents=True)
+    claude_session(home, project, "frozen-recent", datetime(2026, 10, 19, 12, 0, 0))
+    claude_session(home, project, "frozen-older", datetime(2026, 10, 12, 12, 0, 0))
     first, _ = _json(capsys, "stats", "--all", "--since", "4w", "--format", "json")
     clock["now"] = datetime(2026, 10, 20, 6, 5, 10)
     second, _ = _json(capsys, "stats", "--all", "--since", "4w", "--format", "json")
