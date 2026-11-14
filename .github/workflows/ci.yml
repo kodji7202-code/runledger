@@ -25,7 +25,10 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
         python: ["3.9", "3.10", "3.11", "3.12", "3.13"]
-                exclude:
+        # ubuntu-latest is Ubuntu 26.04 now, and actions/setup-python publishes no Python 3.9
+        # build for it ("The version '3.9' with architecture 'x64' was not found for Ubuntu
+        # 26.04"), so that one cell runs on the previous LTS rather than dropping 3.9 on Linux.
+        exclude:
           - os: ubuntu-latest
             python: "3.9"
         include:
