@@ -430,7 +430,7 @@ def test_a_backup_does_not_hold_the_store_while_it_copies(tmp_path, monkeypatch)
 
             def backup(self, target, **kwargs):
                 def other():
-                    seen["stats"] = db.stats(team_id)
+                    seen["stats"] = db.stats(team_id, now=NOW)
                     db.upsert_run(team_id, _pushable("during"), key_id=key_id)
                     seen["pushed"] = True
 
@@ -454,7 +454,7 @@ def test_a_backup_does_not_hold_the_store_while_it_copies(tmp_path, monkeypatch)
             db.backup_to(str(dest))
         assert seen["finished"] is True and seen["pushed"] is True
         assert seen["stats"]["totals"]["runs"] == 1  # the concurrent push is not in this report
-        assert db.stats(team_id)["totals"]["runs"] == 2
+        assert db.stats(team_id, now=NOW)["totals"]["runs"] == 2
         with sqlite3.connect(str(dest)) as copy:
             assert copy.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
             assert copy.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 2
@@ -492,7 +492,7 @@ def test_a_backup_of_a_busy_store_runs_beside_the_pushes(tmp_path):
         thread.join(60)
         assert failures == [] and not thread.is_alive()
         assert max(latencies) < 2.0
-        assert db.stats(team_id)["totals"]["runs"] == 2020
+        assert db.stats(team_id, now=NOW)["totals"]["runs"] == 2020
         with sqlite3.connect(str(dest)) as copy_db:
             assert copy_db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
             copied = copy_db.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
