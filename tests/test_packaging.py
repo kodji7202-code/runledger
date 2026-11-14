@@ -283,6 +283,12 @@ def test_ci_matrix_has_every_os_and_python():
     assert 'python: ["3.9", "3.10", "3.11", "3.12", "3.13"]' in ci
     assert "python -m compileall -q runledger" in ci
     assert "/health" in ci
+    # ubuntu-latest is Ubuntu 26.04, which has no Python 3.9 build: that one cell runs on the
+    # previous LTS, so the minimum version stays tested on Linux instead of being dropped.
+    assert re.search(r"exclude:\n\s+- os: ubuntu-latest\n\s+python: \"3\.9\"\n", ci), \
+        "the Python 3.9 ubuntu cell is excluded from ubuntu-latest"
+    assert re.search(r"include:\n\s+- os: ubuntu-24\.04\n\s+python: \"3\.9\"\n", ci), \
+        "the Python 3.9 ubuntu cell runs on ubuntu-24.04"
     action = (ROOT / "action.yml").read_text(encoding="utf-8")
     assert "python-version: ${{ inputs.python-version }}" in action
 
