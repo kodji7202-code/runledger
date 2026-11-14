@@ -88,16 +88,23 @@ def _iso_minutes_later(stamp: str, minutes: int) -> str:
     return (parsed + timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _stored(payload, run_id, *, steps=4, ended=None, cost=0.1, risk=20, **extra):
+_UNSET = object()
+
+
+def _stored(payload, run_id, *, steps=4, ended=_UNSET, cost=0.1, risk=20, **extra):
     """A receipt for `run_id` with a chosen step count, end time, cost and risk.
     Without an explicit `started` the run is dated yesterday, so it always sits
-    inside the default stats window; an explicit `started=None` stays None."""
+    inside the default stats window; an explicit `started=None` stays None.
+    An omitted `ended` defaults to five minutes after `started`; an explicit
+    `ended=None` stays None, so a test can still push a receipt that has no
+    end time at all (the two must not be conflated: `None` is a real value
+    the supersede rules treat specially)."""
     body = copy.deepcopy(payload)
     body["session_id"] = run_id
     started = extra.pop("started", _iso_days_ago(1))
     body["started"] = started
-    if ended is None and started:
-        ended = _iso_minutes_later(started, 5)
+    if ended is _UNSET:
+        ended = _iso_minutes_later(started, 5) if started else None
     body["ended"] = ended
     body["totals"] = dict(body["totals"], steps=steps, cost_usd=cost)
     body["models"] = {"claude-sonnet-4-5-20250929": {"tokens": 1000, "cost_usd": cost}}
