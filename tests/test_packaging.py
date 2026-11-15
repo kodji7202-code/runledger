@@ -298,7 +298,10 @@ def test_ci_has_timeouts_and_least_privilege():
     assert "on:\n  push:\n    branches: [main]\n  pull_request:\n  workflow_dispatch:" in ci
     assert "permissions:\n  contents: read\n" in ci
     assert "cancel-in-progress: true" in ci
-    assert ci.count("uses: actions/setup-python@v5") == ci.count("cache: pip")
+    # Only the action name and its major-version tag are pinned here, never one exact major:
+    # Dependabot bumps these (checkout 4→7, setup-python 5→7, upload/download-artifact 4→7/8)
+    # and a hardcoded major turned every bump into a red matrix.
+    assert len(re.findall(r"uses: actions/setup-python@v\d+", ci)) == ci.count("cache: pip")
     jobs = _workflow_jobs(ci)
     assert jobs, "no jobs found in ci.yml"
     for name, body in jobs.items():
@@ -319,9 +322,10 @@ def test_release_workflow_uses_trusted_publishing_on_version_tags():
     # Only the third-party publish action is pinned by commit; first-party actions stay on tags.
     assert re.search(r"pypa/gh-action-pypi-publish@[0-9a-f]{40} # release/v1", release)
     assert "pypa/gh-action-pypi-publish@release/v1" not in release
-    for action in ("actions/checkout@v4", "actions/setup-python@v5", "actions/upload-artifact@v4",
-                   "actions/download-artifact@v4"):
-        assert action in release
+    for action in ("actions/checkout", "actions/setup-python", "actions/upload-artifact",
+                   "actions/download-artifact"):
+        assert re.search(rf"uses: {re.escape(action)}@v\d+\b", release), \
+            f"the release workflow does not use {action} from a major-version tag"
     assert "v0.3.0" not in release
 
 
