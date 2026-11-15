@@ -9,9 +9,15 @@ import sqlite3
 import threading
 import time
 from contextlib import closing
+from datetime import datetime, timezone
 
 from runledger.server.app import receipt_to_run
 from runledger.server.db import Database
+
+# The fixture receipts are dated 2026-10-15 (see _stored_run). A report resolves its window
+# against this instant rather than against the day the suite happens to run, so the default
+# 30 days keep containing them however late that is.
+STATS_NOW = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
 
 # The runs table exactly as 0.6.0 created it: no revision, usage_source, cost_partial,
 # agent_id or sort_at, and no run_revisions table.
@@ -268,7 +274,7 @@ def test_reports_read_on_their_own_connection_while_a_writer_holds_the_store(tmp
         thread.start()
         assert started.wait(5)
         began = time.monotonic()
-        stats = db.stats(team_id)
+        stats = db.stats(team_id, now=STATS_NOW)
         events = db.audit_events(team_id)
         elapsed = time.monotonic() - began
         release.set()
