@@ -801,10 +801,12 @@ class _Handler(BaseHTTPRequestHandler):
             "max_quality": _int_param(query, "max_quality", None, 0, 100),
             "ai_verdict": ai_verdict,
         }
+        after = (query.get("after") or [""])[0] or None  # a run id, kept verbatim: ids may hold spaces
         db = self.server.db
         try:
-            runs = db.list_runs(ident.team_id, limit=_int_param(query, "limit", 100, 1, 500),
-                                after=_text_param(query, "after", 200), **filters)
+            if after is not None and not _valid_id(after):
+                raise KeyError(after)
+            runs = db.list_runs(ident.team_id, limit=_int_param(query, "limit", 100, 1, 500), after=after, **filters)
         except KeyError:
             raise _HttpError(400, "bad_request", "'after' must be the id of one of the team's runs.") from None
         self._send_json(200, {"runs": runs, "total": db.count_runs(ident.team_id, **filters)})

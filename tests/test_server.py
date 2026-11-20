@@ -554,6 +554,11 @@ def test_runs_page_with_after_and_report_the_filtered_total(env):
     rest = page("user=bo&limit=500&after=" + bo["runs"][0]["id"])
     assert [r["user"] for r in rest["runs"]] == ["bo@example.com"] * 2
 
+    assert _push(base, key, _stored(payload, " run-spaced ", started=_iso_days_ago(30)))[0] == 201
+    assert _push(base, key, _stored(payload, "run-spaced", started=_iso_days_ago(1)))[0] == 201
+    tail = page("limit=500&after=%20run-spaced%20")
+    assert tail["runs"] == [] and tail["total"] == 7  # the cursor is not trimmed onto another run
+
     status, _, raw = _http(base, "GET", "/api/runs?after=no-such-run", headers=_auth(key))
     assert status == 400 and _json(raw)["error"]["code"] == "bad_request"
     _, other = srv.db.create_team("beta")
