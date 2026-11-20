@@ -523,6 +523,43 @@ def test_agent_id_round_trips_and_the_agent_filter_keeps_working(env):
     assert [r["id"] for r in _json(_http(base, "GET", "/api/runs?agent=droid", headers=_auth(key))[2])["runs"]] == ["run-droid"]
 
 
+def test_runs_page_with_after_and_report_the_filtered_total(env):
+    """Walking the list two at a time with `after` returns every run once, in list order, even
+    when runs share a start time; `total` counts every run the filters match."""
+    srv, base = env
+    _, key = srv.db.create_team("alpha")
+    payload = client.build_payload(FIX, user="dev@example.com")
+    tied = _iso_days_ago(1)
+    for i in range(5):
+        user = "ana@example.com" if i % 2 else "bo@example.com"
+        assert _push(base, key, _stored(payload, f"run-{i}", started=tied if i < 3 else _iso_days_ago(i), user=user))[0] == 201
+
+    def page(query):
+        return _json(_http(base, "GET", "/api/runs?" + query, headers=_auth(key))[2])
+
+    everything = page("limit=500")
+    assert everything["total"] == 5
+    walked, after = [], None
+    while True:
+        body = page("limit=2" + (f"&after={after}" if after else ""))
+        assert body["total"] == 5
+        if not body["runs"]:
+            break
+        walked += [r["id"] for r in body["runs"]]
+        after = body["runs"][-1]["id"]
+    assert walked == [r["id"] for r in everything["runs"]]
+
+    bo = page("user=bo&limit=1")
+    assert bo["total"] == 3 and len(bo["runs"]) == 1
+    rest = page("user=bo&limit=500&after=" + bo["runs"][0]["id"])
+    assert [r["user"] for r in rest["runs"]] == ["bo@example.com"] * 2
+
+    status, _, raw = _http(base, "GET", "/api/runs?after=no-such-run", headers=_auth(key))
+    assert status == 400 and _json(raw)["error"]["code"] == "bad_request"
+    _, other = srv.db.create_team("beta")
+    assert _http(base, "GET", "/api/runs?after=run-0", headers=_auth(other))[0] == 400
+
+
 def _receipts(base, key, run_id):
     """The run row from the list, from the detail view and from the table."""
     listed = {r["id"]: r for r in _json(_http(base, "GET", "/api/runs", headers=_auth(key))[2])["runs"]}

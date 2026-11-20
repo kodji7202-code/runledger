@@ -1,7 +1,7 @@
 """HTTP server for the RunLedger team dashboard and the push API.
 
   POST /api/runs                              push a receipt -> 201 (admin, member)
-  GET  /api/runs[?user&project&agent&min_risk&min_quality&max_quality&ai_verdict&limit]  list runs (any role)
+  GET  /api/runs[?user&project&agent&min_risk&min_quality&max_quality&ai_verdict&limit&after]  list runs (any role)
   GET  /api/runs/<id>                         one run with its receipt JSON and risk reasons
   GET  /api/stats[?days=30]                   team totals; cost by developer, model, project, agent
   GET  /api/insights[?days=30]                quality, cost by model and agent, recommendations, AI review (any role)
@@ -792,18 +792,22 @@ class _Handler(BaseHTTPRequestHandler):
         ai_verdict = _text_param(query, "ai_verdict", 20)
         if ai_verdict is not None and ai_verdict not in insights.VERDICTS:
             raise _HttpError(400, "bad_request", "'ai_verdict' must be one of looks_safe, needs_review, dangerous.")
-        runs = self.server.db.list_runs(
-            ident.team_id,
-            user=_text_param(query, "user"),
-            project=_text_param(query, "project"),
-            min_risk=_int_param(query, "min_risk", None, 0, 100),
-            limit=_int_param(query, "limit", 100, 1, 500),
-            agent=_text_param(query, "agent"),
-            min_quality=_int_param(query, "min_quality", None, 0, 100),
-            max_quality=_int_param(query, "max_quality", None, 0, 100),
-            ai_verdict=ai_verdict,
-        )
-        self._send_json(200, {"runs": runs})
+        filters = {
+            "user": _text_param(query, "user"),
+            "project": _text_param(query, "project"),
+            "min_risk": _int_param(query, "min_risk", None, 0, 100),
+            "agent": _text_param(query, "agent"),
+            "min_quality": _int_param(query, "min_quality", None, 0, 100),
+            "max_quality": _int_param(query, "max_quality", None, 0, 100),
+            "ai_verdict": ai_verdict,
+        }
+        db = self.server.db
+        try:
+            runs = db.list_runs(ident.team_id, limit=_int_param(query, "limit", 100, 1, 500),
+                                after=_text_param(query, "after", 200), **filters)
+        except KeyError:
+            raise _HttpError(400, "bad_request", "'after' must be the id of one of the team's runs.") from None
+        self._send_json(200, {"runs": runs, "total": db.count_runs(ident.team_id, **filters)})
 
     def _stats(self, query: Dict[str, List[str]]) -> None:
         ident = self._identify()

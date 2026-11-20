@@ -131,6 +131,7 @@ button.small.btn-danger{color:var(--red);border-color:var(--red)}
 .progress-fill.danger{background:var(--red)}
 .budget-form{margin-top:12px;border-top:1px solid var(--line);padding-top:12px}
 .section-gap{margin-top:8px}
+.runs-foot{display:flex;flex-wrap:wrap;align-items:center;justify-content:center;gap:12px;margin-top:14px}
 .link-row{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 8px}
 .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
 dialog{background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:12px;padding:0;width:min(92vw,420px);max-width:92vw}
@@ -291,6 +292,10 @@ tr.pickable:hover{background:var(--chip)}
 </table>
 </div>
 <div id="runs-empty" class="empty"></div>
+<div class="runs-foot" id="runs-foot" hidden>
+  <span class="label-inline" id="runs-count" role="status" aria-live="polite"></span>
+  <button type="button" id="runs-more" hidden>Load more</button>
+</div>
 </section>
 
 <section class="view" id="view-insights" role="tabpanel" aria-labelledby="tab-insights" tabindex="-1" hidden>
@@ -499,6 +504,7 @@ tr.pickable:hover{background:var(--chip)}
   var ADMIN_VIEWS = { keys: true, audit: true, settings: true };
   var ROLES = ["admin", "member", "viewer"];
   var AUDIT_PAGE = 100;
+  var RUNS_PAGE = 200;
   var MAX_BUDGET_USD = 1000000000;
   var MAX_TTL_S = 604800;
   var EXPORT_PATHS = {
@@ -512,6 +518,7 @@ tr.pickable:hover{background:var(--chip)}
   var approvalsView = { seq: 0, signature: null, items: [], failed: false };
   var keysView = { items: [] };
   var auditView = { events: [], busy: false, more: false };
+  var runsView = { runs: [], total: 0, more: false, busy: false, seq: 0 };
   var exportReady = {};
 
   function $(id) { return document.getElementById(id); }
@@ -831,14 +838,27 @@ tr.pickable:hover{background:var(--chip)}
       "No risky actions recorded.");
   }
 
-  function renderRuns(body) {
-    var runs = (body && body.runs) || [];
+  function formatCount(n) {
+    return Number(n).toLocaleString();
+  }
+
+  // Appends `rows` to the runs table (after clearing it unless `append`), then updates the
+  // footer from runsView.
+  function renderRuns(rows, append) {
     var tbody = $("runs");
-    clear(tbody);
-    $("runs-empty").textContent = runs.length
+    if (!append) { clear(tbody); }
+    var loaded = runsView.runs.length;
+    $("runs-empty").textContent = loaded
       ? ""
       : "No runs match these filters. Push a session with: runledger push --server URL --key KEY";
-    runs.forEach(function (r) {
+    $("runs-foot").hidden = loaded === 0;
+    $("runs-count").textContent = runsView.more
+      ? "Showing " + formatCount(loaded) + " of " + formatCount(runsView.total) + " runs"
+      : formatCount(loaded) + (loaded === 1 ? " run" : " runs");
+    var more = $("runs-more");
+    more.hidden = !runsView.more;
+    more.textContent = "Load " + formatCount(Math.min(RUNS_PAGE, runsView.total - loaded)) + " more";
+    rows.forEach(function (r) {
       var lv = level(r.risk_level);
       var tr = el("tr", "pickable");
       tr.title = "Show run detail";
@@ -936,7 +956,7 @@ tr.pickable:hover{background:var(--chip)}
     return String(Math.min(100, Math.max(0, Math.floor(Number(raw)) || 0)));
   }
 
-  function runQuery() {
+  function runQuery(after) {
     var params = new URLSearchParams();
     var user = $("f-user").value.trim();
     if (user) { params.set("user", user); }
@@ -952,7 +972,8 @@ tr.pickable:hover{background:var(--chip)}
     if (maxQuality !== "") { params.set("max_quality", boundedNumber(maxQuality)); }
     var verdict = $("f-verdict").value.trim();
     if (verdict) { params.set("ai_verdict", verdict); }
-    params.set("limit", "200");
+    params.set("limit", String(RUNS_PAGE));
+    if (after) { params.set("after", after); }
     return params.toString();
   }
 
@@ -960,8 +981,27 @@ tr.pickable:hover{background:var(--chip)}
     return getJSON("/api/stats?days=" + encodeURIComponent(String(state.days))).then(renderStats);
   }
 
-  function loadRuns() {
-    return getJSON("/api/runs?" + runQuery()).then(renderRuns);
+  // Loads the first page of runs, or with `more` the page after the last loaded run. A newer
+  // load (a filter change, a refresh) wins over one still in flight.
+  function loadRuns(more) {
+    var last = runsView.runs[runsView.runs.length - 1];
+    if (more && (runsView.busy || !last)) { return Promise.resolve(); }
+    var seq = ++runsView.seq;
+    runsView.busy = true;
+    $("runs-more").disabled = true;
+    function done() {
+      if (seq !== runsView.seq) { return; }
+      runsView.busy = false;
+      $("runs-more").disabled = false;
+    }
+    return getJSON("/api/runs?" + runQuery(more ? last.id : null)).then(function (body) {
+      if (seq !== runsView.seq) { return; }
+      var rows = Array.isArray(body && body.runs) ? body.runs : [];
+      runsView.runs = more ? runsView.runs.concat(rows) : rows;
+      runsView.total = Math.max(Number(body && body.total) || 0, runsView.runs.length);
+      runsView.more = rows.length >= RUNS_PAGE && runsView.runs.length < runsView.total;
+      renderRuns(rows, more);
+    }).then(done, function (err) { done(); throw err; });
   }
 
   function refresh() {
@@ -1975,6 +2015,7 @@ tr.pickable:hover{background:var(--chip)}
 
   $("audit-filter").addEventListener("input", renderAudit);
   $("audit-more").addEventListener("click", function () { loadAudit(false); });
+  $("runs-more").addEventListener("click", function () { report(loadRuns(true)); });
   $("audit-days").addEventListener("change", refreshExportLinks);
   $("exp-days").addEventListener("change", refreshExportLinks);
 
