@@ -14,12 +14,11 @@ from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Optional
 
 from . import llm
+from .ai_defaults import DEFAULT_AI_MODEL
 from .parser import Run, Step, Usage
 from .paths import is_abs, relative
 from .ps_writes import ps_deletes, ps_writes, shell_kind
 from .shell_writes import shell_deletes, shell_writes
-
-DEFAULT_AI_MODEL = os.environ.get("RUNLEDGER_SUMMARY_MODEL", "claude-haiku-5-5")
 
 
 def _short(path: str, cwd: Optional[str]) -> str:

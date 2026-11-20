@@ -19,7 +19,7 @@ from runledger.server.app import make_server
 from runledger.server.dashboard import APPROVAL_HTML, DASHBOARD_HTML
 
 NONCE_PLACEHOLDER = "__CSP_NONCE__"
-VIEWS = ["runs", "insights", "approvals", "keys", "audit", "settings"]
+VIEWS = ["runs", "insights", "approvals", "sessions", "keys", "audit", "settings"]
 ADMIN_TABS = ["keys", "audit", "settings"]
 
 # Every endpoint the page calls, from the team API contract.
@@ -37,6 +37,8 @@ CONTRACT_ENDPOINTS = [
     "/api/export/report.html",
     "/api/team/settings",
     "/api/approvals",
+    "/session/logout",
+    "/sessions",
 ]
 
 FORBIDDEN_SINKS = [
@@ -146,7 +148,40 @@ def test_tabs_are_a_tablist_wired_to_their_panels():
 
     for name in VIEWS:
         assert f"view-{name}" in by_id and f"tab-{name}" in by_id
-    assert f'var VIEWS = ["runs", "insights", "approvals", "keys", "audit", "settings"];' in _script(DASHBOARD_HTML)
+    assert f'var VIEWS = ["runs", "insights", "approvals", "sessions", "keys", "audit", "settings"];' in _script(DASHBOARD_HTML)
+
+
+def test_session_controls_are_available_to_all_roles_and_use_the_authenticated_helper():
+    attrs = {a["id"]: a for _, a in _page(DASHBOARD_HTML).elements if a.get("id")}
+    assert "hidden" not in attrs["tab-sessions"] and "hidden" not in attrs["sign-out"]
+    js = _script(DASHBOARD_HTML)
+    assert 'getJSON("/sessions")' in js
+    assert 'postJSON("/session/logout").then(goToSignIn' in js
+    assert 'request("DELETE", "/sessions/" + encodeURIComponent(session.id))' in js
+    assert 'session.current ? key + " (This session)" : key' in js
+    assert 'if (res.status === 401) { goToSignIn(); }' in js
+    sign_in = js[js.index("function goToSignIn()"):js.index("function parseBody")]
+    assert 'history.replaceState(null, "", "/");' in sign_in and "location.reload();" in sign_in
+
+
+def test_background_polls_are_marked_on_both_pages():
+    js = _script(DASHBOARD_HTML)
+    assert 'loadApprovals(true).then(' in js
+    assert 'getJSON("/api/approvals?status=pending&limit=50", background)' in js
+    approval = _script(APPROVAL_HTML)
+    assert 'load(true).then(' in approval
+    assert 'encodeURIComponent(approvalId), undefined, background)' in approval
+    for script in (js, approval):
+        assert 'if (background) { opts.headers["X-RunLedger-Background"] = "1"; }' in script
+
+
+def test_revoke_session_confirmation_identifies_the_target():
+    js = _script(DASHBOARD_HTML)
+    row = js[js.index("function sessionRow("):js.index("function renderKeys(")]
+    assert 'nameOf(session.key_label, session.key_id)' in row
+    assert 'var target = session.current ? "your current session" : "the session";' in row
+    assert """confirmAction("Revoke " + target + " for '" + key + "'?",""" in row
+    assert 'when(session.created_at) + ".", "Revoke session", true)' in row
 
 
 def test_admin_tabs_start_hidden_so_members_and_viewers_never_see_them():
@@ -413,6 +448,21 @@ def test_new_key_is_shown_once_with_a_warning_and_copy_button():
     js = _script(DASHBOARD_HTML)
     assert '$("key-value").textContent = key;' in js       # plaintext goes in as text only
     assert js.count("clearKeyOnce();") >= 2                 # when the user dismisses it and when they leave the tab
+
+
+def test_rotating_own_key_keeps_replacement_visible_until_dismissed():
+    js = _script(DASHBOARD_HTML)
+    assert "state.keyId = me && me.key ? me.key.id : null;" in js
+    rotate = js[js.index("function rotateKey("):js.index("// Audit log (admin)")]
+    assert rotate.index("state.selfRotation = ownKey;") < rotate.index('postJSON("/api/keys/"')
+    assert 'var ownKey = key.id === state.keyId;' in rotate
+    assert re.search(r'if \(ownKey\) \{[^}]+Your session ended[^}]+return;\s+\}', rotate)
+    assert rotate.index("return loadKeys();") > rotate.index('textContent = "I have copied it — sign in"')
+    sign_in = js[js.index("function goToSignIn()"):js.index("function parseBody")]
+    assert sign_in.index("if (state.selfRotation) { return; }") < sign_in.index("location.reload();")
+    assert 'if (state.view === "keys" && !state.selfRotation) { clearKeyOnce(); }' in js
+    dismiss = js[js.index('$("key-dismiss").addEventListener'):js.index('$("audit-filter").addEventListener')]
+    assert dismiss.index("clearKeyOnce();") < dismiss.index("state.selfRotation = false;") < dismiss.index("goToSignIn();")
 
 
 # Checks against a real server
