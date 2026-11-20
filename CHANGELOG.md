@@ -7,6 +7,13 @@ change behavior, so read the entry before you upgrade.
 
 ## [Unreleased]
 
+### Fixed
+
+- **An out-of-range `runledger stats --since` is a usage error (`runledger.stats`):** a relative
+  window too large for the calendar (`--since 99999999999d`) made `parse_since()` raise
+  `OverflowError`, so the command printed a traceback and exited 1. It now prints the usual
+  `argument --since: invalid value ...` usage error and exits 2, like any other bad value.
+
 ## [0.7.0] - 2026-10-20
 
 ### Added
