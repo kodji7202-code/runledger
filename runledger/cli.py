@@ -380,7 +380,10 @@ def cmd_list(args) -> int:
     entries, dirty = session_cache.load()
     print(f"{'when':<16}  {'id':<8}  {'agent':<12}  {'steps':>5}  first request")
     limit = max(0, args.limit) if args.limit is not None else 20
-    for f in files[:limit]:
+    shown = 0
+    for f in files:
+        if shown >= limit:
+            break
         try:
             st = os.stat(_fs_str(f))
         except OSError:  # removed after it was listed
@@ -432,6 +435,7 @@ def cmd_list(args) -> int:
         print(f"{when}  {sid[:8]:<8}  {agent[:12]:<12}  {steps_count:>5} steps  {first}")
         if args.all:
             print(f"                  {cwd}")
+        shown += 1
     if dirty:
         session_cache.save(entries)
     return 0
