@@ -7,6 +7,12 @@ change behavior, so read the entry before you upgrade.
 
 ## [Unreleased]
 
+### Added
+
+- **Dashboard session controls:** Sign out of the current session or list and revoke active sessions
+  from the Sessions tab. Admins can manage any session in their team; other roles can manage sessions
+  started with their key. Operators can optionally configure an inactivity timeout.
+
 ## [0.7.0] - 2026-10-20
 
 ### Added

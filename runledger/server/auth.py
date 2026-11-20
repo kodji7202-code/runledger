@@ -4,7 +4,7 @@ A team has any number of API keys. Each key has one role:
 
   admin   everything, including deciding approvals, key management, team settings and the audit log
   member  push runs, request approvals, read everything
-  viewer  read only: every GET endpoint except the admin ones
+  viewer  read team data, manage sessions started with the same key
 
 A key looks like "rl_" followed by 40 URL-safe characters. The server keeps only the
 SHA-256 hash of the key, plus its first 8 characters (the prefix) for display.
@@ -13,8 +13,8 @@ at once.
 
 The dashboard signs in with a key once and keeps an opaque session token in a cookie.
 The server stores only the SHA-256 hash of that token, in the sessions table (db.py), so
-a restart does not sign anyone out. The session carries the role of its key and ends
-when the key is revoked or rotated, or after SESSION_TTL_SECONDS.
+a restart does not sign anyone out. A session carries the role of its key and ends on
+sign-out, revocation, key rotation or revocation, or expiry (absolute or idle).
 
 Rejected API keys and failed sign-ins are counted per client address, in memory. More
 than 20 within five minutes and that address gets 429 until enough of them age out.
@@ -114,6 +114,7 @@ class Identity:
     role: str
     prefix: Optional[str]
     via: str  # "key" for an API key, "session" for a dashboard cookie
+    session_id: Optional[str] = None
 
     def actor(self) -> str:
         """Who did it, as written to the audit log. Never the key itself."""
@@ -131,6 +132,7 @@ def identity_from_row(row: Mapping[str, Any], via: str) -> Identity:
         role=row["role"],
         prefix=row["prefix"],
         via=via,
+        session_id=row.get("session_id") if via == "session" else None,
     )
 
 

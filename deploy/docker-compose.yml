@@ -18,6 +18,8 @@ services:
       RUNLEDGER_PUBLIC_URL: ${RUNLEDGER_PUBLIC_URL:?set RUNLEDGER_PUBLIC_URL in deploy/.env}
       # Sets the Secure flag on the dashboard cookie and sends HSTS. The server reads this variable.
       RUNLEDGER_SECURE_COOKIES: "1"
+      # Idle dashboard session lifetime in seconds. Zero disables idle expiry.
+      RUNLEDGER_SESSION_IDLE_TIMEOUT: ${RUNLEDGER_SESSION_IDLE_TIMEOUT:-0}
       # The network below is pinned, so its subnet is a stable trusted proxy: the server reads each
       # client's address from X-Forwarded-For instead of counting everyone under Caddy's address.
       # Set RUNLEDGER_TRUSTED_PROXIES in deploy/.env to override it. See ../docs/self-hosting.md

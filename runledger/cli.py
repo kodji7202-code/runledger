@@ -499,11 +499,12 @@ def cmd_serve(args) -> int:
             tls_cert=args.tls_cert, tls_key=args.tls_key,
             secure_cookies=args.secure_cookies, trust_proxy=args.trust_proxy,
             trusted_proxies=args.trusted_proxy,
+            session_idle_timeout=args.session_idle_timeout,
         )
     except TLSConfigError as exc:  # missing or unusable certificate or key
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    except ValueError as exc:  # invalid trusted proxy or retention setting
+    except ValueError as exc:  # invalid server setting
         print(f"error: {exc}", file=sys.stderr)
         return 1
     except OSError as exc:  # port in use, bad address
@@ -1040,6 +1041,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ps.add_argument("--trusted-proxy", action="append", default=[], metavar="CIDR",
                     help="address or range of a reverse proxy whose X-Forwarded-For gives the client address "
                          "(repeatable; also $RUNLEDGER_TRUSTED_PROXIES, comma separated)")
+    ps.add_argument("--session-idle-timeout", type=int, metavar="SECONDS",
+                    help="sign out idle dashboard sessions (default: RUNLEDGER_SESSION_IDLE_TIMEOUT or 0 to disable)")
     ps.set_defaults(func=cmd_serve)
 
     pt = sub.add_parser("team", help="manage teams on a team server")
