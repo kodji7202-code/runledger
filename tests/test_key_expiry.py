@@ -286,3 +286,51 @@ def test_cli_creates_rotates_and_lists_keys_with_kind_and_expiry(tmp_path, capsy
     listing = capsys.readouterr().out
     assert "service" in listing and "expires" in listing
     assert KEY_RE.search(listing) is None
+
+
+def test_an_expired_key_at_sign_in_says_expired_and_is_not_counted(tmp_path):
+    db_path = tmp_path / "rl.db"
+    with running(db_path) as (srv, base):
+        _, admin = srv.db.create_team("alpha")
+        view = _json(_new_key(base, admin, expires_in_days=10)[2])
+        _set_expiry(db_path, view["id"], _stamp(seconds=-1))
+        for _ in range(25):  # more than the failure limit
+            status, _, raw = _http(base, "GET", f"/?key={view['key']}")
+            assert status == 401 and b"expired" in raw
+        assert _http(base, "GET", "/api/me", headers=_auth(admin))[0] == 200
+
+
+def test_an_expired_bearer_key_does_not_hide_a_valid_session(tmp_path):
+    db_path = tmp_path / "rl.db"
+    with running(db_path) as (srv, base):
+        _, admin = srv.db.create_team("alpha")
+        view = _json(_new_key(base, admin, expires_in_days=10)[2])
+        cookie = _cookie_for(base, admin)
+        _set_expiry(db_path, view["id"], _stamp(seconds=-1))
+        headers = {**_auth(view["key"]), "Cookie": cookie}
+        assert _http(base, "GET", "/api/me", headers=headers)[0] == 200
+
+
+def test_a_warning_is_not_recorded_for_a_lifetime_that_changed_after_it_was_read(tmp_path, monkeypatch):
+    db = Database(str(tmp_path / "rl.db"))
+    try:
+        team_id, _ = db.create_team("alpha")
+        view = db.create_key(team_id, "ci", "member", "test", expires_in_days=3)
+        real = db._conn.execute
+
+        def rotate_between(sql, *args):
+            result = real(sql, *args)
+            if sql.startswith("SELECT k.id, k.team_id") and "expiry_warned_at IS NULL" in sql:
+                real("UPDATE api_keys SET expires_at = ?, expiry_warned_at = NULL WHERE id = ?",
+                     (_stamp(days=30), view["id"]))
+            return result
+
+        monkeypatch.setattr(db, "_conn", type("C", (), {
+            "execute": staticmethod(rotate_between), "__enter__": lambda s: db.__dict__["_real"].__enter__(),
+            "__exit__": lambda s, *a: db.__dict__["_real"].__exit__(*a)})())
+        db.__dict__["_real"] = real.__self__
+        assert db.keys_expiring() == []
+        assert db.list_audit(team_id, action="key.expiring") == []
+    finally:
+        monkeypatch.undo()
+        db.close()
