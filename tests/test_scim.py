@@ -196,3 +196,23 @@ def test_scim_writes_accept_existing_transaction(scim):
         db.scim_group_update(team, "viewer", {user["id"]: "viewer"})
     assert db.get_user(user["id"])["name"] == "Updated"
     assert db.list_members(team)[0]["role"] == "viewer"
+
+
+def test_group_replace_sets_exact_members(scim):
+    db, team, key, token, base, call = scim
+    first = db.add_member(team, "first@example.com", "admin")
+    second = db.add_member(team, "second@example.com", "member")
+    for role in ("admin", "member", "viewer"):
+        db.change_member(team, first["id"], role)
+        for value in ([{"value": second["id"]}], {"members": [{"value": second["id"]}]}):
+            db.change_member(team, first["id"], role)
+            status, group = call("PATCH", "/Groups/" + role, {"Operations": [{"op": "replace", "path": "members", "value": value}]})
+            assert status == 200
+            ids = {m["value"] for m in group["members"]}
+            assert second["id"] in ids
+            assert (first["id"] in ids) == (role == "viewer")
+    db.change_member(team, first["id"], "admin")
+    db.create_key(team, "sole-admin", "admin", "cli", user=first["id"])
+    db.revoke_key(team, db.key_for_token(key)["id"], "cli")
+    assert call("PATCH", "/Groups/admin", {"Operations": [{"op": "replace", "value": {"members": []}}]})[0] == 400
+    assert db.list_members(team)[0]["role"] == "admin"

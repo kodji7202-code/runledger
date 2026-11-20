@@ -231,6 +231,10 @@ def groups(h, db, team, method, rid, body, members):
             entries = entries.get("members")
         if (path != "members" and not match) or not isinstance(entries, list):
             raise Error(400, "Supply members or members[value eq \"id\"].", "invalidPath")
+        if op["op"].lower() == "replace" and not match:
+            for member in members:
+                if changes.get(member["id"], member["role"]) == rid:
+                    changes[member["id"]] = "viewer" if rid == "member" else "member" if rid == "admin" else "viewer"
         for entry in entries:
             user_id = entry.get("value") if isinstance(entry, dict) else None
             member = next((m for m in members if m["id"] == user_id), None)
