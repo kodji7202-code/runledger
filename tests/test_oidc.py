@@ -12,7 +12,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 import pytest
 
 from runledger.server.oidc import Client, OIDCError
-from test_auth import _http, _json, running, _auth
+from test_auth import APPROVAL, CSRF, _http, _json, running, _auth
 
 N = int(
     "bcff197de087597304150526d7f593b85d21710b6720c13f59f0d6c535bf1ca2470cf1452152b062d0df37c1f7994337c8cd2426ffac628a8166a939ec14df5f66b4226c35b05cd4855fb464046ffe89ba9c2e6857942c8945c194ae8742484b88cacfee880dad665a318bb36abfd51ae20f0054340759f2e0ea64d75ddc35490a9b10c63fb187a92925ce1108d6bb33129022577387c3d69c3ae234024e0ab8e82b35ec576abc7bb5dd246416d218b6a59302e666b72e70cb0ef166b2e63a229f3628271ce41b3fe946ee2ea95188c3ea95a824db0910008676cfba8592a124e81cf87a3a645a1f456a8038d6115b7dd34702c6e7efa3ab40bc50e7628feedb",
@@ -408,3 +408,33 @@ def test_unusable_public_url_fails_at_startup(env, tmp_path):
     with pytest.raises(OIDCError, match="valid public URL"):
         with running(tmp_path / "invalid.db", oidc_config=str(env[-1]), public_url=" "):
             pass
+
+
+@pytest.mark.parametrize("role", ["member", "admin"])
+def test_keyless_sessions_cannot_push_runs_or_request_approvals(env, role):
+    server, base, _, team, person, *_ = env
+    server.db.change_member(team, person["id"], role=role)
+    status, headers, _ = finish(env)
+    assert status == 200
+    auth = dict(CSRF, Cookie=headers["set-cookie"].split(";")[0])
+    for path, action in (("/api/runs", "push runs"), ("/api/approvals", "request approvals")):
+        status, _, raw = _http(base, "POST", path, body={}, headers=auth)
+        assert status == 403
+        assert _json(raw)["error"]["message"] == f"Use an API key to {action}."
+
+
+def test_sso_admin_can_decide_key_requested_approval(env):
+    server, base, _, team, person, key, _ = env
+    server.db.change_member(team, person["id"], role="admin")
+    requester = server.db.create_key(team, "guard", "member", "cli")
+    status, _, raw = _http(base, "POST", "/api/approvals", body=APPROVAL,
+                           headers=_auth(requester["key"]))
+    assert status == 201
+    approval = _json(raw)["id"]
+    status, headers, _ = finish(env)
+    assert status == 200
+    auth = dict(CSRF, Cookie=headers["set-cookie"].split(";")[0])
+    status, _, raw = _http(base, "POST", f"/api/approvals/{approval}/decision",
+                           body={"decision": "approve"}, headers=auth)
+    assert status == 200, raw
+    assert "ana@example.com" in _json(raw)["decided_by"]
