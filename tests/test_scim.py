@@ -251,3 +251,13 @@ def test_groups_filter_and_pagination(scim):
     assert call("GET", "/Groups?count=bad")[0] == 400
     status, error = call("GET", "/Groups?filter=" + quote('displayName co "a"'))
     assert status == 400 and error["scimType"] == "invalidFilter"
+
+
+def test_patch_name_object_and_remove(scim):
+    db, team, key, token, base, call = scim
+    user = call("POST", body={"userName": "object@example.com"})[1]
+    path = "/Users/" + user["id"]
+    for name, expected in (({"formatted": "Formatted"}, "Formatted"), ({"givenName": "First", "familyName": "Last"}, "First Last")):
+        assert call("PATCH", path, {"Operations": [{"op": "replace", "path": "name", "value": name}]})[1]["displayName"] == expected
+    assert call("PATCH", path, {"Operations": [{"op": "remove", "path": "name"}]})[0] == 200
+    assert db.get_user(user["id"])["name"] is None

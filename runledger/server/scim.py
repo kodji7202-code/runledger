@@ -187,13 +187,13 @@ def dispatch(h, method, path, query):
                             raise Error(400, "A value object is required.", "invalidValue")
                         data.update(values(op["value"]))
                     else:
-                        if not isinstance(path, str) or path.lower() not in ("active", "name.formatted", "name.givenname", "name.familyname", "displayname", "username", "externalid", "roles"):
+                        if not isinstance(path, str) or path.lower() not in ("active", "name", "name.formatted", "name.givenname", "name.familyname", "displayname", "username", "externalid", "roles"):
                             raise Error(400, "Unsupported patch path.", "invalidPath")
                         value = op.get("value")
                         if op["op"].lower() == "remove":
                             if path.lower() in ("active", "username"):
                                 raise Error(400, "Cannot remove required attribute.", "mutability")
-                            value = [{"value": "member"}] if path.lower() == "roles" else None
+                            value = [{"value": "member"}] if path.lower() == "roles" else {} if path.lower() == "name" else None
                         if path.lower() in ("name.givenname", "name.familyname"):
                             name_parts["givenName" if path.lower() == "name.givenname" else "familyName"] = value
                             data["name"] = name_from_parts(name_parts)
