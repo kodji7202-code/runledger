@@ -67,6 +67,35 @@ def test_fixture_metadata_prompts_and_results():
     assert not any(s.is_error for s in run.steps)
 
 
+@pytest.mark.parametrize("content, is_error, has_result", [
+    ("", False, True), ([], False, True), ("Done", False, True),
+    ("", True, True), ("Failed", True, True), (None, False, False),
+])
+def test_tool_result_presence_and_guard_outcome(tmp_path, capsys, content, is_error, has_result):
+    rows = [_message([_call("Execute", {"command": "true"})])]
+    if has_result:
+        rows.append(_message([{"type": "tool_result", "tool_use_id": "call",
+                               "content": content, "is_error": is_error}], role="user", mid="result"))
+    path = _session(tmp_path, rows)
+    run = droid.parse(path)
+    assert run.steps[0].has_result is has_result
+    assert run.steps[0].is_error is is_error
+    header, *messages = path.read_text(encoding="utf-8").splitlines()
+    header = json.loads(header)
+    header["cwd"] = str(tmp_path)
+    path.write_text("\n".join([json.dumps(header)] + messages) + "\n", encoding="utf-8")
+    log = tmp_path / ".runledger" / "guard.log"
+    log.parent.mkdir()
+    log.write_text(json.dumps({"session_id": "synthetic-session", "tool": "Execute",
+                               "agent": "droid", "canonical_tool": "Bash",
+                               "summary": "true", "decision": "ask"}) + "\n",
+                   encoding="utf-8")
+    receipt = _receipt(capsys, path, "json")
+    assert receipt["guard"][0]["step"] == 1
+    assert receipt["guard"][0]["outcome"] == (
+        "Approved by user" if has_result else "Rejected by user")
+
+
 def test_cumulative_usage_is_not_counted_again_as_inclusive_last_call_or_thinking():
     run = droid.parse(FIX)
     assert run.usage == Usage(1003, 203, 103, 503)
