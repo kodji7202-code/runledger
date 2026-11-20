@@ -494,6 +494,7 @@ class Database:
                 self._add_missing_columns("api_keys", (("user_id", "TEXT REFERENCES users (id)"),))
                 self._add_missing_columns("sessions", (("user_id", "TEXT REFERENCES users (id)"),))
                 self._add_missing_columns("users", (("oidc_issuer", "TEXT"), ("oidc_subject", "TEXT")))
+                self._add_missing_columns("users", (("saml_issuer", "TEXT"), ("saml_subject", "TEXT")))
                 self._add_missing_columns("sessions", (("oidc_provider", "TEXT"),))
                 if any(
                     row["name"] == "key_id" and row["notnull"]
@@ -513,6 +514,7 @@ class Database:
                     self._conn.execute("DROP TABLE sessions_old")
                     self._conn.execute("CREATE INDEX sessions_by_key ON sessions (key_id)")
                     self._conn.commit()
+                self._add_missing_columns("sessions", (("saml_provider", "TEXT"),))
                 self._add_missing_columns("audit_log", (("actor_user_id", "TEXT REFERENCES users (id)"),))
                 self._add_missing_columns("teams", TEAM_SETTING_COLUMNS)
                 self._add_missing_columns("runs", RUN_COLUMNS)
@@ -955,7 +957,9 @@ class Database:
 
     # Dashboard sessions
 
-    def audit_oidc_rejection(self, user_id: Optional[str], provider: Optional[str], ip: str) -> None:
+    def audit_sso_rejection(
+        self, method: str, user_id: Optional[str], provider: Optional[str], ip: str
+    ) -> None:
         """Record a rejected, resolved identity only in its own membership teams."""
         if user_id is None:
             return
@@ -966,33 +970,50 @@ class Database:
             for row in teams:
                 self._audit(
                     row["team_id"],
-                    "oidc",
+                    method,
                     "auth.sign_in_rejected",
                     user_id,
-                    {"method": "oidc", "provider": provider, "ip": ip},
+                    {"method": method, "provider": provider, "ip": ip},
                 )
 
     def oidc_user(self, email: str, issuer: str, subject: str) -> Dict[str, Any]:
+        return self._sso_user("oidc", email, issuer, subject)
+
+    def saml_user(self, email: str, issuer: str, subject: str, name: Optional[str]) -> Dict[str, Any]:
+        return self._sso_user("saml", email, issuer, subject, name)
+
+    def _sso_user(
+        self, method: str, email: str, issuer: str, subject: str, name: Optional[str] = None
+    ) -> Dict[str, Any]:
         """Resolve an enabled member by email and bind its first provider identity."""
+        issuer_col, subject_col = {"oidc": ("oidc_issuer", "oidc_subject"),
+                                   "saml": ("saml_issuer", "saml_subject")}[method]
+        if name is not None:
+            try:
+                name = validate_label(name)
+            except InvalidKey:
+                name = None
         with self._lock, self._conn:
+            if not self._conn.in_transaction:
+                self._conn.execute("BEGIN IMMEDIATE")
             person = self.get_user(email)
             if not person or person["disabled_at"] or not self.user_teams(person["id"]):
                 raise ValueError(f"No RunLedger account for {email}; ask a team admin to add you")
-            if person["oidc_issuer"] and (
-                person["oidc_issuer"] != issuer or person["oidc_subject"] != subject
+            if person[issuer_col] and (
+                person[issuer_col] != issuer or person[subject_col] != subject
             ):
                 raise ValueError(
                     "This email is bound to a different identity provider account; ask a team admin."
                 )
-            if not person["oidc_issuer"]:
+            if not person[issuer_col]:
                 existing = self._conn.execute(
-                    "SELECT id FROM users WHERE oidc_issuer = ? AND oidc_subject = ?", (issuer, subject)
+                    f"SELECT id FROM users WHERE {issuer_col} = ? AND {subject_col} = ?", (issuer, subject)
                 ).fetchone()
                 if existing and existing["id"] != person["id"]:
                     raise ValueError("This identity provider account is already bound to another user.")
                 self._conn.execute(
-                    "UPDATE users SET oidc_issuer = ?, oidc_subject = ? WHERE id = ?",
-                    (issuer, subject, person["id"]),
+                    f"UPDATE users SET {issuer_col} = ?, {subject_col} = ?, name = COALESCE(name, ?) WHERE id = ?",
+                    (issuer, subject, name, person["id"]),
                 )
             return person
 
@@ -1007,10 +1028,11 @@ class Database:
             ).fetchall()
             return [dict(row) for row in rows]
 
-    def issue_oidc_session(self, team_id: int, user_id: str, provider: str) -> str:
+    def issue_sso_session(self, method: str, team_id: int, user_id: str, provider: str) -> str:
         """Issue a keyless dashboard token only while the membership is active."""
         token = new_session_token()
         now = datetime.now(timezone.utc)
+        provider_col = {"oidc": "oidc_provider", "saml": "saml_provider"}[method]
         with self._lock, self._conn:
             self._conn.execute(
                 "DELETE FROM sessions WHERE expires_at <= ?", (now.strftime(TIME_FORMAT),)
@@ -1023,7 +1045,7 @@ class Database:
             )
             self._conn.execute(
                 "INSERT INTO sessions (token_hash, team_id, key_id, role, created_at, expires_at, "
-                "user_id, oidc_provider) SELECT ?, m.team_id, NULL, m.role, ?, ?, m.user_id, ? "
+                f"user_id, {provider_col}) SELECT ?, m.team_id, NULL, m.role, ?, ?, m.user_id, ? "
                 "FROM memberships m JOIN users u ON u.id = m.user_id "
                 "WHERE m.team_id = ? AND m.user_id = ? AND u.disabled_at IS NULL",
                 (
@@ -1071,7 +1093,7 @@ class Database:
         token_hash = hash_key(token)
         with self._lock, self._conn:
             row = self._conn.execute(
-                "SELECT key_id, team_id, expires_at, user_id, oidc_provider "
+                "SELECT key_id, team_id, expires_at, user_id, oidc_provider, saml_provider "
                 "FROM sessions WHERE token_hash = ?", (token_hash,)
             ).fetchone()
             if row is None:
@@ -1090,7 +1112,9 @@ class Database:
                 if person is None:
                     self._conn.execute("DELETE FROM sessions WHERE token_hash = ?", (token_hash,))
                     return None
-                return dict(person, id=None, prefix=None, label="sso:" + row["oidc_provider"])
+                provider = row["saml_provider"] or row["oidc_provider"]
+                return dict(person, id=None, prefix=None, label="sso:" + provider,
+                            sign_in_method="saml" if row["saml_provider"] else "oidc")
             key = self._conn.execute(
                 _KEY_JOIN + " WHERE k.id = ? AND k.team_id = ? AND " + _USABLE,
                 (row["key_id"], row["team_id"], utc_now()),
