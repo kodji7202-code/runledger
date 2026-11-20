@@ -11,11 +11,89 @@ import pytest
 
 from runledger.labels import command_labels, show_reason
 from runledger.parser import Run, Step, Usage
-from runledger.risk import _outside, assess, assess_step, load_policy
+from runledger.risk import _outside, _without_global_options, assess, assess_step, load_policy
 
 WIN_CWD = "D:\\runledger"
 POSIX_CWD = "/home/dev/payments-service"
 NO_POLICY = {"ignore": [], "severity_overrides": {}, "extra_secret_paths": []}
+
+
+@pytest.mark.parametrize("tool", ["Bash", "PowerShell"])
+@pytest.mark.parametrize("command,severity", [
+    ("git -C . push --force", "high"),
+    ("git -c k=v push -f", "high"),
+    ("git --git-dir=x reset --hard", "medium"),
+    ("kubectl --context x delete pod p", "high"),
+    ("kubectl -n ns apply -f y", "high"),
+    ("terraform -chdir=. apply", "high"),
+    ("helm --namespace ns uninstall r", "high"),
+    ("docker --context x volume prune", "high"),
+    ("docker -H h system prune --volumes", "high"),
+    ("aws --profile p s3 rm s3://b --recursive", "high"),
+    ("aws --region r s3 rb s3://b --force", "high"),
+])
+def test_leading_global_options_command_risks(command, severity, tool):
+    assert any(r.code == "command" and r.severity == severity
+               for r in _risks(tool, command=command))
+
+
+@pytest.mark.parametrize("command", [
+    "git -C . status", "kubectl --context x get pods",
+    "aws --profile p s3 ls", "terraform -chdir=. plan",
+])
+def test_leading_global_options_read_only(command):
+    assert not any(r.severity == "high" for r in _risks("Bash", command=command))
+
+
+@pytest.mark.parametrize("command,expected", [
+    ("", ""),
+    ("git", "git"),
+    ("git -C", "git "),
+    ("git -C ; push --force", "git  ; push --force"),
+    ("git -C\n push --force", "git \n push --force"),
+    ("git -C | push --force", "git  | push --force"),
+    ("git -C . status --short", "git  status --short"),
+    ('git -C "a b" -c k=v push -f', "git  push -f"),
+    ("git --no-pager --git-dir=x push -f", "git  push -f"),
+    ("git -- status", "git  status"),
+    ("gh -R owner/repo repo delete", "gh  repo delete"),
+    ("GIT -C . push -f", "GIT  push -f"),
+    ("git --exec-path push -f", "git  push -f"),
+    ("git -C . status; docker -H h volume prune", "git  status; docker  volume prune"),
+])
+def test_normalize_leading_global_options(command, expected):
+    assert _without_global_options(command) == expected
+
+
+def test_global_options_do_not_duplicate_findings():
+    risks = _risks("Bash", command="git push -f; git -C . push -f")
+    reasons = [r.reason for r in risks if r.code == "command"]
+    assert reasons.count("Force-pushed to a git remote") == 1
+    assert reasons.count("Pushed to a git remote") == 1
+
+
+@pytest.mark.parametrize("raw,expected", [(False, 1), (True, 0)])
+def test_global_options_custom_command_rules(raw, expected):
+    policy = dict(NO_POLICY, command_rules={"deny": [
+        {"rx": re.compile(r"\bgit\s+push\b"), "label": "no pushes", "raw": raw},
+    ]})
+    risks = assess_step(_step("Bash", command="git -C . push -f"), POSIX_CWD, policy)
+    assert sum(r.code == "rule_deny" for r in risks) == expected
+
+
+def test_global_options_no_subcommand_across_separator():
+    assert not any(r.code == "command" for r in
+                   _risks("Bash", command="git -C ; push --force"))
+
+
+def test_global_options_custom_rule_keeps_match_limit():
+    from runledger.risk import RULE_MATCH_MAX_CHARS, command_rule_risks
+
+    command = "git " + "-q " * RULE_MATCH_MAX_CHARS + "push -f"
+    policy = {"command_rules": {"deny": [
+        {"rx": re.compile(r"\bgit\s+push\b"), "label": "no pushes", "raw": False},
+    ]}}
+    assert command_rule_risks(command, command, policy, 1) == []
 
 
 def _step(tool, index=1, **inp):
@@ -1233,5 +1311,3 @@ def test_unreachable_unc_share_never_hangs_realpath():
     assert any(r.code == "write_outside" for r in out_risks)
     assert dec["decision"] == "ask"
     assert "write_outside" in dec["codes"]
-
-
