@@ -295,7 +295,7 @@ def test_text_output_falls_back_for_nonpositive_terminal_width(monkeypatch, colu
 def test_text_output_wraps_with_hanging_indents(monkeypatch):
     monkeypatch.setenv("COLUMNS", "80")
     detail = "A long diagnostic message with useful context. " * 4
-    fix = "Run the suggested command and check the configuration. " * 3
+    fix = "runledger guard install --agent codex --project /a/long/project/path --global"
     extra = "Additional diagnostic context to help locate the configuration. " * 3
     monkeypatch.setattr(doctor, "check_extra", lambda report, check: [extra])
     report = doctor.Report("/project", [doctor.Check(
@@ -303,9 +303,10 @@ def test_text_output_wraps_with_hanging_indents(monkeypatch):
 
     lines = doctor.render_text(report, verbose=True).splitlines()
 
-    assert all(len(line) <= 80 for line in lines)
+    assert f"        -> {fix}" in lines
+    assert all(len(line) <= 80 for line in lines if not line.startswith("        -> "))
     for content, prefix, indent in ((detail, "[warn] config codex project: ", 7),
-                                    (fix, "        -> ", 11), (extra, "        ", 8)):
+                                    (extra, "        ", 8)):
         start = next(i for i, line in enumerate(lines)
                      if line.startswith(prefix + content.split()[0]))
         wrapped = [lines[start][len(prefix):]]

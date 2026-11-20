@@ -1197,7 +1197,7 @@ def render_text(report: Report, verbose: bool = False) -> str:
         append(f"[{check.status}] {check.title}{who}: {check.detail}",
                indent=len(f"[{check.status}] "))
         if check.fix and check.status in (WARN, FAIL):
-            append(check.fix, "        -> ", indent=11)
+            lines.append(f"        -> {check.fix}")
         if verbose:
             for extra in check_extra(report, check):
                 append(extra, "        ", indent=8)
