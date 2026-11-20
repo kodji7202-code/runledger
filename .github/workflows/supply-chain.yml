@@ -51,6 +51,8 @@ jobs:
       attestations: write # Store build and SBOM attestations on GitHub.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0  # a release tag's commit is checked against origin/main below
       - name: Image metadata
         id: meta
         run: |
@@ -59,6 +61,9 @@ jobs:
           echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
           if [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF" == refs/tags/v* ]]; then
             test "$GITHUB_REF_NAME" = "v$version"
+            # Same check as release.yml: a tag on a commit that is not on main publishes nothing.
+            git fetch --no-tags origin main
+            git merge-base --is-ancestor "$GITHUB_SHA" origin/main
             echo "release=true" >> "$GITHUB_OUTPUT"
           else
             echo "release=false" >> "$GITHUB_OUTPUT"
