@@ -216,3 +216,15 @@ def test_group_replace_sets_exact_members(scim):
     db.revoke_key(team, db.key_for_token(key)["id"], "cli")
     assert call("PATCH", "/Groups/admin", {"Operations": [{"op": "replace", "value": {"members": []}}]})[0] == 400
     assert db.list_members(team)[0]["role"] == "admin"
+
+
+def test_scim_failed_tokens_share_sign_in_limiter(scim):
+    from runledger.server.auth import MAX_FAILURES
+
+    db, team, key, token, base, call = scim
+    for _ in range(MAX_FAILURES + 1):
+        assert call("GET", headers=_auth("wrong-scim-token"))[0] == 401
+    status, headers, raw = _http(base, "GET", "/scim/v2/Users", headers=_auth(token))
+    assert status == 429 and int(headers["retry-after"]) > 0
+    assert _json(raw)["schemas"] == ["urn:ietf:params:scim:api:messages:2.0:Error"]
+    assert _http(base, "GET", "/api/me", headers=_auth(key))[0] == 429

@@ -14,9 +14,9 @@ class Error(Exception):
         self.status, self.detail, self.kind = status, detail, kind
 
 
-def send(h, status, body):
+def send(h, status, body, headers=None):
     from .app import _json_bytes
-    h._send(status, b"" if status == 204 else _json_bytes(body), "application/scim+json; charset=utf-8")
+    h._send(status, b"" if status == 204 else _json_bytes(body), "application/scim+json; charset=utf-8", headers)
 
 
 def listing(resources, start=1, count=200):
@@ -92,8 +92,11 @@ def dispatch(h, method, path, query):
         h._send_json(201 if method == "POST" else 200, result)
         return
     try:
-        team = db.scim_team(h._bearer_token())
+        token = h._bearer_token()
+        team = db.scim_team(token)
         if team is None:
+            if token is not None:
+                h.server.limiter.record_failure(h._client_ip())
             raise Error(401, "A valid SCIM bearer token is required.")
         parts = path[len("/scim/v2/"):].strip("/").split("/")
         kind = parts[0]
@@ -204,12 +207,12 @@ def dispatch(h, method, path, query):
         error(h, Error(exc.status, exc.message))
 
 
-def error(h, exc):
+def error(h, exc, headers=None):
     body = {"schemas": [MESSAGES + "Error"], "status": str(exc.status), "detail": exc.detail}
     if exc.kind:
         body["scimType"] = exc.kind
     h.close_connection = True
-    send(h, exc.status, body)
+    send(h, exc.status, body, headers)
 
 
 def groups(h, db, team, method, rid, body, members):

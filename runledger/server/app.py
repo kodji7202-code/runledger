@@ -479,7 +479,7 @@ class _Handler(BaseHTTPRequestHandler):
         except _HttpError as exc:
             if urlsplit(self.path).path.startswith("/scim/v2"):
                 from .scim import Error, error
-                error(self, Error(exc.status, exc.message))
+                error(self, Error(exc.status, exc.message), exc.headers)
             else:
                 self._send_json(exc.status, {"error": {"code": exc.code, "message": exc.message}}, exc.headers)
         except Exception:  # never leak internals to the client
