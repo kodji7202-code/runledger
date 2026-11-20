@@ -175,6 +175,15 @@ def test_background_polls_are_marked_on_both_pages():
         assert 'if (background) { opts.headers["X-RunLedger-Background"] = "1"; }' in script
 
 
+def test_revoke_session_confirmation_identifies_the_target():
+    js = _script(DASHBOARD_HTML)
+    row = js[js.index("function sessionRow("):js.index("function renderKeys(")]
+    assert 'nameOf(session.key_label, session.key_id)' in row
+    assert 'var target = session.current ? "your current session" : "the session";' in row
+    assert """confirmAction("Revoke " + target + " for '" + key + "'?",""" in row
+    assert 'when(session.created_at) + ".", "Revoke session", true)' in row
+
+
 def test_admin_tabs_start_hidden_so_members_and_viewers_never_see_them():
     page = _page(DASHBOARD_HTML)
     attrs = {a["id"]: a for _, a in page.elements if a.get("id")}

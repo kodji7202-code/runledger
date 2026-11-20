@@ -1309,7 +1309,9 @@ tr.pickable:hover{background:var(--chip)}
     revoke.setAttribute("aria-label", session.current ? "Revoke this session" :
       "Revoke session for " + key + ", signed in " + when(session.created_at));
     revoke.addEventListener("click", function () {
-      confirmAction("Revoke this session?", "This signs out the session immediately.", "Revoke session", true)
+      var target = session.current ? "your current session" : "the session";
+      confirmAction("Revoke " + target + " for '" + key + "'?",
+        "This immediately signs out the session started " + when(session.created_at) + ".", "Revoke session", true)
         .then(function (yes) {
           if (!yes) { return; }
           return request("DELETE", "/sessions/" + encodeURIComponent(session.id)).then(function () {
