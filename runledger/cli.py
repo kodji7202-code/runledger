@@ -43,6 +43,7 @@ import sys
 import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
+from textwrap import fill
 from typing import List, Optional, Tuple
 from urllib.parse import quote
 
@@ -223,8 +224,11 @@ def cmd_checkpoints(args) -> int:
         for cp in checkpoints:
             plan = repo.plan(cp, tree)
             label = repr(redact(cp.label))
-            print(f"{cp.id}  {cp.created_at}  {label}  "
-                  f"({len(plan.restore) + len(plan.remove) + len(plan.keep_ignored)} file(s) differ)")
+            changed = len(plan.restore) + len(plan.remove) + len(plan.keep_ignored)
+            print(f"{cp.id}  ({changed} file(s) differ)")
+            print(f"  {cp.created_at}")
+            print(fill(label, width=80, initial_indent="  ", subsequent_indent="  ",
+                       break_long_words=False, break_on_hyphens=False))
             for path in plan.restore:
                 print(f"  restore {path!r}")
             for path in plan.remove:
