@@ -9,6 +9,7 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unicodedata import east_asian_width
 
 import pytest
 
@@ -726,6 +727,10 @@ def test_listing_counts_differing_files_that_must_remain_ignored(repo, monkeypat
     assert "keep ignored '.secret'" in output
 
 
+def _display_width(text):
+    return sum(2 if east_asian_width(char) in ("F", "W") else 1 for char in text)
+
+
 @pytest.mark.parametrize("label", [
     "Before refactoring the authentication middleware and adding integration test coverage",
     " ".join(["界" * 12] * 6),
@@ -740,7 +745,7 @@ def test_checkpoint_listing_wraps_long_labels_between_words(repo, capsys, label)
     assert len(label_lines) > 1
     assert label_lines[0].startswith("  '")
     assert all(len(line) - len(line.lstrip()) == 3 for line in label_lines[1:])
-    assert all(len(line) + line.count("界") <= 80 for line in [header, timestamp, *label_lines])
+    assert all(_display_width(line) <= 80 for line in [header, timestamp, *label_lines])
     assert " ".join(line.strip() for line in label_lines) == repr(label)
 
 
