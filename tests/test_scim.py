@@ -228,3 +228,13 @@ def test_scim_failed_tokens_share_sign_in_limiter(scim):
     assert status == 429 and int(headers["retry-after"]) > 0
     assert _json(raw)["schemas"] == ["urn:ietf:params:scim:api:messages:2.0:Error"]
     assert _http(base, "GET", "/api/me", headers=_auth(key))[0] == 429
+
+
+def test_nameless_user_get_put_roundtrip(scim):
+    db, team, key, token, base, call = scim
+    user = call("POST", body={"userName": "nameless@example.com"})[1]
+    path = "/Users/" + user["id"]
+    assert call("PUT", path, call("GET", path)[1])[0] == 200
+    for name in ({"displayName": "  "}, {"name": {"formatted": " "}}, {"name": {"givenName": " ", "familyName": ""}}):
+        assert call("PUT", path, dict(name, userName="nameless@example.com"))[0] == 200
+        assert db.get_user(user["id"])["name"] is None

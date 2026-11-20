@@ -69,6 +69,8 @@ def values(body):
             if not isinstance(value, list) or len(value) != 1 or not isinstance(value[0], dict) or value[0].get("value") not in ROLES:
                 raise Error(400, "Supply one role: admin, member or viewer.", "invalidValue")
             result["role"] = value[0]["value"]
+    if isinstance(result.get("name"), str) and not result["name"].strip():
+        result["name"] = None
     return result
 
 
