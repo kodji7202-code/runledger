@@ -24,6 +24,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import urllib.error
 import urllib.parse
@@ -1172,21 +1173,33 @@ def _mode_check(user: Dict[str, Any], project_policy: Dict[str, Any]) -> Check:
 # ---------------------------------------------------------------- rendering
 
 def render_text(report: Report, verbose: bool = False) -> str:
-    """The text report: one line per check, `->` fix hints, a final summary line."""
+    """The text report: wrapped checks, `->` fix hints, a final summary line."""
     from . import __version__
 
-    lines = [f"RunLedger doctor {__version__}  |  python {platform.python_version()}  |  "
-             f"{sys.platform}  |  {report.project}"]
+    width = shutil.get_terminal_size(fallback=(80, 24)).columns
+    lines = []
+
+    def append(text: str, prefix: str = "") -> None:
+        if not text:
+            lines.append(prefix)
+            return
+        lines.append(textwrap.fill(text, width=width, initial_indent=prefix,
+                                   subsequent_indent=" " * len(prefix),
+                                   break_long_words=False, break_on_hyphens=False))
+
+    append(f"RunLedger doctor {__version__}  |  python {platform.python_version()}  |  "
+           f"{sys.platform}  |  {report.project}")
     for check in report.checks:
         who = f" {check.agent}" if check.agent else ""
         who += f" {check.scope}" if check.scope else ""
-        lines.append(f"[{check.status}] {check.title}{who}: {check.detail}")
+        append(check.detail, f"[{check.status}] {check.title}{who}: ")
         if check.fix and check.status in (WARN, FAIL):
-            lines.append(f"        -> {check.fix}")
+            append(check.fix, "        -> ")
         if verbose:
-            lines.extend(f"        {extra}" for extra in check_extra(report, check))
+            for extra in check_extra(report, check):
+                append(extra, "        ")
     counts = summary(report.checks)
-    lines.append(f"Summary: {counts['ok']} ok, {counts['warn']} warnings, {counts['fail']} failures")
+    append(f"{counts['ok']} ok, {counts['warn']} warnings, {counts['fail']} failures", "Summary: ")
     return "\n".join(lines) + "\n"
 
 
