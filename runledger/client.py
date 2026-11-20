@@ -168,7 +168,11 @@ def push(
     )
     try:
         with _opener_for(endpoint).open(request, timeout=timeout) as response:
-            return json.loads(response.read().decode("utf-8"))
+            result = json.loads(response.read().decode("utf-8"))
+            expires = response.headers.get("X-RunLedger-Key-Expires")
+            if expires and isinstance(result, dict):
+                result["key_expires_at"] = expires  # the key is inside its team's warning window
+            return result
     except urllib.error.HTTPError as exc:  # before URLError: HTTPError is a subclass
         raise PushError(f"Server refused the run (HTTP {exc.code}): {_server_message(exc)}") from None
     except urllib.error.URLError as exc:

@@ -7,6 +7,22 @@ change behavior, so read the entry before you upgrade.
 
 ## [Unreleased]
 
+### Added
+
+- **API key expiry, kinds and a team key policy:** keys are `personal` (default; may sign in to the
+  dashboard) or `service` (API only) and may carry an `expires_at`. `POST /api/keys` and
+  `runledger key create` take `kind` / `--kind` and `expires_in_days` / `--expires-in-days`. Team
+  settings gain `key_max_ttl_days`, `service_key_max_ttl_days` (the cap and default lifetime per kind;
+  `null` is no limit) and `key_expiry_warn_days` (default 14). An expired key gets `401 key_expired`,
+  which does not count toward the failed-credential limit, and a dashboard session never outlives its
+  key. Rotation renews the lifetime and brings an expired key back (optional `expires_in_days`).
+  Inside the warning window, responses carry `X-RunLedger-Key-Expires`, `runledger push` warns,
+  `/api/me` reports `expires_soon`, the dashboard shows a banner, and the server records a
+  `key.expiring` audit event and notifies the team's webhooks once per key lifetime. The dashboard's
+  keys page shows kind and expiry and its settings page edits the policy. Existing keys become
+  personal keys that never expire; a new or lower cap shortens existing keys of that kind to that many
+  days from now.
+
 ### Changed
 
 - **A warm `runledger stats` prices each model bucket once (`runledger.stats`):** the totals, the
