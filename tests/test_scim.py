@@ -269,3 +269,24 @@ def test_external_id_filter_is_case_exact(scim):
     assert call("GET", "/Users?filter=" + quote('externalId eq "External-A"'))[1]["totalResults"] == 1
     assert call("GET", "/Users?filter=" + quote('externalId eq "external-a"'))[1]["totalResults"] == 0
     assert call("GET", "/Users?filter=" + quote('userName eq "CASE@example.com"'))[1]["totalResults"] == 1
+
+
+def test_deactivation_and_key_expiry_are_independent(scim):
+    db, team, key, token, base, call = scim
+    user = call("POST", body={"userName": "expiry@example.com"})[1]
+    personal = db.create_key(team, "expiring", "member", "cli", kind="personal",
+                             expires_in_days=1, user=user["id"])
+    cookie = _cookie_for(base, personal["key"])
+    path = "/Users/" + user["id"]
+    assert _http(base, "GET", "/api/me", headers=_auth(personal["key"]))[0] == 200
+    assert call("PATCH", path, {"Operations": [{"op": "replace", "path": "active", "value": False}]})[0] == 200
+    assert _http(base, "GET", "/api/me", headers=_auth(personal["key"]))[0] == 401
+    assert _http(base, "GET", "/api/me", headers={"Cookie": cookie})[0] == 401
+    assert call("PATCH", path, {"Operations": [{"op": "replace", "path": "active", "value": True}]})[0] == 200
+    assert _http(base, "GET", "/api/me", headers=_auth(personal["key"]))[0] == 200
+    with db._lock, db._conn:
+        db._conn.execute("UPDATE api_keys SET expires_at = '2000-01-01T00:00:00Z' WHERE id = ?", (personal["id"],))
+    assert call("PATCH", path, {"Operations": [{"op": "replace", "path": "active", "value": False}]})[0] == 200
+    assert call("PATCH", path, {"Operations": [{"op": "replace", "path": "active", "value": True}]})[0] == 200
+    assert _http(base, "GET", "/api/me", headers=_auth(personal["key"]))[0] == 401
+    assert call("GET", path)[0] == 200
