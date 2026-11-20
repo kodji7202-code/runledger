@@ -656,6 +656,28 @@ def _aider_history(project: Optional[str], history_file: str) -> List[Path]:
 
 # ---------------------------------------------------------------- collecting
 
+def _session_start(path: Path) -> Optional[datetime]:
+    """Read a standard JSONL header; uncertainty falls back to the full parser."""
+    if path.suffix != ".jsonl" or path.name.lower().endswith(".runledger.jsonl"):
+        return None
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            line = handle.readline(EMPTY_FILE_BYTES)
+        record = json.loads(line)
+    except (OSError, ValueError, RecursionError):
+        return None
+    if not isinstance(record, dict) or "runledger_format" in record:
+        return None
+    kind = record.get("type")
+    codex = (kind == "session_meta" or "instructions" in record or
+             (path.name.startswith("rollout-") and
+              any(part.lower() == "sessions" for part in path.parent.parts)))
+    if codex and adapters.get("codex")._envelope(record) is None:
+        return None
+    stamp = record.get("timestamp")
+    return _local(_ts(stamp)) if isinstance(stamp, str) else None
+
+
 def collect(files: Sequence[Path], since: datetime, until: datetime,
             cache: Optional[StatsCache] = None, limit: Optional[int] = None
             ) -> Tuple[List[SessionSummary], List[Dict[str, str]], int]:
@@ -673,9 +695,11 @@ def collect(files: Sequence[Path], since: datetime, until: datetime,
         except OSError:
             skipped.append({"path": str(path), "reason": "the file is gone"})
             continue
-        if stat_result.st_mtime < since.timestamp():
-            continue  # written before the window opened, so it cannot hold a newer session
         summary = cache.get(path, stat_result) if cache is not None else None
+        if summary is None and stat_result.st_mtime < since.timestamp():
+            started = _session_start(path)
+            if started is not None and not since <= started <= until:
+                continue
         if summary is None:
             misses += 1
             if misses == PROGRESS_AFTER + 1:

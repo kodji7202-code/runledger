@@ -367,6 +367,69 @@ def test_sessions_only_outside_the_window_hint_at_since(capsys, isolated_setting
     assert "No sessions found" in err and "--since" in err and err.count("\n") == 1
 
 
+@pytest.mark.parametrize("factory", [claude_session, codex_session, droid_session])
+@pytest.mark.parametrize("cached", [False, True])
+def test_old_mtime_does_not_hide_in_window_start(isolated_settings, factory, cached, monkeypatch):
+    project = isolated_settings / "restored"
+    project.mkdir()
+    started = datetime(2026, 5, 10, 12)
+    path = factory(isolated_settings, project, "restored", started)
+    old = datetime(2020, 1, 1).timestamp()
+    os.utime(path, (old, old))
+    cache = stats.StatsCache() if cached else None
+    if cache is not None:
+        cache.put(path, path.stat(), stats.summarize(path))
+        monkeypatch.setattr(stats, "summarize", lambda path: pytest.fail("cached session reparsed"))
+    summaries, skipped, total = stats.collect(
+        [path], datetime(2026, 5, 1), datetime(2026, 5, 31), cache)
+    assert total == 1
+    assert summaries[0].started == started
+    assert skipped == []
+
+
+def test_old_sessions_only_read_the_header(isolated_settings, monkeypatch):
+    project = isolated_settings / "old"
+    project.mkdir()
+    path = claude_session(isolated_settings, project, "old", datetime(2020, 1, 1))
+    os.utime(path, (1, 1))
+    monkeypatch.setattr(stats, "summarize", lambda path: pytest.fail("old session fully parsed"))
+    assert stats.collect([path], datetime(2026, 5, 1), datetime(2026, 5, 31)) == ([], [], 0)
+
+
+def test_old_mtime_with_non_timestamped_prefix(isolated_settings):
+    project = isolated_settings / "prefixed"
+    project.mkdir()
+    path = claude_session(isolated_settings, project, "prefixed", datetime(2026, 5, 10))
+    path.write_text('{}\n' + path.read_text(encoding="utf-8"), encoding="utf-8")
+    os.utime(path, (1, 1))
+    summaries, skipped, total = stats.collect(
+        [path], datetime(2026, 5, 1), datetime(2026, 5, 31))
+    assert total == 1 and len(summaries) == 1 and skipped == []
+
+
+@pytest.mark.parametrize("content", ["", "not json\n", "{}\n", '[1, 2]\n',
+                                     '{"timestamp": "invalid"}\n'])
+def test_start_probe_uncertain_headers_fall_back(tmp_path, content):
+    path = tmp_path / "unknown.jsonl"
+    path.write_text(content, encoding="utf-8")
+    assert stats._session_start(path) is None
+
+
+def test_start_probe_missing_file_falls_back(tmp_path):
+    assert stats._session_start(tmp_path / "missing.jsonl") is None
+
+
+@pytest.mark.parametrize("content", ["", "not json\n"])
+def test_old_mtime_invalid_files_are_reported(tmp_path, content):
+    path = tmp_path / "invalid.jsonl"
+    path.write_text(content, encoding="utf-8")
+    os.utime(path, (1, 1))
+    summaries, skipped, total = stats.collect(
+        [path], datetime(2026, 5, 1), datetime(2026, 5, 31))
+    assert summaries == [] and total == 0
+    assert len(skipped) == 1
+
+
 def test_default_window_and_project_scope(capsys, fixture_a, monkeypatch):
     data, _ = _json(capsys, "stats", "--all", "--format", "json")
     assert data["totals"]["sessions"] == 3  # the 60-day-old Codex session is out of the window
