@@ -97,6 +97,7 @@ SECURE_COOKIES_ENV = "RUNLEDGER_SECURE_COOKIES"
 TRUSTED_PROXIES_ENV = "RUNLEDGER_TRUSTED_PROXIES"
 HSTS_VALUE = "max-age=31536000"
 MAINTENANCE_INTERVAL_S = 3600
+KEY_EXPIRES_HEADER = "X-RunLedger-Key-Expires"
 EXPORT_ROUTES = {
     "/api/export/runs.csv": "runs",
     "/api/export/audit.csv": "audit",
@@ -262,6 +263,23 @@ class RunLedgerServer(ThreadingHTTPServer):
 
         threading.Thread(target=loop, name="runledger-maintenance", daemon=True).start()
         return True
+
+    def start_key_expiry_warnings(self, interval_s: float = MAINTENANCE_INTERVAL_S) -> None:
+        """Warn about keys entering their team's warning window, now and then every interval_s,
+        on a daemon thread, until server_close(). Each key is warned about once per lifetime."""
+
+        def loop() -> None:
+            while True:
+                try:
+                    count = maintenance.warn_expiring_keys(self.db)
+                    if count:
+                        sys.stderr.write(f"RunLedger: {count} API key(s) expire soon; see the audit log\n")
+                except Exception:
+                    traceback.print_exc()
+                if self._maintenance_stop.wait(interval_s):
+                    return
+
+        threading.Thread(target=loop, name="runledger-key-expiry", daemon=True).start()
 
     def server_close(self) -> None:
         self._maintenance_stop.set()
@@ -452,6 +470,7 @@ class _Handler(BaseHTTPRequestHandler):
     # Routing
 
     def _route(self, method: str) -> None:
+        self._extra_headers: Dict[str, str] = {}
         try:
             url = urlsplit(self.path)
             path = url.path
@@ -580,7 +599,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("X-Frame-Options", "DENY")
         if self._secure():
             self.send_header("Strict-Transport-Security", HSTS_VALUE)
-        for name, value in (headers or {}).items():
+        for name, value in {**getattr(self, "_extra_headers", {}), **(headers or {})}.items():
             self.send_header(name, value)
         self.end_headers()
 
@@ -638,12 +657,22 @@ class _Handler(BaseHTTPRequestHandler):
         if token is not None:
             ident = self.server.identify_key(token)
             if ident is not None:
+                if ident.expires_soon:
+                    self._extra_headers[KEY_EXPIRES_HEADER] = ident.expires_at or ""
                 return ident
+        expired = self.server.db.expired_key_for_token(token) if token is not None else None
         cookie = self._cookie(COOKIE_NAME)
         if cookie:
             ident = self.server.identify_session(cookie)
             if ident is not None:
                 return ident
+        if expired is not None:
+            # The right secret, past its end: not a guess, so not counted as a failure.
+            raise _HttpError(
+                401, "key_expired",
+                f"This API key expired at {expired['expires_at']}. Ask a team admin to rotate it "
+                "(runledger key rotate ID, or Rotate on the dashboard's API keys page).",
+            )
         if token is not None:
             self.server.limiter.record_failure(self._client_ip())
         raise _unauthorized()
@@ -701,7 +730,8 @@ class _Handler(BaseHTTPRequestHandler):
         me: Dict[str, Any] = {
             "team": {"id": ident.team_id, "name": ident.team_name},
             "role": ident.role,
-            "key": {"id": ident.key_id, "label": ident.label, "prefix": ident.prefix},
+            "key": {"id": ident.key_id, "label": ident.label, "prefix": ident.prefix,
+                    "kind": ident.kind, "expires_at": ident.expires_at, "expires_soon": ident.expires_soon},
         }
         self._send_json(200, me)
 
@@ -813,8 +843,7 @@ class _Handler(BaseHTTPRequestHandler):
             self.server.warn_query_key_once()
             row = self.server.db.key_for_token(key)
             if row is None:
-                self.server.limiter.record_failure(self._client_ip())
-                self._sign_in_page("That key was not recognized. Check the key and try again.")
+                self._refuse_sign_in_key(key)
                 return
             current = self._try_identify()
             if current is not None and current.team_id != row["team_id"]:
@@ -881,13 +910,26 @@ class _Handler(BaseHTTPRequestHandler):
         key = (fields.get("key") or [""])[0].strip()
         row = self.server.db.key_for_token(key) if key else None
         if row is None:
-            if key:
-                self.server.limiter.record_failure(self._client_ip())
-            self._sign_in_page("That key was not recognized. Check the key and try again.")
+            self._refuse_sign_in_key(key)
             return
         self._sign_in(row)
 
+    def _refuse_sign_in_key(self, key: str) -> None:
+        """Sign-in page for a key that did not sign in. An expired key is named as expired and,
+        not being a guess, does not count toward the failure limit."""
+        expired = self.server.db.expired_key_for_token(key) if key else None
+        if expired is not None:
+            self._sign_in_page(f"That key expired at {expired['expires_at']}. Ask a team admin to rotate it.")
+            return
+        if key:
+            self.server.limiter.record_failure(self._client_ip())
+        self._sign_in_page("That key was not recognized. Check the key and try again.")
+
     def _sign_in(self, row: Mapping[str, Any]) -> None:
+        if row.get("kind") == "service":
+            self._sign_in_page("Service keys work on the API only and cannot sign in to the dashboard. "
+                               "Sign in with a personal key.")
+            return
         token = self.server.db.issue_session(row["team_id"], row["id"], row["role"])
         session = identity_from_row(row, "session")
         self.server.db.record_audit(row["team_id"], session.actor(), "auth.sign_in", row["id"],
@@ -1036,7 +1078,8 @@ class _Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length) if length else b""
         body = _json_object(raw)
         try:
-            view = self.server.db.create_key(ident.team_id, body.get("label"), body.get("role"), ident.actor())
+            view = self.server.db.create_key(ident.team_id, body.get("label"), body.get("role"), ident.actor(),
+                                             kind=body.get("kind"), expires_in_days=body.get("expires_in_days"))
         except InvalidKey as exc:
             raise _HttpError(400, "invalid_key", str(exc)) from None
         self._send_json(201, view)
@@ -1061,7 +1104,15 @@ class _Handler(BaseHTTPRequestHandler):
         key_id = _key_id(raw_id)
         ident = self._identify()
         self._require(ident, "admin", "rotate keys", write=True)
-        outcome, view = self.server.db.rotate_key(ident.team_id, key_id, ident.actor())
+        body: Dict[str, Any] = {}
+        if self.headers.get("Content-Length") not in (None, "0"):
+            length = self._content_length(approvals.SMALL_BODY_LIMIT, "Key requests")
+            body = _json_object(self.rfile.read(length) if length else b"")
+        try:
+            outcome, view = self.server.db.rotate_key(ident.team_id, key_id, ident.actor(),
+                                                      expires_in_days=body.get("expires_in_days"))
+        except InvalidKey as exc:
+            raise _HttpError(400, "invalid_key", str(exc)) from None
         if outcome == "missing":
             raise _HttpError(404, "not_found", "Key not found.")
         if outcome == "revoked":

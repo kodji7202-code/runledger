@@ -1,0 +1,54 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '23 4 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [python, javascript-typescript]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: '3.12'
+      - name: Extract embedded JavaScript for CodeQL
+        if: matrix.language == 'javascript-typescript'
+        run: |
+          python - <<'PY'
+          import ast
+          from pathlib import Path
+
+          output = Path('codeql-sources')
+          output.mkdir()
+          for source in Path('runledger').rglob('*.py'):
+              tree = ast.parse(source.read_text(encoding='utf-8'))
+              for index, node in enumerate(ast.walk(tree)):
+                  if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                      if '<script' in node.value and '</script>' in node.value:
+                          name = '-'.join(source.with_suffix('').parts)
+                          (output / f'{name}-{index}.html').write_text(node.value, encoding='utf-8')
+          PY
+      - uses: github/codeql-action/init@aaf92c3279600a7c7217a1cd605774c6c791c6c3 # v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+      - uses: github/codeql-action/analyze@aaf92c3279600a7c7217a1cd605774c6c791c6c3 # v3
+        with:
+          category: '/language:${{ matrix.language }}'
