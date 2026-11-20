@@ -75,7 +75,66 @@ runledger user enable --email ana@example.com
 
 All these local commands accept `--db FILE`. Adding an email creates a user if needed; an existing
 user is reused across teams. Display names are optional. There are no passwords or interactive
-account registration: people still sign in with their personal key. SSO is not implemented.
+account registration: people sign in with their personal key or configured OIDC provider.
+
+### OIDC single sign-on
+
+Create an OIDC web application at your identity provider, enable Authorization Code and PKCE
+S256, and register `https://ledger.example.com/auth/oidc/work/callback` as its redirect URI.
+Use RS256 ID tokens. Provision people and team memberships with the commands above first:
+SSO never creates an account. An enabled user with no team membership cannot sign in.
+
+Store a server-wide JSON configuration outside the repository:
+
+```json
+{
+  "public_url": "https://ledger.example.com",
+  "disable_key_sign_in": true,
+  "providers": [{
+    "id": "work",
+    "name": "Company SSO",
+    "issuer": "https://company.okta.com/oauth2/default",
+    "client_id": "your-web-client-id",
+    "client_secret_env": "RUNLEDGER_WORK_SECRET",
+    "allowed_email_domains": ["example.com"],
+    "email_claim": "email",
+    "require_email_verified": true
+  }]
+}
+```
+
+Start with `runledger serve --oidc-config /etc/runledger/oidc.json` (equivalently,
+`RUNLEDGER_OIDC_CONFIG`). Multiple providers are supported. `client_secret` may replace
+`client_secret_env`; prefer the environment variable and restrict config file permissions.
+Set `public_url` to the externally visible origin, including HTTPS. Without it the existing
+`RUNLEDGER_PUBLIC_URL` or bound-server URL is used. When no public URL is supplied, the server
+derives one from its bound address and actual port (wildcard binds become loopback addresses).
+This is suitable for local use; configure an explicit URL behind a proxy or for remote users.
+An unusable base URL fails at startup when OIDC is enabled, before accepting sign-in requests.
+HTTP is allowed only for loopback testing.
+
+- **Okta:** use the exact authorization server issuer (for example the `/oauth2/default`
+  issuer above), grant the web app `openid email profile`, and allow assigned users.
+- **Entra ID:** use the tenant-specific issuer
+  `https://login.microsoftonline.com/<tenant>/v2.0`, never `/common`. If needed, use
+  `"email_claim": "preferred_username"`. Entra may omit `email_verified`; the secure default
+  rejects that. Only set `"require_email_verified": false` after ensuring that your tenant
+  controls and verifies those usernames and app assignments.
+- **Google Workspace:** use issuer `https://accounts.google.com` and add
+  `"hosted_domain": "example.com"`. This checks the signed `hd` claim, not merely the email
+  suffix. Also restrict the OAuth app to your organization.
+
+Email lookup is case-insensitive. First sign-in binds the user's issuer and subject; another
+identity cannot take over that email. A different issuer is also rejected once bound. People
+with several memberships choose a team before receiving a session. Sessions have no API key;
+membership roles and disabled status are checked on every request. Disabling dashboard key
+sign-in does not disable API/CLI keys. Failed sign-ins count toward the address failure limit
+and are audited only in the resolved user's membership teams, without tokens or supplied email
+addresses. Unresolved identities and invalid states or tokens are not written to team audit logs.
+
+The short-lived pre-auth cookie uses SameSite=Lax for the cross-site callback. The final
+session cookie remains HttpOnly, SameSite=Strict (and Secure for HTTPS). The callback returns
+a 200 continuation page rather than a redirect chain so the Strict cookie reaches the dashboard.
 
 Personal keys work only while the user is enabled and is a member of the key's team. The effective
 role is the weaker of the key role and membership role, checked on every API and dashboard request.
@@ -431,8 +490,8 @@ teams and API keys remain available.
 
 ## What RunLedger does not do
 
-- It has per-person accounts and team memberships, but no single sign-on (SAML or OIDC), SCIM,
-  passwords or multi-factor authentication.
+- It has per-person accounts, team memberships and OIDC single sign-on, but no SAML, SCIM,
+  local passwords or local multi-factor authentication. Enforce MFA at your identity provider.
 - Keys do not expire, and there is no IP allow-list.
 - Without `RUNLEDGER_RETENTION_DAYS`, runs, approvals, budget alerts and audit events are never
   deleted automatically. There is no per-team retention period.

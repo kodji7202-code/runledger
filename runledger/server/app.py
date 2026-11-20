@@ -32,6 +32,9 @@
   GET  /                                      dashboard; sign in with the form, which posts the key
   POST /session                               sign in: form field "key" -> session cookie (302);
                                               from another origin (Origin/Sec-Fetch-Site) -> 403
+  GET  /auth/oidc/<provider>/start             start Authorization Code + PKCE sign-in
+  GET  /auth/oidc/<provider>/callback          validate identity, choose team or issue cookie
+  POST /auth/oidc/team                        single-use, cookie-bound team choice
   GET  /?key=API_KEY                          legacy sign-in: redirects to strip the key; never
                                               replaces a session of another team without confirmation
   GET  /health                                liveness, no auth
@@ -72,7 +75,7 @@ from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from .. import __version__
 from ..parser import _ts as _parse_ts
-from . import approvals, budgets, exports, insights, maintenance
+from . import approvals, budgets, exports, insights, maintenance, oidc
 from .auth import (
     SESSION_TTL_SECONDS,
     FailureLimiter,
@@ -116,18 +119,25 @@ RECEIPT_CSP = (
     "base-uri 'none'; form-action 'none'; frame-ancestors 'none'; sandbox"
 )
 SIGN_IN_CSP = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'"
-SIGN_IN_HTML = """<!doctype html>
+SIGN_IN_HEAD = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>RunLedger sign in</title>
 <style>body{font:15px/1.5 system-ui,sans-serif;margin:0;padding:48px 16px;background:#0a0b0d;color:#eef0f2}
 @media (prefers-color-scheme: light){body{background:#f7f8f9;color:#121417}}
 main{max-width:560px;margin:0 auto}code{font-family:ui-monospace,monospace;background:rgba(127,127,127,.18);padding:2px 6px;border-radius:6px}
 form{display:flex;gap:8px;margin:18px 0}input{flex:1;padding:9px 11px;border:1px solid rgba(127,127,127,.4);border-radius:8px;background:transparent;color:inherit;font:inherit}
-button{padding:9px 16px;border:0;border-radius:8px;background:#3b82f6;color:#fff;font:inherit;font-weight:600;cursor:pointer}
+button,.sso{display:inline-block;padding:9px 16px;border:0;border-radius:8px;background:#3b82f6;color:#fff;font:inherit;font-weight:600;cursor:pointer;text-decoration:none}
 .error{color:#e5484d;font-weight:600}</style>
 </head><body><main>
+"""
+SIGN_IN_HTML = SIGN_IN_HEAD + """
 <h1 style="font-size:20px">RunLedger team dashboard</h1>
 __ERROR__
+__SSO_BUTTONS__
+__KEY_FORM__
+</main></body></html>
+"""
+SIGN_IN_KEY_FORM = """
 <p>Sign in with a team API key. The server then sets a session cookie, and the key is never put in the address bar.</p>
 <form method="post" action="/session">
 <label for="key" style="position:absolute;left:-9999px">API key</label>
@@ -135,6 +145,12 @@ __ERROR__
 <button type="submit">Sign in</button>
 </form>
 <p>Create a team and its key with <code>runledger team create NAME</code>. Make more keys with <code>runledger key create</code>.</p>
+"""
+OIDC_TEAM_HTML = SIGN_IN_HEAD + """
+<h1 style="font-size:20px">Choose a team</h1>
+<form method="post" action="/auth/oidc/team">
+<input type="hidden" name="state" value="__STATE__">__TEAMS__
+</form>
 </main></body></html>
 """
 SWITCH_TEAM_HTML = """<!doctype html>
@@ -212,8 +228,10 @@ class RunLedgerServer(ThreadingHTTPServer):
         trusted_proxies: Sequence[_IPNetwork] = (),
         retention_days: Optional[int] = None,
         audit_retention_days: Optional[int] = None,
+        oidc_client: Optional[oidc.Client] = None,
     ) -> None:
         self.db = db
+        self.oidc = oidc_client
         self.log_requests = log_requests
         self.tls_context = tls_context
         self.secure_cookies = secure_cookies
@@ -235,6 +253,12 @@ class RunLedgerServer(ThreadingHTTPServer):
         scheme = "https" if tls_context is not None else "http"
         chosen = public_url or os.environ.get(PUBLIC_URL_ENV) or f"{scheme}://{shown}:{port}"
         self.public_url = chosen.strip().rstrip("/")
+        if self.oidc:
+            try:
+                oidc.validate_public_url(self.public_url)
+            except oidc.OIDCError:
+                self.server_close()
+                raise
 
     def get_request(self) -> Tuple[socket.socket, Any]:
         # The handshake runs in the request's own thread (see _Handler.setup), so a slow
@@ -371,6 +395,7 @@ def make_server(
     trusted_proxies: Optional[Sequence[str]] = None,
     retention_days: Optional[int] = None,
     audit_retention_days: Optional[int] = None,
+    oidc_config: Optional[str] = None,
 ) -> RunLedgerServer:
     """Open the database and bind the server. Port 0 picks a free port (see server_address).
     The caller owns the server: call shutdown(), server_close() and db.close() when done.
@@ -395,6 +420,10 @@ def make_server(
         audit_retention_days = maintenance.audit_retention_from_env()
     tls_context = make_tls_context(tls_cert, tls_key) if tls_cert else None
     secure = bool(secure_cookies) or _env_flag(SECURE_COOKIES_ENV)
+    config_path = oidc_config or os.environ.get("RUNLEDGER_OIDC_CONFIG")
+    oidc_client = oidc.Client(config_path) if config_path else None
+    if oidc_client and oidc_client.public_url:
+        public_url = oidc_client.public_url
     db = Database(db_path)
     cls = _IPv6Server if ":" in host else RunLedgerServer
     try:
@@ -403,6 +432,7 @@ def make_server(
             tls_context=tls_context, secure_cookies=secure, trust_proxy=bool(trust_proxy),
             trusted_proxies=networks, retention_days=retention_days,
             audit_retention_days=audit_retention_days,
+            oidc_client=oidc_client,
         )
     except Exception:
         db.close()
@@ -476,7 +506,9 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(500, {"error": {"code": "internal_error", "message": "Internal server error."}})
 
     def _dispatch(self, method: str, path: str, query: Dict[str, List[str]]) -> None:
-        if path == "/":
+        if path.startswith("/auth/oidc/"):
+            self._oidc_route(method, path, query)
+        elif path == "/":
             self._only(method, ("GET",))
             self._dashboard(query)
         elif path == "/session":
@@ -603,7 +635,120 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _sign_in_page(self, error: Optional[str] = None) -> None:
         message = f'<p class="error" role="alert">{_escape(error)}</p>' if error else ""
-        self._send_html(401, SIGN_IN_HTML.replace("__ERROR__", message), {"Content-Security-Policy": SIGN_IN_CSP})
+        buttons = []
+        key_form = SIGN_IN_KEY_FORM
+        if self.server.oidc:
+            for provider in self.server.oidc.providers.values():
+                buttons.append(
+                    f'<p><a class="sso" href="/auth/oidc/{provider["id"]}/start">'
+                    f'Sign in with {_escape(provider["name"])}</a></p>'
+                )
+            if self.server.oidc.disable_key_sign_in:
+                key_form = ""
+        page = (
+            SIGN_IN_HTML.replace("__ERROR__", message)
+            .replace("__SSO_BUTTONS__", "".join(buttons))
+            .replace("__KEY_FORM__", key_form)
+        )
+        self._send_html(401, page, {"Content-Security-Policy": SIGN_IN_CSP})
+
+    def _oidc_route(self, method: str, path: str, query: Dict[str, List[str]]) -> None:
+        """Handle provider callbacks and cookie-bound, single-use team choices."""
+        client = self.server.oidc
+        if client is None:
+            raise _not_found()
+        self._check_rate_limit()
+        provider = None
+        user_id = None
+        try:
+            if path == "/auth/oidc/team":
+                self._only(method, ("POST",))
+                self._refuse_cross_origin_sign_in()
+                length = self._content_length(SIGN_IN_BODY_LIMIT, "Team choice")
+                fields = parse_qs(self.rfile.read(length).decode("utf-8", "replace"))
+                pending = client.consume((fields.get("state") or [""])[0], self._cookie("rl_oidc"))
+                if "user_id" not in pending:
+                    raise oidc.OIDCError("Invalid team choice.")
+                user_id = pending["user_id"]
+                provider = pending["provider"]
+                team_id = int((fields.get("team") or [""])[0])
+                if team_id not in [t["id"] for t in self.server.db.user_teams(pending["user_id"])]:
+                    raise oidc.OIDCError("Team membership is no longer available.")
+                self._oidc_sign_in(pending["user_id"], team_id, provider)
+                return
+            parts = path.split("/")
+            if (
+                len(parts) != 5
+                or parts[3] not in client.providers
+                or parts[4] not in ("start", "callback")
+            ):
+                raise _not_found()
+            self._only(method, ("GET",))
+            provider, action = parts[3:]
+            if action == "start":
+                redirect_uri = self.server.public_url + "/auth/oidc/" + provider + "/callback"
+                location, cookie = client.start(provider, redirect_uri)
+                value = f"rl_oidc={cookie}; Path=/auth/oidc/; HttpOnly; SameSite=Lax; Max-Age=600"
+                if self._secure():
+                    value += "; Secure"
+                self._send(302, b"", "text/plain", {"Location": location, "Set-Cookie": value})
+                return
+            pending = client.consume((query.get("state") or [""])[0], self._cookie("rl_oidc"))
+            if pending["provider"] != provider or "user_id" in pending:
+                raise oidc.OIDCError("Invalid sign-in state.")
+            code = (query.get("code") or [""])[0]
+            if not code or query.get("error"):
+                raise oidc.OIDCError("Identity provider denied sign-in.")
+            claims = client.exchange(pending, code)
+            resolved = self.server.db.get_user(claims["email"])
+            user_id = resolved["id"] if resolved else None
+            person = self.server.db.oidc_user(**claims)
+            teams = self.server.db.user_teams(person["id"])
+            if len(teams) == 1:
+                self._oidc_sign_in(person["id"], teams[0]["id"], provider)
+                return
+            state = client.stash(
+                dict(user_id=person["id"], provider=provider, cookie=pending["cookie"])
+            )
+            buttons = "".join(
+                f'<button name="team" value="{t["id"]}">{_escape(t["name"])}</button>' for t in teams
+            )
+            page = OIDC_TEAM_HTML.replace("__STATE__", state).replace("__TEAMS__", buttons)
+            self._send_html(200, page, {"Content-Security-Policy": SIGN_IN_CSP})
+        except (oidc.OIDCError, ValueError) as exc:
+            self.server.limiter.record_failure(self._client_ip())
+            self.server.db.audit_oidc_rejection(user_id, provider, self._client_ip())
+            self._sign_in_page(
+                str(exc)
+                if isinstance(exc, oidc.OIDCError)
+                or str(exc).startswith(("No RunLedger account", "This email", "This identity"))
+                else "Invalid sign-in response."
+            )
+
+    def _oidc_sign_in(self, user_id: str, team_id: int, provider: str) -> None:
+        """Issue the Strict session cookie on a same-site continuation document."""
+        token = self.server.db.issue_oidc_session(team_id, user_id, provider)
+        identity = self.server.identify_session(token)
+        if identity is None:
+            raise oidc.OIDCError("Team membership is no longer available.")
+        self.server.db.record_audit(
+            team_id,
+            identity,
+            "auth.sign_in",
+            user_id,
+            {"method": "oidc", "provider": provider, "ip": self._client_ip()},
+        )
+        cookie = (
+            f"{COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_TTL_SECONDS}"
+        )
+        if self._secure():
+            cookie += "; Secure"
+        self._send_html(
+            200,
+            '<!doctype html><meta http-equiv="refresh" content="0;url=/">'
+            '<title>Signed in</title><p>Signed in. <a href="/">Continue to dashboard</a></p>',
+            {"Set-Cookie": cookie, "Content-Security-Policy": SIGN_IN_CSP},
+        )
 
     # Auth
 
@@ -712,9 +857,11 @@ class _Handler(BaseHTTPRequestHandler):
         me: Dict[str, Any] = {
             "team": {"id": ident.team_id, "name": ident.team_name},
             "role": ident.role,
-            "key": {"id": ident.key_id, "label": ident.label, "prefix": ident.prefix},
+            "key": {"id": ident.key_id, "label": ident.label, "prefix": ident.prefix} if ident.key_id else None,
             "user": {"id": ident.user_id, "email": ident.email, "name": ident.name} if ident.user_id else None,
         }
+        if self.server.oidc:
+            me["sign_in_method"] = "oidc" if ident.key_id is None else "key"
         self._send_json(200, me)
 
     def _create_run(self) -> None:
@@ -815,6 +962,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _dashboard(self, query: Dict[str, List[str]]) -> None:
         key = (query.get("key") or [""])[0].strip()
+        if key and self.server.oidc and self.server.oidc.disable_key_sign_in:
+            self._sign_in_page("Key sign-in is disabled; use your identity provider.")
+            return
         if key:
             # Legacy sign-in: trade the key for an opaque cookie and redirect so the key leaves
             # the URL. A session of another team is never replaced without a confirming click,
@@ -885,6 +1035,10 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _session_post(self) -> None:
         """The sign-in form: the key travels in the body, never in the URL."""
+        if self.server.oidc and self.server.oidc.disable_key_sign_in:
+            self._sign_in_page("Key sign-in is disabled; use your identity provider.")
+            self.close_connection = True
+            return
         self._refuse_cross_origin_sign_in()
         length = self._content_length(SIGN_IN_BODY_LIMIT, "Sign-in forms")
         raw = self.rfile.read(length) if length else b""
@@ -1171,6 +1325,8 @@ class _Handler(BaseHTTPRequestHandler):
 
 def _attested_identity(ident: Identity) -> str:
     """Stable human-readable attribution derived only from authenticated key data."""
+    if ident.user_id:
+        return ident.actor()
     source = "dashboard" if ident.via == "session" else "api"
     key_ref = ident.prefix or ident.key_id
     return f"{source}: {ident.label} ({key_ref})"

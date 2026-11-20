@@ -109,7 +109,7 @@ class Identity:
 
     team_id: int
     team_name: str
-    key_id: str
+    key_id: Optional[str]
     label: str
     role: str
     prefix: Optional[str]
@@ -121,6 +121,8 @@ class Identity:
     def actor(self) -> str:
         """Who did it, as written to the audit log. Never the key itself."""
         if self.user_id:
+            if self.key_id is None:
+                return f"{self.email} via {self.label}"
             return f"{self.email} via {self.label} ({self.prefix or self.key_id})"
         if self.via == "session":
             return f"dashboard:{self.label}"
