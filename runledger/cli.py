@@ -49,18 +49,12 @@ from urllib.parse import quote
 from . import __version__
 from . import adapters
 from . import hook_targets
+from .ai_defaults import DEFAULT_AI_MODEL, DEFAULT_REVIEW_MODEL
 from .gitinfo import current_branch, file_diffs, repo_context, session_base, toplevel, working_changes
 from .guard import load_user_config, redact
-from .guard_receipt import load_guard_decisions
 from .parser import _ts
 from .paths import is_abs
-from .pricing import apply_costs
-from .quality import analyze
-from .receipt import md_trailer, redact_run, render
-from .safe import make_safe
 from .risk import assess, is_test_source
-from .review import DEFAULT_REVIEW_MODEL, ai_review
-from .summarize import DEFAULT_AI_MODEL, ai_summaries, apply_templates, file_changes
 
 AGENTS = ("claude-code", "codex", "droid", "aider", "native")
 GUARD_AGENTS = hook_targets.AGENTS                 # the agents the guard can hook
@@ -75,6 +69,12 @@ def build(session_path: str, use_ai: bool = False, ai_model: str = DEFAULT_AI_MO
     The rule-based score and risks are the same with or without them. When an AI step fails,
     the deterministic receipt is kept and `note` says why, one line per failed step.
     Secrets are masked in everything the receipt shows, after the rules have scored the raw text."""
+    from .guard_receipt import load_guard_decisions
+    from .pricing import apply_costs
+    from .quality import analyze
+    from .receipt import redact_run
+    from .summarize import apply_templates
+
     path = Path(session_path)
     run = adapters.detect(path).parse(path)
     reconcile_git(run)
@@ -85,6 +85,8 @@ def build(session_path: str, use_ai: bool = False, ai_model: str = DEFAULT_AI_MO
     apply_templates(run)
     notes: List[str] = []
     if use_ai:
+        from .summarize import ai_summaries
+
         try:
             ai_summaries(run, model=ai_model)
         except Exception as exc:  # keep the deterministic receipt
@@ -92,6 +94,8 @@ def build(session_path: str, use_ai: bool = False, ai_model: str = DEFAULT_AI_MO
     score, level, risks = assess(run)
     analyze(run, risks)
     if review:
+        from .review import ai_review
+
         try:
             ai_review(run, risks, model=review_model)
         except Exception as exc:  # keep the deterministic receipt
@@ -105,6 +109,8 @@ def reconcile_git(run) -> None:
     branch when none was recorded, line counts for files written through the shell, and
     the diffs of changed test files. When the run's changes were committed after it began,
     both compare the working tree with the last commit before the session start (run.git_base)."""
+    from .summarize import file_changes
+
     with repo_context():
         if not run.git_branch:
             run.git_branch = current_branch(run.cwd)
@@ -438,6 +444,9 @@ def _default_receipt_path(stem: str, ext: str) -> Path:
 
 
 def cmd_receipt(args) -> int:
+    from .receipt import md_trailer, render
+    from .safe import make_safe
+
     path = _session_path(args)
     if path is None:
         return 1
@@ -500,11 +509,12 @@ def cmd_serve(args) -> int:
             tls_cert=args.tls_cert, tls_key=args.tls_key,
             secure_cookies=args.secure_cookies, trust_proxy=args.trust_proxy,
             trusted_proxies=args.trusted_proxy,
+            session_idle_timeout=args.session_idle_timeout,
         )
     except TLSConfigError as exc:  # missing or unusable certificate or key
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    except ValueError as exc:  # invalid trusted proxy or retention setting
+    except ValueError as exc:  # invalid server setting
         print(f"error: {exc}", file=sys.stderr)
         return 1
     except OSError as exc:  # port in use, bad address
@@ -1062,6 +1072,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ps.add_argument("--trusted-proxy", action="append", default=[], metavar="CIDR",
                     help="address or range of a reverse proxy whose X-Forwarded-For gives the client address "
                          "(repeatable; also $RUNLEDGER_TRUSTED_PROXIES, comma separated)")
+    ps.add_argument("--session-idle-timeout", type=int, metavar="SECONDS",
+                    help="sign out idle dashboard sessions (default: RUNLEDGER_SESSION_IDLE_TIMEOUT or 0 to disable)")
     ps.set_defaults(func=cmd_serve)
 
     pt = sub.add_parser("team", help="manage teams on a team server")

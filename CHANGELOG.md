@@ -7,12 +7,21 @@ change behavior, so read the entry before you upgrade.
 
 ## [Unreleased]
 
+### Fixed
+
+- Team receipt ingest rejects numbers outside the finite float range and JSON strings with
+  lone Unicode surrogates with HTTP 400 instead of an internal server error.
+
 ### Added
 
 - **Paging for the dashboard runs list:** the list no longer stops at 200 runs. Below the table it
   shows `Showing 200 of 1,240 runs` and a `Load 200 more` button that appends the next page, with
   the filters kept. `GET /api/runs` takes `after` (the id of the last run on a page) and reports
   `total`, the number of runs the filters match.
+- **Dashboard session controls:** Sign out of the current session or list and revoke active sessions
+  from the Sessions tab. Admins can manage any session in their team; other roles can manage sessions
+  started with their key. Operators can optionally configure an inactivity timeout.
+
 - **API key expiry, kinds and a team key policy:** keys are `personal` (default; may sign in to the
   dashboard) or `service` (API only) and may carry an `expires_at`. `POST /api/keys` and
   `runledger key create` take `kind` / `--kind` and `expires_in_days` / `--expires-in-days`. Team
@@ -26,6 +35,26 @@ change behavior, so read the entry before you upgrade.
   keys page shows kind and expiry and its settings page edits the policy. Existing keys become
   personal keys that never expire; a new or lower cap shortens existing keys of that kind to that many
   days from now.
+- **Signed release images and SBOMs (`.github/workflows/supply-chain.yml`):** each `v*` tag now
+  pushes the team server image to `ghcr.io/kodji7202-code/runledger`, signs it with keyless cosign,
+  attaches SLSA build provenance and a CycloneDX SBOM attestation to the image digest, and uploads
+  CycloneDX SBOMs of the Python package and the image to the GitHub Release. Pull requests that
+  touch the Dockerfile, `pyproject.toml` or the workflow run the same build and SBOM steps without
+  publishing. PyPI publishing in `release.yml` is unchanged.
+
+### Fixed
+
+- **An out-of-range `runledger stats --since` is a usage error (`runledger.stats`):** a relative
+  window too large for the calendar (`--since 99999999999d`) made `parse_since()` raise
+  `OverflowError`, so the command printed a traceback and exited 1. It now prints the usual
+  `argument --since: invalid value ...` usage error and exits 2, like any other bad value.
+
+### Changed
+
+- **A warm `runledger stats` prices each model bucket once (`runledger.stats`):** the totals, the
+  groups, the partial-cost notes and the top-models line share one per-request priced cost per
+  session model instead of repricing it up to nine times, so a warm report over 500 sessions
+  runs in well under half the time with the same figures.
 
 ## [0.7.0] - 2026-10-20
 

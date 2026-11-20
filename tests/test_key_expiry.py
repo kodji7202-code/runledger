@@ -202,6 +202,22 @@ def test_a_dashboard_session_never_outlives_its_key(tmp_path):
         assert _http(base, "GET", "/api/me", headers={"Cookie": cookie})[0] == 401
 
 
+def test_sessions_with_an_expired_key_are_not_listed_or_revocable(env):
+    srv, base = env
+    _, admin = srv.db.create_team("alpha")
+    member = _json(_new_key(base, admin)[2])
+    cookie = {"Cookie": _cookie_for(base, member["key"])}
+    status, _, raw = _http(base, "GET", "/sessions", headers=_auth(admin))
+    assert status == 200
+    session, = _json(raw)["sessions"]
+    assert session["key_id"] == member["id"]
+    _set_expiry(srv.db.path, member["id"], _stamp(seconds=-1))
+    status, _, raw = _http(base, "GET", "/sessions", headers=_auth(admin))
+    assert status == 200 and _json(raw)["sessions"] == []
+    assert _http(base, "DELETE", f"/sessions/{session['id']}", headers=_auth(admin))[0] == 404
+    assert _http(base, "GET", "/api/me", headers=cookie)[0] == 401
+
+
 def test_service_keys_cannot_sign_in_to_the_dashboard(env):
     srv, base = env
     _, admin = srv.db.create_team("alpha")

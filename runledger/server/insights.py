@@ -34,6 +34,7 @@ VERDICTS = ("looks_safe", "needs_review", "dangerous")
 ASSESSMENTS = ("confirmed", "false_positive", "uncertain")
 MAX_ITEMS = 50
 MAX_TEXT = 2000
+MAX_COST_USD = 10 ** 12
 TOP_LIMIT = 10
 TABLE_LIMIT = 20
 # json.dumps writes a non-empty list of objects as '"recommendations": [{'. The database uses
@@ -70,6 +71,8 @@ def _whole(value: Any) -> Optional[int]:
 
 
 def _usd(value: Any) -> Optional[float]:
+    if isinstance(value, (int, float)) and value > MAX_COST_USD:
+        return None
     number = _number(value)
     if number is None or number < 0:
         return None
@@ -222,7 +225,7 @@ def review_fields(payload: Dict[str, Any]) -> Dict[str, Any]:
         "quality_score": quality["score"] if quality else None,
         "quality_grade": quality["grade"] if quality else None,
         "ai_verdict": ai_review["verdict"] if ai_review else None,
-        "est_savings_usd": round(sum(estimates), 6) if estimates else None,
+        "est_savings_usd": _usd(sum(estimates)) if estimates else None,
         "recommendation_counts": [
             {"kind": r["kind"], "title": r["title"], "est_savings_usd": r["est_savings_usd"]}
             for r in recommendations
