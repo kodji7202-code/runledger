@@ -739,7 +739,8 @@ def test_existing_database_is_upgraded_with_the_approval_settings(tmp_path):
     with closing(Database(str(path))) as db:
         assert db.approval_settings(1) == {
             "slack_webhook_url": None, "webhook_url": None, "approval_ttl_s": 600,
-            "attribution": "client",
+            "attribution": "client", "key_max_ttl_days": None, "service_key_max_ttl_days": None,
+            "key_expiry_warn_days": 14,
         }
         db.update_approval_settings(1, {"webhook_url": "https://example.com/hook"})
     with closing(Database(str(path))) as db:  # reopening does not fail or reset anything
