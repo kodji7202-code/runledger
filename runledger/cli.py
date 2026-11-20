@@ -40,10 +40,10 @@ import os
 import re
 import sqlite3
 import sys
+import unicodedata
 import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
-from textwrap import fill
 from typing import List, Optional, Tuple
 from urllib.parse import quote
 
@@ -197,6 +197,22 @@ def _prune_scope(keep, older_than) -> str:
     return f"Removed only checkpoints older than {older_than}."
 
 
+def _wrap_checkpoint_label(label: str) -> str:
+    lines = []
+    line, columns = "  ", 2
+    for match in re.finditer(r"( *)([^ ]+)", repr(redact(label))):
+        gap, word = match.groups()
+        width = sum(2 if unicodedata.east_asian_width(char) in ("F", "W") else 1
+                    for char in word if unicodedata.category(char) not in ("Mn", "Me"))
+        if line.strip() and columns + len(gap) + width > 80:
+            lines.append(line)
+            line, columns = "   " + word, 3 + width
+        else:
+            line += gap + word
+            columns += len(gap) + width
+    return "\n".join([*lines, line])
+
+
 def cmd_checkpoints(args) -> int:
     from .rollback import CheckpointError, Repository, parse_duration
     try:
@@ -223,12 +239,10 @@ def cmd_checkpoints(args) -> int:
         tree = repo.snapshot_tree()
         for cp in checkpoints:
             plan = repo.plan(cp, tree)
-            label = repr(redact(cp.label))
             changed = len(plan.restore) + len(plan.remove) + len(plan.keep_ignored)
             print(f"{cp.id}  ({changed} file(s) differ)")
             print(f"  {cp.created_at}")
-            print(fill(label, width=80, initial_indent="  ", subsequent_indent="   ",
-                       break_long_words=False, break_on_hyphens=False))
+            print(_wrap_checkpoint_label(cp.label))
             for path in plan.restore:
                 print(f"  restore {path!r}")
             for path in plan.remove:
