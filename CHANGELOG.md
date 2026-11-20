@@ -7,6 +7,11 @@ change behavior, so read the entry before you upgrade.
 
 ## [Unreleased]
 
+### Fixed
+
+- Droid tool calls with an empty successful result now show **Approved by user** rather than
+  **Rejected by user** for Guard ask decisions.
+
 ## [0.7.0] - 2026-10-20
 
 ### Added
