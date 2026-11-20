@@ -505,6 +505,8 @@ def cmd_serve(args) -> int:
             tls_cert=args.tls_cert, tls_key=args.tls_key,
             secure_cookies=args.secure_cookies, trust_proxy=args.trust_proxy,
             trusted_proxies=args.trusted_proxy,
+            oidc_config=args.oidc_config,
+            saml_config=args.saml_config,
         )
     except TLSConfigError as exc:  # missing or unusable certificate or key
         print(f"error: {exc}", file=sys.stderr)
@@ -1110,6 +1112,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ps.add_argument("--host", default="127.0.0.1", help="bind address (default 127.0.0.1)")
     ps.add_argument("--port", type=int, default=8787)
     ps.add_argument("--db", default="runledger.db", help="SQLite database file (default runledger.db)")
+    ps.add_argument("--oidc-config", metavar="PATH", help="OIDC JSON config (also RUNLEDGER_OIDC_CONFIG)")
+    ps.add_argument("--saml-config", metavar="PATH", help="SAML JSON config (also RUNLEDGER_SAML_CONFIG)")
     ps.add_argument("--tls-cert", metavar="FILE", help="PEM certificate: serve HTTPS (TLS 1.2+); needs --tls-key")
     ps.add_argument("--tls-key", metavar="FILE", help="PEM private key for --tls-cert")
     ps.add_argument("--secure-cookies", action="store_true",

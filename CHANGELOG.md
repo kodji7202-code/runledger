@@ -9,6 +9,10 @@ change behavior, so read the entry before you upgrade.
 
 ### Added
 
+- Dashboard OIDC sign-in for Okta, Entra ID and Google Workspace using standard-library
+  Authorization Code + PKCE and RS256 verification. Person-bound, keyless sessions use live
+  membership roles; optional SSO-only dashboard login leaves API keys working.
+
 - Team-scoped SCIM 2.0 user provisioning, deactivation/reactivation and fixed role groups,
   dedicated rotating bearer tokens with admin API/local CLI, discovery and audit events.
   Membership deactivation blocks personal keys without disabling users in other teams.
