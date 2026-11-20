@@ -802,7 +802,8 @@ class Database:
             action = "update"
             if active != (old["deactivated_at"] is None):
                 action = "reactivate" if active else "deactivate"
-            self._audit(team_id, "scim", "scim.user." + action, user_id, {})
+            self._audit(team_id, "scim", "scim.user." + action, email.lower(),
+                        {"user_id": user_id, "email": email.lower(), "role": role})
 
     def scim_group_update(self, team_id, group, changes):
         with self._lock, self._conn:
@@ -851,8 +852,10 @@ class Database:
             if scim_data is not None:
                 self._conn.execute("UPDATE memberships SET deactivated_at = ?, external_id = ?, updated_at = ? WHERE team_id = ? AND user_id = ?",
                                    (None if scim_data.get("active", True) else utc_now(), scim_data.get("external_id"), utc_now(), team_id, user["id"]))
-                self._audit(team_id, actor, "scim.user.create", user["id"], {})
-            self._audit(team_id, actor, "member.add", user["id"], {"email": email, "role": role})
+                self._audit(team_id, actor, "scim.user.create", email,
+                            {"user_id": user["id"], "email": email, "role": role})
+            self._audit(team_id, actor, "member.add", email,
+                        {"user_id": user["id"], "email": email, "role": role})
         return dict(user, role=role)
 
     def _working_admins(self, team_id: int, exclude_user: Optional[str] = None,
@@ -888,8 +891,8 @@ class Database:
             else:
                 self._conn.execute("UPDATE memberships SET role = ? WHERE team_id = ? AND user_id = ?",
                                    (role, team_id, person["id"]))
-            self._audit(team_id, actor, "member.remove" if role is None else "member.role", person["id"],
-                        {"email": person["email"], "role": role})
+            self._audit(team_id, actor, "member.remove" if role is None else "member.role", person["email"],
+                        {"user_id": person["id"], "email": person["email"], "role": role})
 
     def set_user_disabled(self, user: str, disabled: bool) -> None:
         with self._lock, self._conn:
@@ -898,7 +901,7 @@ class Database:
             person = self.get_user(user)
             if person is None:
                 raise InvalidKey("User not found.")
-            teams = [r[0] for r in self._conn.execute("SELECT team_id FROM memberships WHERE user_id = ?",
+            teams = [r[0] for r in self._conn.execute("SELECT team_id FROM memberships WHERE user_id = ? ORDER BY team_id",
                                                     (person["id"],))]
             if disabled:
                 for team_id in teams:
@@ -906,10 +909,15 @@ class Database:
                         raise InvalidKey("Cannot disable the team's last working admin key.")
             self._conn.execute("UPDATE users SET disabled_at = ? WHERE id = ?",
                                (utc_now() if disabled else None, person["id"]))
+            for team_id in teams:
+                details = {"user_id": person["id"], "email": person["email"]}
+                if disabled:
+                    deleted = self._conn.execute("DELETE FROM sessions WHERE team_id = ? AND user_id = ?",
+                                                 (team_id, person["id"]))
+                    details["sessions_deleted"] = deleted.rowcount
+                self._audit(team_id, "cli", "user.disable" if disabled else "user.enable", person["email"], details)
             if disabled:
                 self._conn.execute("DELETE FROM sessions WHERE user_id = ?", (person["id"],))
-            for team_id in teams:
-                self._audit(team_id, "cli", "user.disable" if disabled else "user.enable", person["id"], {})
 
     def create_team(self, name: str, actor: Union[str, Identity] = "cli") -> Tuple[int, str]:
         """Create a team and its first admin key ("initial"). Returns (team_id, key).

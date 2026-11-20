@@ -160,7 +160,8 @@ def dispatch(h, method, path, query):
             return
         if method == "DELETE" and rid:
             db.change_member(team, rid, actor="scim")
-            db.record_audit(team, "scim", "scim.user.delete", rid)
+            db.record_audit(team, "scim", "scim.user.delete", member["email"],
+                            {"user_id": rid, "email": member["email"], "role": member["role"]})
             send(h, 204, {})
             return
         if method == "POST" and not rid:

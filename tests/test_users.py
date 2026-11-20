@@ -148,6 +148,14 @@ def test_disable_is_server_wide_and_enable_does_not_restore_sessions(db):
     assert db.key_for_token(kb["key"])
     for team in (a, b):
         assert {e["action"] for e in db.list_audit(team)} >= {"user.disable", "user.enable"}
+        for action in ("user.disable", "user.enable"):
+            event = next(e for e in db.list_audit(team) if e["action"] == action)
+            assert event["actor"] == "cli" and event["actor_user_id"] is None
+            assert event["target"] == user["email"]
+            expected = {"user_id": user["id"], "email": user["email"]}
+            if action == "user.disable":
+                expected["sessions_deleted"] = 1
+            assert event["details"] == expected
 
 
 @pytest.mark.parametrize("mutation", ["DELETE FROM memberships WHERE user_id = ?",
@@ -219,10 +227,14 @@ def test_person_audit_attribution_and_service_actors(db):
     assert ident.actor() == f"ana@example.com via laptop-ana ({key['prefix']})"
     db.add_member(team, "bob@example.com", "member", actor=ident)
     db.change_member(team, "bob@example.com", "viewer", actor=ident)
+    bob = db.get_user("bob@example.com")
     db.change_member(team, "bob@example.com", actor=ident)
     for event in db.list_audit(team)[:3]:
         assert event["actor_user_id"] == user["id"]
         assert event["actor"] == ident.actor()
+        assert event["target"] == "bob@example.com"
+        assert event["details"]["user_id"] == bob["id"]
+        assert event["details"]["email"] == "bob@example.com"
     service_ident = identity_from_row(db.key_for_token(service), "session")
     assert service_ident.actor() == "dashboard:initial"
     db.record_audit(team, service_ident, "service")
