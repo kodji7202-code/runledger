@@ -309,7 +309,8 @@ def test_me_reports_team_role_and_key_for_a_bearer_key_and_a_session(env):
     assert me == {
         "team": {"id": team_id, "name": "alpha"},
         "role": "member",
-        "key": {"id": member["id"], "label": "laptop", "prefix": member["key"][:8]},
+        "key": {"id": member["id"], "label": "laptop", "prefix": member["key"][:8],
+                "kind": "personal", "expires_at": None, "expires_soon": False},
         "user": None,
     }
     cookie = _cookie_for(base, member["key"])
@@ -320,7 +321,7 @@ def test_create_key_returns_the_secret_once_and_listing_never_does(env):
     srv, base = env
     _, admin = srv.db.create_team("alpha")
     created = _create_key(base, admin, "laptop", "member")
-    assert set(created) == {"id", "label", "role", "prefix", "created_at", "key", "user_id", "user"}
+    assert set(created) == {"id", "label", "role", "kind", "prefix", "created_at", "expires_at", "key", "user_id", "user"}
     assert created["label"] == "laptop" and created["role"] == "member"
     assert KEY_RE.fullmatch(created["key"]) and created["prefix"] == created["key"][:8]
 
@@ -329,7 +330,8 @@ def test_create_key_returns_the_secret_once_and_listing_never_does(env):
     keys = _json(raw)["keys"]
     assert {k["label"] for k in keys} == {"initial", "laptop"}
     assert all("key" not in k and "key_hash" not in k for k in keys)
-    assert set(keys[0]) == {"id", "label", "role", "prefix", "created_at", "last_used_at", "revoked_at", "user_id", "user"}
+    assert set(keys[0]) == {"id", "label", "role", "kind", "prefix", "created_at", "last_used_at",
+                            "revoked_at", "expires_at", "user_id", "user"}
     assert _http(base, "GET", "/api/me", headers=_auth(created["key"]))[0] == 200
 
 
