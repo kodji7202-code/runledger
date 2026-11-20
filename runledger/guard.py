@@ -548,11 +548,6 @@ def _valid_extra_with_warnings(value: Any, existing_count: int = 0) -> Tuple[Lis
     return out, warnings
 
 
-def _valid_extra(value: Any) -> List[str]:
-    out, _ = _valid_extra_with_warnings(value)
-    return out
-
-
 def _risk_settings(project: Dict[str, Any], user: Dict[str, Any]) -> Dict[str, Any]:
     """`assess` is what risk.py gets: the user's ignore and severity overrides, the
     union of secret-path patterns, and the user's rules plus the project's (a project may
@@ -1101,10 +1096,6 @@ def _warning_records(decision: dict) -> List[Dict[str, Any]]:
 
 def _log_decision(decision: dict) -> None:
     _append_log(decision["cwd"], _decision_record(decision))
-
-
-def _log_warnings(decision: dict) -> None:
-    _append_logs(decision["cwd"], _warning_records(decision))
 
 
 def _log_warnings_and_decision(decision: dict) -> None:
