@@ -52,6 +52,8 @@ change behavior, so read the entry before you upgrade.
 
 ### Fixed
 
+- `runledger stats --until YYYY-MM-DD` includes sessions and guard events in the final
+  fractional second of the day, while still excluding the next day's midnight.
 - Team stats and Insights count model aliases sharing a friendly label once per receipt,
   keeping additive tokens and costs and preserving partly priced lower bounds.
 - Team server request logging handles oversized URLs rejected before parsing, returning HTTP 414
