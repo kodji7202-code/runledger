@@ -44,6 +44,7 @@ other teams retain access there. **Email and name are global attributes**: provi
 change them if the user belongs to another team. Adding an existing user keeps their name.
 Okta given/family name parts are combined when no formatted name is supplied. `externalId`, role
 and active status are team-local. The last working admin cannot be deactivated, demoted or deleted.
+`runledger user list` shows a SCIM-deactivated membership as `deactivated` (a server-wide disable shows `disabled`).
 
 Revoke provisioning access with `DELETE /api/scim/token` or the local `scim-token revoke` command.
 Token administration and SCIM changes appear in the audit log. Automated updates use actor `scim`.

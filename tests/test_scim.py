@@ -305,3 +305,21 @@ def test_eq_filter_parses_without_regex():
     assert eq_filter('title eq "a"', ("username",)) is None
     assert eq_filter('userName eq "a"b"', ("username",)) is None
     assert eq_filter("userName eq " + " " * 50000 + "x", ("username",)) is None
+
+
+def test_user_list_shows_scim_deactivation(scim, capsys):
+    db, team, key, token, base, call = scim
+    user = call("POST", body={"userName": "mira@example.com"})[1]
+    path = "/Users/" + user["id"]
+
+    def status():
+        capsys.readouterr()
+        assert main(["user", "list", "--team-id", str(team), "--db", db.path]) == 0
+        line = next(l for l in capsys.readouterr().out.splitlines() if "mira@example.com" in l)
+        return line.split()[-1]
+
+    assert status() == "active"
+    assert call("PATCH", path, {"Operations": [{"op": "replace", "path": "active", "value": False}]})[0] == 200
+    assert status() == "deactivated"
+    assert call("PATCH", path, {"Operations": [{"op": "replace", "path": "active", "value": True}]})[0] == 200
+    assert status() == "active"

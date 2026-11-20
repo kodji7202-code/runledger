@@ -763,7 +763,8 @@ def cmd_user(args) -> int:
             if db.team_name(args.team_id) is None:
                 raise InvalidKey("Team not found.")
             for member in db.list_members(args.team_id):
-                status = "disabled" if member["disabled_at"] else "active"
+                status = ("disabled" if member["disabled_at"] else
+                          "deactivated" if member.get("deactivated_at") else "active")
                 print(f"{member['id']}  {member['email']}  {member['name'] or '-'}  {member['role']}  {status}")
         elif args.user_cmd == "add":
             member = db.add_member(args.team_id, args.email, args.role, args.name)
