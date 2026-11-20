@@ -571,6 +571,21 @@ def test_start_probe_missing_file_falls_back(tmp_path):
     assert stats._session_start(tmp_path / "missing.jsonl") is None
 
 
+def test_overflowing_probe_timestamp_is_reported_as_skipped(isolated_settings):
+    project = isolated_settings / "overflow"
+    project.mkdir()
+    path = claude_session(isolated_settings, project, "overflow", datetime(2020, 1, 1))
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    rows[0]["timestamp"] = "0001-01-01T00:00:00+01:00"
+    _write(path, rows)
+    os.utime(path, (1, 1))
+    assert stats._session_start(path) is None
+    summaries, skipped, total = stats.collect(
+        [path], datetime(2026, 1, 1), datetime(2026, 2, 1))
+    assert summaries == [] and total == 0
+    assert len(skipped) == 1 and skipped[0]["path"] == str(path)
+
+
 @pytest.mark.parametrize("content", ["", "not json\n"])
 def test_old_mtime_invalid_files_are_reported(tmp_path, content):
     path = tmp_path / "invalid.jsonl"

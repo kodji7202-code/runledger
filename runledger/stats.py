@@ -320,9 +320,9 @@ class StatsCache:
             return None
         try:
             started = datetime.fromisoformat(record["started"])
-        except (KeyError, TypeError, ValueError):
+            return _local(started) if started.tzinfo is not None else None
+        except (KeyError, TypeError, ValueError, OverflowError):
             return None
-        return _local(started) if started.tzinfo is not None else None
 
     def put_start(self, path: Path, stat_result: os.stat_result, started: datetime) -> None:
         self._put(path, {"version": RECORD_VERSION, "kind": "start",
@@ -719,7 +719,10 @@ def _session_start(path: Path) -> Optional[datetime]:
         if not modern and not legacy:
             return None
     stamp = record.get("timestamp")
-    return _local(_ts(stamp)) if isinstance(stamp, str) else None
+    try:
+        return _local(_ts(stamp)) if isinstance(stamp, str) else None
+    except (ValueError, OverflowError):
+        return None
 
 
 def collect(files: Sequence[Path], since: datetime, until: datetime,
@@ -755,7 +758,7 @@ def collect(files: Sequence[Path], since: datetime, until: datetime,
                       f"({len(files)} file(s) listed)...", file=sys.stderr)
             try:
                 summary = summarize(path)
-            except (OSError, ValueError) as exc:
+            except (OSError, ValueError, OverflowError) as exc:
                 skipped.append({"path": str(path), "reason": _reason(path, exc)})
                 if cache is not None:
                     cache.drop(path)
