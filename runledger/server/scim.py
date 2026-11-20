@@ -62,6 +62,18 @@ def name_from_parts(parts):
     return " ".join((name or "").strip() for name in names).strip() or None
 
 
+def parts_of(body):
+    """Name parts a whole-name value leaves for later name-part operations in the same PATCH."""
+    parts = {}
+    for key, value in body.items():
+        if key.lower() in ("displayname", "name.formatted"):
+            parts = {}
+        elif key.lower() == "name":
+            parts = {} if not isinstance(value, dict) or "formatted" in value else \
+                {k: value[k] for k in ("givenName", "familyName") if k in value}
+    return parts
+
+
 def values(body):
     result = {}
     for key, value in body.items():
@@ -199,6 +211,8 @@ def dispatch(h, method, path, query):
                         if not isinstance(op.get("value"), dict) or op["op"].lower() == "remove":
                             raise Error(400, "A value object is required.", "invalidValue")
                         data.update(values(op["value"]))
+                        if any(k.lower() in ("name", "name.formatted", "displayname") for k in op["value"]):
+                            name_parts = parts_of(op["value"])
                     else:
                         if not isinstance(path, str) or path.lower() not in ("active", "name", "name.formatted", "name.givenname", "name.familyname", "displayname", "username", "externalid", "roles"):
                             raise Error(400, "Unsupported patch path.", "invalidPath")
@@ -212,6 +226,8 @@ def dispatch(h, method, path, query):
                             data["name"] = name_from_parts(name_parts)
                         else:
                             data.update(values({path: value}))
+                            if path.lower() in ("name", "name.formatted", "displayname"):
+                                name_parts = parts_of({path: value})
             db.scim_update(team, rid, data)
             send(h, 200, resource(next(m for m in db.list_members(team) if m["id"] == rid)))
             return
@@ -250,29 +266,34 @@ def groups(h, db, team, method, rid, body, members, query=None):
         return
     if method != "PATCH" or not rid:
         raise Error(405, "Only GET and PATCH of fixed role groups are supported.")
-    changes = {}
-    for op in operations(body):
-        path = op.get("path", "members")
-        match = re.fullmatch(r'members\[value eq "([^"\\]+)"\]', path) if isinstance(path, str) else None
-        entries = [{"value": match[1]}] if match else op.get("value")
-        if isinstance(entries, dict):
-            entries = entries.get("members")
-        if (path != "members" and not match) or not isinstance(entries, list):
-            raise Error(400, "Supply members or members[value eq \"id\"].", "invalidPath")
-        if op["op"].lower() == "replace" and not match:
-            for member in members:
-                if changes.get(member["id"], member["role"]) == rid:
-                    changes[member["id"]] = "viewer" if rid == "member" else "member" if rid == "admin" else "viewer"
-        for entry in entries:
-            user_id = entry.get("value") if isinstance(entry, dict) else None
-            member = next((m for m in members if m["id"] == user_id), None)
-            if member is None:
-                raise Error(400, "Member not found.", "invalidValue")
-            role = changes.get(user_id, member["role"])
-            if op["op"].lower() == "remove":
-                if role == rid:
-                    changes[user_id] = "viewer" if rid == "member" else "member"
-            else:
-                changes[user_id] = rid
-    db.scim_group_update(team, rid, changes)
+    ops = operations(body)
+
+    def compute(members):
+        changes = {}
+        for op in ops:
+            path = op.get("path", "members")
+            match = re.fullmatch(r'members\[value eq "([^"\\]+)"\]', path) if isinstance(path, str) else None
+            entries = [{"value": match[1]}] if match else op.get("value")
+            if isinstance(entries, dict):
+                entries = entries.get("members")
+            if (path != "members" and not match) or not isinstance(entries, list):
+                raise Error(400, "Supply members or members[value eq \"id\"].", "invalidPath")
+            if op["op"].lower() == "replace" and not match:
+                for member in members:
+                    if changes.get(member["id"], member["role"]) == rid:
+                        changes[member["id"]] = "viewer" if rid == "member" else "member" if rid == "admin" else "viewer"
+            for entry in entries:
+                user_id = entry.get("value") if isinstance(entry, dict) else None
+                member = next((m for m in members if m["id"] == user_id), None)
+                if member is None:
+                    raise Error(400, "Member not found.", "invalidValue")
+                role = changes.get(user_id, member["role"])
+                if op["op"].lower() == "remove":
+                    if role == rid:
+                        changes[user_id] = "viewer" if rid == "member" else "member"
+                else:
+                    changes[user_id] = rid
+        return changes
+
+    db.scim_group_update(team, rid, compute)
     groups(h, db, team, "GET", rid, {}, db.list_members(team))
