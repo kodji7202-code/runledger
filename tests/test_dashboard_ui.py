@@ -427,6 +427,21 @@ def test_new_key_is_shown_once_with_a_warning_and_copy_button():
     assert js.count("clearKeyOnce();") >= 2                 # when the user dismisses it and when they leave the tab
 
 
+def test_rotating_own_key_keeps_replacement_visible_until_dismissed():
+    js = _script(DASHBOARD_HTML)
+    assert "state.keyId = me && me.key ? me.key.id : null;" in js
+    rotate = js[js.index("function rotateKey("):js.index("// Audit log (admin)")]
+    assert rotate.index("state.selfRotation = ownKey;") < rotate.index('postJSON("/api/keys/"')
+    assert 'var ownKey = key.id === state.keyId;' in rotate
+    assert re.search(r'if \(ownKey\) \{[^}]+Your session ended[^}]+return;\s+\}', rotate)
+    assert rotate.index("return loadKeys();") > rotate.index('textContent = "I have copied it — sign in"')
+    sign_in = js[js.index("function goToSignIn()"):js.index("function parseBody")]
+    assert sign_in.index("if (state.selfRotation) { return; }") < sign_in.index("location.reload();")
+    assert 'if (state.view === "keys" && !state.selfRotation) { clearKeyOnce(); }' in js
+    dismiss = js[js.index('$("key-dismiss").addEventListener'):js.index('$("audit-filter").addEventListener')]
+    assert dismiss.index("clearKeyOnce();") < dismiss.index("state.selfRotation = false;") < dismiss.index("goToSignIn();")
+
+
 # Checks against a real server
 
 SESSION = "7f3c2a10-9b1e-4c55-a1d2-0e6f8b3c9d42"

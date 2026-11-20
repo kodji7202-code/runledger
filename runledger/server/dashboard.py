@@ -492,7 +492,8 @@ tr.pickable:hover{background:var(--chip)}
     report: "/api/export/report.html"
   };
 
-  var state = { days: 30, role: null, keyRef: null, meLoaded: false, view: null, thresholds: [50, 80, 100] };
+  var state = { days: 30, role: null, keyRef: null, keyId: null, selfRotation: false,
+    meLoaded: false, view: null, thresholds: [50, 80, 100] };
   var budgetState = { edited: false, settings: null, status: null };
   var approvalsView = { seq: 0, signature: null, items: [], failed: false };
   var keysView = { items: [] };
@@ -568,6 +569,7 @@ tr.pickable:hover{background:var(--chip)}
   }
 
   function goToSignIn() {
+    if (state.selfRotation) { return; }
     history.replaceState(null, "", "/");
     location.reload();
   }
@@ -1254,6 +1256,7 @@ tr.pickable:hover{background:var(--chip)}
     $("key-value").textContent = "";
     $("key-once-label").textContent = "";
     $("key-once").hidden = true;
+    $("key-dismiss").textContent = "I have copied it";
     setMsg($("key-copy-msg"), "", false);
   }
 
@@ -1387,17 +1390,29 @@ tr.pickable:hover{background:var(--chip)}
   }
 
   function rotateKey(key) {
+    if (state.selfRotation) { return; }
     var name = nameOf(key.label, String(key.id));
     confirmAction("Rotate this key?",
       "A new key replaces '" + name + "'. The old key may stop working. The new key is shown once.",
       "Rotate key", false)
       .then(function (yes) {
         if (!yes) { return; }
+        var ownKey = key.id === state.keyId;
+        state.selfRotation = ownKey;
         return postJSON("/api/keys/" + encodeURIComponent(key.id) + "/rotate", {}).then(function (created) {
+          if (ownKey) {
+            showKeyOnce(created, "Your session ended. Copy the replacement key to sign in again.");
+            $("key-dismiss").textContent = "I have copied it — sign in";
+            return;
+          }
           showKeyOnce(created, "New key for '" + name + "'.");
           setMsg($("keys-msg"), "Key rotated.", false);
           return loadKeys();
         }, function (err) {
+          if (ownKey) {
+            state.selfRotation = false;
+            if (err.status === 401) { goToSignIn(); }
+          }
           setMsg($("keys-msg"), keyError(err), true);
         });
       });
@@ -1842,7 +1857,7 @@ tr.pickable:hover{background:var(--chip)}
       tab.classList.toggle("active", on);
     });
     if (state.view !== name) {
-      if (state.view === "keys") { clearKeyOnce(); }
+      if (state.view === "keys" && !state.selfRotation) { clearKeyOnce(); }
       state.view = name;
       enterView(name);
     }
@@ -1875,6 +1890,7 @@ tr.pickable:hover{background:var(--chip)}
       state.meLoaded = true;
       state.role = ROLES.indexOf(me && me.role) >= 0 ? me.role : null;
       state.keyRef = me && me.key ? (me.key.prefix || me.key.id || null) : null;
+      state.keyId = me && me.key ? me.key.id : null;
       if (me && me.team && me.team.name) { setTeam(me.team.name); }
       applyRole();
     }, function () {
@@ -1882,6 +1898,7 @@ tr.pickable:hover{background:var(--chip)}
       state.meLoaded = true;
       state.role = null;
       state.keyRef = null;
+      state.keyId = null;
       applyRole();
     });
   }
@@ -1979,6 +1996,11 @@ tr.pickable:hover{background:var(--chip)}
   });
   $("key-dismiss").addEventListener("click", function () {
     clearKeyOnce();
+    if (state.selfRotation) {
+      state.selfRotation = false;
+      goToSignIn();
+      return;
+    }
     $("key-label").focus();
   });
 
