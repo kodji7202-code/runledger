@@ -389,6 +389,45 @@ def _approval_row_view(row: sqlite3.Row, ttl_s: int, now: float) -> Dict[str, An
     return _approval_view(data, ttl_s, now)
 
 
+def _run_filters(
+    team_id: int,
+    *,
+    user: Optional[str],
+    project: Optional[str],
+    min_risk: Optional[int],
+    agent: Optional[str],
+    min_quality: Optional[int],
+    max_quality: Optional[int],
+    ai_verdict: Optional[str],
+) -> Tuple[List[str], List[Any]]:
+    """The WHERE clauses and parameters shared by list_runs and count_runs."""
+    clauses = ["team_id = ?"]
+    params: List[Any] = [team_id]
+    if user:  # case-insensitive substring match, so "bob" finds "bob@example.com"
+        clauses.append("user LIKE ? ESCAPE '\\'")
+        params.append(_contains(user))
+    if project:
+        clauses.append("project LIKE ? ESCAPE '\\'")
+        params.append(_contains(project))
+    if agent:  # "claude" finds "Claude Code"
+        clauses.append("agent LIKE ? ESCAPE '\\'")
+        params.append(_contains(agent))
+    if min_risk is not None:
+        clauses.append("risk_score >= ?")
+        params.append(int(min_risk))
+    # A run with no quality score matches neither bound.
+    if min_quality is not None:
+        clauses.append("quality_score >= ?")
+        params.append(int(min_quality))
+    if max_quality is not None:
+        clauses.append("quality_score <= ?")
+        params.append(int(max_quality))
+    if ai_verdict:
+        clauses.append("ai_verdict = ?")
+        params.append(ai_verdict)
+    return clauses, params
+
+
 def _summary(row: sqlite3.Row) -> Dict[str, Any]:
     return {
         "id": row["id"],
@@ -1205,39 +1244,52 @@ class Database:
         min_quality: Optional[int] = None,
         max_quality: Optional[int] = None,
         ai_verdict: Optional[str] = None,
+        after: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        clauses = ["team_id = ?"]
-        params: List[Any] = [team_id]
-        if user:  # case-insensitive substring match, so "bob" finds "bob@example.com"
-            clauses.append("user LIKE ? ESCAPE '\\'")
-            params.append(_contains(user))
-        if project:
-            clauses.append("project LIKE ? ESCAPE '\\'")
-            params.append(_contains(project))
-        if agent:  # "claude" finds "Claude Code"
-            clauses.append("agent LIKE ? ESCAPE '\\'")
-            params.append(_contains(agent))
-        if min_risk is not None:
-            clauses.append("risk_score >= ?")
-            params.append(int(min_risk))
-        # A run with no quality score matches neither bound.
-        if min_quality is not None:
-            clauses.append("quality_score >= ?")
-            params.append(int(min_quality))
-        if max_quality is not None:
-            clauses.append("quality_score <= ?")
-            params.append(int(max_quality))
-        if ai_verdict:
-            clauses.append("ai_verdict = ?")
-            params.append(ai_verdict)
-        params.append(max(1, min(int(limit), 500)))
-        sql = (
-            f"SELECT {_SUMMARY_COLUMNS} FROM runs WHERE {' AND '.join(clauses)} "
-            "ORDER BY sort_at DESC, created_at DESC, id LIMIT ?"
+        """Runs matching the filters, newest first. `after` is the id of a run in the list: only
+        the runs that come after it are returned, so its last id fetches the next page. An id
+        that names no run of the team raises KeyError."""
+        clauses, params = _run_filters(
+            team_id, user=user, project=project, min_risk=min_risk, agent=agent,
+            min_quality=min_quality, max_quality=max_quality, ai_verdict=ai_verdict,
         )
         with self._reading() as conn:
-            rows = conn.execute(sql, params).fetchall()
+            if after is not None:
+                cursor = conn.execute(
+                    "SELECT sort_at, created_at, id FROM runs WHERE team_id = ? AND id = ?",
+                    (team_id, after),
+                ).fetchone()
+                if cursor is None:
+                    raise KeyError(after)
+                # The same order as the ORDER BY below: sort_at and created_at descending, id ascending.
+                clauses.append("(sort_at < ? OR (sort_at = ? AND (created_at < ? OR (created_at = ? AND id > ?))))")
+                params += [cursor["sort_at"], cursor["sort_at"], cursor["created_at"], cursor["created_at"],
+                           cursor["id"]]
+            sql = (
+                f"SELECT {_SUMMARY_COLUMNS} FROM runs WHERE {' AND '.join(clauses)} "
+                "ORDER BY sort_at DESC, created_at DESC, id LIMIT ?"
+            )
+            rows = conn.execute(sql, params + [max(1, min(int(limit), 500))]).fetchall()
         return [_summary(r) for r in rows]
+
+    def count_runs(
+        self,
+        team_id: int,
+        user: Optional[str] = None,
+        project: Optional[str] = None,
+        min_risk: Optional[int] = None,
+        agent: Optional[str] = None,
+        min_quality: Optional[int] = None,
+        max_quality: Optional[int] = None,
+        ai_verdict: Optional[str] = None,
+    ) -> int:
+        """How many runs list_runs would page through with the same filters."""
+        clauses, params = _run_filters(
+            team_id, user=user, project=project, min_risk=min_risk, agent=agent,
+            min_quality=min_quality, max_quality=max_quality, ai_verdict=ai_verdict,
+        )
+        with self._reading() as conn:
+            return conn.execute(f"SELECT COUNT(*) FROM runs WHERE {' AND '.join(clauses)}", params).fetchone()[0]
 
     def get_run(self, team_id: int, run_id: str) -> Optional[Dict[str, Any]]:
         """One run with its receipt (parsed) and risk reasons. The HTML is fetched separately."""
