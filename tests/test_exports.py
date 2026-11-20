@@ -239,7 +239,8 @@ def test_audit_csv_has_its_header_and_the_details_as_json(env):
     assert rows[0] == AUDIT_HEADER
     create = [dict(zip(AUDIT_HEADER, r)) for r in rows[1:] if r[3] == "key.create" and r[4] == created["id"]]
     assert len(create) == 1
-    assert json.loads(create[0]["details_json"]) == {"label": "ci", "prefix": created["key"][:8], "role": "member"}
+    assert json.loads(create[0]["details_json"]) == {"label": "ci", "prefix": created["key"][:8], "role": "member",
+                                                       "kind": "personal", "expires_at": None}
 
 
 @pytest.mark.parametrize("title, user", [

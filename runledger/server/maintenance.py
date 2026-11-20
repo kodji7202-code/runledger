@@ -6,6 +6,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Mapping, Optional
 
+from . import approvals
 from .db import TIME_FORMAT, Database
 
 RETENTION_ENV = "RUNLEDGER_RETENTION_DAYS"
@@ -80,3 +81,15 @@ def run_maintenance(
     if audit_days:
         audit_cutoff = (moment - timedelta(days=audit_days)).astimezone(timezone.utc).strftime(TIME_FORMAT)
     return db.purge_before(run_cutoff, audit_cutoff)
+
+
+def warn_expiring_keys(db: Database, moment: Optional[datetime] = None) -> int:
+    """Report each key that entered its team's warning window: an audit event (key.expiring)
+    and the team's Slack and generic webhooks. Returns how many keys were reported."""
+    due = db.keys_expiring(moment)
+    by_team: Dict[int, list] = {}
+    for key in due:
+        by_team.setdefault(key["team_id"], []).append(key)
+    for team_id, keys in by_team.items():
+        approvals.notify_key_expiry(db.approval_settings(team_id), keys)
+    return len(due)
