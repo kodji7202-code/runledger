@@ -814,6 +814,20 @@ When OIDC is configured, `GET /api/me` includes `user` (id, email, name),
 `key: null` for SSO sessions. API keys still authenticate normally when dashboard key sign-in
 is disabled. See [enterprise.md](enterprise.md#oidc-single-sign-on) for configuration.
 
+### SAML dashboard sign-in
+
+With `runledger serve --saml-config PATH` (or `RUNLEDGER_SAML_CONFIG`),
+`GET /auth/saml/<provider>/metadata` returns the SP metadata. From the dashboard login page,
+`GET /auth/saml/<provider>/start` redirects to the configured IdP and sets a short-lived,
+host-only Secure cookie. The IdP POSTs form fields `SAMLResponse` and `RelayState` to
+`/auth/saml/<provider>/acs`. The ACS verifies the signature and matches the signed bearer
+confirmation to the pending request and browser. Invalid responses return the sign-in page
+(401) and count toward the failure limiter.
+
+Existing users with multiple memberships use the same single-use team form as OIDC, posted to
+`/auth/saml/team`. The resulting session has `key: null` and `sign_in_method: "saml"` in
+`GET /api/me`. See [enterprise.md](enterprise.md#saml-20-single-sign-on) for configuration.
+
 ## Error codes
 
 | Status | Code | When |
