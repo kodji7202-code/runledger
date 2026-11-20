@@ -294,7 +294,12 @@ def cmd_rollback(args) -> int:
                 print(f"  keep ignored {path!r}")
         if not (plan.restore or plan.remove):
             scope = f" for {', '.join(plan.paths)}" if plan.paths else ""
-            print(f"Nothing to restore{scope} (already matches {checkpoint.id}).")
+            if plan.keep_ignored:
+                kept = len(plan.keep_ignored)
+                print(f"Nothing to restore{scope} (matches {checkpoint.id} except {kept} "
+                      f"ignored file{'' if kept == 1 else 's'}, which rollback keeps).")
+            else:
+                print(f"Nothing to restore{scope} (already matches {checkpoint.id}).")
             return 0
         size = _changed_bytes(repo, plan, CheckpointError)
         detail = f" ({size} bytes)" if size >= 0 else ""

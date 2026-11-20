@@ -1605,6 +1605,21 @@ def test_whole_tree_nothing_to_restore_says_so_and_creates_no_ref(scoped_repo, c
     assert git(repo.root, "for-each-ref", rollback.PREFIX) == refs
 
 
+def test_whole_tree_nothing_to_restore_but_ignored_files_does_not_claim_a_match(scoped_repo,
+                                                                                  capsys):
+    repo = scoped_repo
+    cp = repo.create()
+    git(repo.root, "add", "-f", ".secret")
+    refs = git(repo.root, "for-each-ref", rollback.PREFIX)
+    assert main(["rollback", cp.id, "--yes", "--cwd", str(repo.root)]) == 0
+    output = capsys.readouterr().out
+    assert "keep ignored '.secret'" in output
+    assert (f"Nothing to restore (matches {cp.id} except 1 ignored file, "
+            "which rollback keeps).") in output
+    assert "already matches" not in output
+    assert git(repo.root, "for-each-ref", rollback.PREFIX) == refs
+
+
 def test_whole_tree_nothing_to_restore_does_not_ask_for_confirmation(scoped_repo, capsys,
                                                                        monkeypatch):
     repo = scoped_repo

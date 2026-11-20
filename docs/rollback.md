@@ -25,7 +25,9 @@ ends with the number of files and the bytes it would change. Rollback asks for c
 in a terminal. Without a terminal it refuses unless you pass
 `--yes`. A dry run never asks for confirmation or creates a checkpoint ref. When the working
 tree already matches the checkpoint, the command prints `Nothing to restore (already matches
-<id>).` and exits 0 without asking, restoring anything or creating a checkpoint.
+<id>).` and exits 0 without asking, restoring anything or creating a checkpoint. If the only
+difference is ignored files that rollback keeps, it says so instead: `Nothing to restore (matches
+<id> except N ignored files, which rollback keeps).`
 
 Before restoring anything, rollback saves a **safety checkpoint** of the current state. If saving
 it fails, no files are restored or removed. The successful command prints an undo command:
