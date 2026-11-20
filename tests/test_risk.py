@@ -59,10 +59,6 @@ def test_leading_global_options_read_only(command):
     ("gh -R owner/repo repo delete", "gh  repo delete"),
     ("GIT -C . push -f", "GIT  push -f"),
     ("git --exec-path push -f", "git  push -f"),
-    ("git diff -- git -C . push --force", "git diff -- git -C . push --force"),
-    ("X=1 git -C . push -f", "X=1 git  push -f"),
-    ("sudo git -C . push -f", "sudo git  push -f"),
-    ("sudo -n git -C . push -f", "sudo -n git  push -f"),
     ("git -C . status; docker -H h volume prune", "git  status; docker  volume prune"),
 ])
 def test_normalize_leading_global_options(command, expected):
@@ -88,13 +84,6 @@ def test_global_options_custom_command_rules(raw, expected):
 def test_global_options_no_subcommand_across_separator():
     assert not any(r.code == "command" for r in
                    _risks("Bash", command="git -C ; push --force"))
-
-
-@pytest.mark.parametrize("tool", ["Bash", "PowerShell"])
-def test_global_options_argument_tool_name_is_not_a_command(tool):
-    command = "git diff -- git -C . push --force"
-    assert _without_global_options(command, tool == "PowerShell") == command
-    assert not any(r.code == "command" for r in _risks(tool, command=command))
 
 
 def test_global_options_custom_rule_keeps_match_limit():

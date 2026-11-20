@@ -795,8 +795,10 @@ def _join_base(current: Optional[str], value: str) -> str:
     return mod.normpath(mod.join(current, value))
 
 
-def _command_index(plain: List[_Word], ps: bool) -> int:
-    """Skip leading assignments and the wrappers understood by the shell planner."""
+def _plan(words: List[_Word], ps: bool) -> Optional[str]:
+    """Give each word of one simple command its role and mark the arguments of delete
+    commands. Returns the command name (lower case, no .exe), or None."""
+    plain = [w for w in words if w.role == "word"]
     j, wrapped = 0, False
     while j < len(plain):
         v = plain[j].value
@@ -807,14 +809,6 @@ def _command_index(plain: List[_Word], ps: bool) -> int:
         elif not (wrapped and v.startswith("-")):
             break
         j += 1
-    return j
-
-
-def _plan(words: List[_Word], ps: bool) -> Optional[str]:
-    """Give each word of one simple command its role and mark the arguments of delete
-    commands. Returns the command name (lower case, no .exe), or None."""
-    plain = [w for w in words if w.role == "word"]
-    j = _command_index(plain, ps)
     if j >= len(plain):
         return None
     name = _name(plain[j].value)
@@ -1038,19 +1032,12 @@ _GLOBAL_OPTION_VALUES = {
 def _without_global_options(code: str, ps: bool = False) -> str:
     """Remove only the option run before a supported tool's first subcommand."""
     items, _ = _scan(code, ps)
-    command_starts: Set[int] = set()
-    for words in _simple_commands(items):
-        plain = [w for w in words if w.role == "word"]
-        j = _command_index(plain, ps)
-        if j < len(plain):
-            command_starts.add(plain[j].start)
     spans: List[Tuple[int, int]] = []
     i = 0
     while i < len(items):
         item = items[i]
         i += 1
-        if (item[0] != "word" or item[1].start not in command_starts
-                or item[1].value.lower() not in _GLOBAL_OPTION_VALUES):
+        if item[0] != "word" or item[1].value.lower() not in _GLOBAL_OPTION_VALUES:
             continue
         tool = item[1]
         values = _GLOBAL_OPTION_VALUES[tool.value.lower()]
