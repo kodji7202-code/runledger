@@ -317,6 +317,16 @@ def test_display_width(text, width):
     assert doctor._display_width(text) == width
 
 
+@pytest.mark.parametrize("text, expected", [
+    ("a" + " " * 200_000 + "b", "a\n  b"),
+    (" " * 200_000, ""),
+])
+def test_text_wrapping_handles_long_space_runs_quickly(text, expected):
+    start = time.perf_counter()
+    assert doctor._wrap_doctor_text(text, 80) == expected
+    assert time.perf_counter() - start < 1
+
+
 def test_text_output_wraps_with_hanging_indents(monkeypatch):
     monkeypatch.setenv("COLUMNS", "80")
     detail = "A long diagnostic message with useful context. " * 4

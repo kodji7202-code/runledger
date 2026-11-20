@@ -1182,16 +1182,20 @@ def _wrap_doctor_text(text: str, width: int, prefix: str = "", indent: int = 2) 
         return prefix + text
     lines = []
     line, columns = prefix, _display_width(prefix)
+    line_has_word = bool(prefix.strip())
     text = text.expandtabs().translate(str.maketrans("\t\n\v\f\r", "     "))
-    for match in re.finditer(r"( *)([^ ]+)", text):
-        gap, word = match.groups()
+    end = 0
+    for match in re.finditer(r"[^ ]+", text):
+        gap, word = text[end:match.start()], match.group()
+        end = match.end()
         word_width = _display_width(word)
-        if line.strip() and columns + len(gap) + word_width > width:
+        if line_has_word and columns + len(gap) + word_width > width:
             lines.append(line)
             line, columns = " " * indent + word, indent + word_width
         else:
             line += gap + word
             columns += len(gap) + word_width
+        line_has_word = True
     return "\n".join([*lines, line])
 
 
