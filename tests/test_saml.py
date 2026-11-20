@@ -47,11 +47,12 @@ def keys(tmp_path_factory):
 
 
 @pytest.fixture
-def env(tmp_path, keys, monkeypatch):
+def env(tmp_path, keys, monkeypatch, request):
     config = tmp_path / "saml.json"
     config.write_text(json.dumps({"providers": [{
         "id": "work", "name": "Company SAML", "idp_entity_id": ISSUER,
-        "idp_sso_url": "https://idp.example.test/sso", "idp_cert": str(keys[0][1]),
+        "idp_sso_url": getattr(request, "param", "https://idp.example.test/sso"),
+        "idp_cert": str(keys[0][1]),
         "email_attribute": "workEmail", "name_attribute": "displayName",
     }]}))
     oidc_config = tmp_path / "oidc.json"
@@ -66,17 +67,27 @@ def env(tmp_path, keys, monkeypatch):
         yield server, base, team, person
 
 
-def _start(base):
+def _start(base, expected_sso_url="https://idp.example.test/sso"):
     status, headers, _ = _http(base, "GET", ROOT + "/start")
     assert status == 302
     assert "HttpOnly; SameSite=None; Secure" in headers["set-cookie"]
+    separator = "&" if "?" in expected_sso_url else "?"
+    assert headers["location"].startswith(expected_sso_url + separator + "SAMLRequest=")
     url = urlsplit(headers["location"])
     assert url.netloc == "idp.example.test"
     query = parse_qs(url.query)
     request = etree.fromstring(zlib.decompress(base64.b64decode(query["SAMLRequest"][0]), -15))
+    assert request.get("Destination") == expected_sso_url
     assert request.get("AssertionConsumerServiceURL") == base + ROOT + "/acs"
     assert request.findtext("saml:Issuer", namespaces=NS) == base + ROOT + "/metadata"
     return query["RelayState"][0], headers["set-cookie"].split(";")[0], request.get("ID")
+
+
+@pytest.mark.parametrize("env", ["https://idp.example.test/sso?tenant=acme&connection=Work%20SSO"], indirect=True)
+def test_saml_start_preserves_idp_query(env):
+    _, base, _, _ = env
+    state, _, request_id = _start(base, "https://idp.example.test/sso?tenant=acme&connection=Work%20SSO")
+    assert state and request_id
 
 
 def _timestamp(seconds):
