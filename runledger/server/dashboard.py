@@ -558,6 +558,7 @@ tr.pickable:hover{background:var(--chip)}
     var v = Number(value);
     if (!isFinite(v)) { return "n/a"; }
     if (v === 0) { return "$0.00"; }
+    if (v > 0 && v < 0.0001) { return "<$0.0001"; }
     if (v < 0.01) { return "$" + v.toFixed(4); }
     if (v < 1) { return "$" + v.toFixed(3); }
     return "$" + v.toFixed(2);
@@ -713,6 +714,7 @@ tr.pickable:hover{background:var(--chip)}
   // tokens out is a lower bound, so it reads "≥$X". A group with no priced run stays "n/a".
 
   function costText(value, lowerBound) {
+    if (lowerBound && Number(value) > 0 && Number(value) < 0.0001) { return ">$0.00"; }
     var text = money(value);
     return (lowerBound && text !== "n/a") ? "≥" + text : text;
   }
@@ -757,14 +759,18 @@ tr.pickable:hover{background:var(--chip)}
   // The unpriced hint names the cause: the agent recorded no usage, the model has no known
   // price, or both.
   function unpricedHint(t) {
-    var unpriced = Number(t.unpriced_runs) || 0;
-    if (!unpriced) { return ""; }
+    var partial = Number(t.partial_runs) || 0;
+    var unpriced = Math.max(0, (Number(t.unpriced_runs) || 0) - partial);
+    var notes = [];
+    if (partial) { notes.push("Includes " + runCount(partial) + " partly priced (known cost only)."); }
+    if (!unpriced) { return notes.join(" "); }
     var missing = Math.min(Number(t.missing_usage_runs) || 0, unpriced);
     var unknown = unpriced - missing;
     var causes = [];
     if (missing) { causes.push(runCount(missing) + " without recorded token usage"); }
     if (unknown) { causes.push(runCount(unknown) + " with an unknown model price"); }
-    return runCount(unpriced) + " left out: " + causes.join(", ") + ".";
+    notes.push(runCount(unpriced) + " left out: " + causes.join(", ") + ".");
+    return notes.join(" ");
   }
 
   function notify(message, isError) {

@@ -57,6 +57,11 @@ change behavior, so read the entry before you upgrade.
 - Droid tool calls with an empty successful result now show **Approved by user** rather than
   **Rejected by user** for Guard ask decisions.
 
+### Fixed
+
+- Dashboard costs below $0.0001 display as `<$0.0001` instead of rounding to zero;
+  the Cost KPI clarifies that partly priced runs contribute their known cost.
+
 ## [0.7.0] - 2026-10-20
 
 ### Added
