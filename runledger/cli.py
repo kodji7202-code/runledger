@@ -227,7 +227,7 @@ def cmd_checkpoints(args) -> int:
             changed = len(plan.restore) + len(plan.remove) + len(plan.keep_ignored)
             print(f"{cp.id}  ({changed} file(s) differ)")
             print(f"  {cp.created_at}")
-            print(fill(label, width=80, initial_indent="  ", subsequent_indent="  ",
+            print(fill(label, width=80, initial_indent="  ", subsequent_indent="   ",
                        break_long_words=False, break_on_hyphens=False))
             for path in plan.restore:
                 print(f"  restore {path!r}")
