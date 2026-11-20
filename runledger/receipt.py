@@ -681,9 +681,9 @@ h1,.meta,.risk>div{min-width:0;overflow-wrap:anywhere}
 .steps tbody{display:grid;grid-template-columns:auto 1fr auto auto}
 .steps tr{display:grid;grid-column:1/-1;grid-template-columns:subgrid;border-bottom:1px solid var(--line)}
 .steps td,.steps th{border:0}
-.steps td:first-child{grid-row:span 2}.steps td:nth-child(2){grid-column:2/-1;padding-bottom:2px}.steps td:nth-child(n+3){padding-top:0}
-.steps th:nth-child(2){display:none}
-.steps .sev{white-space:normal;overflow-wrap:anywhere;line-height:22px;-webkit-box-decoration-break:clone;box-decoration-break:clone}
+.steps tr>:first-child{grid-row:span 2}.steps tr>:nth-child(2){grid-column:2/-1;padding-bottom:2px}.steps tr>:nth-child(n+3){padding-top:0}
+.steps .sev{display:inline-block;max-width:100%;margin:2px 0;border-radius:11px;line-height:16px;white-space:normal;overflow-wrap:anywhere;vertical-align:middle}
+.steps code{display:inline-block;max-width:100%;word-break:normal;overflow-wrap:anywhere}
 }
 """
 
