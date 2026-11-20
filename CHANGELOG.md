@@ -13,6 +13,9 @@ change behavior, so read the entry before you upgrade.
   and exits 0, as `--path` already did. It no longer asks for confirmation, prints `Restored`, or
   creates a safety checkpoint of an unchanged tree. When only kept ignored files differ, it names
   them instead of claiming an exact match.
+- The HTML receipt fits phone screens (375px and up) instead of scrolling sideways and hiding the
+  Tokens and Cost columns: on screens up to 600px wide, step rows put the model, tokens and cost on
+  a line under the step, and the quality score and AI review tables move their notes under each row.
 - `runledger stats --until YYYY-MM-DD` includes sessions and guard events in the final
   fractional second of the day, while still excluding the next day's midnight.
 - Team server request logging handles oversized URLs rejected before parsing, returning HTTP 414

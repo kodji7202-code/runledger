@@ -882,9 +882,14 @@ class Database:
                         {"user_id": user_id, "email": email.lower(), "role": role})
 
     def scim_group_update(self, team_id, group, changes):
+        """Apply role changes; a callable receives the members read inside the write transaction."""
         with self._lock, self._conn:
             if not self._conn.in_transaction:
                 self._conn.execute("BEGIN IMMEDIATE")
+            if callable(changes):
+                changes = changes([dict(r) for r in self._conn.execute(
+                    "SELECT u.*, m.role, m.deactivated_at, m.external_id, m.updated_at, m.created_at AS joined_at FROM memberships m "
+                    "JOIN users u ON u.id = m.user_id WHERE m.team_id = ? ORDER BY u.email", (team_id,))])
             had_admin = self._working_admins(team_id)
             for user_id, role in changes.items():
                 role = validate_role(role)
