@@ -488,7 +488,14 @@ def test_changed_start_cache_is_reprobed_and_promoted(isolated_settings, changed
     text = path.read_text(encoding="utf-8").replace("2020-01-01", "2026-05-10")
     path.write_text(text + ("\n" if changed == "size" else ""), encoding="utf-8")
     os.utime(path, ns=(before.st_atime_ns,
-                      before.st_mtime_ns + (1 if changed == "mtime" else 0)))
+                      before.st_mtime_ns + (2_000_000_000 if changed == "mtime" else 0)))
+    after = path.stat()
+    if changed == "mtime":
+        assert after.st_mtime_ns != before.st_mtime_ns
+        assert after.st_size == before.st_size
+    else:
+        assert after.st_mtime_ns == before.st_mtime_ns
+        assert after.st_size != before.st_size
     assert cache.get_start(path, path.stat()) is None
     summaries, skipped, total = stats.collect([path], since, until, cache)
     assert total == 1 and skipped == []
