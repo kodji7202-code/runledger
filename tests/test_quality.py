@@ -281,6 +281,19 @@ def test_escaped_quotes_and_separators(command, expected):
     assert _is_test_command(command) is expected
 
 
+@pytest.mark.parametrize("command, expected", [
+    ("echo hi # don't skip tests\npytest", True),
+    ('echo hi # "pytest;\npytest', True),
+    ("echo hi # pytest; pytest", False),
+    ("echo a#b; pytest", True),
+    ("echo a#b' ; pytest'", False),
+    ("echo '# note; pytest'", False),
+    (r"echo \# note; pytest", True),
+])
+def test_shell_comments_do_not_affect_test_run_boundaries(command, expected):
+    assert _is_test_command(command) is expected
+
+
 @pytest.mark.parametrize("command", [
     "pip install pytest", "pip3 install pytest", "python -m pip install pytest",
     "npm install --save-dev jest", "npm uninstall -y pytest", "npm i jest", "yarn remove jest",

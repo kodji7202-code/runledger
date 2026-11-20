@@ -238,7 +238,12 @@ def _split_commands(command: str) -> List[List[str]]:
     word: List[str] = []
     quote = ""
     escaped = False
+    comment = False
     for i, ch in enumerate(command):
+        if comment:
+            if ch != "\n":
+                continue
+            comment = False
         if escaped:
             word.append(ch)
             escaped = False
@@ -253,6 +258,9 @@ def _split_commands(command: str) -> List[List[str]]:
                 quote = ""
         elif ch in "'\"":
             quote = ch
+        elif ch == "#" and not word:
+            comment = True
+            continue
         elif ch in ";|\n" or (ch == "&" and
                 (command[i:i + 2] == "&&" or command[max(0, i - 1):i + 1] == "&&")):
             if word:
