@@ -24,13 +24,14 @@ Contents:
 cookie instead: `rl_session`, set by the sign-in form (`POST /session`).
 
 - A request with an API key needs no extra header.
-- A `POST` or `PUT` that uses the session cookie must also send `X-Requested-With: runledger`. Without
+- A write that uses the session cookie must also send `X-Requested-With: runledger`. Without
   it, the response is `403 csrf_required`.
-- A valid API key is checked first. The session cookie is used when the request carries no valid key.
+- A valid API key is checked first, except for `POST /session/logout`, which requires the cookie.
 - Endpoints that require a role authenticate before they read the request body, so a large body sent
   with a bad key gets `401` (or `403` for a role that is too low) instead of `413`.
 
-**Roles.** Each key has one role: `viewer` (read only), `member` (also pushes runs and requests
+**Roles.** Each key has one role: `viewer` (reads team data and manages its own dashboard sessions),
+`member` (also pushes runs and requests
 approvals) or `admin` (also decides approvals, manages settings, keys, the audit log, budgets and exports).
 An approval requires an admin key other than the requesting key. Each endpoint
 below names the minimum role. A higher role always works. See [enterprise.md](enterprise.md#model-teams-keys-and-roles).
@@ -576,7 +577,8 @@ Role: any. Quality, model, agent and AI-review aggregates over the last `days`
     "by_grade": {"A": 2, "B": 5, "C": 3, "D": 1, "F": 1},
     "trend": [{"date": "2026-10-07", "avg": 68.0}, {"date": "2026-10-08", "avg": 74.0}]
   },
-  "models": [{"model": "claude-sonnet-5-5", "runs": 9, "cost_usd": 1.42,
+  "models": [{"model": "claude-sonnet-5-5", "runs": 9, "cost_usd": 1.42, "priced_runs": 9,
+              "partial_runs": 1, "cost_is_lower_bound": true,
               "avg_quality": 73.1, "cost_per_run": 0.158, "share_of_cost": 0.81}],
   "agents": [{"agent": "Claude Code", "runs": 10, "avg_quality": 72.0,
               "avg_risk": 31.5, "cost_usd": 1.61, "priced_runs": 9, "partial_runs": 1,
@@ -591,8 +593,8 @@ Role: any. Quality, model, agent and AI-review aggregates over the last `days`
 
 `share_of_cost` and `false_positive_rate` are ratios from 0 to 1. `cost_per_run`
 divides by priced runs only. A run's quality counts toward every model it used.
-An agent whose runs were never priced has a `cost_usd` of `null` with `priced_runs` 0, and
-`cost_is_lower_bound` is `true` when the agent's figure leaves a run out: it has an unpriced run
+An agent or model whose runs were never priced has a `cost_usd` of `null` with `priced_runs` 0, and
+`cost_is_lower_bound` is `true` when its figure leaves a run out: it has an unpriced run
 (`priced_runs` below `runs`) or a partly priced one (`partial_runs`).
 `top_recommendations` is ranked by total estimated savings, then count, at most 10.
 
@@ -686,13 +688,15 @@ and no body, and nothing is built or audited.
 **`runs.csv`** has this header row, and one row per run:
 
 ```
-id,started_at,user,project,agent,models,steps,tokens,files_changed,cost_usd,risk_score,risk_level,title,quality_score,quality_grade,ai_verdict,est_savings_usd
-7f3c2a10-9b1e-4c55-a1d2-0e6f8b3c9d42,2026-10-08T10:00:17Z,Ana,payments-service,Claude Code,claude-haiku-4-5-20251001; claude-sonnet-4-5-20250929,10,116416,3,0.108408,80,high,The payment retry logic gives up after the first failure. Add exponential backoff (3 attempts) and make the tests pass.,62,C,needs_review,0.031
+id,started_at,user,project,agent,models,steps,tokens,files_changed,cost_usd,risk_score,risk_level,title,quality_score,quality_grade,ai_verdict,est_savings_usd,cost_partial
+7f3c2a10-9b1e-4c55-a1d2-0e6f8b3c9d42,2026-10-08T10:00:17Z,Ana,payments-service,Claude Code,claude-haiku-4-5-20251001; claude-sonnet-4-5-20250929,10,116416,3,0.108408,80,high,The payment retry logic gives up after the first failure. Add exponential backoff (3 attempts) and make the tests pass.,62,C,needs_review,0.031,false
 ```
 
 `models` lists the model names joined with `; `. The receipt JSON and the HTML receipt are never included.
 A run whose cost is unknown has an empty `cost_usd` cell, never `0`; `quality_score` and
-`est_savings_usd` are empty in the same way when they are unknown.
+`est_savings_usd` are empty in the same way when they are unknown. `cost_partial` is `true` when
+`cost_usd` is a lower bound (some of the run's tokens had no price), `false` when it is complete, and
+empty when the cost is unknown.
 
 **`audit.csv`** has the header `id,at,actor,action,target,details_json`. `details_json` is the event's
 details as JSON text.
@@ -760,7 +764,30 @@ non-browser client sends no such headers (`Sec-Fetch-Site: none`), so those keep
 At most 20 sessions are kept per key; signing in again past that cap drops the oldest session of that
 key, and other keys are unaffected.
 
-There is no sign-out endpoint. Revoke or rotate the key to end a session.
+### `POST /session/logout`
+
+End the session in the `rl_session` cookie and clear that cookie. Requires the cookie and
+`X-Requested-With: runledger`; a bearer key alone returns `401`. Returns `204 No Content` on success.
+Other sessions and the API key are unaffected.
+
+### `GET /sessions`
+
+List active dashboard sessions, newest first. Accepts a dashboard cookie or bearer key. Admins see
+their team's sessions; members and viewers see sessions started with their own key. The response has
+a `sessions` array. Each item contains `id` (a public session identifier), `key_id`, `key_label`,
+`role`, `created_at`, `last_seen_at`, `expires_at`, and `current` (true only for the authenticated
+cookie's session). No token or token hash is returned.
+
+### `DELETE /sessions/<id>`
+
+Revoke one session within the same scope as listing. Returns `204 No Content` on success or `404`
+if the session does not exist or is outside the caller's scope. When the caller authenticates
+with the session being revoked, the response also clears the cookie. Cookie-authenticated calls
+require `X-Requested-With: runledger`.
+
+The server can additionally enforce an [idle timeout](self-hosting.md#security-checklist). An
+authenticated cookie request refreshes `last_seen_at` unless it sends
+`X-RunLedger-Background: 1`, as the dashboard's background polls do.
 
 ## Error codes
 
