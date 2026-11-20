@@ -688,7 +688,7 @@ class Database:
             raise InvalidKey("User must be an id or email.")
         with self._lock:
             row = self._conn.execute(
-                "SELECT * FROM users WHERE id = ? OR email = ? COLLATE NOCASE", (user, user.strip())
+                "SELECT * FROM users WHERE id = ? OR email = ? COLLATE NOCASE", (user, user.strip().lower())
             ).fetchone()
         return dict(row) if row else None
 
