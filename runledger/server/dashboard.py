@@ -659,6 +659,7 @@ tr.pickable:hover{background:var(--chip)}
   // tokens out is a lower bound, so it reads "≥$X". A group with no priced run stays "n/a".
 
   function costText(value, lowerBound) {
+    if (lowerBound && Number(value) > 0 && Number(value) < 0.0001) { return ">$0.00"; }
     var text = money(value);
     return (lowerBound && text !== "n/a") ? "≥" + text : text;
   }
