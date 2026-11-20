@@ -314,8 +314,36 @@ def test_parse_since_rejects_bad_values(bad):
 
 def test_parse_until_a_date_covers_the_whole_day():
     until = stats.parse_until("2026-05-01", datetime(2026, 10, 19))
-    assert until.date().isoformat() == "2026-05-01"
-    assert (until.hour, until.minute) == (23, 59)
+    assert until == datetime(2026, 5, 1, 23, 59, 59, 999999)
+
+
+@pytest.mark.parametrize("microsecond", [0, 500000, 999999])
+def test_until_includes_last_fractional_second(capsys, isolated_settings, tmp_path,
+                                              microsecond):
+    started = datetime(2026, 11, 19, 23, 59, 59, microsecond)
+    path = claude_session(isolated_settings, tmp_path, "fraction", started)
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    rows[0]["timestamp"] = started.astimezone(timezone.utc).isoformat()
+    _write(path, rows)
+    record = guard_record(started, "allow")
+    record["ts"] = started.astimezone(timezone.utc).isoformat()
+    guard_log(tmp_path, [record, guard_record(datetime(2026, 11, 20), "deny")])
+    claude_session(isolated_settings, tmp_path, "next-day", datetime(2026, 11, 20))
+    claude_session(isolated_settings, tmp_path, "previous-day", datetime(2026, 11, 18, 23, 59, 59))
+    os.utime(path, (started.timestamp() + 10, started.timestamp() + 10))
+    data, _ = _json(capsys, "stats", "--all", "--since", "2026-11-19",
+                    "--until", "2026-11-19", "--format", "json", "--no-cache")
+    assert data["totals"]["sessions"] == 1
+    assert data["guard"]["allow"] == 1
+    assert data["guard"]["deny"] == 0
+
+
+def test_until_relative_and_datetime_validation_are_unchanged():
+    now = datetime(2026, 11, 19, 12, 34, 56, 123456)
+    assert stats.parse_until("7d", now) == now - timedelta(days=7)
+    assert stats.parse_until("9999-12-31") == datetime.max
+    with pytest.raises(stats.SinceError):
+        stats.parse_until("2026-11-19T12:34:56")
 
 
 def test_window_label_reads_naturally():

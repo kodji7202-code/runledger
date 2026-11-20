@@ -101,7 +101,7 @@ def parse_until(value: str, now: Optional[datetime] = None) -> datetime:
     raw = value.strip() if isinstance(value, str) else ""
     if _ISO_DAY.match(raw):
         start = parse_since(raw, now)
-        return start + timedelta(hours=23, minutes=59, seconds=59)
+        return start.replace(hour=23, minute=59, second=59, microsecond=999999)
     return parse_since(raw, now)
 
 
