@@ -12,7 +12,7 @@ import zlib
 
 import pytest
 
-from test_auth import _http, _json, running
+from test_auth import CSRF, _http, _json, running
 
 etree = pytest.importorskip("lxml.etree")
 xmlsec = pytest.importorskip("xmlsec")
@@ -187,6 +187,20 @@ def test_saml_sign_in(env, keys, sign):
     assert _acs(base, state, encoded, cookie)[0] == 401
     new_state, new_cookie, _ = _start(base)
     assert _acs(base, new_state, encoded, new_cookie)[0] == 401
+
+
+@pytest.mark.parametrize("role", ["member", "admin"])
+def test_saml_sessions_cannot_push_runs_or_request_approvals(env, keys, role):
+    server, base, team, person = env
+    server.db.change_member(team, person["id"], role=role)
+    state, cookie, request_id = _start(base)
+    status, headers, _ = _acs(base, state, _response(base, request_id, keys), cookie)
+    assert status == 200
+    auth = dict(CSRF, Cookie=headers["set-cookie"].split(";")[0])
+    for path in ("/api/runs", "/api/approvals"):
+        status, _, body = _http(base, "POST", path, body={}, headers=auth)
+        assert status == 403
+        assert _json(body)["error"]["code"] == "api_key_required"
 
 
 @pytest.mark.parametrize("invalid", [
