@@ -8,6 +8,8 @@ and check what the page is served with.
 import http.client
 import json
 import re
+import shutil
+import subprocess
 import threading
 from contextlib import contextmanager
 from html.parser import HTMLParser
@@ -94,6 +96,51 @@ def _script(html):
     match = re.search(r'<script nonce="__CSP_NONCE__">(.*?)</script>', html, re.S)
     assert match, "the page has one inline script that uses the CSP nonce placeholder"
     return match.group(1)
+
+
+def _js_call(functions, expression):
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required to execute dashboard JavaScript helpers")
+    js = _script(DASHBOARD_HTML)
+    helpers = []
+    for name in functions:
+        match = re.search(r"  function " + name + r"\(.*?\n  }", js, re.S)
+        assert match, name
+        helpers.append(match.group(0))
+    result = subprocess.run(
+        [node, "-e", "\n".join(helpers) + "\nconsole.log(JSON.stringify(" + expression + "));"],
+        capture_output=True, text=True, check=True,
+    )
+    return json.loads(result.stdout)
+
+
+@pytest.mark.parametrize("value, expected", [
+    (0.00003, "<$0.0001"), (0.000001, "<$0.0001"),
+    (0.00009999, "<$0.0001"), (0.0001, "$0.0001"),
+    (0, "$0.00"), (0.005, "$0.0050"), (0.25, "$0.250"), (12.34, "$12.34"),
+    (None, "n/a"), ("invalid", "n/a"),
+])
+def test_money_displays_tiny_nonzero_costs_honestly(value, expected):
+    assert _js_call(["money"], "money(" + json.dumps(value) + ")") == expected
+
+
+@pytest.mark.parametrize("totals, expected", [
+    ({}, ""),
+    ({"unpriced_runs": 0, "partial_runs": 0}, ""),
+    ({"unpriced_runs": 1, "partial_runs": 1},
+     "Includes 1 run partly priced (known cost only)."),
+    ({"unpriced_runs": 2, "partial_runs": 2},
+     "Includes 2 runs partly priced (known cost only)."),
+    ({"unpriced_runs": 3, "partial_runs": 1, "missing_usage_runs": 1},
+     "Includes 1 run partly priced (known cost only). "
+     "2 runs left out: 1 run without recorded token usage, 1 run with an unknown model price."),
+    ({"unpriced_runs": 1, "missing_usage_runs": 1},
+     "1 run left out: 1 run without recorded token usage."),
+    ({"unpriced_runs": 1}, "1 run left out: 1 run with an unknown model price."),
+])
+def test_cost_kpi_hint_distinguishes_included_partial_costs(totals, expected):
+    assert _js_call(["runCount", "unpricedHint"], "unpricedHint(" + json.dumps(totals) + ")") == expected
 
 
 # Static checks on the served HTML string
