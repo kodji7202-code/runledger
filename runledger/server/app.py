@@ -35,6 +35,9 @@
   GET  /auth/oidc/<provider>/start             start Authorization Code + PKCE sign-in
   GET  /auth/oidc/<provider>/callback          validate identity, choose team or issue cookie
   POST /auth/oidc/team                        single-use, cookie-bound team choice
+  GET/POST/DELETE /api/scim/token              administer the team's dedicated SCIM token
+  /scim/v2/{Users,Groups}                     SCIM provisioning (dedicated bearer token only)
+  /scim/v2/{ServiceProviderConfig,ResourceTypes,Schemas}  SCIM discovery
   GET  /?key=API_KEY                          legacy sign-in: redirects to strip the key; never
                                               replaces a session of another team without confirmation
   GET  /health                                liveness, no auth
@@ -517,12 +520,24 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_json(200, {"ok": True, "version": __version__})
                 return
             self._check_rate_limit()
+            if path == "/scim/v2" or path.startswith("/scim/v2/") or path == "/api/scim/token":
+                from .scim import dispatch
+                dispatch(self, method, path, query)
+                return
             self._dispatch(method, path, query)
         except _HttpError as exc:
-            self._send_json(exc.status, {"error": {"code": exc.code, "message": exc.message}}, exc.headers)
+            if urlsplit(self.path).path.startswith("/scim/v2"):
+                from .scim import Error, error
+                error(self, Error(exc.status, exc.message), exc.headers)
+            else:
+                self._send_json(exc.status, {"error": {"code": exc.code, "message": exc.message}}, exc.headers)
         except Exception:  # never leak internals to the client
             traceback.print_exc()
-            self._send_json(500, {"error": {"code": "internal_error", "message": "Internal server error."}})
+            if urlsplit(self.path).path.startswith("/scim/v2"):
+                from .scim import Error, error
+                error(self, Error(500, "Internal server error."))
+            else:
+                self._send_json(500, {"error": {"code": "internal_error", "message": "Internal server error."}})
 
     def _dispatch(self, method: str, path: str, query: Dict[str, List[str]]) -> None:
         if path.startswith("/auth/oidc/"):

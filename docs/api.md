@@ -13,11 +13,57 @@ Contents:
 - [Team settings](#team-settings)
 - [API keys](#api-keys)
 - [Members](#members)
+- [SCIM provisioning](#scim-provisioning)
 - [Audit log](#audit-log)
 - [Budgets](#budgets)
 - [Exports](#exports)
 - [Dashboard pages](#dashboard-pages)
 - [Error codes](#error-codes)
+
+## SCIM provisioning
+
+SCIM uses a **dedicated per-team bearer token**, not an API key or session cookie.
+An admin creates/rotates it with `POST /api/scim/token` (201, `token` shown once),
+inspects non-secret metadata with `GET /api/scim/token`, and revokes it with
+`DELETE /api/scim/token`. These admin endpoints use normal API authentication;
+cookie writes require `X-Requested-With: runledger`. Rotation invalidates the old token immediately.
+Local alternative: `runledger scim-token create|revoke --team NAME --db runledger.db`.
+
+Provisioning base URL: `https://<host>/scim/v2`. Send `Authorization: Bearer <token>`
+and `Content-Type: application/scim+json` (`application/json` also accepted).
+Responses and SCIM Error objects use `application/scim+json`. Request bodies are limited to 64 KiB.
+
+| Method | Path under `/scim/v2` | Purpose |
+| --- | --- | --- |
+| GET | `/ServiceProviderConfig`, `/ResourceTypes`, `/Schemas` | Minimal discovery |
+| GET, POST | `/Users` | List or create a team membership |
+| GET, PUT, PATCH, DELETE | `/Users/{id}` | Read, replace, patch or remove membership |
+| GET | `/Groups`, `/Groups/{admin,member,viewer}` | Fixed role groups and their members |
+| PATCH | `/Groups/{admin,member,viewer}` | Add/remove role group members |
+
+Lists support 1-based `startIndex`, `count` (maximum 200), and filters
+`userName eq "email"` (case-insensitive) and `externalId eq "id"`.
+Other filters return 400 `invalidFilter`. Duplicate user names return 409 `uniqueness`.
+User fields: `userName`/primary email, `name.formatted` or `displayName`, `active`,
+`externalId` (per membership), and `roles: [{"value":"member"}]` (admin/member/viewer).
+POST defaults to member. PATCH accepts add/replace/remove and no-path value objects;
+operation names are case-insensitive and `active` accepts boolean strings for Entra.
+PUT replaces mutable fields; omitted name/externalId are cleared and role/active default to member/true.
+
+Deactivation deletes sessions and blocks personal-key authentication **only in this team**;
+reactivation restores personal-key access, not deleted sessions. It does not disable the global user.
+DELETE removes membership and revokes its personal keys/sessions. Email and name are server-wide:
+SCIM cannot change them when the user belongs to other teams (400 `mutability`);
+unchanged values remain accepted. Existing global users are reused by email and keep their
+existing name on POST. Okta `name.givenName` and `name.familyName` are joined when `formatted`
+is absent; PATCH name-part paths use the parts supplied in that request.
+No operation may remove the last working admin.
+All changes are audited with actor `scim`; token administration uses its admin actor.
+
+Groups cannot be created/deleted. Adding a member sets their role to that group.
+Removing from their current group sets member (or viewer when removing from member);
+removing from a different role group is a no-op. Group patches accept `members` arrays
+or removal paths `members[value eq "user-id"]`. Bulk, sort, ETags and password changes are unsupported.
 
 ## Conventions
 
