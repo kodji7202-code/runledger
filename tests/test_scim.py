@@ -23,6 +23,30 @@ def scim(tmp_path):
         yield srv.db, team, key, token, base, call
 
 
+@pytest.mark.parametrize("method", ["oidc", "saml"])
+def test_sso_sessions_require_active_team_membership(scim, method):
+    db, team, _, _, _, _ = scim
+    person = db.add_member(team, "sso@example.com", "member")
+    other, _ = db.create_team("other")
+    db.add_member(other, person["email"], "viewer")
+    token = db.issue_sso_session(method, team, person["id"], "test")
+    assert db.session_key(token)["user_id"] == person["id"]
+    with db._lock, db._conn:
+        db._conn.execute(
+            "UPDATE memberships SET deactivated_at = ? WHERE team_id = ? AND user_id = ?",
+            ("2026-01-01T00:00:00Z", team, person["id"]),
+        )
+    assert db.session_key(token) is None
+    assert [row["id"] for row in db.user_teams(person["id"])] == [other]
+    refused = db.issue_sso_session(method, team, person["id"], "test")
+    assert db.session_key(refused) is None
+    allowed = db.issue_sso_session(method, other, person["id"], "test")
+    assert db.session_key(allowed)["role"] == "viewer"
+    db.scim_update(team, person["id"], {"active": True})
+    restored = db.issue_sso_session(method, team, person["id"], "test")
+    assert db.session_key(restored)["role"] == "member"
+
+
 def test_idp_lifecycle(scim):
     db, team, key, token, base, call = scim
     assert call("GET")[1]["Resources"] == []

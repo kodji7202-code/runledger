@@ -260,13 +260,15 @@ def test_jwks_expiry_fails_closed_when_provider_unavailable(env, monkeypatch):
     assert finish(env)[0] == 401
 
 
-@pytest.mark.parametrize("mode", ["disabled", "no_membership", "subject", "domain", "hd"])
+@pytest.mark.parametrize("mode", ["disabled", "no_membership", "deactivated", "subject", "domain", "hd"])
 def test_account_and_domain_restrictions(env, mode):
     server, _, state, team, person, *_ = env
     if mode == "disabled":
         server.db.set_user_disabled(person["id"], True)
     elif mode == "no_membership":
         server.db.change_member(team, person["id"])
+    elif mode == "deactivated":
+        server.db.scim_update(team, person["id"], {"active": False})
     elif mode == "subject":
         assert finish(env)[0] == 200
         state["claims"]["sub"] = "different"
