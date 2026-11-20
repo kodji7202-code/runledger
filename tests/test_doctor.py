@@ -278,6 +278,44 @@ def test_fix_hints_appear_on_warnings_and_failures(tmp_path):
     assert "->" in text
 
 
+def test_text_output_wraps_with_hanging_indents(monkeypatch):
+    monkeypatch.setenv("COLUMNS", "80")
+    detail = "A long diagnostic message with useful context. " * 4
+    fix = "Run the suggested command and check the configuration. " * 3
+    extra = "Additional diagnostic context to help locate the configuration. " * 3
+    monkeypatch.setattr(doctor, "check_extra", lambda report, check: [extra])
+    report = doctor.Report("/project", [doctor.Check(
+        "config", "warn", "config", detail, fix, agent="codex", scope="project")])
+
+    lines = doctor.render_text(report, verbose=True).splitlines()
+
+    assert all(len(line) <= 80 for line in lines)
+    for content, prefix in ((detail, "[warn] config codex project: "),
+                            (fix, "        -> "), (extra, "        ")):
+        start = next(i for i, line in enumerate(lines)
+                     if line.startswith(prefix + content.split()[0]))
+        wrapped = [lines[start][len(prefix):]]
+        for line in lines[start + 1:]:
+            if not line.startswith(" " * len(prefix)):
+                break
+            wrapped.append(line[len(prefix):])
+        assert len(wrapped) > 1
+        assert " ".join(wrapped) == content.strip()
+
+
+@pytest.mark.parametrize("detail", ["", "All good", "https://example.com/" + "a-b/" * 30,
+                                   "/" + "long-path/" * 20, "command-" * 20])
+def test_text_output_preserves_short_lines_and_long_tokens(monkeypatch, detail):
+    monkeypatch.setenv("COLUMNS", "80")
+    report = doctor.Report("/project", [doctor.Check("config", "ok", "config", detail)])
+
+    lines = doctor.render_text(report).splitlines()
+
+    assert lines[1] == f"[ok] config: {detail}"
+    assert len(lines) == 3
+    assert lines[-1] == "Summary: 1 ok, 0 warnings, 0 failures"
+
+
 def test_exit_codes_follow_the_highest_severity(tmp_path):
     proj = tmp_path / "proj"
     proj.mkdir()
@@ -1676,6 +1714,5 @@ def test_the_doc_says_the_log_check_cannot_check_git_outside_a_repo():
     section = text.split("### `log`", 1)[1].split("### `rollback`", 1)[0]
     assert re.search(r"outside a Git (work tree|repository)", section, re.I), section
     assert "`info`" in section, section
-
 
 
