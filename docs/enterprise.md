@@ -107,7 +107,7 @@ runledger user enable --email ana@example.com
 
 All these local commands accept `--db FILE`. Adding an email creates a user if needed; an existing
 user is reused across teams. Display names are optional. There are no passwords or interactive
-account registration: people sign in with their personal key or configured OIDC provider.
+account registration: people sign in with their personal key or a configured OIDC or SAML provider.
 
 ### OIDC single sign-on
 
@@ -159,14 +159,69 @@ HTTP is allowed only for loopback testing.
 Email lookup is case-insensitive. First sign-in binds the user's issuer and subject; another
 identity cannot take over that email. A different issuer is also rejected once bound. People
 with several memberships choose a team before receiving a session. Sessions have no API key;
-membership roles and disabled status are checked on every request. Disabling dashboard key
-sign-in does not disable API/CLI keys. Failed sign-ins count toward the address failure limit
+membership roles and disabled status are checked on every request. Setting
+`"disable_key_sign_in": true` in either the OIDC or SAML config disables dashboard key sign-in
+without disabling API/CLI keys. Failed sign-ins count toward the address failure limit
 and are audited only in the resolved user's membership teams, without tokens or supplied email
 addresses. Unresolved identities and invalid states or tokens are not written to team audit logs.
 
 The short-lived pre-auth cookie uses SameSite=Lax for the cross-site callback. The final
 session cookie remains HttpOnly, SameSite=Strict (and Secure for HTTPS). The callback returns
 a 200 continuation page rather than a redirect chain so the Strict cookie reaches the dashboard.
+
+### SAML 2.0 single sign-on
+
+Install the optional server dependency with `pip install 'runledger-ai[saml]'` (from a clone,
+`pip install '.[saml]'`). Configure your IdP for SP-initiated SAML 2.0: use HTTP-Redirect for
+the AuthnRequest and HTTP-POST for the response. In this example, import the SP metadata from
+`https://ledger.example.com/auth/saml/work/metadata` or register that URL as the SP entity ID
+and `https://ledger.example.com/auth/saml/work/acs` as the assertion consumer service URL.
+Configure the IdP to sign the assertion or response with a current SHA-2 algorithm and supply
+its trusted signing certificate as PEM. AuthnRequests and SP metadata are unsigned; encrypted
+assertions, unsolicited IdP-initiated login and SAML single logout are not supported.
+
+Store a server-wide JSON configuration outside the repository:
+
+```json
+{
+  "public_url": "https://ledger.example.com",
+  "disable_key_sign_in": true,
+  "providers": [{
+    "id": "work",
+    "name": "Company SAML",
+    "idp_entity_id": "https://sso.example.com/metadata",
+    "idp_sso_url": "https://sso.example.com/saml/login",
+    "idp_cert": "company-signing.pem",
+    "email_attribute": "email",
+    "name_attribute": "displayName"
+  }]
+}
+```
+
+Start with `runledger serve --saml-config /etc/runledger/saml.json` (or
+`RUNLEDGER_SAML_CONFIG`). The certificate path may be absolute or relative to the config file.
+Set `public_url` to the externally visible HTTPS URL; if omitted, SAML uses the dashboard's
+public URL (including any OIDC override), or the bound address for local use.
+HTTP is only allowed on loopback for testing; the browser must allow a Secure cookie on the
+loopback origin. Multiple providers are supported; set `sp_entity_id` if the IdP requires an
+entity ID different from the provider's metadata URL. OIDC can remain enabled in parallel.
+
+`disable_key_sign_in` defaults to `false`. Set it to `true` to remove the dashboard key form
+and reject key sign-in at `POST /session` and `/?key=...`, even without OIDC configured. The SAML
+config must still define at least one provider. This setting does not disable API or CLI keys.
+
+Pre-provision each person and their team memberships; SAML does not create users or grant roles.
+`email_attribute` defaults to `email` and must be a single, IdP-controlled email value.
+The IdP must provide a stable non-transient NameID, or you can set `subject_attribute` to the
+name of a stable, unique, signed attribute. The account is bound to the IdP entity ID and
+subject separately from its OIDC binding. If `name_attribute` is configured, its value fills
+an empty display name on first SAML sign-in; it does not overwrite an administrator-set name.
+People with multiple teams choose one before receiving a session.
+
+The short-lived pre-auth cookie is host-bound, Secure, and SameSite=None so the IdP can POST
+back to the assertion consumer service. The dashboard session remains HttpOnly and
+SameSite=Strict, and is Secure on HTTPS. Pending logins are single-use and do not survive a
+server restart.
 
 Personal keys work only while the user is enabled and is a member of the key's team. The effective
 role is the weaker of the key role and membership role, checked on every API and dashboard request.
@@ -554,7 +609,7 @@ teams and API keys remain available.
 
 ## What RunLedger does not do
 
-- It has per-person accounts, team memberships and OIDC single sign-on, but no SAML, SCIM,
+- It has per-person accounts, team memberships and OIDC and SAML single sign-on, but no SCIM,
   local passwords or local multi-factor authentication. Enforce MFA at your identity provider.
 - Keys do not expire, and there is no IP allow-list.
 - Without `RUNLEDGER_RETENTION_DAYS`, runs, approvals, budget alerts and audit events are never
