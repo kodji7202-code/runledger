@@ -79,6 +79,7 @@ from .auth import (
 )
 from .dashboard import APPROVAL_HTML, DASHBOARD_HTML
 from .db import TIME_FORMAT, Database, normalize_missing_costs
+from .insights import MAX_COST_USD
 
 MAX_BODY_BYTES = 10 * 1024 * 1024
 SIGN_IN_BODY_LIMIT = 4096
@@ -1396,7 +1397,7 @@ def _int(value: Any, default: Optional[int], lo: int = 0, hi: int = 10 ** 12) ->
 
 
 def _money(value: Any) -> Optional[float]:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value > MAX_COST_USD or not math.isfinite(value):
         return None
     return round(max(0.0, float(value)), 6)
 
@@ -1476,7 +1477,7 @@ def receipt_to_run(
                 c for c in (_money(s.get("cost_usd")) for s in steps if s.get("model") == name)
                 if c is not None
             ]
-            cost = round(sum(step_costs), 6) if step_costs else None
+            cost = _money(sum(step_costs)) if step_costs else None
         models[label] = {"tokens": _int(info.get("tokens"), 0) or 0, "cost_usd": cost}
 
     risks: List[Dict[str, Any]] = []

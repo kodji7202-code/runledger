@@ -6,6 +6,7 @@ temporary SQLite database.
 import copy
 import http.client
 import json
+import math
 import re
 import sqlite3
 import threading
@@ -18,7 +19,7 @@ import pytest
 
 from runledger import client
 from runledger.cli import main
-from runledger.server.app import MAX_BODY_BYTES, RECEIPT_CSP, make_server
+from runledger.server.app import MAX_BODY_BYTES, RECEIPT_CSP, _money, make_server, receipt_to_run
 from runledger.server.dashboard import DASHBOARD_HTML
 from runledger.server.db import Database
 
@@ -133,6 +134,62 @@ def _revisions(db_path, run_id):
         return [row[0] for row in conn.execute(
             "SELECT revision FROM run_revisions WHERE run_id = ? ORDER BY revision", (run_id,)
         )]
+
+
+def test_huge_costs_leave_stats_strict_json(env):
+    srv, base = env
+    _, key = srv.db.create_team("huge-costs")
+    fixture = client.build_payload(FIX)
+    for index in range(2):
+        body = _stored(fixture, f"huge-{index}", cost=1e308)
+        body["steps"] = []
+        assert _push(base, key, body)[0] == 201
+
+    status, _, raw = _http(base, "GET", "/api/stats", headers=_auth(key))
+    assert status == 200
+
+    def reject_constant(value):
+        raise ValueError(f"Non-finite JSON constant: {value}")
+
+    stats = json.loads(raw, parse_constant=reject_constant)
+    assert stats["totals"]["runs"] == 2
+    for row in [stats["totals"], *stats["by_model"], *stats["by_user"],
+                *stats["by_project"], *stats["by_agent"]]:
+        assert row["cost_usd"] is None or math.isfinite(row["cost_usd"])
+        assert row["cost_usd"] is None
+        assert row["priced_runs"] == 0
+        assert row["unpriced_runs"] == 2
+
+
+@pytest.mark.parametrize("value, expected", [
+    (None, None), (True, None), ("1", None), (float("inf"), None),
+    (float("nan"), None), (1e308, None), (10 ** 400, None),
+    (10 ** 12 + 1, None), (10 ** 12, 1e12), (0, 0.0),
+    (-1, 0.0), (1.2345678, 1.234568),
+])
+def test_money_bounds(value, expected):
+    assert _money(value) == expected
+
+
+@pytest.mark.parametrize("step_cost, expected", [(1e308, None), (6e11, None), (0.25, 0.5)])
+def test_model_step_fallback_money_bounds(step_cost, expected):
+    run = receipt_to_run({
+        "session_id": "step-cost", "models": {"demo": {}},
+        "steps": [{"model": "demo", "cost_usd": step_cost}] * 2,
+    })
+    assert run["models"]["demo"]["cost_usd"] == expected
+
+
+@pytest.mark.parametrize("estimate, expected", [(1e308, None), (6e11, None), (0.25, 0.5), (-1, None)])
+def test_recommendation_money_bounds(estimate, expected):
+    run = receipt_to_run({
+        "session_id": "savings", "recommendations": [
+            {"kind": "cost", "title": "Save", "est_savings_usd": estimate},
+        ] * 2,
+    })
+    assert run["est_savings_usd"] == expected
+    assert all(item["est_savings_usd"] is None or math.isfinite(item["est_savings_usd"])
+               for item in json.loads(run["recommendations"]))
 
 
 def test_push_then_list_get_and_stats(env):
