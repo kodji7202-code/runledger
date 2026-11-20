@@ -7,6 +7,11 @@ change behavior, so read the entry before you upgrade.
 
 ## [Unreleased]
 
+### Fixed
+
+- Team receipt ingest rejects numbers outside the finite float range and JSON strings with
+  lone Unicode surrogates with HTTP 400 instead of an internal server error.
+
 ## [0.7.0] - 2026-10-20
 
 ### Added
