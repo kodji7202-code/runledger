@@ -281,6 +281,13 @@ def test_escaped_quotes_and_separators(command, expected):
     assert _is_test_command(command) is expected
 
 
+@pytest.mark.parametrize("command", [
+    "python -m \\\npytest -q", "pytest \\\n-q", "py\\\ntest -q",
+])
+def test_bash_line_continuations_do_not_hide_test_runs(command):
+    assert _is_test_command(command)
+
+
 @pytest.mark.parametrize("command, expected", [
     ("echo hi # don't skip tests\npytest", True),
     ('echo hi # "pytest;\npytest', True),

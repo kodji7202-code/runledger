@@ -245,7 +245,10 @@ def _split_commands(command: str) -> List[List[str]]:
                 continue
             comment = False
         if escaped:
-            word.append(ch)
+            if ch == "\n":
+                word.pop()
+            else:
+                word.append(ch)
             escaped = False
             continue
         if ch == "\\" and (not quote or (quote == '"' and command[i + 1:i + 2] in
