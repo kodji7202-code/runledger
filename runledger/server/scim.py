@@ -153,7 +153,8 @@ def dispatch(h, method, path, query):
                     if not match:
                         raise Error(400, "Unsupported filter.", "invalidFilter")
                     key = "email" if match[1].lower() == "username" else "external_id"
-                    members = [m for m in members if (m[key] or "").lower() == match[2].lower()]
+                    members = [m for m in members if
+                               (m[key].lower() == match[2].lower() if key == "email" else m[key] == match[2])]
                 result = paginated([resource(m) for m in members], query)
             send(h, 200, result)
             return
