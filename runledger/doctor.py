@@ -1177,6 +1177,8 @@ def render_text(report: Report, verbose: bool = False) -> str:
     from . import __version__
 
     width = shutil.get_terminal_size(fallback=(80, 24)).columns
+    if width <= 0:
+        width = 80
     lines = []
 
     def append(text: str, prefix: str = "", indent: int = 2) -> None:
