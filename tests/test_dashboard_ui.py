@@ -8,6 +8,8 @@ and check what the page is served with.
 import http.client
 import json
 import re
+import shutil
+import subprocess
 import threading
 from contextlib import contextmanager
 from html.parser import HTMLParser
@@ -19,7 +21,7 @@ from runledger.server.app import make_server
 from runledger.server.dashboard import APPROVAL_HTML, DASHBOARD_HTML
 
 NONCE_PLACEHOLDER = "__CSP_NONCE__"
-VIEWS = ["runs", "insights", "approvals", "keys", "audit", "settings"]
+VIEWS = ["runs", "insights", "approvals", "sessions", "keys", "audit", "settings"]
 ADMIN_TABS = ["keys", "audit", "settings"]
 
 # Every endpoint the page calls, from the team API contract.
@@ -37,6 +39,8 @@ CONTRACT_ENDPOINTS = [
     "/api/export/report.html",
     "/api/team/settings",
     "/api/approvals",
+    "/session/logout",
+    "/sessions",
 ]
 
 FORBIDDEN_SINKS = [
@@ -96,6 +100,69 @@ def _script(html):
     return match.group(1)
 
 
+def _js_call(functions, expression):
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required to execute dashboard JavaScript helpers")
+    js = _script(DASHBOARD_HTML)
+    helpers = []
+    for name in functions:
+        match = re.search(r"  function " + name + r"\(.*?\n  }", js, re.S)
+        assert match, name
+        helpers.append(match.group(0))
+    result = subprocess.run(
+        [node, "-e", "\n".join(helpers) + "\nconsole.log(JSON.stringify(" + expression + "));"],
+        capture_output=True, text=True, encoding="utf-8", check=True,
+    )
+    return json.loads(result.stdout)
+
+
+@pytest.mark.parametrize("value, expected", [
+    (0.00003, "<$0.0001"), (0.000001, "<$0.0001"),
+    (0.00009999, "<$0.0001"), (0.0001, "$0.0001"),
+    (0, "$0.00"), (0.005, "$0.0050"), (0.25, "$0.250"), (12.34, "$12.34"),
+    (None, "n/a"), ("invalid", "n/a"),
+])
+def test_money_displays_tiny_nonzero_costs_honestly(value, expected):
+    assert _js_call(["money"], "money(" + json.dumps(value) + ")") == expected
+
+
+@pytest.mark.parametrize("value, partial, expected", [
+    (0.00003, True, ">$0.00"), (0.000001, True, ">$0.00"),
+    (0.00009999, True, ">$0.00"), (0.0001, True, "≥$0.0001"),
+    (0, True, "≥$0.00"), (0.25, True, "≥$0.250"),
+    (0.00003, False, "<$0.0001"), (None, True, "n/a"), ("invalid", True, "n/a"),
+])
+def test_partial_run_cost_uses_a_single_coherent_bound(value, partial, expected):
+    run = {"cost_usd": value, "cost_partial": partial}
+    expression = "(function(r) { return costNode(r.cost_usd, r.cost_partial); })(" + json.dumps(run) + ")"
+    assert _js_call(["money", "costText", "costNode"], expression) == expected
+
+
+def test_partial_tiny_total_uses_a_single_coherent_bound():
+    totals = {"cost_usd": 0.00003, "cost_is_lower_bound": True}
+    expression = "(function(t) { return costText(t.cost_usd, t.cost_is_lower_bound); })(" + json.dumps(totals) + ")"
+    assert _js_call(["money", "costText"], expression) == ">$0.00"
+
+
+@pytest.mark.parametrize("totals, expected", [
+    ({}, ""),
+    ({"unpriced_runs": 0, "partial_runs": 0}, ""),
+    ({"unpriced_runs": 1, "partial_runs": 1},
+     "Includes 1 run partly priced (known cost only)."),
+    ({"unpriced_runs": 2, "partial_runs": 2},
+     "Includes 2 runs partly priced (known cost only)."),
+    ({"unpriced_runs": 3, "partial_runs": 1, "missing_usage_runs": 1},
+     "Includes 1 run partly priced (known cost only). "
+     "2 runs left out: 1 run without recorded token usage, 1 run with an unknown model price."),
+    ({"unpriced_runs": 1, "missing_usage_runs": 1},
+     "1 run left out: 1 run without recorded token usage."),
+    ({"unpriced_runs": 1}, "1 run left out: 1 run with an unknown model price."),
+])
+def test_cost_kpi_hint_distinguishes_included_partial_costs(totals, expected):
+    assert _js_call(["runCount", "unpricedHint"], "unpricedHint(" + json.dumps(totals) + ")") == expected
+
+
 # Static checks on the served HTML string
 
 def test_page_uses_no_forbidden_dom_sinks():
@@ -146,7 +213,40 @@ def test_tabs_are_a_tablist_wired_to_their_panels():
 
     for name in VIEWS:
         assert f"view-{name}" in by_id and f"tab-{name}" in by_id
-    assert f'var VIEWS = ["runs", "insights", "approvals", "keys", "audit", "settings"];' in _script(DASHBOARD_HTML)
+    assert f'var VIEWS = ["runs", "insights", "approvals", "sessions", "keys", "audit", "settings"];' in _script(DASHBOARD_HTML)
+
+
+def test_session_controls_are_available_to_all_roles_and_use_the_authenticated_helper():
+    attrs = {a["id"]: a for _, a in _page(DASHBOARD_HTML).elements if a.get("id")}
+    assert "hidden" not in attrs["tab-sessions"] and "hidden" not in attrs["sign-out"]
+    js = _script(DASHBOARD_HTML)
+    assert 'getJSON("/sessions")' in js
+    assert 'postJSON("/session/logout").then(goToSignIn' in js
+    assert 'request("DELETE", "/sessions/" + encodeURIComponent(session.id))' in js
+    assert 'session.current ? key + " (This session)" : key' in js
+    assert 'if (res.status === 401) { goToSignIn(); }' in js
+    sign_in = js[js.index("function goToSignIn()"):js.index("function parseBody")]
+    assert 'history.replaceState(null, "", "/");' in sign_in and "location.reload();" in sign_in
+
+
+def test_background_polls_are_marked_on_both_pages():
+    js = _script(DASHBOARD_HTML)
+    assert 'loadApprovals(true).then(' in js
+    assert 'getJSON("/api/approvals?status=pending&limit=50", background)' in js
+    approval = _script(APPROVAL_HTML)
+    assert 'load(true).then(' in approval
+    assert 'encodeURIComponent(approvalId), undefined, background)' in approval
+    for script in (js, approval):
+        assert 'if (background) { opts.headers["X-RunLedger-Background"] = "1"; }' in script
+
+
+def test_revoke_session_confirmation_identifies_the_target():
+    js = _script(DASHBOARD_HTML)
+    row = js[js.index("function sessionRow("):js.index("function renderKeys(")]
+    assert 'nameOf(session.key_label, session.key_id)' in row
+    assert 'var target = session.current ? "your current session" : "the session";' in row
+    assert """confirmAction("Revoke " + target + " for '" + key + "'?",""" in row
+    assert 'when(session.created_at) + ".", "Revoke session", true)' in row
 
 
 def test_admin_tabs_start_hidden_so_members_and_viewers_never_see_them():
@@ -399,6 +499,21 @@ def test_new_key_is_shown_once_with_a_warning_and_copy_button():
     js = _script(DASHBOARD_HTML)
     assert '$("key-value").textContent = key;' in js       # plaintext goes in as text only
     assert js.count("clearKeyOnce();") >= 2                 # when the user dismisses it and when they leave the tab
+
+
+def test_rotating_own_key_keeps_replacement_visible_until_dismissed():
+    js = _script(DASHBOARD_HTML)
+    assert "state.keyId = me && me.key ? me.key.id : null;" in js
+    rotate = js[js.index("function rotateKey("):js.index("// Audit log (admin)")]
+    assert rotate.index("state.selfRotation = ownKey;") < rotate.index('postJSON("/api/keys/"')
+    assert 'var ownKey = key.id === state.keyId;' in rotate
+    assert re.search(r'if \(ownKey\) \{[^}]+Your session ended[^}]+return;\s+\}', rotate)
+    assert rotate.index("return loadKeys();") > rotate.index('textContent = "I have copied it — sign in"')
+    sign_in = js[js.index("function goToSignIn()"):js.index("function parseBody")]
+    assert sign_in.index("if (state.selfRotation) { return; }") < sign_in.index("location.reload();")
+    assert 'if (state.view === "keys" && !state.selfRotation) { clearKeyOnce(); }' in js
+    dismiss = js[js.index('$("key-dismiss").addEventListener'):js.index('$("audit-filter").addEventListener')]
+    assert dismiss.index("clearKeyOnce();") < dismiss.index("state.selfRotation = false;") < dismiss.index("goToSignIn();")
 
 
 # Checks against a real server

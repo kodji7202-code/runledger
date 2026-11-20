@@ -523,6 +523,11 @@ roll back, install the older version and restore the backup from before the upgr
       is read-only (only the data volume and `/tmp` are writable), and it drops every Linux capability
       and cannot gain new privileges (`deploy/docker-compose.yml`).
 - [ ] **Back up regularly, and test the restore.**
+- [ ] **Set a dashboard idle timeout if needed.** Set `RUNLEDGER_SESSION_IDLE_TIMEOUT` on the
+      server (or in `deploy/.env` for Compose), or pass `runledger serve --session-idle-timeout SECONDS`
+      to override the environment. The default `0` disables idle expiry; a positive integer signs out
+      sessions after that many seconds without an authenticated interactive request. Background polls
+      do not reset the timer. Sessions always expire after 12 hours at the latest.
 
 ## Known limits
 
@@ -531,7 +536,6 @@ roll back, install the older version and restore the backup from before the upgr
   a separate period for audit events (`RUNLEDGER_AUDIT_RETENTION_DAYS`). There is no command to
   delete a single run.
 - One server process and one SQLite file. This is not a multi-node cluster.
-- There is no sign-out endpoint. Sessions end when their key is revoked or rotated, or after 12 hours.
 - Receipts and the guard's log mask secrets by pattern. A secret in an unknown format, or a short
   one, is not masked. The server stores what clients send; receipts pushed by clients older than
   0.3.0 were not masked.

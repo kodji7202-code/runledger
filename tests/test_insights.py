@@ -510,6 +510,37 @@ def test_a_model_without_prices_has_no_cost_per_run_and_no_share(env):
     assert model["cost_per_run"] is None and model["share_of_cost"] is None and model["avg_quality"] is None
 
 
+def test_a_model_in_a_partly_priced_run_is_a_lower_bound_like_its_agent(env):
+    """A partly priced run leaves its priced models' figures below the real spend, so the model
+    row is marked as a lower bound exactly as the agent row is (and as /api/stats by_model is)."""
+    srv, base = env
+    _, admin, _, _ = team_with_keys(srv)
+    payload = receipt("partial-1", cost=1.0, models={SONNET: {"tokens": 10, "cost_usd": 1.0}})
+    payload["totals"] = dict(payload["totals"], cost_usd=1.0, cost_partial=True, usage_source="messages")
+    push(base, admin, payload)
+    push(base, admin, receipt("complete-1", cost=0.5, models={HAIKU: {"tokens": 5, "cost_usd": 0.5}}))
+
+    body = insights_of(base, admin)
+    models = {m["model"]: m for m in body["models"]}
+    sonnet = models[friendly_model(SONNET)]
+    assert sonnet["cost_usd"] == pytest.approx(1.0) and sonnet["priced_runs"] == 1
+    assert sonnet["partial_runs"] == 1 and sonnet["cost_is_lower_bound"] is True
+    haiku = models[friendly_model(HAIKU)]
+    assert haiku["partial_runs"] == 0 and haiku["cost_is_lower_bound"] is False
+    (agent,) = body["agents"]
+    assert agent["cost_is_lower_bound"] is True
+
+
+def test_a_model_left_unpriced_in_some_runs_is_a_lower_bound(env):
+    srv, base = env
+    _, admin, _, _ = team_with_keys(srv)
+    push(base, admin, receipt("priced", models={SONNET: {"tokens": 10, "cost_usd": 1.0}}, cost=1.0))
+    push(base, admin, receipt("unpriced", models={SONNET: {"tokens": 10, "cost_usd": None}}, cost=None, steps=[]))
+    (model,) = insights_of(base, admin)["models"]
+    assert model["runs"] == 2 and model["priced_runs"] == 1 and model["partial_runs"] == 0
+    assert model["cost_is_lower_bound"] is True
+
+
 def test_an_agent_with_no_priced_run_has_a_null_cost(env):
     """Droid runs whose usage was never recorded have no cost: n/a, never 0."""
     srv, base = env
@@ -722,7 +753,8 @@ def test_runs_csv_gains_the_review_columns_with_blanks_for_missing_values(env):
     assert status == 200
     rows = _rows(raw)
     header = rows[0]
-    assert header[-NUMBER_OF_EXPORT_COLUMNS_ADDED:] == ["quality_score", "quality_grade", "ai_verdict", "est_savings_usd"]
+    start = header.index("title") + 1
+    assert header[start:start + NUMBER_OF_EXPORT_COLUMNS_ADDED] == list(REVIEW_KEYS)
     by_id = {r[0]: dict(zip(header, r)) for r in rows[1:]}
     assert by_id["csv-1"]["quality_score"] == "88" and by_id["csv-1"]["quality_grade"] == "A"
     assert by_id["csv-1"]["ai_verdict"] == "looks_safe" and by_id["csv-1"]["est_savings_usd"] == "1.25"
@@ -796,7 +828,7 @@ def test_the_page_has_an_insights_tab_wired_to_its_panel_and_the_api():
     assert 'id="view-insights"' in DASHBOARD_HTML and 'role="tabpanel"' in DASHBOARD_HTML
     js = _script(DASHBOARD_HTML)
     assert "/api/insights" in js
-    assert 'var VIEWS = ["runs", "insights", "approvals", "keys", "audit", "settings"];' in js
+    assert 'var VIEWS = ["runs", "insights", "approvals", "sessions", "keys", "audit", "settings"];' in js
     assert 'if (name === "insights") { loadInsights(); }' in js
 
 
