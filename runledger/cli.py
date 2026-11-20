@@ -9,7 +9,12 @@
   runledger team create NAME [--db runledger.db]
   runledger backup [--db runledger.db] [--dir backups] [--keep 14]
   runledger key create --team-id N --label L --role admin|member|viewer [--kind personal|service]
-                       [--expires-in-days N] [--db runledger.db]
+                       [--expires-in-days N] [--user EMAIL] [--db runledger.db]
+  runledger user add --team-id N --email E [--name NAME] --role admin|member|viewer [--db runledger.db]
+  runledger user list --team-id N [--db runledger.db]
+  runledger user role --team-id N --email E --role admin|member|viewer [--db runledger.db]
+  runledger user remove --team-id N --email E [--db runledger.db]
+  runledger user disable|enable --email E [--db runledger.db]
   runledger key list --team-id N [--db runledger.db]
   runledger key revoke ID [--db runledger.db]
   runledger key rotate ID [--expires-in-days N] [--db runledger.db]
@@ -531,6 +536,8 @@ def cmd_serve(args) -> int:
             tls_cert=args.tls_cert, tls_key=args.tls_key,
             secure_cookies=args.secure_cookies, trust_proxy=args.trust_proxy,
             trusted_proxies=args.trusted_proxy,
+            oidc_config=args.oidc_config,
+            saml_config=args.saml_config,
             session_idle_timeout=args.session_idle_timeout,
         )
     except TLSConfigError as exc:  # missing or unusable certificate or key
@@ -757,6 +764,59 @@ def cmd_backup(args) -> int:
     return 0
 
 
+def cmd_scim_token(args) -> int:
+    """Manage the dedicated provisioning credential locally."""
+    from .server.db import Database
+
+    db = Database(args.db)
+    try:
+        with db._lock:
+            team = db._conn.execute("SELECT id FROM teams WHERE name = ?", (args.team,)).fetchone()
+        if team is None:
+            print("error: Team not found.", file=sys.stderr)
+            return 1
+        result = db.scim_token(team["id"], args.scim_cmd)
+        print(result.get("token", "SCIM token revoked."))
+        return 0
+    finally:
+        db.close()
+
+
+def cmd_user(args) -> int:
+    """Local user and membership administration."""
+    from .server.auth import InvalidKey
+    from .server.db import Database
+
+    try:
+        db = Database(args.db)
+    except sqlite3.Error as exc:
+        print(f"error: cannot open database {args.db}: {exc}", file=sys.stderr)
+        return 1
+    try:
+        if args.user_cmd == "list":
+            if db.team_name(args.team_id) is None:
+                raise InvalidKey("Team not found.")
+            for member in db.list_members(args.team_id):
+                status = ("disabled" if member["disabled_at"] else
+                          "deactivated" if member.get("deactivated_at") else "active")
+                print(f"{member['id']}  {member['email']}  {member['name'] or '-'}  {member['role']}  {status}")
+        elif args.user_cmd == "add":
+            member = db.add_member(args.team_id, args.email, args.role, args.name)
+            print(f"Added {member['email']} to team {args.team_id} as {member['role']}.")
+        elif args.user_cmd in ("role", "remove"):
+            db.change_member(args.team_id, args.email, args.role if args.user_cmd == "role" else None)
+            print(f"Updated membership for {args.email} in team {args.team_id}.")
+        else:
+            db.set_user_disabled(args.email, args.user_cmd == "disable")
+            print(f"User {args.email}: {args.user_cmd}.")
+        return 0
+    except (InvalidKey, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        db.close()
+
+
 def cmd_key(args) -> int:
     """Local key administration on the team database. The server does not need to be running.
     Changes are audited with the actor "cli"."""
@@ -776,7 +836,7 @@ def cmd_key(args) -> int:
                 print(f"error: no team with id {args.team_id}", file=sys.stderr)
                 return 1
             try:
-                view = db.create_key(args.team_id, args.label, args.role, actor="cli",
+                view = db.create_key(args.team_id, args.label, args.role, actor="cli", user=args.user,
                                      kind=args.kind, expires_in_days=args.expires_in_days)
             except (InvalidKey, ValueError) as exc:
                 print(f"error: {exc}", file=sys.stderr)
@@ -1084,6 +1144,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ps.add_argument("--host", default="127.0.0.1", help="bind address (default 127.0.0.1)")
     ps.add_argument("--port", type=int, default=8787)
     ps.add_argument("--db", default="runledger.db", help="SQLite database file (default runledger.db)")
+    ps.add_argument("--oidc-config", metavar="PATH", help="OIDC JSON config (also RUNLEDGER_OIDC_CONFIG)")
+    ps.add_argument("--saml-config", metavar="PATH", help="SAML JSON config (also RUNLEDGER_SAML_CONFIG)")
     ps.add_argument("--tls-cert", metavar="FILE", help="PEM certificate: serve HTTPS (TLS 1.2+); needs --tls-key")
     ps.add_argument("--tls-key", metavar="FILE", help="PEM private key for --tls-cert")
     ps.add_argument("--secure-cookies", action="store_true",
@@ -1105,6 +1167,29 @@ def main(argv: Optional[List[str]] = None) -> int:
     ptc.add_argument("--db", default="runledger.db", help="SQLite database file (default runledger.db)")
     ptc.set_defaults(func=cmd_team_create)
 
+    ps = sub.add_parser("scim-token", help="manage dedicated team provisioning tokens")
+    ss = ps.add_subparsers(dest="scim_cmd", required=True)
+    for action in ("create", "revoke"):
+        sp = ss.add_parser(action)
+        sp.add_argument("--team", required=True)
+        sp.add_argument("--db", default="runledger.db")
+        sp.set_defaults(func=cmd_scim_token)
+
+    pu = sub.add_parser("user", help="manage people and team memberships on a team database")
+    usub = pu.add_subparsers(dest="user_cmd", required=True)
+    for action in ("add", "list", "role", "remove", "disable", "enable"):
+        up = usub.add_parser(action, help=f"{action} users or memberships")
+        up.add_argument("--db", default="runledger.db", help="SQLite database file (default runledger.db)")
+        if action not in ("disable", "enable"):
+            up.add_argument("--team-id", type=int, required=True)
+        if action != "list":
+            up.add_argument("--email", required=True)
+        if action in ("add", "role"):
+            up.add_argument("--role", required=True, choices=["admin", "member", "viewer"])
+        if action == "add":
+            up.add_argument("--name")
+        up.set_defaults(func=cmd_user)
+
     pbk = sub.add_parser("backup", help="copy the team database safely while the server runs")
     pbk.add_argument("--db", default="runledger.db", help="SQLite database file (default runledger.db)")
     pbk.add_argument("--dir", default="backups", help="folder for the copies (default backups)")
@@ -1117,6 +1202,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     pkc.add_argument("--team-id", type=int, required=True)
     pkc.add_argument("--label", required=True, help="what the key is for, e.g. 'laptop' or 'CI'")
     pkc.add_argument("--role", required=True, choices=["admin", "member", "viewer"])
+    pkc.add_argument("--user", help="owner's email or user id (must be a team member)")
     pkc.add_argument("--kind", choices=["personal", "service"], default="personal",
                      help="personal (one person, may sign in to the dashboard) or service (API only)")
     pkc.add_argument("--expires-in-days", type=int, metavar="N",

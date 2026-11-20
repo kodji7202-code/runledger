@@ -21,7 +21,7 @@ from runledger import client
 from runledger.cli import main
 from runledger.server.app import MAX_BODY_BYTES, RECEIPT_CSP, _money, make_server, receipt_to_run
 from runledger.server.dashboard import DASHBOARD_HTML
-from runledger.server.db import Database
+from runledger.server.db import Database, _supersedes
 
 FIX = Path(__file__).parent / "fixtures" / "sample_session.jsonl"
 DROID_FIX = Path(__file__).parent / "fixtures" / "droid_session.jsonl"
@@ -29,6 +29,15 @@ NATIVE = Path(__file__).parent / "fixtures" / "native_session.json"
 ROOT = Path(__file__).resolve().parent.parent
 SESSION_ID = "7f3c2a10-9b1e-4c55-a1d2-0e6f8b3c9d42"
 XSS = "<script>alert(1)</script>"
+
+
+def test_supersedes_does_not_match_missing_key_provenance():
+    existing = {"pushed_by_key_id": None, "ended_at": None, "steps": 1}
+    run = {"ended_at": None, "steps": 2}
+    assert not _supersedes(existing, run, None, "member")
+    existing["pushed_by_key_id"] = "owner"
+    assert not _supersedes(existing, run, None, "member")
+    assert _supersedes(existing, run, "owner", "member")
 
 
 @contextmanager
@@ -1681,4 +1690,3 @@ def test_push_needs_server_and_key(monkeypatch, tmp_path):
     with pytest.raises(client.PushError):
         client.push("http://127.0.0.1:9", "rl_x", tmp_path / "missing.jsonl")
     assert client.default_user()
-
