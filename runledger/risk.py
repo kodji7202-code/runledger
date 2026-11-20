@@ -1000,6 +1000,66 @@ def _code_view(text: str, comments: List[Tuple[int, int]], text_words: List[_Wor
     return out
 
 
+_GLOBAL_OPTION_VALUES = {
+    "git": {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env"},
+    "kubectl": {
+        "--context", "--namespace", "-n", "--kubeconfig", "--cluster", "--user",
+        "--server", "-s", "--token", "--certificate-authority", "--client-certificate",
+        "--client-key", "--as", "--as-group", "--as-uid", "--request-timeout",
+        "--tls-server-name", "--cache-dir", "--v", "-v", "--vmodule",
+        "--username", "--password", "--proxy-url", "--as-user-extra",
+    },
+    "helm": {
+        "--namespace", "-n", "--kube-context", "--kubeconfig", "--kube-apiserver",
+        "--kube-as-user", "--kube-as-group", "--kube-ca-file", "--kube-token",
+        "--kube-tls-server-name", "--registry-config", "--repository-cache",
+        "--repository-config", "--burst-limit", "--qps",
+    },
+    "docker": {
+        "--context", "-c", "--host", "-H", "--config", "--log-level", "-l",
+        "--tlscacert", "--tlscert", "--tlskey",
+    },
+    "terraform": set(),
+    "aws": {
+        "--profile", "--region", "--output", "--endpoint-url", "--query", "--color",
+        "--ca-bundle", "--cli-read-timeout", "--cli-connect-timeout",
+        "--cli-binary-format",
+    },
+    "gh": {"-R", "--repo"},
+}
+
+
+def _without_global_options(code: str, ps: bool = False) -> str:
+    """Remove only the option run before a supported tool's first subcommand."""
+    items, _ = _scan(code, ps)
+    spans: List[Tuple[int, int]] = []
+    i = 0
+    while i < len(items):
+        item = items[i]
+        i += 1
+        if item[0] != "word" or item[1].value.lower() not in _GLOBAL_OPTION_VALUES:
+            continue
+        tool = item[1]
+        values = _GLOBAL_OPTION_VALUES[tool.value.lower()]
+        end = tool.end
+        while i < len(items) and items[i][0] == "word":
+            word = items[i][1]
+            if not word.value.startswith("-") or word.value == "-":
+                break
+            i += 1
+            end = word.end
+            if word.value == "--":
+                break
+            if word.value in values and i < len(items) and items[i][0] == "word":
+                end = items[i][1].end
+                i += 1
+        if end != tool.end:
+            spans.append((tool.end, end))
+    for start, end in reversed(spans):
+        code = code[:start] + " " + code[end:]
+    return code
+
+
 def _shell_risks(step: Step, cwd: Optional[str], extra: List["re.Pattern"], risks: List[Risk],
                  default_workdir: Optional[str] = None,
                  policy: Optional[Dict[str, Any]] = None) -> Set[str]:
@@ -1025,16 +1085,17 @@ def _shell_risks(step: Step, cwd: Optional[str], extra: List["re.Pattern"], risk
     names = [_plan(words, ps) for words in cmds]
     text_words = [w for words in cmds for w in words if w.role == "text"]
     code = _code_view(prepared, comments, text_words, ps)
+    normalized = _without_global_options(code, ps)
 
     rules = list(_DANGEROUS)
     if ps:
         rules += _PS_RULES
     for rx, sev, why in rules:
-        if rx.search(code):
+        if rx.search(code) or rx.search(normalized):
             risks.append(Risk(sev, "command", why, step.index))
     if _SUDO_RE.search(code):
         risks.append(Risk("high", "command", "Ran a command with sudo", step.index))
-    risks.extend(command_rule_risks(cmd, code, policy, step.index))
+    risks.extend(command_rule_risks(cmd, code, policy, step.index, ps))
 
     assigns: Dict[str, Optional[str]] = {}
     for words, name in zip(cmds, names):
@@ -1320,20 +1381,25 @@ def _rule_matched_risks(kind: str, code: str, severity: str, matched: List[str],
     return [Risk(severity, code, f"Matched {kind} rule: {label}", index) for label in matched]
 
 
-def command_rule_risks(command: str, view: str, policy: Optional[Dict[str, Any]], index: int) -> List[Risk]:
+def command_rule_risks(command: str, view: str, policy: Optional[Dict[str, Any]], index: int,
+                       ps: bool = False) -> List[Risk]:
     """Risks for the `command_rules` of the user's file and the project's file.
 
     `view` is the quote/heredoc-blanked command the built-in rules read; an entry with
-    `raw: true` reads `command` itself, so a rule can also match quoted text. Either way only
+    `raw: true` reads `command` itself, so a rule can also match quoted text. Non-raw rules
+    also read a copy with leading global options removed. Either way only
     the first `RULE_MATCH_MAX_CHARS` characters are read."""
     rules = policy.get("command_rules") if isinstance(policy, dict) else None
     risks: List[Risk] = []
     if not isinstance(rules, dict):
         return risks
     text = view[:RULE_MATCH_MAX_CHARS]
+    normalized = _without_global_options(text, ps)
     raw = command[:RULE_MATCH_MAX_CHARS]
     for kind, code, severity in RULE_CODES:
-        hits = [r["label"] for r in rules.get(kind) or [] if r["rx"].search(raw if r["raw"] else text)]
+        hits = [r["label"] for r in rules.get(kind) or []
+                if (r["rx"].search(raw) if r["raw"] else
+                    r["rx"].search(text) or r["rx"].search(normalized))]
         risks.extend(_rule_matched_risks(kind, code, severity, hits, index))
     return risks
 

@@ -9,10 +9,16 @@ change behavior, so read the entry before you upgrade.
 
 ### Fixed
 
+- Team server request logging handles oversized URLs rejected before parsing, returning HTTP 414
+  instead of dropping the connection with an internal error.
 - Team receipt ingest rejects numbers outside the finite float range and JSON strings with
   lone Unicode surrogates with HTTP 400 instead of an internal server error.
 
 ### Added
+
+- **Dashboard session controls:** Sign out of the current session or list and revoke active sessions
+  from the Sessions tab. Admins can manage any session in their team; other roles can manage sessions
+  started with their key. Operators can optionally configure an inactivity timeout.
 
 - **API key expiry, kinds and a team key policy:** keys are `personal` (default; may sign in to the
   dashboard) or `service` (API only) and may carry an `expires_at`. `POST /api/keys` and
@@ -49,6 +55,26 @@ change behavior, so read the entry before you upgrade.
   runs in well under half the time with the same figures.
 
 - Removed unused internal guard and PowerShell redirection definitions without changing guard decisions.
+
+### Fixed
+
+- Droid tool calls with an empty successful result now show **Approved by user** rather than
+  **Rejected by user** for Guard ask decisions.
+
+### Fixed
+
+- Dashboard costs below $0.0001 display as `<$0.0001` instead of rounding to zero;
+  the Cost KPI clarifies that partly priced runs contribute their known cost.
+
+### Fixed
+
+- **Insights model rows keep the lower-bound mark (`runledger.server.insights`):** a model used in
+  a partly priced run (`cost_partial`) now reports `partial_runs` and `cost_is_lower_bound`, so the
+  dashboard shows its cost as `≥ $X` like the agent row and the `/api/stats` `by_model` rows,
+  instead of a figure that reads as complete.
+- **`runs.csv` keeps the cost coverage (`runledger.server.exports`):** a new last column,
+  `cost_partial`, is `true` when `cost_usd` is a lower bound, `false` when it is complete, and
+  empty when the cost is unknown. Existing columns keep their positions.
 
 ## [0.7.0] - 2026-10-20
 

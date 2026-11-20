@@ -3,10 +3,10 @@
 Server data is rendered with DOM text APIs only, so a developer name such as
 <script> shows up as plain text. The server sends this page with a
 per-response nonce CSP that allows only the script below. The script calls the
-API with cookie credentials; every POST or PUT sends X-Requested-With, which a
+API with cookie credentials; every write sends X-Requested-With, which a
 cross-site form cannot set.
 
-Views are switched by location hash (#runs, #insights, #approvals, and for admins #keys,
+Views are switched by location hash (#runs, #insights, #approvals, #sessions, and for admins #keys,
 #audit, #settings), and the runs filters live in that hash too, so a reload keeps them. Only the
 runs route reads or writes that query: switching to another view leaves the filter bar untouched,
 and returning to runs writes the filters back into the hash. Members
@@ -189,6 +189,7 @@ tr.pickable:hover{background:var(--chip)}
       <option value="365">1 year</option>
     </select>
     <button type="button" id="refresh">Refresh</button>
+    <button type="button" id="sign-out">Sign out</button>
   </div>
 </header>
 
@@ -198,6 +199,7 @@ tr.pickable:hover{background:var(--chip)}
   <button type="button" role="tab" class="tab" id="tab-runs" data-view="runs" aria-controls="view-runs" aria-selected="true" tabindex="0">Runs</button>
   <button type="button" role="tab" class="tab" id="tab-insights" data-view="insights" aria-controls="view-insights" aria-selected="false" tabindex="-1">Insights</button>
   <button type="button" role="tab" class="tab" id="tab-approvals" data-view="approvals" aria-controls="view-approvals" aria-selected="false" tabindex="-1">Approvals <span class="count" id="tab-approvals-count">0</span></button>
+  <button type="button" role="tab" class="tab" id="tab-sessions" data-view="sessions" aria-controls="view-sessions" aria-selected="false" tabindex="-1">Sessions</button>
   <button type="button" role="tab" class="tab" id="tab-keys" data-view="keys" aria-controls="view-keys" aria-selected="false" tabindex="-1" hidden>API keys</button>
   <button type="button" role="tab" class="tab" id="tab-audit" data-view="audit" aria-controls="view-audit" aria-selected="false" tabindex="-1" hidden>Audit log</button>
   <button type="button" role="tab" class="tab" id="tab-settings" data-view="settings" aria-controls="view-settings" aria-selected="false" tabindex="-1" hidden>Settings</button>
@@ -218,6 +220,19 @@ tr.pickable:hover{background:var(--chip)}
 <div id="notice" class="notice" role="alert"></div>
 
 <p class="msg error" id="key-expiry-banner" role="status" hidden></p>
+
+<section class="view" id="view-sessions" role="tabpanel" aria-labelledby="tab-sessions" tabindex="-1" hidden>
+  <h2>Dashboard sessions</h2>
+  <p class="msg">Revoking a session signs it out without changing its API key.</p>
+  <div class="table-wrap">
+    <table aria-label="Active dashboard sessions">
+      <thead><tr><th scope="col">Key</th><th scope="col">Role</th><th scope="col">Signed in</th><th scope="col">Last active</th><th scope="col">Expires</th><th scope="col">Action</th></tr></thead>
+      <tbody id="sessions-body"></tbody>
+    </table>
+  </div>
+  <p class="msg" id="sessions-msg" role="status" aria-live="polite"></p>
+</section>
+
 <section class="view" id="view-runs" role="tabpanel" aria-labelledby="tab-runs" tabindex="-1">
 <section class="kpis">
   <div class="card"><div class="kpi-label">Total cost</div><div class="kpi-value" id="k-cost">-</div><div class="kpi-sub" id="k-cost-sub"></div></div>
@@ -495,7 +510,7 @@ tr.pickable:hover{background:var(--chip)}
 
   var APPROVAL_POLL_MS = 3000;
   var APPROVAL_POLL_MAX_MS = 30000;
-  var VIEWS = ["runs", "insights", "approvals", "keys", "audit", "settings"];
+  var VIEWS = ["runs", "insights", "approvals", "sessions", "keys", "audit", "settings"];
   var ADMIN_VIEWS = { keys: true, audit: true, settings: true };
   var ROLES = ["admin", "member", "viewer"];
   var AUDIT_PAGE = 100;
@@ -507,7 +522,8 @@ tr.pickable:hover{background:var(--chip)}
     report: "/api/export/report.html"
   };
 
-  var state = { days: 30, role: null, keyRef: null, meLoaded: false, view: null, thresholds: [50, 80, 100] };
+  var state = { days: 30, role: null, keyRef: null, keyId: null, selfRotation: false,
+    meLoaded: false, view: null, thresholds: [50, 80, 100] };
   var budgetState = { edited: false, settings: null, status: null };
   var approvalsView = { seq: 0, signature: null, items: [], failed: false };
   var keysView = { items: [] };
@@ -542,6 +558,7 @@ tr.pickable:hover{background:var(--chip)}
     var v = Number(value);
     if (!isFinite(v)) { return "n/a"; }
     if (v === 0) { return "$0.00"; }
+    if (v > 0 && v < 0.0001) { return "<$0.0001"; }
     if (v < 0.01) { return "$" + v.toFixed(4); }
     if (v < 1) { return "$" + v.toFixed(3); }
     return "$" + v.toFixed(2);
@@ -582,7 +599,14 @@ tr.pickable:hover{background:var(--chip)}
     node.className = "msg" + (message ? (isError ? " error" : " ok") : "");
   }
 
+  function goToSignIn() {
+    if (state.selfRotation) { return; }
+    history.replaceState(null, "", "/");
+    location.reload();
+  }
+
   function parseBody(res) {
+    if (res.status === 401) { goToSignIn(); }
     return res.text().then(function (text) {
       var body = {};
       try { body = text ? JSON.parse(text) : {}; } catch (e) { body = {}; }
@@ -598,17 +622,20 @@ tr.pickable:hover{background:var(--chip)}
   }
 
   // The only place that sends API requests. Anything other than GET carries the CSRF header.
-  function request(method, url, payload) {
+  function request(method, url, payload, background) {
     var opts = { method: method, credentials: "same-origin", cache: "no-store", headers: { "Accept": "application/json" } };
     if (method !== "GET") {
-      opts.headers["Content-Type"] = "application/json";
       opts.headers["X-Requested-With"] = "runledger";
-      opts.body = JSON.stringify(payload === undefined ? {} : payload);
+      if (payload !== undefined) {
+        opts.headers["Content-Type"] = "application/json";
+        opts.body = JSON.stringify(payload);
+      }
     }
+    if (background) { opts.headers["X-RunLedger-Background"] = "1"; }
     return fetch(url, opts).then(parseBody);
   }
 
-  function getJSON(url) { return request("GET", url); }
+  function getJSON(url, background) { return request("GET", url, undefined, background); }
   function postJSON(url, payload) { return request("POST", url, payload); }
   function putJSON(url, payload) { return request("PUT", url, payload); }
 
@@ -687,6 +714,7 @@ tr.pickable:hover{background:var(--chip)}
   // tokens out is a lower bound, so it reads "≥$X". A group with no priced run stays "n/a".
 
   function costText(value, lowerBound) {
+    if (lowerBound && Number(value) > 0 && Number(value) < 0.0001) { return ">$0.00"; }
     var text = money(value);
     return (lowerBound && text !== "n/a") ? "≥" + text : text;
   }
@@ -731,14 +759,18 @@ tr.pickable:hover{background:var(--chip)}
   // The unpriced hint names the cause: the agent recorded no usage, the model has no known
   // price, or both.
   function unpricedHint(t) {
-    var unpriced = Number(t.unpriced_runs) || 0;
-    if (!unpriced) { return ""; }
+    var partial = Number(t.partial_runs) || 0;
+    var unpriced = Math.max(0, (Number(t.unpriced_runs) || 0) - partial);
+    var notes = [];
+    if (partial) { notes.push("Includes " + runCount(partial) + " partly priced (known cost only)."); }
+    if (!unpriced) { return notes.join(" "); }
     var missing = Math.min(Number(t.missing_usage_runs) || 0, unpriced);
     var unknown = unpriced - missing;
     var causes = [];
     if (missing) { causes.push(runCount(missing) + " without recorded token usage"); }
     if (unknown) { causes.push(runCount(unknown) + " with an unknown model price"); }
-    return runCount(unpriced) + " left out: " + causes.join(", ") + ".";
+    notes.push(runCount(unpriced) + " left out: " + causes.join(", ") + ".");
+    return notes.join(" ");
   }
 
   function notify(message, isError) {
@@ -1184,9 +1216,9 @@ tr.pickable:hover{background:var(--chip)}
     items.forEach(function (a) { list.appendChild(approvalCard(a)); });
   }
 
-  function loadApprovals() {
+  function loadApprovals(background) {
     var mine = ++approvalsView.seq;
-    return getJSON("/api/approvals?status=pending&limit=50").then(function (body) {
+    return getJSON("/api/approvals?status=pending&limit=50", background).then(function (body) {
       if (mine !== approvalsView.seq) { return; }
       approvalsView.failed = false;
       notifyApproval("");
@@ -1260,6 +1292,7 @@ tr.pickable:hover{background:var(--chip)}
     $("key-value").textContent = "";
     $("key-once-label").textContent = "";
     $("key-once").hidden = true;
+    $("key-dismiss").textContent = "I have copied it";
     setMsg($("key-copy-msg"), "", false);
   }
 
@@ -1283,6 +1316,50 @@ tr.pickable:hover{background:var(--chip)}
     selection.removeAllRanges();
     selection.addRange(range);
     try { return document.execCommand("copy"); } catch (e) { return false; }
+  }
+
+  function loadSessions() {
+    var body = $("sessions-body");
+    var msg = $("sessions-msg");
+    return getJSON("/sessions").then(function (result) {
+      clear(body);
+      result.sessions.forEach(function (session) { body.appendChild(sessionRow(session)); });
+      setMsg(msg, result.sessions.length ? "" : "No active dashboard sessions.", false);
+    }, function (err) {
+      clear(body);
+      setMsg(msg, explain(err), true);
+    });
+  }
+
+  function sessionRow(session) {
+    var row = el("tr");
+    var key = nameOf(session.key_label, session.key_id);
+    row.appendChild(cell(session.current ? key + " (This session)" : key));
+    row.appendChild(cell(session.role));
+    row.appendChild(cell(when(session.created_at), "mono"));
+    row.appendChild(cell(when(session.last_seen_at), "mono"));
+    row.appendChild(cell(when(session.expires_at), "mono"));
+    var action = cell("", "num");
+    var revoke = el("button", "small btn-danger", "Revoke");
+    revoke.type = "button";
+    revoke.setAttribute("aria-label", session.current ? "Revoke this session" :
+      "Revoke session for " + key + ", signed in " + when(session.created_at));
+    revoke.addEventListener("click", function () {
+      var target = session.current ? "your current session" : "the session";
+      confirmAction("Revoke " + target + " for '" + key + "'?",
+        "This immediately signs out the session started " + when(session.created_at) + ".", "Revoke session", true)
+        .then(function (yes) {
+          if (!yes) { return; }
+          return request("DELETE", "/sessions/" + encodeURIComponent(session.id)).then(function () {
+            if (session.current) { goToSignIn(); } else { return loadSessions(); }
+          }, function (err) {
+            setMsg($("sessions-msg"), explain(err), true);
+          });
+        });
+    });
+    action.appendChild(revoke);
+    row.appendChild(action);
+    return row;
   }
 
   function renderKeys() {
@@ -1354,17 +1431,29 @@ tr.pickable:hover{background:var(--chip)}
   }
 
   function rotateKey(key) {
+    if (state.selfRotation) { return; }
     var name = nameOf(key.label, String(key.id));
     confirmAction("Rotate this key?",
       "A new key replaces '" + name + "'. The old key may stop working. The new key is shown once, and its expiry is renewed.",
       "Rotate key", false)
       .then(function (yes) {
         if (!yes) { return; }
+        var ownKey = key.id === state.keyId;
+        state.selfRotation = ownKey;
         return postJSON("/api/keys/" + encodeURIComponent(key.id) + "/rotate", {}).then(function (created) {
+          if (ownKey) {
+            showKeyOnce(created, "Your session ended. Copy the replacement key to sign in again.");
+            $("key-dismiss").textContent = "I have copied it — sign in";
+            return;
+          }
           showKeyOnce(created, "New key for '" + name + "'.");
           setMsg($("keys-msg"), "Key rotated.", false);
           return loadKeys();
         }, function (err) {
+          if (ownKey) {
+            state.selfRotation = false;
+            if (err.status === 401) { goToSignIn(); }
+          }
           setMsg($("keys-msg"), keyError(err), true);
         });
       });
@@ -1453,6 +1542,7 @@ tr.pickable:hover{background:var(--chip)}
     return fetch(EXPORT_PATHS[name] + "?days=7", {
       method: "HEAD", credentials: "same-origin", cache: "no-store"
     }).then(function (res) {
+      if (res.status === 401) { goToSignIn(); }
       if (res.body && typeof res.body.cancel === "function") { res.body.cancel().catch(function () {}); }
       return res.ok || res.status >= 500;
     }, function () {
@@ -1806,6 +1896,7 @@ tr.pickable:hover{background:var(--chip)}
     }
     if (name === "settings") { loadSettings(); }
     if (name === "approvals") { loadApprovals(); }
+    if (name === "sessions") { loadSessions(); }
   }
 
   function showView(requested) {
@@ -1823,7 +1914,7 @@ tr.pickable:hover{background:var(--chip)}
       tab.classList.toggle("active", on);
     });
     if (state.view !== name) {
-      if (state.view === "keys") { clearKeyOnce(); }
+      if (state.view === "keys" && !state.selfRotation) { clearKeyOnce(); }
       state.view = name;
       enterView(name);
     }
@@ -1856,6 +1947,7 @@ tr.pickable:hover{background:var(--chip)}
       state.meLoaded = true;
       state.role = ROLES.indexOf(me && me.role) >= 0 ? me.role : null;
       state.keyRef = me && me.key ? (me.key.prefix || me.key.id || null) : null;
+      state.keyId = me && me.key ? me.key.id : null;
       var banner = $("key-expiry-banner");
       if (me && me.key && me.key.expires_soon && me.key.expires_at) {
         banner.textContent = "The key you signed in with expires " + when(me.key.expires_at) +
@@ -1871,6 +1963,7 @@ tr.pickable:hover{background:var(--chip)}
       state.meLoaded = true;
       state.role = null;
       state.keyRef = null;
+      state.keyId = null;
       applyRole();
     });
   }
@@ -1883,6 +1976,7 @@ tr.pickable:hover{background:var(--chip)}
     if (state.view === "keys") { loadKeys(); }
     if (state.view === "audit") { loadAudit(true); probeExport("audit").then(refreshExportLinks); }
     if (state.view === "settings") { loadSettings(); }
+    if (state.view === "sessions") { loadSessions(); }
   }
 
   // Event wiring
@@ -1893,6 +1987,14 @@ tr.pickable:hover{background:var(--chip)}
     if (state.view === "insights") { loadInsights(); }
   });
   $("refresh").addEventListener("click", refreshAll);
+  $("sign-out").addEventListener("click", function () {
+    var button = this;
+    button.disabled = true;
+    postJSON("/session/logout").then(goToSignIn, function (err) {
+      button.disabled = false;
+      notify(explain(err), true);
+    });
+  });
   ["f-user", "f-project", "f-agent", "f-min", "f-quality", "f-max-quality"].forEach(function (id) {
     $(id).addEventListener("input", applyFilters);
   });
@@ -1970,6 +2072,11 @@ tr.pickable:hover{background:var(--chip)}
   });
   $("key-dismiss").addEventListener("click", function () {
     clearKeyOnce();
+    if (state.selfRotation) {
+      state.selfRotation = false;
+      goToSignIn();
+      return;
+    }
     $("key-label").focus();
   });
 
@@ -2095,7 +2202,7 @@ tr.pickable:hover{background:var(--chip)}
   loadBudget();
   loadApprovals();
   var approvalPoller = makePoller(function () {
-    return loadApprovals().then(function () { return !approvalsView.failed; });
+    return loadApprovals(true).then(function () { return !approvalsView.failed; });
   }, APPROVAL_POLL_MS, APPROVAL_POLL_MAX_MS);
   pollWhileVisible(approvalPoller);
   approvalPoller.start();
@@ -2239,6 +2346,7 @@ a{color:var(--accent)}
   }
 
   function parseBody(res) {
+    if (res.status === 401) { location.replace("/"); }
     return res.text().then(function (text) {
       var body = {};
       try { body = text ? JSON.parse(text) : {}; } catch (e) { body = {}; }
@@ -2251,8 +2359,9 @@ a{color:var(--accent)}
     });
   }
 
-  function request(method, url, payload) {
+  function request(method, url, payload, background) {
     var opts = { method: method, credentials: "same-origin", headers: { "Accept": "application/json" } };
+    if (background) { opts.headers["X-RunLedger-Background"] = "1"; }
     if (payload !== undefined) {
       opts.headers["Content-Type"] = "application/json";
       opts.headers["X-Requested-With"] = "runledger";
@@ -2399,8 +2508,8 @@ a{color:var(--accent)}
     };
   }
 
-  function load() {
-    return request("GET", "/api/approvals/" + encodeURIComponent(approvalId)).then(function (a) {
+  function load(background) {
+    return request("GET", "/api/approvals/" + encodeURIComponent(approvalId), undefined, background).then(function (a) {
       failed = false;
       notice("");
       render(a);
@@ -2441,7 +2550,7 @@ a{color:var(--accent)}
   $("approve").addEventListener("click", function () { decide("approve"); });
   $("deny").addEventListener("click", function () { decide("deny"); });
   var poller = makePoller(function () {
-    return load().then(function () { return !failed; });
+    return load(true).then(function () { return !failed; });
   }, POLL_MS, POLL_MAX_MS);
   document.addEventListener("visibilitychange", function () {
     if (document.hidden) { poller.stop(); } else { poller.resume(); }

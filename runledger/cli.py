@@ -40,6 +40,7 @@ import os
 import re
 import sqlite3
 import sys
+import unicodedata
 import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
@@ -202,6 +203,22 @@ def _prune_scope(keep, older_than) -> str:
     return f"Removed only checkpoints older than {older_than}."
 
 
+def _wrap_checkpoint_label(label: str) -> str:
+    lines = []
+    line, columns = "  ", 2
+    for match in re.finditer(r"( *)([^ ]+)", repr(redact(label))):
+        gap, word = match.groups()
+        width = sum(2 if unicodedata.east_asian_width(char) in ("F", "W") else 1
+                    for char in word if unicodedata.category(char) not in ("Mn", "Me"))
+        if line.strip() and columns + len(gap) + width > 80:
+            lines.append(line)
+            line, columns = "   " + word, 3 + width
+        else:
+            line += gap + word
+            columns += len(gap) + width
+    return "\n".join([*lines, line])
+
+
 def cmd_checkpoints(args) -> int:
     from .rollback import CheckpointError, Repository, parse_duration
     try:
@@ -228,9 +245,10 @@ def cmd_checkpoints(args) -> int:
         tree = repo.snapshot_tree()
         for cp in checkpoints:
             plan = repo.plan(cp, tree)
-            label = repr(redact(cp.label))
-            print(f"{cp.id}  {cp.created_at}  {label}  "
-                  f"({len(plan.restore) + len(plan.remove) + len(plan.keep_ignored)} file(s) differ)")
+            changed = len(plan.restore) + len(plan.remove) + len(plan.keep_ignored)
+            print(f"{cp.id}  ({changed} file(s) differ)")
+            print(f"  {cp.created_at}")
+            print(_wrap_checkpoint_label(cp.label))
             for path in plan.restore:
                 print(f"  restore {path!r}")
             for path in plan.remove:
@@ -509,11 +527,12 @@ def cmd_serve(args) -> int:
             tls_cert=args.tls_cert, tls_key=args.tls_key,
             secure_cookies=args.secure_cookies, trust_proxy=args.trust_proxy,
             trusted_proxies=args.trusted_proxy,
+            session_idle_timeout=args.session_idle_timeout,
         )
     except TLSConfigError as exc:  # missing or unusable certificate or key
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    except ValueError as exc:  # invalid trusted proxy or retention setting
+    except ValueError as exc:  # invalid server setting
         print(f"error: {exc}", file=sys.stderr)
         return 1
     except OSError as exc:  # port in use, bad address
@@ -1071,6 +1090,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ps.add_argument("--trusted-proxy", action="append", default=[], metavar="CIDR",
                     help="address or range of a reverse proxy whose X-Forwarded-For gives the client address "
                          "(repeatable; also $RUNLEDGER_TRUSTED_PROXIES, comma separated)")
+    ps.add_argument("--session-idle-timeout", type=int, metavar="SECONDS",
+                    help="sign out idle dashboard sessions (default: RUNLEDGER_SESSION_IDLE_TIMEOUT or 0 to disable)")
     ps.set_defaults(func=cmd_serve)
 
     pt = sub.add_parser("team", help="manage teams on a team server")
