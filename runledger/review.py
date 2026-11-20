@@ -18,12 +18,12 @@ import posixpath
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from . import llm
+from .ai_defaults import DEFAULT_REVIEW_MODEL
 from .parser import Run, Step
 from .pricing import cost_of
 from .risk import DELETE_TOOLS, WRITE_TOOLS, Risk
 from .summarize import FileChange, file_changes
 
-DEFAULT_REVIEW_MODEL = "claude-sonnet-5-5"
 ESCALATION_MODEL = "claude-opus-5-5"
 ESCALATE_ENV = "RUNLEDGER_ESCALATE_OPUS"   # "1": re-run a "dangerous" verdict on Opus
 VERDICTS = ("looks_safe", "needs_review", "dangerous")
