@@ -35,6 +35,10 @@
   GET  /auth/oidc/<provider>/start             start Authorization Code + PKCE sign-in
   GET  /auth/oidc/<provider>/callback          validate identity, choose team or issue cookie
   POST /auth/oidc/team                        single-use, cookie-bound team choice
+  GET  /auth/saml/<provider>/metadata         SP metadata
+  GET  /auth/saml/<provider>/start            start SP-initiated sign-in
+  POST /auth/saml/<provider>/acs              validate SAML response and sign in
+  POST /auth/saml/team                        single-use, cookie-bound team choice
   GET  /?key=API_KEY                          legacy sign-in: redirects to strip the key; never
                                               replaces a session of another team without confirmation
   GET  /health                                liveness, no auth
@@ -53,7 +57,7 @@ from any other peer is ignored. With --trust-proxy, X-Forwarded-Proto is honoure
 trusted peers, or from anyone when no trusted proxy is configured (the earlier behaviour).
 
 Errors are JSON ({"error": {"code", "message"}}) and never include tracebacks;
-tracebacks go to the server's stderr. Standard library only.
+tracebacks go to the server's stderr.
 """
 from __future__ import annotations
 
@@ -75,7 +79,7 @@ from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from .. import __version__
 from ..parser import _ts as _parse_ts
-from . import approvals, budgets, exports, insights, maintenance, oidc
+from . import approvals, budgets, exports, insights, maintenance, oidc, saml
 from .auth import (
     SESSION_TTL_SECONDS,
     FailureLimiter,
@@ -90,6 +94,8 @@ from .db import TIME_FORMAT, Database, normalize_missing_costs
 
 MAX_BODY_BYTES = 10 * 1024 * 1024
 SIGN_IN_BODY_LIMIT = 4096
+SAML_BODY_LIMIT = 256 * 1024
+SAML_FLOW_COOKIE = "__Host-rl_saml"
 COOKIE_NAME = "rl_session"
 LEVELS = ("low", "medium", "high")
 SEVERITIES = ("low", "medium", "high")
@@ -147,9 +153,9 @@ SIGN_IN_KEY_FORM = """
 </form>
 <p>Create a team and its key with <code>runledger team create NAME</code>. Make more keys with <code>runledger key create</code>.</p>
 """
-OIDC_TEAM_HTML = SIGN_IN_HEAD + """
+SSO_TEAM_HTML = SIGN_IN_HEAD + """
 <h1 style="font-size:20px">Choose a team</h1>
-<form method="post" action="/auth/oidc/team">
+<form method="post" action="/auth/__METHOD__/team">
 <input type="hidden" name="state" value="__STATE__">__TEAMS__
 </form>
 </main></body></html>
@@ -230,9 +236,11 @@ class RunLedgerServer(ThreadingHTTPServer):
         retention_days: Optional[int] = None,
         audit_retention_days: Optional[int] = None,
         oidc_client: Optional[oidc.Client] = None,
+        saml_client: Optional[saml.Client] = None,
     ) -> None:
         self.db = db
         self.oidc = oidc_client
+        self.saml = saml_client
         self.log_requests = log_requests
         self.tls_context = tls_context
         self.secure_cookies = secure_cookies
@@ -254,12 +262,18 @@ class RunLedgerServer(ThreadingHTTPServer):
         scheme = "https" if tls_context is not None else "http"
         chosen = public_url or os.environ.get(PUBLIC_URL_ENV) or f"{scheme}://{shown}:{port}"
         self.public_url = chosen.strip().rstrip("/")
-        if self.oidc:
-            try:
+        try:
+            if self.oidc:
                 oidc.validate_public_url(self.public_url)
-            except oidc.OIDCError:
-                self.server_close()
-                raise
+            if self.saml:
+                self.saml.bind(self.public_url)
+        except ValueError:
+            self.server_close()
+            raise
+
+    @property
+    def dashboard_key_sign_in_disabled(self) -> bool:
+        return any(client.disable_key_sign_in for client in (self.oidc, self.saml) if client is not None)
 
     def get_request(self) -> Tuple[socket.socket, Any]:
         # The handshake runs in the request's own thread (see _Handler.setup), so a slow
@@ -414,6 +428,7 @@ def make_server(
     retention_days: Optional[int] = None,
     audit_retention_days: Optional[int] = None,
     oidc_config: Optional[str] = None,
+    saml_config: Optional[str] = None,
 ) -> RunLedgerServer:
     """Open the database and bind the server. Port 0 picks a free port (see server_address).
     The caller owns the server: call shutdown(), server_close() and db.close() when done.
@@ -442,6 +457,8 @@ def make_server(
     oidc_client = oidc.Client(config_path) if config_path else None
     if oidc_client and oidc_client.public_url:
         public_url = oidc_client.public_url
+    saml_path = saml_config or os.environ.get("RUNLEDGER_SAML_CONFIG")
+    saml_client = saml.Client(saml_path) if saml_path else None
     db = Database(db_path)
     cls = _IPv6Server if ":" in host else RunLedgerServer
     try:
@@ -451,6 +468,7 @@ def make_server(
             trusted_proxies=networks, retention_days=retention_days,
             audit_retention_days=audit_retention_days,
             oidc_client=oidc_client,
+            saml_client=saml_client,
         )
     except Exception:
         db.close()
@@ -527,6 +545,8 @@ class _Handler(BaseHTTPRequestHandler):
     def _dispatch(self, method: str, path: str, query: Dict[str, List[str]]) -> None:
         if path.startswith("/auth/oidc/"):
             self._oidc_route(method, path, query)
+        elif path.startswith("/auth/saml/"):
+            self._saml_route(method, path)
         elif path == "/":
             self._only(method, ("GET",))
             self._dashboard(query)
@@ -655,15 +675,19 @@ class _Handler(BaseHTTPRequestHandler):
     def _sign_in_page(self, error: Optional[str] = None) -> None:
         message = f'<p class="error" role="alert">{_escape(error)}</p>' if error else ""
         buttons = []
-        key_form = SIGN_IN_KEY_FORM
+        key_form = "" if self.server.dashboard_key_sign_in_disabled else SIGN_IN_KEY_FORM
         if self.server.oidc:
             for provider in self.server.oidc.providers.values():
                 buttons.append(
                     f'<p><a class="sso" href="/auth/oidc/{provider["id"]}/start">'
                     f'Sign in with {_escape(provider["name"])}</a></p>'
                 )
-            if self.server.oidc.disable_key_sign_in:
-                key_form = ""
+        if self.server.saml:
+            for provider in self.server.saml.providers.values():
+                buttons.append(
+                    f'<p><a class="sso" href="/auth/saml/{provider["id"]}/start">'
+                    f'Sign in with {_escape(provider["name"])}</a></p>'
+                )
         page = (
             SIGN_IN_HTML.replace("__ERROR__", message)
             .replace("__SSO_BUTTONS__", "".join(buttons))
@@ -693,7 +717,7 @@ class _Handler(BaseHTTPRequestHandler):
                 team_id = int((fields.get("team") or [""])[0])
                 if team_id not in [t["id"] for t in self.server.db.user_teams(pending["user_id"])]:
                     raise oidc.OIDCError("Team membership is no longer available.")
-                self._oidc_sign_in(pending["user_id"], team_id, provider)
+                self._sso_sign_in("oidc", user_id, team_id, provider)
                 return
             parts = path.split("/")
             if (
@@ -722,21 +746,10 @@ class _Handler(BaseHTTPRequestHandler):
             resolved = self.server.db.get_user(claims["email"])
             user_id = resolved["id"] if resolved else None
             person = self.server.db.oidc_user(**claims)
-            teams = self.server.db.user_teams(person["id"])
-            if len(teams) == 1:
-                self._oidc_sign_in(person["id"], teams[0]["id"], provider)
-                return
-            state = client.stash(
-                dict(user_id=person["id"], provider=provider, cookie=pending["cookie"])
-            )
-            buttons = "".join(
-                f'<button name="team" value="{t["id"]}">{_escape(t["name"])}</button>' for t in teams
-            )
-            page = OIDC_TEAM_HTML.replace("__STATE__", state).replace("__TEAMS__", buttons)
-            self._send_html(200, page, {"Content-Security-Policy": SIGN_IN_CSP})
+            self._sso_continue("oidc", client, person["id"], provider, pending["cookie"])
         except (oidc.OIDCError, ValueError) as exc:
             self.server.limiter.record_failure(self._client_ip())
-            self.server.db.audit_oidc_rejection(user_id, provider, self._client_ip())
+            self.server.db.audit_sso_rejection("oidc", user_id, provider, self._client_ip())
             self._sign_in_page(
                 str(exc)
                 if isinstance(exc, oidc.OIDCError)
@@ -744,23 +757,99 @@ class _Handler(BaseHTTPRequestHandler):
                 else "Invalid sign-in response."
             )
 
-    def _oidc_sign_in(self, user_id: str, team_id: int, provider: str) -> None:
+    def _saml_route(self, method: str, path: str) -> None:
+        client = self.server.saml
+        if client is None:
+            raise _not_found()
+        provider = None
+        user_id = None
+        try:
+            if path == "/auth/saml/team":
+                self._only(method, ("POST",))
+                self._refuse_cross_origin_sign_in()
+                length = self._content_length(SIGN_IN_BODY_LIMIT, "Team choice")
+                fields = parse_qs(self.rfile.read(length).decode("utf-8"))
+                pending = client.consume((fields.get("state") or [""])[0], self._cookie(SAML_FLOW_COOKIE))
+                if "user_id" not in pending:
+                    raise saml.SAMLError("Invalid team choice.")
+                user_id = pending["user_id"]
+                provider = pending["provider"]
+                team_id = int((fields.get("team") or [""])[0])
+                self._sso_sign_in("saml", user_id, team_id, provider)
+                return
+            parts = path.split("/")
+            if len(parts) != 5 or parts[3] not in client.providers:
+                raise _not_found()
+            provider, action = parts[3:]
+            if action == "metadata":
+                self._only(method, ("GET",))
+                self._send(200, client.metadata(provider), "application/samlmetadata+xml")
+                return
+            if action == "start":
+                self._only(method, ("GET",))
+                location, cookie = client.start(provider)
+                value = f"{SAML_FLOW_COOKIE}={cookie}; Path=/; HttpOnly; SameSite=None; Secure; Max-Age=600"
+                self._send(302, b"", "text/plain", {"Location": location, "Set-Cookie": value})
+                return
+            if action != "acs":
+                raise _not_found()
+            self._only(method, ("POST",))
+            if self.headers.get_content_type() != "application/x-www-form-urlencoded":
+                raise _HttpError(415, "unsupported_media_type", "SAML responses must be form encoded.")
+            length = self._content_length(SAML_BODY_LIMIT, "SAML responses")
+            fields = parse_qs(self.rfile.read(length).decode("ascii"), max_num_fields=8)
+            state, response = fields.get("RelayState", []), fields.get("SAMLResponse", [])
+            if len(state) != 1 or len(response) != 1:
+                raise saml.SAMLError("Invalid SAML response. Please try again.")
+            pending = client.consume(state[0], self._cookie(SAML_FLOW_COOKIE))
+            if pending["provider"] != provider or "request_id" not in pending:
+                raise saml.SAMLError("Invalid sign-in state.")
+            claims = client.verify(provider, response[0], pending["request_id"])
+            resolved = self.server.db.get_user(claims["email"])
+            user_id = resolved["id"] if resolved else None
+            person = self.server.db.saml_user(**claims)
+            self._sso_continue("saml", client, person["id"], provider, pending["cookie"])
+        except ValueError as exc:
+            self.server.limiter.record_failure(self._client_ip())
+            self.server.db.audit_sso_rejection("saml", user_id, provider, self._client_ip())
+            self._sign_in_page(
+                str(exc) if isinstance(exc, saml.SAMLError)
+                or str(exc).startswith(("No RunLedger account", "This email", "This identity"))
+                else "Invalid sign-in response."
+            )
+
+    def _sso_continue(
+        self, method: str, client: Union[oidc.Client, saml.Client], user_id: str, provider: str, cookie: str
+    ) -> None:
+        teams = self.server.db.user_teams(user_id)
+        if len(teams) == 1:
+            self._sso_sign_in(method, user_id, teams[0]["id"], provider)
+            return
+        state = client.stash(dict(user_id=user_id, provider=provider, cookie=cookie))
+        buttons = "".join(
+            f'<button name="team" value="{t["id"]}">{_escape(t["name"])}</button>' for t in teams
+        )
+        page = SSO_TEAM_HTML.replace("__METHOD__", method).replace("__STATE__", state).replace("__TEAMS__", buttons)
+        self._send_html(200, page, {"Content-Security-Policy": SIGN_IN_CSP})
+
+    def _sso_sign_in(self, method: str, user_id: str, team_id: int, provider: str) -> None:
         """Issue the Strict session cookie on a same-site continuation document."""
-        token = self.server.db.issue_oidc_session(team_id, user_id, provider)
+        token = self.server.db.issue_sso_session(method, team_id, user_id, provider)
         identity = self.server.identify_session(token)
         if identity is None:
-            raise oidc.OIDCError("Team membership is no longer available.")
+            error = saml.SAMLError if method == "saml" else oidc.OIDCError
+            raise error("Team membership is no longer available.")
         self.server.db.record_audit(
             team_id,
             identity,
             "auth.sign_in",
             user_id,
-            {"method": "oidc", "provider": provider, "ip": self._client_ip()},
+            {"method": method, "provider": provider, "ip": self._client_ip()},
         )
         cookie = (
             f"{COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_TTL_SECONDS}"
         )
-        if self._secure():
+        if self._secure() or (method == "saml" and self.server.saml.public_url.startswith("https://")):
             cookie += "; Secure"
         self._send_html(
             200,
@@ -896,8 +985,8 @@ class _Handler(BaseHTTPRequestHandler):
             } if ident.key_id else None,
             "user": {"id": ident.user_id, "email": ident.email, "name": ident.name} if ident.user_id else None,
         }
-        if self.server.oidc:
-            me["sign_in_method"] = "oidc" if ident.key_id is None else "key"
+        if self.server.oidc or self.server.saml or ident.sign_in_method != "key":
+            me["sign_in_method"] = ident.sign_in_method
         self._send_json(200, me)
 
     def _create_run(self) -> None:
@@ -1000,7 +1089,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _dashboard(self, query: Dict[str, List[str]]) -> None:
         key = (query.get("key") or [""])[0].strip()
-        if key and self.server.oidc and self.server.oidc.disable_key_sign_in:
+        if key and self.server.dashboard_key_sign_in_disabled:
             self._sign_in_page("Key sign-in is disabled; use your identity provider.")
             return
         if key:
@@ -1072,7 +1161,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _session_post(self) -> None:
         """The sign-in form: the key travels in the body, never in the URL."""
-        if self.server.oidc and self.server.oidc.disable_key_sign_in:
+        if self.server.dashboard_key_sign_in_disabled:
             self._sign_in_page("Key sign-in is disabled; use your identity provider.")
             self.close_connection = True
             return
