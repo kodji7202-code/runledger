@@ -8,9 +8,11 @@ import re
 import secrets
 import threading
 import time
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Tuple
 from urllib.parse import urlsplit
+from xml.sax.saxutils import escape
 
 _SAML = "urn:oasis:names:tc:SAML:2.0:assertion"
 _DS = "http://www.w3.org/2000/09/xmldsig#"
@@ -25,13 +27,13 @@ class SAMLError(ValueError):
     """A configuration or sign-in failure safe to show in the dashboard."""
 
 
-def _url(value: str) -> str:
+def _url(value: str, *, allow_query: bool = False) -> str:
     parsed = urlsplit(value)
     loopback = parsed.hostname in ("localhost", "127.0.0.1", "::1")
     if (
         (parsed.scheme != "https" and not (parsed.scheme == "http" and loopback))
         or not parsed.hostname or parsed.username is not None or parsed.password is not None
-        or parsed.query or parsed.fragment or any(c.isspace() for c in value)
+        or (not allow_query and "?" in value) or "#" in value or any(c.isspace() for c in value)
     ):
         raise ValueError("SAML URLs require HTTPS (HTTP is allowed only on loopback).")
     parsed.port  # Validate the port before the server starts.
@@ -42,7 +44,7 @@ class Client:
     def __init__(self, path: str) -> None:
         try:
             from lxml import etree
-            from onelogin.saml2.auth import OneLogin_Saml2_Auth
+            from onelogin.saml2.authn_request import OneLogin_Saml2_Authn_Request
             from onelogin.saml2.errors import OneLogin_Saml2_Error, OneLogin_Saml2_ValidationError
             from onelogin.saml2.response import OneLogin_Saml2_Response
             from onelogin.saml2.settings import OneLogin_Saml2_Settings
@@ -51,7 +53,7 @@ class Client:
         except ImportError:
             raise SAMLError("SAML requires the optional dependency: pip install 'runledger-ai[saml]'.") from None
 
-        self._auth = OneLogin_Saml2_Auth
+        self._authn_request = OneLogin_Saml2_Authn_Request
         self._response = OneLogin_Saml2_Response
         self._settings_class = OneLogin_Saml2_Settings
         self._utils = OneLogin_Saml2_Utils
@@ -82,7 +84,7 @@ class Client:
                         raise ValueError(f"Each configured {field} must be a non-empty string.")
                 if not re.fullmatch(r"[A-Za-z0-9_-]+", p["id"]) or p["id"] in self.providers:
                     raise ValueError("Provider ids must be unique URL-safe identifiers.")
-                _url(p["idp_sso_url"])
+                _url(p["idp_sso_url"], allow_query=True)
                 cert = (source.parent / p["idp_cert"]).read_text(encoding="ascii")
                 xmlsec.Key.from_memory(cert, xmlsec.KeyFormat.CERT_PEM, None)
                 p["cert"] = cert
@@ -144,9 +146,12 @@ class Client:
 
     def start(self, provider: str) -> Tuple[str, str]:
         state, cookie = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
-        auth = self._auth(self._request_data(provider), self._settings[provider])
-        location = auth.login(return_to=state, set_nameid_policy=False)
-        self._stash(state, provider=provider, request_id=auth.get_last_request_id(), cookie=cookie)
+        settings = deepcopy(self._settings[provider])
+        destination = settings.get_idp_sso_url()
+        settings.get_idp_data()["singleSignOnService"]["url"] = escape(destination, {'"': "&quot;"})
+        request = self._authn_request(settings, set_nameid_policy=False)
+        location = self._utils.redirect(destination, {"SAMLRequest": request.get_request(), "RelayState": state})
+        self._stash(state, provider=provider, request_id=request.get_id(), cookie=cookie)
         return location, cookie
 
     def verify(self, provider: str, encoded: str, request_id: str) -> Dict[str, Any]:
