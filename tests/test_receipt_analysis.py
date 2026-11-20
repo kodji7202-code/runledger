@@ -362,4 +362,4 @@ def test_html_tables_reflow_on_narrow_screens():
     narrow = "".join(block.split("}\n}", 1)[0] for block in html.split("@media (max-width:600px){")[1:])
     for table in ("steps", "signals", "assess"):
         assert f".{table} tr{{display:grid" in narrow or f".{table} tr," in narrow
-    assert ".steps .sev{white-space:normal" in narrow
+    assert ".steps .sev{display:inline-block" in narrow
