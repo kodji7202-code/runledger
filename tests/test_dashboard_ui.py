@@ -125,6 +125,24 @@ def test_money_displays_tiny_nonzero_costs_honestly(value, expected):
     assert _js_call(["money"], "money(" + json.dumps(value) + ")") == expected
 
 
+@pytest.mark.parametrize("value, partial, expected", [
+    (0.00003, True, ">$0.00"), (0.000001, True, ">$0.00"),
+    (0.00009999, True, ">$0.00"), (0.0001, True, "≥$0.0001"),
+    (0, True, "≥$0.00"), (0.25, True, "≥$0.250"),
+    (0.00003, False, "<$0.0001"), (None, True, "n/a"), ("invalid", True, "n/a"),
+])
+def test_partial_run_cost_uses_a_single_coherent_bound(value, partial, expected):
+    run = {"cost_usd": value, "cost_partial": partial}
+    expression = "(function(r) { return costNode(r.cost_usd, r.cost_partial); })(" + json.dumps(run) + ")"
+    assert _js_call(["money", "costText", "costNode"], expression) == expected
+
+
+def test_partial_tiny_total_uses_a_single_coherent_bound():
+    totals = {"cost_usd": 0.00003, "cost_is_lower_bound": True}
+    expression = "(function(t) { return costText(t.cost_usd, t.cost_is_lower_bound); })(" + json.dumps(totals) + ")"
+    assert _js_call(["money", "costText"], expression) == ">$0.00"
+
+
 @pytest.mark.parametrize("totals, expected", [
     ({}, ""),
     ({"unpriced_runs": 0, "partial_runs": 0}, ""),
