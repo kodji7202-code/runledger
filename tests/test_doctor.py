@@ -321,7 +321,7 @@ def test_display_width(text, width):
 @pytest.mark.parametrize("text, expected", [
     ("a" + " " * 200_000 + "b", "a\n  b"),
     (" " * 200_000, ""),
-])
+], ids=["spaced-words", "only-spaces"])
 def test_text_wrapping_handles_long_space_runs_quickly(text, expected):
     start = time.perf_counter()
     assert wrap_text(text, 80, subsequent_indent="  ") == expected
