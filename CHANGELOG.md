@@ -9,6 +9,9 @@ change behavior, so read the entry before you upgrade.
 
 ### Fixed
 
+- `runledger rollback` with nothing to restore prints `Nothing to restore (already matches <id>).`
+  and exits 0, as `--path` already did. It no longer asks for confirmation, prints `Restored`, or
+  creates a safety checkpoint of an unchanged tree.
 - Team server request logging handles oversized URLs rejected before parsing, returning HTTP 414
   instead of dropping the connection with an internal error.
 - Team receipt ingest rejects numbers outside the finite float range and JSON strings with

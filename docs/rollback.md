@@ -23,7 +23,9 @@ The first command prints a checkpoint id. The list shows its UTC time, label, an
 would differ from the current working tree. The preview names files to restore or remove and
 ends with the number of files and the bytes it would change. Rollback asks for confirmation
 in a terminal. Without a terminal it refuses unless you pass
-`--yes`. A dry run never asks for confirmation or creates a checkpoint ref.
+`--yes`. A dry run never asks for confirmation or creates a checkpoint ref. When the working
+tree already matches the checkpoint, the command prints `Nothing to restore (already matches
+<id>).` and exits 0 without asking, restoring anything or creating a checkpoint.
 
 Before restoring anything, rollback saves a **safety checkpoint** of the current state. If saving
 it fails, no files are restored or removed. The successful command prints an undo command:
