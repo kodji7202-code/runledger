@@ -189,6 +189,7 @@ Role: any. Lists runs, newest first.
 | `min_quality`, `max_quality` | Only runs whose quality score (0 to 100) is in this range. Runs without a score are excluded. |
 | `ai_verdict` | `looks_safe`, `needs_review` or `dangerous`: only runs the AI review gave this verdict. |
 | `limit` | 1 to 500, default 100. |
+| `after` | The `id` of a run in the list: return the runs that come after it. Pass the last `id` of a page to get the next one. |
 
 Each text filter is limited to 200 characters.
 
@@ -221,20 +222,22 @@ Each text filter is limited to 200 characters.
     "created_at": "2026-10-08T16:37:34Z",
     "updated_at": "2026-10-08T16:37:34Z"
   }
-]}
+], "total": 1}
 ```
 
 The list is ordered by the run's start time, or by its push time when it has none (`sort_at`), newest
-first. `revision` is 1 until the same session is pushed again and replaces it. Runs stored before
-`agent_id` existed report `null`, and a receipt from a client that did not report how it measured
-usage has `usage_source` `null`.
+first. `total` is the number of runs the filters match, the same on every page. `revision` is 1
+until the same session is pushed again and replaces it. Runs stored before `agent_id` existed
+report `null`, and a receipt from a client that did not report how it measured usage has
+`usage_source` `null`.
 
 `cost_usd` is `null` when nothing could be priced: the agent recorded no usage
 (`usage_source: "missing"`), or no model had a known price. It is never `0.0` for an unknown cost; a
 reported zero is stored and shown as `0.0`. `cost_partial` is `true` when some of the run's tokens had
 no price, so the figure is a lower bound. `pushed_by` is the label of the key that pushed the run.
 
-Errors: `400` `bad_request` (for example `limit=0`, or `min_risk=101`); `401`.
+Errors: `400` `bad_request` (for example `limit=0`, `min_risk=101`, or an `after` that is not one of
+the team's runs); `401`.
 
 ### `GET /api/runs/{id}`
 

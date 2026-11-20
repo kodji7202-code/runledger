@@ -377,6 +377,20 @@ def test_budget_card_and_developer_rows_render_unknown_and_partial_spend_honestl
     assert "p = Math.round((100 * spend) / limit);" in js
 
 
+def test_runs_list_pages_past_the_first_200_runs():
+    page = _page(DASHBOARD_HTML)
+    assert "runs-more" in page.ids and "runs-count" in page.ids
+    js = _script(DASHBOARD_HTML)
+    assert "var RUNS_PAGE = 200;" in js
+    assert 'params.set("limit", String(RUNS_PAGE));' in js
+    assert 'if (after) { params.set("after", after); }' in js
+    assert 'runQuery(more ? last.id : null)' in js
+    assert '"Showing " + formatCount(loaded) + " of " + formatCount(runsView.total) + " runs"' in js
+    assert '$("runs-more").addEventListener("click", function () { report(loadRuns(true)); });' in js
+    # A filter change or refresh starts a new load that wins over a page still in flight.
+    assert "if (seq !== runsView.seq) { return; }" in js
+
+
 def test_run_detail_dialog_shows_who_pushed_the_run():
     page = _page(DASHBOARD_HTML)
     ids = {a["id"] for _, a in page.elements if a.get("id")}
