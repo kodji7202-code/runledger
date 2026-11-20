@@ -269,10 +269,13 @@ def _models_block(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if not isinstance(names, dict):
             continue
         quality = row["quality_score"]
+        partial = bool(row.get("cost_partial"))
         for name, info in names.items():
             label = friendly_model(str(name))
-            slot = slots.setdefault(label, {"runs": 0, "priced": 0, "cost": 0.0, "q_sum": 0.0, "q_n": 0})
+            slot = slots.setdefault(label, {"runs": 0, "priced": 0, "partial": 0, "cost": 0.0,
+                                             "q_sum": 0.0, "q_n": 0})
             slot["runs"] += 1
+            slot["partial"] += int(partial)
             cost = _usd(info.get("cost_usd")) if isinstance(info, dict) else None
             if cost is not None:
                 slot["priced"] += 1
@@ -289,6 +292,10 @@ def _models_block(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
             # No priced run: the model's cost is unknown (n/a), not zero.
             "cost_usd": round(slot["cost"], 6) if slot["priced"] else None,
             "priced_runs": slot["priced"],
+            # A run left unpriced or only partly priced leaves the model's figure a lower bound,
+            # as it does for the agent rows and the /api/stats by_model rows.
+            "partial_runs": slot["partial"],
+            "cost_is_lower_bound": bool(slot["priced"] < slot["runs"] or slot["partial"]),
             "avg_quality": round(slot["q_sum"] / slot["q_n"], 1) if slot["q_n"] else None,
             "cost_per_run": round(slot["cost"] / slot["priced"], 6) if slot["priced"] else None,
             "share_of_cost": round(slot["cost"] / total, 4) if total > 0 else None,

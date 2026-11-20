@@ -548,7 +548,8 @@ Role: any. Quality, model, agent and AI-review aggregates over the last `days`
     "by_grade": {"A": 2, "B": 5, "C": 3, "D": 1, "F": 1},
     "trend": [{"date": "2026-10-07", "avg": 68.0}, {"date": "2026-10-08", "avg": 74.0}]
   },
-  "models": [{"model": "claude-sonnet-5-5", "runs": 9, "cost_usd": 1.42,
+  "models": [{"model": "claude-sonnet-5-5", "runs": 9, "cost_usd": 1.42, "priced_runs": 9,
+              "partial_runs": 1, "cost_is_lower_bound": true,
               "avg_quality": 73.1, "cost_per_run": 0.158, "share_of_cost": 0.81}],
   "agents": [{"agent": "Claude Code", "runs": 10, "avg_quality": 72.0,
               "avg_risk": 31.5, "cost_usd": 1.61, "priced_runs": 9, "partial_runs": 1,
@@ -563,8 +564,8 @@ Role: any. Quality, model, agent and AI-review aggregates over the last `days`
 
 `share_of_cost` and `false_positive_rate` are ratios from 0 to 1. `cost_per_run`
 divides by priced runs only. A run's quality counts toward every model it used.
-An agent whose runs were never priced has a `cost_usd` of `null` with `priced_runs` 0, and
-`cost_is_lower_bound` is `true` when the agent's figure leaves a run out: it has an unpriced run
+An agent or model whose runs were never priced has a `cost_usd` of `null` with `priced_runs` 0, and
+`cost_is_lower_bound` is `true` when its figure leaves a run out: it has an unpriced run
 (`priced_runs` below `runs`) or a partly priced one (`partial_runs`).
 `top_recommendations` is ranked by total estimated savings, then count, at most 10.
 
@@ -658,13 +659,15 @@ and no body, and nothing is built or audited.
 **`runs.csv`** has this header row, and one row per run:
 
 ```
-id,started_at,user,project,agent,models,steps,tokens,files_changed,cost_usd,risk_score,risk_level,title,quality_score,quality_grade,ai_verdict,est_savings_usd
-7f3c2a10-9b1e-4c55-a1d2-0e6f8b3c9d42,2026-10-08T10:00:17Z,Ana,payments-service,Claude Code,claude-haiku-4-5-20251001; claude-sonnet-4-5-20250929,10,116416,3,0.108408,80,high,The payment retry logic gives up after the first failure. Add exponential backoff (3 attempts) and make the tests pass.,62,C,needs_review,0.031
+id,started_at,user,project,agent,models,steps,tokens,files_changed,cost_usd,risk_score,risk_level,title,quality_score,quality_grade,ai_verdict,est_savings_usd,cost_partial
+7f3c2a10-9b1e-4c55-a1d2-0e6f8b3c9d42,2026-10-08T10:00:17Z,Ana,payments-service,Claude Code,claude-haiku-4-5-20251001; claude-sonnet-4-5-20250929,10,116416,3,0.108408,80,high,The payment retry logic gives up after the first failure. Add exponential backoff (3 attempts) and make the tests pass.,62,C,needs_review,0.031,false
 ```
 
 `models` lists the model names joined with `; `. The receipt JSON and the HTML receipt are never included.
 A run whose cost is unknown has an empty `cost_usd` cell, never `0`; `quality_score` and
-`est_savings_usd` are empty in the same way when they are unknown.
+`est_savings_usd` are empty in the same way when they are unknown. `cost_partial` is `true` when
+`cost_usd` is a lower bound (some of the run's tokens had no price), `false` when it is complete, and
+empty when the cost is unknown.
 
 **`audit.csv`** has the header `id,at,actor,action,target,details_json`. `details_json` is the event's
 details as JSON text.
