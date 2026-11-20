@@ -726,8 +726,11 @@ def test_listing_counts_differing_files_that_must_remain_ignored(repo, monkeypat
     assert "keep ignored '.secret'" in output
 
 
-def test_checkpoint_listing_wraps_long_labels_between_words(repo, capsys):
-    label = "Before refactoring the authentication middleware and adding integration test coverage"
+@pytest.mark.parametrize("label", [
+    "Before refactoring the authentication middleware and adding integration test coverage",
+    " ".join(["界" * 12] * 6),
+], ids=["ascii", "wide"])
+def test_checkpoint_listing_wraps_long_labels_between_words(repo, capsys, label):
     checkpoint = repo.create(label)
 
     assert main(["checkpoints", "--cwd", str(repo.root)]) == 0
@@ -737,7 +740,7 @@ def test_checkpoint_listing_wraps_long_labels_between_words(repo, capsys):
     assert len(label_lines) > 1
     assert label_lines[0].startswith("  '")
     assert all(len(line) - len(line.lstrip()) == 3 for line in label_lines[1:])
-    assert all(len(line) <= 80 for line in [header, timestamp, *label_lines])
+    assert all(len(line) + line.count("界") <= 80 for line in [header, timestamp, *label_lines])
     assert " ".join(line.strip() for line in label_lines) == repr(label)
 
 
