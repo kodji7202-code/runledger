@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from runledger import doctor, guard, hook_targets, pricing, rollback
+from runledger._text import display_width, wrap_text
 from runledger.cli import main as cli_main
 
 AGENTS = ("claude-code", "droid", "codex")
@@ -314,7 +315,7 @@ def test_text_output_wraps_wide_characters(monkeypatch):
 
 @pytest.mark.parametrize("text, width", [("日本語", 6), ("😀", 2), ("cafe\u0301", 4), ("Ａ", 2)])
 def test_display_width(text, width):
-    assert doctor._display_width(text) == width
+    assert display_width(text) == width
 
 
 @pytest.mark.parametrize("text, expected", [
@@ -323,7 +324,7 @@ def test_display_width(text, width):
 ])
 def test_text_wrapping_handles_long_space_runs_quickly(text, expected):
     start = time.perf_counter()
-    assert doctor._wrap_doctor_text(text, 80) == expected
+    assert wrap_text(text, 80, subsequent_indent="  ") == expected
     assert time.perf_counter() - start < 1
 
 
