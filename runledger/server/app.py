@@ -15,7 +15,11 @@
   PUT  /api/team/settings                     change them (admin)
   GET  /api/me                                the caller's team, role and key (any role)
   GET  /api/keys                              the team's keys, never their secrets (admin)
-  POST /api/keys                              {label, role} -> 201; the key is shown once (admin)
+  POST /api/keys                              {label, role, kind?, expires_in_days?, user?} -> 201 (admin)
+  GET  /api/members                           team members (admin)
+  POST /api/members                           {email, name?, role} -> 201 (admin)
+  PATCH /api/members/<user_id>                 {role} (admin)
+  DELETE /api/members/<user_id>                remove member and revoke their team keys (admin)
   POST /api/keys/<id>/revoke                  revoke a key (admin)
   POST /api/keys/<id>/rotate                  new secret for a key, same id, label and role (admin)
   GET  /api/audit[?limit&before&action]       audit log, newest first; action= keeps a prefix, e.g. key. (admin)
@@ -28,6 +32,16 @@
   GET  /                                      dashboard; sign in with the form, which posts the key
   POST /session                               sign in: form field "key" -> session cookie (302);
                                               from another origin (Origin/Sec-Fetch-Site) -> 403
+  GET  /auth/oidc/<provider>/start             start Authorization Code + PKCE sign-in
+  GET  /auth/oidc/<provider>/callback          validate identity, choose team or issue cookie
+  POST /auth/oidc/team                        single-use, cookie-bound team choice
+  GET/POST/DELETE /api/scim/token              administer the team's dedicated SCIM token
+  /scim/v2/{Users,Groups}                     SCIM provisioning (dedicated bearer token only)
+  /scim/v2/{ServiceProviderConfig,ResourceTypes,Schemas}  SCIM discovery
+  GET  /auth/saml/<provider>/metadata         SP metadata
+  GET  /auth/saml/<provider>/start            start SP-initiated sign-in
+  POST /auth/saml/<provider>/acs              validate SAML response and sign in
+  POST /auth/saml/team                        single-use, cookie-bound team choice
   POST /session/logout                        sign out of the current dashboard session (204)
   GET  /sessions                              list active sessions (own key, or whole team for admin)
   DELETE /sessions/<id>                       revoke one session in the same scope (204)
@@ -49,7 +63,7 @@ from any other peer is ignored. With --trust-proxy, X-Forwarded-Proto is honoure
 trusted peers, or from anyone when no trusted proxy is configured (the earlier behaviour).
 
 Errors are JSON ({"error": {"code", "message"}}) and never include tracebacks;
-tracebacks go to the server's stderr. Standard library only.
+tracebacks go to the server's stderr.
 """
 from __future__ import annotations
 
@@ -72,7 +86,7 @@ from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from .. import __version__
 from ..parser import _ts as _parse_ts
-from . import approvals, budgets, exports, insights, maintenance
+from . import approvals, budgets, exports, insights, maintenance, oidc, saml
 from .auth import (
     SESSION_TTL_SECONDS,
     FailureLimiter,
@@ -80,6 +94,7 @@ from .auth import (
     InvalidKey,
     allows,
     identity_from_row,
+    validate_role,
 )
 from .dashboard import APPROVAL_HTML, DASHBOARD_HTML
 from .db import TIME_FORMAT, Database, normalize_missing_costs
@@ -87,6 +102,8 @@ from .insights import MAX_COST_USD
 
 MAX_BODY_BYTES = 10 * 1024 * 1024
 SIGN_IN_BODY_LIMIT = 4096
+SAML_BODY_LIMIT = 256 * 1024
+SAML_FLOW_COOKIE = "__Host-rl_saml"
 COOKIE_NAME = "rl_session"
 LEVELS = ("low", "medium", "high")
 SEVERITIES = ("low", "medium", "high")
@@ -119,18 +136,25 @@ RECEIPT_CSP = (
     "base-uri 'none'; form-action 'none'; frame-ancestors 'none'; sandbox"
 )
 SIGN_IN_CSP = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'"
-SIGN_IN_HTML = """<!doctype html>
+SIGN_IN_HEAD = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>RunLedger sign in</title>
 <style>body{font:15px/1.5 system-ui,sans-serif;margin:0;padding:48px 16px;background:#0a0b0d;color:#eef0f2}
 @media (prefers-color-scheme: light){body{background:#f7f8f9;color:#121417}}
 main{max-width:560px;margin:0 auto}code{font-family:ui-monospace,monospace;background:rgba(127,127,127,.18);padding:2px 6px;border-radius:6px}
 form{display:flex;gap:8px;margin:18px 0}input{flex:1;padding:9px 11px;border:1px solid rgba(127,127,127,.4);border-radius:8px;background:transparent;color:inherit;font:inherit}
-button{padding:9px 16px;border:0;border-radius:8px;background:#3b82f6;color:#fff;font:inherit;font-weight:600;cursor:pointer}
+button,.sso{display:inline-block;padding:9px 16px;border:0;border-radius:8px;background:#3b82f6;color:#fff;font:inherit;font-weight:600;cursor:pointer;text-decoration:none}
 .error{color:#e5484d;font-weight:600}</style>
 </head><body><main>
+"""
+SIGN_IN_HTML = SIGN_IN_HEAD + """
 <h1 style="font-size:20px">RunLedger team dashboard</h1>
 __ERROR__
+__SSO_BUTTONS__
+__KEY_FORM__
+</main></body></html>
+"""
+SIGN_IN_KEY_FORM = """
 <p>Sign in with a team API key. The server then sets a session cookie, and the key is never put in the address bar.</p>
 <form method="post" action="/session">
 <label for="key" style="position:absolute;left:-9999px">API key</label>
@@ -138,6 +162,12 @@ __ERROR__
 <button type="submit">Sign in</button>
 </form>
 <p>Create a team and its key with <code>runledger team create NAME</code>. Make more keys with <code>runledger key create</code>.</p>
+"""
+SSO_TEAM_HTML = SIGN_IN_HEAD + """
+<h1 style="font-size:20px">Choose a team</h1>
+<form method="post" action="/auth/__METHOD__/team">
+<input type="hidden" name="state" value="__STATE__">__TEAMS__
+</form>
 </main></body></html>
 """
 SWITCH_TEAM_HTML = """<!doctype html>
@@ -215,9 +245,13 @@ class RunLedgerServer(ThreadingHTTPServer):
         trusted_proxies: Sequence[_IPNetwork] = (),
         retention_days: Optional[int] = None,
         audit_retention_days: Optional[int] = None,
+        oidc_client: Optional[oidc.Client] = None,
+        saml_client: Optional[saml.Client] = None,
         session_idle_timeout: int = 0,
     ) -> None:
         self.db = db
+        self.oidc = oidc_client
+        self.saml = saml_client
         self.log_requests = log_requests
         self.tls_context = tls_context
         self.secure_cookies = secure_cookies
@@ -240,6 +274,18 @@ class RunLedgerServer(ThreadingHTTPServer):
         scheme = "https" if tls_context is not None else "http"
         chosen = public_url or os.environ.get(PUBLIC_URL_ENV) or f"{scheme}://{shown}:{port}"
         self.public_url = chosen.strip().rstrip("/")
+        try:
+            if self.oidc:
+                oidc.validate_public_url(self.public_url)
+            if self.saml:
+                self.saml.bind(self.public_url)
+        except ValueError:
+            self.server_close()
+            raise
+
+    @property
+    def dashboard_key_sign_in_disabled(self) -> bool:
+        return any(client.disable_key_sign_in for client in (self.oidc, self.saml) if client is not None)
 
     def get_request(self) -> Tuple[socket.socket, Any]:
         # The handshake runs in the request's own thread (see _Handler.setup), so a slow
@@ -393,6 +439,8 @@ def make_server(
     trusted_proxies: Optional[Sequence[str]] = None,
     retention_days: Optional[int] = None,
     audit_retention_days: Optional[int] = None,
+    oidc_config: Optional[str] = None,
+    saml_config: Optional[str] = None,
     session_idle_timeout: Optional[int] = None,
 ) -> RunLedgerServer:
     """Open the database and bind the server. Port 0 picks a free port (see server_address).
@@ -427,6 +475,12 @@ def make_server(
         raise ValueError(idle_error)
     tls_context = make_tls_context(tls_cert, tls_key) if tls_cert else None
     secure = bool(secure_cookies) or _env_flag(SECURE_COOKIES_ENV)
+    config_path = oidc_config or os.environ.get("RUNLEDGER_OIDC_CONFIG")
+    oidc_client = oidc.Client(config_path) if config_path else None
+    if oidc_client and oidc_client.public_url:
+        public_url = oidc_client.public_url
+    saml_path = saml_config or os.environ.get("RUNLEDGER_SAML_CONFIG")
+    saml_client = saml.Client(saml_path) if saml_path else None
     db = Database(db_path)
     cls = _IPv6Server if ":" in host else RunLedgerServer
     try:
@@ -434,7 +488,10 @@ def make_server(
             (host, port), db, log_requests=log_requests, public_url=public_url,
             tls_context=tls_context, secure_cookies=secure, trust_proxy=bool(trust_proxy),
             trusted_proxies=networks, retention_days=retention_days,
-            audit_retention_days=audit_retention_days, session_idle_timeout=session_idle_timeout,
+            audit_retention_days=audit_retention_days,
+            oidc_client=oidc_client,
+            saml_client=saml_client,
+            session_idle_timeout=session_idle_timeout,
         )
     except Exception:
         db.close()
@@ -503,15 +560,31 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_json(200, {"ok": True, "version": __version__})
                 return
             self._check_rate_limit()
+            if path == "/scim/v2" or path.startswith("/scim/v2/") or path == "/api/scim/token":
+                from .scim import dispatch
+                dispatch(self, method, path, query)
+                return
             self._dispatch(method, path, query)
         except _HttpError as exc:
-            self._send_json(exc.status, {"error": {"code": exc.code, "message": exc.message}}, exc.headers)
+            if urlsplit(self.path).path.startswith("/scim/v2"):
+                from .scim import Error, error
+                error(self, Error(exc.status, exc.message), exc.headers)
+            else:
+                self._send_json(exc.status, {"error": {"code": exc.code, "message": exc.message}}, exc.headers)
         except Exception:  # never leak internals to the client
             traceback.print_exc()
-            self._send_json(500, {"error": {"code": "internal_error", "message": "Internal server error."}})
+            if urlsplit(self.path).path.startswith("/scim/v2"):
+                from .scim import Error, error
+                error(self, Error(500, "Internal server error."))
+            else:
+                self._send_json(500, {"error": {"code": "internal_error", "message": "Internal server error."}})
 
     def _dispatch(self, method: str, path: str, query: Dict[str, List[str]]) -> None:
-        if path == "/":
+        if path.startswith("/auth/oidc/"):
+            self._oidc_route(method, path, query)
+        elif path.startswith("/auth/saml/"):
+            self._saml_route(method, path)
+        elif path == "/":
             self._only(method, ("GET",))
             self._dashboard(query)
         elif path == "/session":
@@ -573,6 +646,12 @@ class _Handler(BaseHTTPRequestHandler):
                 self._create_key()
             else:
                 self._list_keys()
+        elif path == "/api/members":
+            self._only(method, ("GET", "POST"))
+            self._members(method)
+        elif path.startswith("/api/members/"):
+            self._only(method, ("PATCH", "DELETE"))
+            self._members(method, _key_id(path[len("/api/members/"):]))
         elif path.startswith("/api/keys/"):
             rest = path[len("/api/keys/"):]
             if rest.endswith("/revoke"):
@@ -641,7 +720,190 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _sign_in_page(self, error: Optional[str] = None) -> None:
         message = f'<p class="error" role="alert">{_escape(error)}</p>' if error else ""
-        self._send_html(401, SIGN_IN_HTML.replace("__ERROR__", message), {"Content-Security-Policy": SIGN_IN_CSP})
+        buttons = []
+        key_form = "" if self.server.dashboard_key_sign_in_disabled else SIGN_IN_KEY_FORM
+        if self.server.oidc:
+            for provider in self.server.oidc.providers.values():
+                buttons.append(
+                    f'<p><a class="sso" href="/auth/oidc/{provider["id"]}/start">'
+                    f'Sign in with {_escape(provider["name"])}</a></p>'
+                )
+        if self.server.saml:
+            for provider in self.server.saml.providers.values():
+                buttons.append(
+                    f'<p><a class="sso" href="/auth/saml/{provider["id"]}/start">'
+                    f'Sign in with {_escape(provider["name"])}</a></p>'
+                )
+        page = (
+            SIGN_IN_HTML.replace("__ERROR__", message)
+            .replace("__SSO_BUTTONS__", "".join(buttons))
+            .replace("__KEY_FORM__", key_form)
+        )
+        self._send_html(401, page, {"Content-Security-Policy": SIGN_IN_CSP})
+
+    def _oidc_route(self, method: str, path: str, query: Dict[str, List[str]]) -> None:
+        """Handle provider callbacks and cookie-bound, single-use team choices."""
+        client = self.server.oidc
+        if client is None:
+            raise _not_found()
+        self._check_rate_limit()
+        provider = None
+        user_id = None
+        try:
+            if path == "/auth/oidc/team":
+                self._only(method, ("POST",))
+                self._refuse_cross_origin_sign_in()
+                length = self._content_length(SIGN_IN_BODY_LIMIT, "Team choice")
+                fields = parse_qs(self.rfile.read(length).decode("utf-8", "replace"))
+                pending = client.consume((fields.get("state") or [""])[0], self._cookie("rl_oidc"))
+                if "user_id" not in pending:
+                    raise oidc.OIDCError("Invalid team choice.")
+                user_id = pending["user_id"]
+                provider = pending["provider"]
+                team_id = int((fields.get("team") or [""])[0])
+                if team_id not in [t["id"] for t in self.server.db.user_teams(pending["user_id"])]:
+                    raise oidc.OIDCError("Team membership is no longer available.")
+                self._sso_sign_in("oidc", user_id, team_id, provider)
+                return
+            parts = path.split("/")
+            if (
+                len(parts) != 5
+                or parts[3] not in client.providers
+                or parts[4] not in ("start", "callback")
+            ):
+                raise _not_found()
+            self._only(method, ("GET",))
+            provider, action = parts[3:]
+            if action == "start":
+                redirect_uri = self.server.public_url + "/auth/oidc/" + provider + "/callback"
+                location, cookie = client.start(provider, redirect_uri)
+                value = f"rl_oidc={cookie}; Path=/auth/oidc/; HttpOnly; SameSite=Lax; Max-Age=600"
+                if self._secure():
+                    value += "; Secure"
+                self._send(302, b"", "text/plain", {"Location": location, "Set-Cookie": value})
+                return
+            pending = client.consume((query.get("state") or [""])[0], self._cookie("rl_oidc"))
+            if pending["provider"] != provider or "user_id" in pending:
+                raise oidc.OIDCError("Invalid sign-in state.")
+            code = (query.get("code") or [""])[0]
+            if not code or query.get("error"):
+                raise oidc.OIDCError("Identity provider denied sign-in.")
+            claims = client.exchange(pending, code)
+            resolved = self.server.db.get_user(claims["email"])
+            user_id = resolved["id"] if resolved else None
+            person = self.server.db.oidc_user(**claims)
+            self._sso_continue("oidc", client, person["id"], provider, pending["cookie"])
+        except (oidc.OIDCError, ValueError) as exc:
+            self.server.limiter.record_failure(self._client_ip())
+            self.server.db.audit_sso_rejection("oidc", user_id, provider, self._client_ip())
+            self._sign_in_page(
+                str(exc)
+                if isinstance(exc, oidc.OIDCError)
+                or str(exc).startswith(("No RunLedger account", "This email", "This identity"))
+                else "Invalid sign-in response."
+            )
+
+    def _saml_route(self, method: str, path: str) -> None:
+        client = self.server.saml
+        if client is None:
+            raise _not_found()
+        provider = None
+        user_id = None
+        try:
+            if path == "/auth/saml/team":
+                self._only(method, ("POST",))
+                self._refuse_cross_origin_sign_in()
+                length = self._content_length(SIGN_IN_BODY_LIMIT, "Team choice")
+                fields = parse_qs(self.rfile.read(length).decode("utf-8"))
+                pending = client.consume((fields.get("state") or [""])[0], self._cookie(SAML_FLOW_COOKIE))
+                if "user_id" not in pending:
+                    raise saml.SAMLError("Invalid team choice.")
+                user_id = pending["user_id"]
+                provider = pending["provider"]
+                team_id = int((fields.get("team") or [""])[0])
+                self._sso_sign_in("saml", user_id, team_id, provider)
+                return
+            parts = path.split("/")
+            if len(parts) != 5 or parts[3] not in client.providers:
+                raise _not_found()
+            provider, action = parts[3:]
+            if action == "metadata":
+                self._only(method, ("GET",))
+                self._send(200, client.metadata(provider), "application/samlmetadata+xml")
+                return
+            if action == "start":
+                self._only(method, ("GET",))
+                location, cookie = client.start(provider)
+                value = f"{SAML_FLOW_COOKIE}={cookie}; Path=/; HttpOnly; SameSite=None; Secure; Max-Age=600"
+                self._send(302, b"", "text/plain", {"Location": location, "Set-Cookie": value})
+                return
+            if action != "acs":
+                raise _not_found()
+            self._only(method, ("POST",))
+            if self.headers.get_content_type() != "application/x-www-form-urlencoded":
+                raise _HttpError(415, "unsupported_media_type", "SAML responses must be form encoded.")
+            length = self._content_length(SAML_BODY_LIMIT, "SAML responses")
+            fields = parse_qs(self.rfile.read(length).decode("ascii"), max_num_fields=8)
+            state, response = fields.get("RelayState", []), fields.get("SAMLResponse", [])
+            if len(state) != 1 or len(response) != 1:
+                raise saml.SAMLError("Invalid SAML response. Please try again.")
+            pending = client.consume(state[0], self._cookie(SAML_FLOW_COOKIE))
+            if pending["provider"] != provider or "request_id" not in pending:
+                raise saml.SAMLError("Invalid sign-in state.")
+            claims = client.verify(provider, response[0], pending["request_id"])
+            resolved = self.server.db.get_user(claims["email"])
+            user_id = resolved["id"] if resolved else None
+            person = self.server.db.saml_user(**claims)
+            self._sso_continue("saml", client, person["id"], provider, pending["cookie"])
+        except ValueError as exc:
+            self.server.limiter.record_failure(self._client_ip())
+            self.server.db.audit_sso_rejection("saml", user_id, provider, self._client_ip())
+            self._sign_in_page(
+                str(exc) if isinstance(exc, saml.SAMLError)
+                or str(exc).startswith(("No RunLedger account", "This email", "This identity"))
+                else "Invalid sign-in response."
+            )
+
+    def _sso_continue(
+        self, method: str, client: Union[oidc.Client, saml.Client], user_id: str, provider: str, cookie: str
+    ) -> None:
+        teams = self.server.db.user_teams(user_id)
+        if len(teams) == 1:
+            self._sso_sign_in(method, user_id, teams[0]["id"], provider)
+            return
+        state = client.stash(dict(user_id=user_id, provider=provider, cookie=cookie))
+        buttons = "".join(
+            f'<button name="team" value="{t["id"]}">{_escape(t["name"])}</button>' for t in teams
+        )
+        page = SSO_TEAM_HTML.replace("__METHOD__", method).replace("__STATE__", state).replace("__TEAMS__", buttons)
+        self._send_html(200, page, {"Content-Security-Policy": SIGN_IN_CSP})
+
+    def _sso_sign_in(self, method: str, user_id: str, team_id: int, provider: str) -> None:
+        """Issue the Strict session cookie on a same-site continuation document."""
+        token = self.server.db.issue_sso_session(method, team_id, user_id, provider,
+                                                 idle_timeout=self.server.session_idle_timeout)
+        identity = self.server.identify_session(token)
+        if identity is None:
+            error = saml.SAMLError if method == "saml" else oidc.OIDCError
+            raise error("Team membership is no longer available.")
+        self.server.db.record_audit(
+            team_id,
+            identity,
+            "auth.sign_in",
+            user_id,
+            {"method": method, "provider": provider, "ip": self._client_ip()},
+        )
+        cookie = (
+            f"{COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_TTL_SECONDS}"
+        )
+        if self._secure() or (method == "saml" and self.server.saml.public_url.startswith("https://")):
+            cookie += "; Secure"
+        self._send_html(
+            200,
+            '<!doctype html><meta http-equiv="refresh" content="0;url=/">'
+            '<title>Signed in</title><p>Signed in. <a href="/">Continue to dashboard</a></p>',
+            {"Set-Cookie": cookie, "Content-Security-Policy": SIGN_IN_CSP},
+        )
 
     # Auth
 
@@ -763,13 +1025,24 @@ class _Handler(BaseHTTPRequestHandler):
         me: Dict[str, Any] = {
             "team": {"id": ident.team_id, "name": ident.team_name},
             "role": ident.role,
-            "key": {"id": ident.key_id, "label": ident.label, "prefix": ident.prefix,
-                    "kind": ident.kind, "expires_at": ident.expires_at, "expires_soon": ident.expires_soon},
+            "key": {
+                "id": ident.key_id,
+                "label": ident.label,
+                "prefix": ident.prefix,
+                "kind": ident.kind,
+                "expires_at": ident.expires_at,
+                "expires_soon": ident.expires_soon,
+            } if ident.key_id else None,
+            "user": {"id": ident.user_id, "email": ident.email, "name": ident.name} if ident.user_id else None,
         }
+        if self.server.oidc or self.server.saml or ident.sign_in_method != "key":
+            me["sign_in_method"] = ident.sign_in_method
         self._send_json(200, me)
 
     def _create_run(self) -> None:
         ident = self._authed("member", "push runs", write=True)
+        if ident.key_id is None:
+            raise _HttpError(403, "api_key_required", "Use an API key to push runs.")
         length = self._content_length()
         raw = self.rfile.read(length) if length else b""
         if not raw:
@@ -790,7 +1063,7 @@ class _Handler(BaseHTTPRequestHandler):
         result = self.server.db.upsert_run(
             ident.team_id,
             run,
-            actor=ident.actor(),
+            actor=ident,
             key_id=ident.key_id,
             role=ident.role,
         )
@@ -875,6 +1148,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _dashboard(self, query: Dict[str, List[str]]) -> None:
         key = (query.get("key") or [""])[0].strip()
+        if key and self.server.dashboard_key_sign_in_disabled:
+            self._sign_in_page("Key sign-in is disabled; use your identity provider.")
+            return
         if key:
             # Legacy sign-in: trade the key for an opaque cookie and redirect so the key leaves
             # the URL. A session of another team is never replaced without a confirming click,
@@ -944,6 +1220,10 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _session_post(self) -> None:
         """The sign-in form: the key travels in the body, never in the URL."""
+        if self.server.dashboard_key_sign_in_disabled:
+            self._sign_in_page("Key sign-in is disabled; use your identity provider.")
+            self.close_connection = True
+            return
         self._refuse_cross_origin_sign_in()
         length = self._content_length(SIGN_IN_BODY_LIMIT, "Sign-in forms")
         raw = self.rfile.read(length) if length else b""
@@ -975,7 +1255,7 @@ class _Handler(BaseHTTPRequestHandler):
             row["team_id"], row["id"], row["role"], idle_timeout=self.server.session_idle_timeout,
         )
         session = identity_from_row(row, "session")
-        self.server.db.record_audit(row["team_id"], session.actor(), "auth.sign_in", row["id"],
+        self.server.db.record_audit(row["team_id"], session, "auth.sign_in", row["id"],
                                     {"role": row["role"], "ip": self._client_ip()})
         cookie = self._session_cookie(token, SESSION_TTL_SECONDS)
         self._send(302, b"", "text/plain; charset=utf-8", {"Location": "/", "Set-Cookie": cookie})
@@ -992,7 +1272,7 @@ class _Handler(BaseHTTPRequestHandler):
             raise _HttpError(401, "unauthorized", "Sign in to the dashboard to sign out.")
         self._require(ident, "viewer", "sign out", write=True)
         self.server.db.revoke_session(
-            ident.team_id, ident.key_id, ident.session_id, ident.actor(),
+            ident.team_id, ident.key_id, ident.session_id, ident,
             "auth.sign_out", self.server.session_idle_timeout,
         )
         self._session_ended(clear_cookie=True)
@@ -1000,7 +1280,8 @@ class _Handler(BaseHTTPRequestHandler):
     def _list_sessions(self) -> None:
         ident = self._identify()
         key_id = None if ident.role == "admin" else ident.key_id
-        sessions = self.server.db.list_sessions(ident.team_id, key_id, self.server.session_idle_timeout)
+        user_id = ident.user_id if ident.role != "admin" and ident.key_id is None else None
+        sessions = self.server.db.list_sessions(ident.team_id, key_id, self.server.session_idle_timeout, user_id=user_id)
         for session in sessions:
             session["current"] = session["id"] == ident.session_id
         self._send_json(200, {"sessions": sessions})
@@ -1012,8 +1293,10 @@ class _Handler(BaseHTTPRequestHandler):
         if not re.fullmatch(r"[0-9a-f]{32}", session_id):
             raise _not_found("Session not found.")
         key_id = None if ident.role == "admin" else ident.key_id
+        user_id = ident.user_id if ident.role != "admin" and ident.key_id is None else None
         if not self.server.db.revoke_session(
-            ident.team_id, key_id, session_id, ident.actor(), "auth.session_revoked", self.server.session_idle_timeout,
+            ident.team_id, key_id, session_id, ident, "auth.session_revoked", self.server.session_idle_timeout,
+            user_id=user_id,
         ):
             raise _not_found("Session not found.")
         self._session_ended(clear_cookie=(session_id == ident.session_id))
@@ -1036,6 +1319,8 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _create_approval(self) -> None:
         ident = self._authed("member", "request approvals", write=True)
+        if ident.key_id is None:
+            raise _HttpError(403, "api_key_required", "Use an API key to request approvals.")
         length = self._content_length(approvals.CREATE_BODY_LIMIT, "Approval requests")
         raw = self.rfile.read(length) if length else b""
         try:
@@ -1091,7 +1376,7 @@ class _Handler(BaseHTTPRequestHandler):
         outcome, view = db.decide_approval(
             ident.team_id, approval_id, status, decided_by, reason, db.approval_ttl_s(ident.team_id),
             approver_key_id=ident.key_id,
-            actor=ident.actor(),
+            actor=ident,
         )
         if outcome == "missing":
             raise _not_found("Approval not found.")
@@ -1123,7 +1408,7 @@ class _Handler(BaseHTTPRequestHandler):
                 changes = approvals.validate_settings(_json_object(raw))
             except approvals.InvalidInput as exc:
                 raise _HttpError(400, "invalid_settings", str(exc)) from None
-            db.update_approval_settings(ident.team_id, changes, actor=ident.actor())
+            db.update_approval_settings(ident.team_id, changes, actor=ident)
         else:
             ident = self._identify()
         settings = db.approval_settings(ident.team_id)
@@ -1150,6 +1435,29 @@ class _Handler(BaseHTTPRequestHandler):
 
     # Keys and audit (admin only)
 
+    def _members(self, method: str, user_id: Optional[str] = None) -> None:
+        ident = self._authed("admin", "manage members", write=method != "GET")
+        db = self.server.db
+        if method == "GET":
+            self._send_json(200, {"members": db.list_members(ident.team_id)})
+            return
+        body = {}
+        if method != "DELETE":
+            length = self._content_length(approvals.SMALL_BODY_LIMIT, "Member requests")
+            body = _json_object(self.rfile.read(length) if length else b"")
+        try:
+            if method == "POST":
+                member = db.add_member(ident.team_id, body.get("email"), body.get("role"),
+                                       body.get("name"), actor=ident)
+                self._send_json(201, member)
+                return
+            if method == "PATCH":
+                validate_role(body.get("role"))
+            db.change_member(ident.team_id, user_id, body.get("role") if method == "PATCH" else None, actor=ident)
+        except InvalidKey as exc:
+            raise _HttpError(400, "invalid_member", str(exc)) from None
+        self._send_json(200, {"ok": True})
+
     def _list_keys(self) -> None:
         ident = self._identify()
         self._require(ident, "admin", "list the team's keys")
@@ -1161,8 +1469,9 @@ class _Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length) if length else b""
         body = _json_object(raw)
         try:
-            view = self.server.db.create_key(ident.team_id, body.get("label"), body.get("role"), ident.actor(),
-                                             kind=body.get("kind"), expires_in_days=body.get("expires_in_days"))
+            view = self.server.db.create_key(ident.team_id, body.get("label"), body.get("role"), ident,
+                                             kind=body.get("kind"), expires_in_days=body.get("expires_in_days"),
+                                             user=body.get("user"))
         except InvalidKey as exc:
             raise _HttpError(400, "invalid_key", str(exc)) from None
         self._send_json(201, view)
@@ -1171,7 +1480,7 @@ class _Handler(BaseHTTPRequestHandler):
         key_id = _key_id(raw_id)
         ident = self._identify()
         self._require(ident, "admin", "revoke keys", write=True)
-        outcome, view = self.server.db.revoke_key(ident.team_id, key_id, ident.actor())
+        outcome, view = self.server.db.revoke_key(ident.team_id, key_id, ident)
         if outcome == "missing":
             raise _HttpError(404, "not_found", "Key not found.")
         if outcome == "already_revoked":
@@ -1192,7 +1501,7 @@ class _Handler(BaseHTTPRequestHandler):
             length = self._content_length(approvals.SMALL_BODY_LIMIT, "Key requests")
             body = _json_object(self.rfile.read(length) if length else b"")
         try:
-            outcome, view = self.server.db.rotate_key(ident.team_id, key_id, ident.actor(),
+            outcome, view = self.server.db.rotate_key(ident.team_id, key_id, ident,
                                                       expires_in_days=body.get("expires_in_days"))
         except InvalidKey as exc:
             raise _HttpError(400, "invalid_key", str(exc)) from None
@@ -1238,7 +1547,7 @@ class _Handler(BaseHTTPRequestHandler):
                 raise _HttpError(400, "invalid_budget", exc.message) from None
             except budgets.InvalidBudget as exc:
                 raise _HttpError(400, "invalid_budget", str(exc)) from None
-            settings = db.update_budget_settings(ident.team_id, values, ident.actor())
+            settings = db.update_budget_settings(ident.team_id, values, ident)
         else:
             ident = self._identify()
             settings = db.budget_settings(ident.team_id)
@@ -1260,7 +1569,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._start(200, content_type, headers, length=None)
             return
         body, rows = exports.build(kind, self.server.db, ident.team_id, ident.team_name, days, now)
-        self.server.db.record_audit(ident.team_id, ident.actor(), f"export.{kind}", None,
+        self.server.db.record_audit(ident.team_id, ident, f"export.{kind}", None,
                                     {"days": days, "rows": rows})
         self._send(200, body, content_type, headers)
 
@@ -1270,6 +1579,8 @@ class _Handler(BaseHTTPRequestHandler):
 
 def _attested_identity(ident: Identity) -> str:
     """Stable human-readable attribution derived only from authenticated key data."""
+    if ident.user_id:
+        return ident.actor()
     source = "dashboard" if ident.via == "session" else "api"
     key_ref = ident.prefix or ident.key_id
     return f"{source}: {ident.label} ({key_ref})"

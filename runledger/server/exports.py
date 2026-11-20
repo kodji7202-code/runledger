@@ -39,7 +39,7 @@ RUN_HEADER = [
     "files_changed", "cost_usd", "risk_score", "risk_level", "title",
     "quality_score", "quality_grade", "ai_verdict", "est_savings_usd", "cost_partial",
 ]
-AUDIT_HEADER = ["id", "at", "actor", "action", "target", "details_json"]
+AUDIT_HEADER = ["id", "at", "actor", "action", "target", "details_json", "actor_user_id"]
 
 
 def since_for(now: datetime, days: int) -> str:
@@ -111,7 +111,7 @@ def _audit_csv(db: Database, team_id: int, since: str) -> Tuple[bytes, int]:
     events = db.audit_events(team_id, limit=None, since=since, ascending=True)
     rows = [
         [e["id"], e["at"], e["actor"], e["action"], e["target"] or "",
-         json.dumps(e["details"], sort_keys=True, ensure_ascii=False)]
+         json.dumps(e["details"], sort_keys=True, ensure_ascii=False), e["actor_user_id"] or ""]
         for e in events
     ]
     return _csv_bytes(AUDIT_HEADER, rows), len(rows)
