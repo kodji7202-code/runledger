@@ -866,6 +866,8 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _create_run(self) -> None:
         ident = self._authed("member", "push runs", write=True)
+        if ident.key_id is None:
+            raise _HttpError(403, "api_key_required", "Use an API key to push runs.")
         length = self._content_length()
         raw = self.rfile.read(length) if length else b""
         if not raw:
@@ -1076,6 +1078,8 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _create_approval(self) -> None:
         ident = self._authed("member", "request approvals", write=True)
+        if ident.key_id is None:
+            raise _HttpError(403, "api_key_required", "Use an API key to request approvals.")
         length = self._content_length(approvals.CREATE_BODY_LIMIT, "Approval requests")
         raw = self.rfile.read(length) if length else b""
         try:

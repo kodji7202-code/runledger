@@ -326,7 +326,7 @@ def _supersedes(existing: sqlite3.Row, run: Dict[str, Any], key_id: Optional[str
 
     A run stored before key attribution has no pushing key at all (the migration leaves the
     column NULL), so no member key can be the one that pushed it: only an admin may replace it."""
-    if role != "admin" and existing["pushed_by_key_id"] != key_id:
+    if role != "admin" and (key_id is None or existing["pushed_by_key_id"] != key_id):
         return False
     old_ended, new_ended = existing["ended_at"], run["ended_at"]
     if old_ended is not None and new_ended is not None and new_ended < old_ended:
