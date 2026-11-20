@@ -30,8 +30,9 @@ Docker image, starts it and checks its `/health` endpoint.
 
 ## Rules for the code
 
-- **Standard library only at runtime.** `dependencies` in `pyproject.toml` stays empty.
-  `pytest` is a development dependency only.
+- **Standard library only in the base install.** `dependencies` in `pyproject.toml` stays empty.
+  `pytest` is a development dependency only. To test the optional SAML integration, install
+  `python -m pip install -e '.[saml]'` and ensure OpenSSL is on your PATH.
 - **Python 3.9 must keep working.** Avoid `match` statements, `X | Y` union types outside
   annotations (inside annotations they are fine when the module starts with
   `from __future__ import annotations`), parenthesized context managers, `zip(strict=...)`,
