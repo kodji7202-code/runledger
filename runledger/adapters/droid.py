@@ -16,8 +16,9 @@ import posixpath
 import re
 import sys
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
+from ..jsonl import read_objects
 from ..parser import (SOURCE_MISSING, SOURCE_OK, SOURCE_REJECTED, Run, Step, Usage,
                       _split_usage)
 from ..paths import _norm as _norm_style, join as _join
@@ -199,17 +200,6 @@ def find_sessions(project: Optional[str] = None) -> List[Path]:
         session_cache.save(entries)
     found.sort(key=lambda item: item[0], reverse=True)
     return [p for _, p in found]
-
-
-def _objects(path: Path) -> Iterator[Dict[str, Any]]:
-    with path.open(encoding="utf-8-sig", errors="replace") as fh:
-        for line in fh:
-            try:
-                obj = json.loads(line)
-            except (ValueError, RecursionError):
-                continue  # tolerate partial writes in a live session
-            if isinstance(obj, dict):
-                yield obj
 
 
 def _text(value: Any) -> str:
@@ -508,7 +498,7 @@ def parse(path: Path, git_root: bool = True) -> Run:
     header_seen = False
     pwd: Optional[str] = None
 
-    for obj in _objects(p):
+    for obj in read_objects(p):
         ts = _text(obj.get("timestamp")) or None
         if ts:
             run.started = run.started or ts
