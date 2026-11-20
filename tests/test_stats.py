@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -477,7 +478,7 @@ def test_start_and_summary_cache_entries_share_the_limit(isolated_settings, monk
     assert cache.get_start(paths[2], paths[2].stat()) == datetime(2020, 1, 1)
 
 
-@pytest.mark.parametrize("started", [None, {}, "invalid", "2020-01-01T00:00:00+00:00"])
+@pytest.mark.parametrize("started", [None, {}, "invalid", "2020-01-01T00:00:00"])
 def test_invalid_start_cache_record_is_a_miss(tmp_path, started):
     path = tmp_path / "old.jsonl"
     path.write_text("{}\n", encoding="utf-8")
@@ -486,6 +487,32 @@ def test_invalid_start_cache_record_is_a_miss(tmp_path, started):
     cache.entries[str(path)]["started"] = started
     assert cache.get_start(path, path.stat()) is None
     assert cache.get(path, path.stat()) is None
+
+
+@pytest.mark.skipif(not hasattr(time, "tzset"), reason="requires time.tzset")
+def test_start_cache_follows_timezone_changes(isolated_settings, monkeypatch):
+    project = isolated_settings / "timezone"
+    project.mkdir()
+    path = claude_session(isolated_settings, project, "old", datetime(2020, 1, 1))
+    os.utime(path, (1, 1))
+    try:
+        with monkeypatch.context() as env:
+            env.setenv("TZ", "UTC0")
+            time.tzset()
+            cache = stats.StatsCache()
+            assert stats.collect([path], datetime(2026, 1, 1), datetime(2026, 2, 1),
+                                 cache) == ([], [], 0)
+            env.setenv("TZ", "EST5")
+            time.tzset()
+            cache = stats.StatsCache.load()
+            expected = stats.summarize(path).started
+            assert expected == datetime(2019, 12, 31, 19)
+            assert cache.get_start(path, path.stat()) == expected
+            summaries, skipped, total = stats.collect(
+                [path], datetime(2019, 12, 31, 18), datetime(2019, 12, 31, 20), cache)
+            assert total == 1 and skipped == [] and summaries[0].started == expected
+    finally:
+        time.tzset()
 
 
 def test_start_probe_defers_unrecognized_codex_header(tmp_path):

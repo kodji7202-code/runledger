@@ -25,7 +25,7 @@ import re
 import sys
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from functools import cached_property
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -322,12 +322,12 @@ class StatsCache:
             started = datetime.fromisoformat(record["started"])
         except (KeyError, TypeError, ValueError):
             return None
-        return started if started.tzinfo is None else None
+        return _local(started) if started.tzinfo is not None else None
 
     def put_start(self, path: Path, stat_result: os.stat_result, started: datetime) -> None:
         self._put(path, {"version": RECORD_VERSION, "kind": "start",
                          "mtime_ns": stat_result.st_mtime_ns, "size": stat_result.st_size,
-                         "started": started.isoformat()})
+                         "started": started.astimezone(timezone.utc).isoformat()})
 
     def put(self, path: Path, stat_result: os.stat_result, summary: SessionSummary) -> None:
         """Store one summary - unless the parse could not track every path it depends on
