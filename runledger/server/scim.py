@@ -25,6 +25,14 @@ def listing(resources, start=1, count=200):
             "Resources": resources[start - 1:start - 1 + count]}
 
 
+def paginated(resources, query):
+    try:
+        start, count = int(query.get("startIndex", ["1"])[0]), int(query.get("count", ["200"])[0])
+    except ValueError:
+        raise Error(400, "Invalid pagination.", "invalidValue")
+    return listing(resources, max(1, start), min(200, max(0, count)))
+
+
 def resource(member):
     location = "/scim/v2/Users/" + quote(member["id"])
     return {"schemas": [CORE + "User"], "id": member["id"], "userName": member["email"],
@@ -130,7 +138,7 @@ def dispatch(h, method, path, query):
         members = db.list_members(team)
         member = next((m for m in members if m["id"] == rid), None)
         if kind == "Groups":
-            groups(h, db, team, method, rid, body, members)
+            groups(h, db, team, method, rid, body, members, query)
             return
         if kind != "Users":
             raise Error(404, "Resource not found.")
@@ -146,11 +154,7 @@ def dispatch(h, method, path, query):
                         raise Error(400, "Unsupported filter.", "invalidFilter")
                     key = "email" if match[1].lower() == "username" else "external_id"
                     members = [m for m in members if (m[key] or "").lower() == match[2].lower()]
-                try:
-                    start, count = int(query.get("startIndex", ["1"])[0]), int(query.get("count", ["200"])[0])
-                except ValueError:
-                    raise Error(400, "Invalid pagination.", "invalidValue")
-                result = listing([resource(m) for m in members], max(1, start), min(200, max(0, count)))
+                result = paginated([resource(m) for m in members], query)
             send(h, 200, result)
             return
         if method == "DELETE" and rid:
@@ -217,13 +221,19 @@ def error(h, exc, headers=None):
     send(h, exc.status, body, headers)
 
 
-def groups(h, db, team, method, rid, body, members):
+def groups(h, db, team, method, rid, body, members, query=None):
+    query = query or {}
     if rid and rid not in ROLES:
         raise Error(404, "Group not found.")
     if method == "GET":
         resources = [{"schemas": [CORE + "Group"], "id": role, "displayName": role,
                       "members": [{"value": m["id"], "display": m["email"]} for m in members if m["role"] == role]} for role in ROLES]
-        send(h, 200, next(g for g in resources if g["id"] == rid) if rid else listing(resources))
+        if not rid and "filter" in query:
+            match = re.fullmatch(r'\s*displayName\s+eq\s+"([^"\\]*)"\s*', query["filter"][0], re.I)
+            if not match:
+                raise Error(400, "Unsupported filter.", "invalidFilter")
+            resources = [g for g in resources if g["displayName"].lower() == match[1].lower()]
+        send(h, 200, next(g for g in resources if g["id"] == rid) if rid else paginated(resources, query))
         return
     if method != "PATCH" or not rid:
         raise Error(405, "Only GET and PATCH of fixed role groups are supported.")

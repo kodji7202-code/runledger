@@ -238,3 +238,16 @@ def test_nameless_user_get_put_roundtrip(scim):
     for name in ({"displayName": "  "}, {"name": {"formatted": " "}}, {"name": {"givenName": " ", "familyName": ""}}):
         assert call("PUT", path, dict(name, userName="nameless@example.com"))[0] == 200
         assert db.get_user(user["id"])["name"] is None
+
+
+def test_groups_filter_and_pagination(scim):
+    db, team, key, token, base, call = scim
+    result = call("GET", "/Groups?filter=" + quote('displayName eq "ADMIN"'))[1]
+    assert result["totalResults"] == 1 and result["Resources"][0]["id"] == "admin"
+    result = call("GET", "/Groups?startIndex=2&count=1")[1]
+    assert result["totalResults"] == 3 and result["startIndex"] == 2 and result["itemsPerPage"] == 1
+    assert result["Resources"][0]["id"] == "member"
+    assert call("GET", "/Groups?count=0")[1]["Resources"] == []
+    assert call("GET", "/Groups?count=bad")[0] == 400
+    status, error = call("GET", "/Groups?filter=" + quote('displayName co "a"'))
+    assert status == 400 and error["scimType"] == "invalidFilter"
