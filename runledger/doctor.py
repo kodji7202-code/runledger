@@ -24,8 +24,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import textwrap
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -1172,6 +1172,29 @@ def _mode_check(user: Dict[str, Any], project_policy: Dict[str, Any]) -> Check:
 
 # ---------------------------------------------------------------- rendering
 
+def _display_width(text: str) -> int:
+    return sum(2 if unicodedata.east_asian_width(char) in ("F", "W") else 1
+               for char in text if unicodedata.category(char) not in ("Mn", "Me"))
+
+
+def _wrap_doctor_text(text: str, width: int, prefix: str = "", indent: int = 2) -> str:
+    if _display_width(prefix + text) <= width:
+        return prefix + text
+    lines = []
+    line, columns = prefix, _display_width(prefix)
+    text = text.expandtabs().translate(str.maketrans("\t\n\v\f\r", "     "))
+    for match in re.finditer(r"( *)([^ ]+)", text):
+        gap, word = match.groups()
+        word_width = _display_width(word)
+        if line.strip() and columns + len(gap) + word_width > width:
+            lines.append(line)
+            line, columns = " " * indent + word, indent + word_width
+        else:
+            line += gap + word
+            columns += len(gap) + word_width
+    return "\n".join([*lines, line])
+
+
 def render_text(report: Report, verbose: bool = False) -> str:
     """The text report: wrapped checks, `->` fix hints, a final summary line."""
     from . import __version__
@@ -1182,12 +1205,7 @@ def render_text(report: Report, verbose: bool = False) -> str:
     lines = []
 
     def append(text: str, prefix: str = "", indent: int = 2) -> None:
-        if len(prefix + text) <= width:
-            lines.append(prefix + text)
-            return
-        lines.append(textwrap.fill(text, width=width, initial_indent=prefix,
-                                   subsequent_indent=" " * indent,
-                                   break_long_words=False, break_on_hyphens=False))
+        lines.append(_wrap_doctor_text(text, width, prefix, indent))
 
     append(f"RunLedger doctor {__version__}  |  python {platform.python_version()}  |  "
            f"{sys.platform}  |  {report.project}")
