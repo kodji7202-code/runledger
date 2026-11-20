@@ -8,6 +8,7 @@ Contents:
 
 - [Model: teams, keys and roles](#model-teams-keys-and-roles)
 - [API key lifecycle](#api-key-lifecycle)
+- [SCIM provisioning](#scim-provisioning)
 - [Audit log](#audit-log)
 - [Budgets and alerts](#budgets-and-alerts)
 - [Exports and the compliance report](#exports-and-the-compliance-report)
@@ -17,6 +18,34 @@ Contents:
 - [Webhooks](#webhooks)
 - [Data stored and retention](#data-stored-and-retention)
 - [What RunLedger does not do](#what-runledger-does-not-do)
+
+## SCIM provisioning
+
+For Okta or Microsoft Entra provisioning:
+
+1. Create a team-specific credential using admin `POST /api/scim/token`, or
+   `runledger scim-token create --team NAME --db runledger.db`. Store the returned token
+   securely: only its hash and prefix remain on the server. Creating another rotates it.
+2. Configure an Okta SCIM 2.0 application or Entra enterprise application's automatic
+   provisioning with tenant/base URL `https://<host>/scim/v2` and bearer token authentication.
+   Use HTTPS. API keys and dashboard cookies cannot authenticate SCIM requests.
+3. Map IdP email/UPN to `userName` (a valid email), full name to `displayName` or
+   `name.formatted`, enabled status to `active`, and IdP object ID to `externalId`.
+   Match existing users by `userName` using the `eq` filter. Optionally map one role
+   as `roles[0].value`: admin/member/viewer, default member.
+4. Assign a test user, provision it, disable it, then re-enable it before rolling out.
+   Three fixed groups named admin/member/viewer can set membership roles; do not enable
+   group creation/deletion or password synchronization. See [SCIM API](api.md#scim-provisioning).
+
+Deprovisioning with `active:false` blocks personal keys and deletes sessions for that team
+without revoking keys or disabling the server-wide user. Re-enabling restores keys, not sessions.
+Deleting a SCIM user removes membership and revokes its team personal keys. Users belonging to
+other teams retain access there. **Email and name are global attributes**: editing them via
+one team's provisioning also changes the user's profile in other teams. `externalId`, role
+and active status are team-local. The last working admin cannot be deactivated, demoted or deleted.
+
+Revoke provisioning access with `DELETE /api/scim/token` or the local `scim-token revoke` command.
+Token administration and SCIM changes appear in the audit log. Automated updates use actor `scim`.
 
 ## Model: teams, keys and roles
 
