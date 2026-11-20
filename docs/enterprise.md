@@ -24,7 +24,8 @@ Contents:
   or audit events.
 - Access is by **API key**. Each key belongs to one team and has one **role**. A key may belong
   to a server-wide **user**, identified by a unique, lowercase email, with a membership in that team.
-  Users may join several teams. Keys without an owner are service keys; existing keys stay unowned.
+  Users may join several teams. Keys of kind `service` cannot have an owner; personal keys may also
+  be unowned, and existing keys stay unowned.
 - Use one key per person, or per system (for example a CI job), with the least role that works.
 - Pending approvals created before requester-key attribution was added cannot prove an independent
   approver. For safe separation of duties, agents must submit a fresh request after upgrading.
@@ -153,8 +154,8 @@ Admins can also manage members through `/api/members`; see [api.md](api.md#membe
 
 ## API key lifecycle
 
-A key has an id, a label (1 to 100 characters, no control characters), a role, a prefix, and
-creation, last-use and revocation times. The secret looks like `rl_` followed by 40 URL-safe
+A key has an id, a label (1 to 100 characters, no control characters), a role, a kind, a prefix, and
+creation, last-use, expiry and revocation times. The secret looks like `rl_` followed by 40 URL-safe
 characters. The server stores only the SHA-256 hash of the secret and the first 8 characters (the
 prefix) for display. The secret is shown once, when the key is created or rotated.
 
@@ -181,9 +182,11 @@ Authorization: Bearer <admin key>
 first, with its prefix, status and last use. Secrets are never shown. The last-use time is updated at
 most once a minute.
 
-**Rotate.** Replaces a key's secret. The id, label and role stay the same, and the old secret stops
-working at once. Dashboard sessions that were started with the key end too. Use this when a key may
-have leaked, or on a schedule. A revoked key cannot be rotated.
+**Rotate.** Replaces a key's secret. The id, label, role and kind stay the same, and the old secret
+stops working at once. Dashboard sessions that were started with the key end too. Use this when a key
+may have leaked, or on a schedule. Rotation also renews the key's lifetime (`--expires-in-days N`, else
+its previous lifetime, held to the team's cap), which is how an expired key is brought back. A revoked
+key cannot be rotated.
 
 ```bash
 runledger key rotate <key id> --db runledger.db
@@ -192,6 +195,35 @@ runledger key rotate <key id> --db runledger.db
 ```http
 POST /api/keys/<key id>/rotate
 ```
+
+**Kinds.** A `personal` key (the default) belongs to one person and may sign in to the dashboard. A
+`service` key is for CI or another system: it works on the API only, and the sign-in form and
+`/?key=` links refuse it. Create one with `--kind service` or `"kind": "service"`. Keys from before
+kinds existed are personal.
+
+**Expiry.** A key may carry an `expires_at`. After it, the key is refused with `401 key_expired`
+(not counted as a failed guess) and its dashboard sessions stop working; a session never outlives its
+key. An expired key is not revoked: rotating it gives it a new secret and a new lifetime. Ask for a
+lifetime with `--expires-in-days N` or `"expires_in_days": N` (1 to 3650). Keys from before expiry
+existed never expire until a team cap applies to them.
+
+**Team key policy.** An admin sets, in `PUT /api/team/settings` or on the dashboard's settings page:
+
+| Setting | Meaning |
+| --- | --- |
+| `key_max_ttl_days` | Longest lifetime of a personal key, and the default for a new one. `null`: no limit. |
+| `service_key_max_ttl_days` | The same for service keys, so CI keys can have their own rotation period. |
+| `key_expiry_warn_days` | Days before expiry that a key is warned about (default 14; 0 turns warnings off). |
+
+A key requested for longer than its cap is refused. A new or lower cap also shortens existing keys of
+that kind that would outlive it, to that many days from now, so nothing stops working at once.
+
+**Expiry warnings.** Inside the warning window, every API response to the key carries
+`X-RunLedger-Key-Expires: <expires_at>`, `runledger push` prints a warning, `/api/me` returns
+`"expires_soon": true`, and the dashboard shows a banner to a person signed in with that key. The
+running server also checks hourly and, once per key lifetime, records a `key.expiring` audit event and
+sends the team's Slack and generic webhooks a message (`{"type": "key_expiring", ...}` with the key's
+id, label, role, kind, prefix and `expires_at`, never its secret).
 
 **Revoke.** Ends a key permanently. A revoked key cannot be used again or rotated, and its dashboard
 sessions end at once. Revoked keys stay in the list, marked with their revocation time. The team's
@@ -218,13 +250,14 @@ target and details. Details never include a key secret or a webhook URL.
 
 | Action | Recorded when | Target | Details |
 | --- | --- | --- | --- |
-| `key.create` | A key is created, including the team's first key | Key id | label, role, prefix |
-| `key.rotate` | A key's secret is replaced | Key id | label, role, prefix (of the new secret) |
+| `key.create` | A key is created, including the team's first key | Key id | label, role, prefix, kind, expires_at |
+| `key.rotate` | A key's secret is replaced | Key id | label, role, prefix (of the new secret), expires_at |
+| `key.expiring` | A key enters its team's warning window (once per lifetime; actor `system`) | Key id | label, kind, prefix, expires_at |
 | `key.revoke` | A key is revoked | Key id | label, role, prefix |
 | `run.push` | A new receipt is stored (identical retries are not new writes) | Run id | agent, project |
 | `run.supersede` | A session is pushed again and replaces the stored run | Run id | revision, replaced_revision, agent, project |
 | `approval.decide` | An approval is approved or denied | Approval id | status |
-| `team.settings` | Team settings change | `settings` | the names of the fields changed, and `approval_ttl_s` if it changed. Never the URLs. |
+| `team.settings` | Team settings change | `settings` | the names of the fields changed, and the values of `approval_ttl_s`, `attribution` and the key policy fields that changed, plus `keys_shortened` when a new cap shortened keys. Never the URLs. |
 | `auth.sign_in` | A dashboard sign-in with a key succeeds | Key id | role, and the client address (`ip`) |
 | `budget.update` | This release: the team's budget changes | `budget` | monthly_usd, per_user_monthly_usd, alert_thresholds |
 | `budget.alert` | This release: a threshold fires | Scope (`team` or `user:<name>`) | month, threshold, spend_usd, limit_usd, pct |
@@ -364,8 +397,8 @@ exports as confidential.
   sign you into someone else's team.
 - The cookie is `rl_session`: HttpOnly, SameSite=Strict, and valid for 12 hours. It is Secure when the
   server is behind HTTPS (see below).
-- A session carries the role of its key. It ends after 12 hours, or at once when its key is revoked or
-  rotated. Each key keeps at most 20 sessions; signing in past that cap drops that key's oldest
+- A session carries the role of its key. It ends after 12 hours, at its key's `expires_at` if that is
+  sooner, or at once when its key is revoked or rotated. Service keys cannot sign in. Each key keeps at most 20 sessions; signing in past that cap drops that key's oldest
   session and leaves other keys alone.
 - *This release:* the server keeps sessions in the team database as hashes of their tokens, so a
   server restart does not sign anyone out. Until this release, sessions were held in memory.
@@ -434,7 +467,7 @@ real client. The counter is held in memory, so a restart clears it.
 ## Webhooks
 
 Team settings can hold a Slack incoming-webhook URL and a generic webhook URL. Both are used for
-approval requests, and for budget alerts in this release.
+approval requests, for budget alerts in this release, and for API keys about to expire.
 
 - URLs must use public `https://` destinations. Internal, private, loopback, link-local and
   non-public DNS answers are blocked, including when public and private answers are mixed.
