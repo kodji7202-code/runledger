@@ -4,7 +4,7 @@ A team has any number of API keys. Each key has one role:
 
   admin   everything, including deciding approvals, key management, team settings and the audit log
   member  push runs, request approvals, read everything
-  viewer  read only: every GET endpoint except the admin ones
+  viewer  read team data, manage sessions started with the same key
 
 A key looks like "rl_" followed by 40 URL-safe characters. The server keeps only the
 SHA-256 hash of the key, plus its first 8 characters (the prefix) for display.
@@ -20,8 +20,8 @@ warned about (key_expiry_warn_days).
 
 The dashboard signs in with a key once and keeps an opaque session token in a cookie.
 The server stores only the SHA-256 hash of that token, in the sessions table (db.py), so
-a restart does not sign anyone out. The session carries the role of its key and ends
-when the key is revoked or rotated, or after SESSION_TTL_SECONDS.
+a restart does not sign anyone out. A session carries the role of its key and ends on
+sign-out, revocation, expiry (absolute or idle), or when its key expires, rotates or is revoked.
 
 Rejected API keys and failed sign-ins are counted per client address, in memory. More
 than 20 within five minutes and that address gets 429 until enough of them age out.
@@ -160,6 +160,7 @@ class Identity:
     user_id: Optional[str] = None
     email: Optional[str] = None
     name: Optional[str] = None
+    session_id: Optional[str] = None
     kind: str = "personal"
     expires_at: Optional[str] = None
     expires_soon: bool = False  # inside the team's warning window
@@ -188,6 +189,7 @@ def identity_from_row(row: Mapping[str, Any], via: str) -> Identity:
         user_id=row.get("user_id"),
         email=row.get("email"),
         name=row.get("name"),
+        session_id=row.get("session_id") if via == "session" else None,
         kind=row.get("kind") or "personal",
         expires_at=row.get("expires_at"),
         expires_soon=expires_within(row.get("expires_at"), row.get("expiry_warn_days")),

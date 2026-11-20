@@ -28,7 +28,7 @@ FIXED_NOW = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
 RUN_HEADER = [
     "id", "started_at", "user", "project", "agent", "models", "steps", "tokens",
     "files_changed", "cost_usd", "risk_score", "risk_level", "title",
-    "quality_score", "quality_grade", "ai_verdict", "est_savings_usd",
+    "quality_score", "quality_grade", "ai_verdict", "est_savings_usd", "cost_partial",
 ]
 AUDIT_HEADER = ["id", "at", "actor", "action", "target", "details_json", "actor_user_id"]
 KINDS = {"runs": "/api/export/runs.csv", "audit": "/api/export/audit.csv", "report": "/api/export/report.html"}
@@ -212,6 +212,19 @@ def test_an_unknown_cost_leaves_the_csv_cell_empty(env):
     rows = {r[0]: dict(zip(RUN_HEADER, r)) for r in _rows(export(base, admin, "runs")[2])[1:]}
     assert rows["no-usage"]["cost_usd"] == ""     # not "0.0": nothing was priced
     assert rows["partial"]["cost_usd"] == "0.6"   # the priced part is still reported
+
+
+def test_the_csv_says_which_costs_are_only_partly_priced(env):
+    """A partly priced run's cost_usd is a lower bound, and the export keeps that flag."""
+    srv, base = env
+    _, admin, _, _ = team_with_keys(srv)
+    push_unpriced(base, admin, "no-usage")
+    push_partial(base, admin, "partial", 0.6)
+    push(base, admin, "complete", cost=0.4, started="2026-10-06T10:00:00Z")
+    rows = {r[0]: dict(zip(RUN_HEADER, r)) for r in _rows(export(base, admin, "runs")[2])[1:]}
+    assert rows["partial"]["cost_usd"] == "0.6" and rows["partial"]["cost_partial"] == "true"
+    assert rows["complete"]["cost_usd"] == "0.4" and rows["complete"]["cost_partial"] == "false"
+    assert rows["no-usage"]["cost_usd"] == "" and rows["no-usage"]["cost_partial"] == ""
 
 
 def test_audit_csv_has_its_header_and_the_details_as_json(env):

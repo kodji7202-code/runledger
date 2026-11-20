@@ -249,6 +249,76 @@ def test_other_commands_are_not_test_runs(command):
     assert not _is_test_command(command)
 
 
+@pytest.mark.parametrize("quote", ["'", '"'])
+@pytest.mark.parametrize("separator", [";", "|", "&&", "||", "\n"])
+def test_quoted_separators_do_not_start_test_runs(quote, separator):
+    command = f"echo {quote}note{separator} pytest{quote}"
+    assert not _is_test_command(command)
+    quality = score_run(_run([_bash(1, command)]), [])
+    assert (quality["score"], quality["grade"]) == (75, "B")
+
+
+@pytest.mark.parametrize("separator", [";", "|", "&&", "||", "\n"])
+def test_unquoted_separators_still_start_test_runs(separator):
+    assert _is_test_command(f"echo hi{separator} pytest")
+    assert _is_test_command(f"echo 'note; pytest'{separator} pytest")
+
+
+@pytest.mark.parametrize("command", ["", "echo 'note; pytest", 'echo "note| pytest'])
+def test_empty_or_unbalanced_commands_do_not_start_test_runs(command):
+    assert not _is_test_command(command)
+
+
+@pytest.mark.parametrize("command, expected", [
+    (r'echo "one \"quote" && pytest', True),
+    (r'echo one\"quote && pytest', True),
+    (r'echo "one \\" && pytest', True),
+    (r"echo 'one \' && pytest", True),
+    (r'echo "note\"; pytest"', False),
+    (r'echo note\; pytest', False),
+])
+def test_escaped_quotes_and_separators(command, expected):
+    assert _is_test_command(command) is expected
+
+
+@pytest.mark.parametrize("command", [
+    "python -m \\\npytest -q", "pytest \\\n-q", "py\\\ntest -q",
+])
+def test_bash_line_continuations_do_not_hide_test_runs(command):
+    assert _is_test_command(command)
+
+
+@pytest.mark.parametrize("tool", ["PowerShell", "Bash"])
+@pytest.mark.parametrize("command", [
+    'Set-Location "C:\\repo\\"; pytest -q',
+    'Set-Location .; echo "one `"quote"; pytest -q',
+    'Set-Location .; python -m `\npytest -q',
+])
+def test_powershell_escaping_uses_the_step_dialect(tool, command):
+    steps = [_step(i, tool, {"command": command}, result="3 passed") for i in range(3)]
+    quality = score_run(_run(steps), [])
+    assert _sig(quality, "tests_run")["value"] == 3
+    assert _sig(quality, "retry_loops")["value"] == 0
+
+
+def test_powershell_escaped_separator_is_not_a_test_run():
+    quality = score_run(_run([_step(1, "PowerShell", {"command": "echo hi`; pytest"})]), [])
+    assert _sig(quality, "tests_run") is None
+
+
+@pytest.mark.parametrize("command, expected", [
+    ("echo hi # don't skip tests\npytest", True),
+    ('echo hi # "pytest;\npytest', True),
+    ("echo hi # pytest; pytest", False),
+    ("echo a#b; pytest", True),
+    ("echo a#b' ; pytest'", False),
+    ("echo '# note; pytest'", False),
+    (r"echo \# note; pytest", True),
+])
+def test_shell_comments_do_not_affect_test_run_boundaries(command, expected):
+    assert _is_test_command(command) is expected
+
+
 @pytest.mark.parametrize("command", [
     "pip install pytest", "pip3 install pytest", "python -m pip install pytest",
     "npm install --save-dev jest", "npm uninstall -y pytest", "npm i jest", "yarn remove jest",

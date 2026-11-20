@@ -21,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 from urllib.parse import quote
+from uuid import uuid4
 
 from ..pricing import friendly_model
 from .insights import AI_REVIEW_LIKE, QUALITY_LIKE, RECOMMENDATIONS_LIKE, review_fields
@@ -273,10 +274,12 @@ CREATE TABLE IF NOT EXISTS audit_log (
 CREATE INDEX IF NOT EXISTS audit_by_team ON audit_log (team_id, id);
 CREATE TABLE IF NOT EXISTS sessions (
     token_hash  TEXT PRIMARY KEY,
+    id          TEXT NOT NULL,
     team_id     INTEGER NOT NULL REFERENCES teams (id),
     key_id      TEXT NOT NULL REFERENCES api_keys (id),
     role        TEXT NOT NULL,
     created_at  TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
     expires_at  TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS sessions_by_key ON sessions (key_id);
@@ -320,6 +323,15 @@ def _days_from(now: datetime, days: Optional[int]) -> Optional[str]:
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).strftime(TIME_FORMAT)
+
+
+def _idle_cutoff(now: datetime, idle_timeout: int) -> str:
+    if idle_timeout:
+        try:
+            return (now - timedelta(seconds=idle_timeout)).strftime(TIME_FORMAT)
+        except OverflowError:
+            pass
+    return ""
 
 
 def _contains(text: str) -> str:
@@ -400,6 +412,45 @@ def _approval_row_view(row: sqlite3.Row, ttl_s: int, now: float) -> Dict[str, An
     data = dict(row)
     data["risks"] = json.loads(data["risks"] or "[]")
     return _approval_view(data, ttl_s, now)
+
+
+def _run_filters(
+    team_id: int,
+    *,
+    user: Optional[str],
+    project: Optional[str],
+    min_risk: Optional[int],
+    agent: Optional[str],
+    min_quality: Optional[int],
+    max_quality: Optional[int],
+    ai_verdict: Optional[str],
+) -> Tuple[List[str], List[Any]]:
+    """The WHERE clauses and parameters shared by list_runs and count_runs."""
+    clauses = ["team_id = ?"]
+    params: List[Any] = [team_id]
+    if user:  # case-insensitive substring match, so "bob" finds "bob@example.com"
+        clauses.append("user LIKE ? ESCAPE '\\'")
+        params.append(_contains(user))
+    if project:
+        clauses.append("project LIKE ? ESCAPE '\\'")
+        params.append(_contains(project))
+    if agent:  # "claude" finds "Claude Code"
+        clauses.append("agent LIKE ? ESCAPE '\\'")
+        params.append(_contains(agent))
+    if min_risk is not None:
+        clauses.append("risk_score >= ?")
+        params.append(int(min_risk))
+    # A run with no quality score matches neither bound.
+    if min_quality is not None:
+        clauses.append("quality_score >= ?")
+        params.append(int(min_quality))
+    if max_quality is not None:
+        clauses.append("quality_score <= ?")
+        params.append(int(max_quality))
+    if ai_verdict:
+        clauses.append("ai_verdict = ?")
+        params.append(ai_verdict)
+    return clauses, params
 
 
 def _summary(row: sqlite3.Row) -> Dict[str, Any]:
@@ -502,6 +553,7 @@ class Database:
                 self._add_missing_columns("users", (("oidc_issuer", "TEXT"), ("oidc_subject", "TEXT")))
                 self._add_missing_columns("users", (("saml_issuer", "TEXT"), ("saml_subject", "TEXT")))
                 self._add_missing_columns("sessions", (("oidc_provider", "TEXT"),))
+                self._upgrade_sessions()
                 if any(
                     row["name"] == "key_id" and row["notnull"]
                     for row in self._conn.execute("PRAGMA table_info(sessions)")
@@ -511,11 +563,12 @@ class Database:
                         "CREATE TABLE sessions ("
                         "token_hash TEXT PRIMARY KEY, team_id INTEGER NOT NULL REFERENCES teams (id), "
                         "key_id TEXT REFERENCES api_keys (id), role TEXT NOT NULL, created_at TEXT NOT NULL, "
-                        "expires_at TEXT NOT NULL, user_id TEXT REFERENCES users (id), oidc_provider TEXT)"
+                        "expires_at TEXT NOT NULL, user_id TEXT REFERENCES users (id), oidc_provider TEXT, "
+                        "id TEXT, last_seen_at TEXT)"
                     )
                     self._conn.execute(
                         "INSERT INTO sessions SELECT token_hash, team_id, key_id, role, created_at, "
-                        "expires_at, user_id, oidc_provider FROM sessions_old"
+                        "expires_at, user_id, oidc_provider, id, last_seen_at FROM sessions_old"
                     )
                     self._conn.execute("DROP TABLE sessions_old")
                     self._conn.execute("CREATE INDEX sessions_by_key ON sessions (key_id)")
@@ -526,6 +579,7 @@ class Database:
                 self._add_missing_columns("runs", RUN_COLUMNS)
                 self._add_missing_columns("approvals", APPROVAL_IDENTITY_COLUMNS)
                 self._add_missing_columns("api_keys", API_KEY_COLUMNS)
+                self._upgrade_sessions()
                 self._upgrade_run_store()
                 self._upgrade_review_columns()
                 self._migrate_api_keys()
@@ -1129,15 +1183,13 @@ class Database:
             ).fetchall()
             return [dict(row) for row in rows]
 
-    def issue_sso_session(self, method: str, team_id: int, user_id: str, provider: str) -> str:
+    def issue_sso_session(self, method: str, team_id: int, user_id: str, provider: str, idle_timeout: int = 0) -> str:
         """Issue a keyless dashboard token only while the membership is active."""
         token = new_session_token()
         now = datetime.now(timezone.utc)
         provider_col = {"oidc": "oidc_provider", "saml": "saml_provider"}[method]
         with self._lock, self._conn:
-            self._conn.execute(
-                "DELETE FROM sessions WHERE expires_at <= ?", (now.strftime(TIME_FORMAT),)
-            )
+            self._purge_sessions(now, idle_timeout)
             self._conn.execute(
                 "DELETE FROM sessions WHERE token_hash IN ("
                 "SELECT token_hash FROM sessions WHERE user_id = ? AND key_id IS NULL "
@@ -1145,13 +1197,15 @@ class Database:
                 (user_id, SESSION_CAP_PER_KEY - 1),
             )
             self._conn.execute(
-                "INSERT INTO sessions (token_hash, team_id, key_id, role, created_at, expires_at, "
-                f"user_id, {provider_col}) SELECT ?, m.team_id, NULL, m.role, ?, ?, m.user_id, ? "
+                "INSERT INTO sessions (token_hash, id, team_id, key_id, role, created_at, last_seen_at, expires_at, "
+                f"user_id, {provider_col}) SELECT ?, ?, m.team_id, NULL, m.role, ?, ?, ?, m.user_id, ? "
                 "FROM memberships m JOIN users u ON u.id = m.user_id "
                 "WHERE m.team_id = ? AND m.user_id = ? AND u.disabled_at IS NULL "
                 "AND m.deactivated_at IS NULL",
                 (
                     hash_key(token),
+                    uuid4().hex,
+                    now.strftime(TIME_FORMAT),
                     now.strftime(TIME_FORMAT),
                     (now + timedelta(seconds=SESSION_TTL_SECONDS)).strftime(TIME_FORMAT),
                     provider,
@@ -1161,7 +1215,38 @@ class Database:
             )
         return token
 
-    def issue_session(self, team_id: int, key_id: str, role: str, ttl_s: int = SESSION_TTL_SECONDS) -> str:
+    def _upgrade_sessions(self) -> None:
+        with self._conn:
+            self._conn.execute("BEGIN IMMEDIATE")
+            present = {row["name"] for row in self._conn.execute("PRAGMA table_info(sessions)")}
+            if "id" not in present:
+                self._conn.execute("ALTER TABLE sessions ADD COLUMN id TEXT")
+                for row in self._conn.execute("SELECT token_hash FROM sessions").fetchall():
+                    self._conn.execute("UPDATE sessions SET id = ? WHERE token_hash = ?",
+                                       (uuid4().hex, row["token_hash"]))
+            if "last_seen_at" not in present:
+                self._conn.execute("ALTER TABLE sessions ADD COLUMN last_seen_at TEXT")
+                self._conn.execute("UPDATE sessions SET last_seen_at = created_at")
+            self._conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS sessions_by_id ON sessions (id)")
+
+    def _purge_sessions(self, now: datetime, idle_timeout: int) -> None:
+        now_text = now.strftime(TIME_FORMAT)
+        self._conn.execute(
+            "DELETE FROM sessions WHERE expires_at <= ? OR last_seen_at <= ? "
+            "OR key_id IN (SELECT k.id FROM api_keys k WHERE k.expires_at <= ? OR k.revoked_at IS NOT NULL "
+            "OR (k.user_id IS NOT NULL AND NOT EXISTS ("
+            "SELECT 1 FROM users u JOIN memberships m ON m.user_id = u.id "
+            "WHERE u.id = k.user_id AND u.disabled_at IS NULL AND m.team_id = k.team_id "
+            "AND m.deactivated_at IS NULL))) "
+            "OR (key_id IS NULL AND NOT EXISTS (SELECT 1 FROM users u "
+            "JOIN memberships m ON m.user_id = u.id WHERE u.id = sessions.user_id "
+            "AND m.team_id = sessions.team_id AND u.disabled_at IS NULL AND m.deactivated_at IS NULL))",
+            (now_text, _idle_cutoff(now, idle_timeout), now_text),
+        )
+
+    def issue_session(
+        self, team_id: int, key_id: str, role: str, ttl_s: int = SESSION_TTL_SECONDS, idle_timeout: int = 0,
+    ) -> str:
         """Start a dashboard session for a key. Returns the plaintext token (for the cookie);
         only its hash is stored. Expired sessions are purged here, and a key keeps only its
         SESSION_CAP_PER_KEY newest sessions, so the table stays small."""
@@ -1173,7 +1258,7 @@ class Database:
             key_end = self._conn.execute("SELECT expires_at FROM api_keys WHERE id = ?", (key_id,)).fetchone()
             if key_end is not None and key_end["expires_at"] and key_end["expires_at"] < expires:
                 expires = key_end["expires_at"]  # a session never outlives its key
-            self._conn.execute("DELETE FROM sessions WHERE expires_at <= ?", (now_text,))
+            self._purge_sessions(now, idle_timeout)
             self._conn.execute(
                 "DELETE FROM sessions WHERE token_hash IN ("
                 "SELECT token_hash FROM sessions WHERE key_id = ? "
@@ -1181,26 +1266,28 @@ class Database:
                 (key_id, SESSION_CAP_PER_KEY - 1),
             )
             self._conn.execute(
-                "INSERT INTO sessions (token_hash, team_id, key_id, role, created_at, expires_at, user_id) "
-                "SELECT ?, ?, ?, ?, ?, ?, user_id FROM api_keys WHERE id = ? AND team_id = ?",
-                (hash_key(token), team_id, key_id, role, now_text, expires, key_id, team_id),
+                "INSERT INTO sessions (token_hash, id, team_id, key_id, role, created_at, last_seen_at, expires_at, user_id) "
+                "SELECT ?, ?, ?, ?, ?, ?, ?, ?, user_id FROM api_keys WHERE id = ? AND team_id = ?",
+                (hash_key(token), uuid4().hex, team_id, key_id, role, now_text, now_text, expires, key_id, team_id),
             )
         return token
 
-    def session_key(self, token: Optional[str]) -> Optional[Dict[str, Any]]:
+    def session_key(self, token: Optional[str], idle_timeout: int = 0, touch: bool = True) -> Optional[Dict[str, Any]]:
         """The active key behind a dashboard session token, or None. A session that has
-        expired, or whose key was revoked or rotated, is deleted here."""
+        expired, or whose key expired, was revoked or was rotated, is deleted here."""
         if not token or len(token) > 512:
             return None
         token_hash = hash_key(token)
         with self._lock, self._conn:
             row = self._conn.execute(
-                "SELECT key_id, team_id, expires_at, user_id, oidc_provider, saml_provider "
+                "SELECT id, key_id, team_id, last_seen_at, expires_at, user_id, oidc_provider, saml_provider "
                 "FROM sessions WHERE token_hash = ?", (token_hash,)
             ).fetchone()
             if row is None:
                 return None
-            if row["expires_at"] <= datetime.now(timezone.utc).strftime(TIME_FORMAT):
+            now = datetime.now(timezone.utc)
+            now_text = now.strftime(TIME_FORMAT)
+            if row["expires_at"] <= now_text or row["last_seen_at"] <= _idle_cutoff(now, idle_timeout):
                 self._conn.execute("DELETE FROM sessions WHERE token_hash = ?", (token_hash,))
                 return None
             if row["key_id"] is None:
@@ -1216,18 +1303,69 @@ class Database:
                     self._conn.execute("DELETE FROM sessions WHERE token_hash = ?", (token_hash,))
                     return None
                 provider = row["saml_provider"] or row["oidc_provider"]
+                if touch and row["last_seen_at"] < now_text:
+                    self._conn.execute("UPDATE sessions SET last_seen_at = ? WHERE token_hash = ?",
+                                       (now_text, token_hash))
                 return dict(person, id=None, prefix=None, label="sso:" + provider,
-                            sign_in_method="saml" if row["saml_provider"] else "oidc")
+                            session_id=row["id"], sign_in_method="saml" if row["saml_provider"] else "oidc")
             key = self._conn.execute(
                 _KEY_JOIN + " WHERE k.id = ? AND k.team_id = ? AND " + _USABLE,
-                (row["key_id"], row["team_id"], utc_now()),
+                (row["key_id"], row["team_id"], now_text),
             ).fetchone()
             key = self._effective_key(key)
             if key is None:
                 self._conn.execute("DELETE FROM sessions WHERE token_hash = ?", (token_hash,))
                 return None
+            if touch and row["last_seen_at"] < now_text:
+                self._conn.execute(
+                    "UPDATE sessions SET last_seen_at = ? WHERE token_hash = ? AND last_seen_at < ?",
+                    (now_text, token_hash, now_text),
+                )
             self._touch_key(key["id"])
-        return dict(key)
+        return dict(key, session_id=row["id"])
+
+    def list_sessions(self, team_id: int, key_id: Optional[str], idle_timeout: int,
+                      user_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        with self._lock, self._conn:
+            self._purge_sessions(datetime.now(timezone.utc), idle_timeout)
+            rows = self._conn.execute(
+                "SELECT s.id, s.key_id, COALESCE(k.label, 'sso:' || COALESCE(s.saml_provider, s.oidc_provider)) AS key_label, "
+                "COALESCE(k.role, m.role) AS role, s.created_at, s.last_seen_at, s.expires_at "
+                "FROM sessions s LEFT JOIN api_keys k ON k.id = s.key_id AND k.team_id = s.team_id "
+                "LEFT JOIN memberships m ON m.user_id = s.user_id AND m.team_id = s.team_id "
+                "WHERE s.team_id = ? AND (? IS NULL OR s.key_id = ?) "
+                "AND (? IS NULL OR (s.key_id IS NULL AND s.user_id = ?)) "
+                "ORDER BY s.created_at DESC, s.rowid DESC",
+                (team_id, key_id, key_id, user_id, user_id),
+            ).fetchall()
+            sessions = []
+            for row in rows:
+                if row["key_id"] is None:
+                    sessions.append(dict(row))
+                    continue
+                key = self._effective_key(self._conn.execute(
+                    _KEY_JOIN + " WHERE k.id = ? AND k.team_id = ? AND " + _USABLE,
+                    (row["key_id"], team_id, utc_now()),
+                ).fetchone())
+                if key is not None:
+                    sessions.append(dict(row, role=key["role"]))
+        return sessions
+
+    def revoke_session(
+        self, team_id: int, key_id: Optional[str], session_id: str, actor: Union[str, Identity], action: str,
+        idle_timeout: int, user_id: Optional[str] = None,
+    ) -> bool:
+        with self._lock, self._conn:
+            self._purge_sessions(datetime.now(timezone.utc), idle_timeout)
+            deleted = self._conn.execute(
+                "DELETE FROM sessions WHERE id = ? AND team_id = ? AND (? IS NULL OR key_id = ?) "
+                "AND (? IS NULL OR (key_id IS NULL AND user_id = ?))",
+                (session_id, team_id, key_id, key_id, user_id, user_id),
+            )
+            if deleted.rowcount != 1:
+                return False
+            self._audit(team_id, actor, action, session_id, {})
+            return True
 
 
     def list_keys(self, team_id: int) -> List[Dict[str, Any]]:
@@ -1545,39 +1683,52 @@ class Database:
         min_quality: Optional[int] = None,
         max_quality: Optional[int] = None,
         ai_verdict: Optional[str] = None,
+        after: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        clauses = ["team_id = ?"]
-        params: List[Any] = [team_id]
-        if user:  # case-insensitive substring match, so "bob" finds "bob@example.com"
-            clauses.append("user LIKE ? ESCAPE '\\'")
-            params.append(_contains(user))
-        if project:
-            clauses.append("project LIKE ? ESCAPE '\\'")
-            params.append(_contains(project))
-        if agent:  # "claude" finds "Claude Code"
-            clauses.append("agent LIKE ? ESCAPE '\\'")
-            params.append(_contains(agent))
-        if min_risk is not None:
-            clauses.append("risk_score >= ?")
-            params.append(int(min_risk))
-        # A run with no quality score matches neither bound.
-        if min_quality is not None:
-            clauses.append("quality_score >= ?")
-            params.append(int(min_quality))
-        if max_quality is not None:
-            clauses.append("quality_score <= ?")
-            params.append(int(max_quality))
-        if ai_verdict:
-            clauses.append("ai_verdict = ?")
-            params.append(ai_verdict)
-        params.append(max(1, min(int(limit), 500)))
-        sql = (
-            f"SELECT {_SUMMARY_COLUMNS} FROM runs WHERE {' AND '.join(clauses)} "
-            "ORDER BY sort_at DESC, created_at DESC, id LIMIT ?"
+        """Runs matching the filters, newest first. `after` is the id of a run in the list: only
+        the runs that come after it are returned, so its last id fetches the next page. An id
+        that names no run of the team raises KeyError."""
+        clauses, params = _run_filters(
+            team_id, user=user, project=project, min_risk=min_risk, agent=agent,
+            min_quality=min_quality, max_quality=max_quality, ai_verdict=ai_verdict,
         )
         with self._reading() as conn:
-            rows = conn.execute(sql, params).fetchall()
+            if after is not None:
+                cursor = conn.execute(
+                    "SELECT sort_at, created_at, id FROM runs WHERE team_id = ? AND id = ?",
+                    (team_id, after),
+                ).fetchone()
+                if cursor is None:
+                    raise KeyError(after)
+                # The same order as the ORDER BY below: sort_at and created_at descending, id ascending.
+                clauses.append("(sort_at < ? OR (sort_at = ? AND (created_at < ? OR (created_at = ? AND id > ?))))")
+                params += [cursor["sort_at"], cursor["sort_at"], cursor["created_at"], cursor["created_at"],
+                           cursor["id"]]
+            sql = (
+                f"SELECT {_SUMMARY_COLUMNS} FROM runs WHERE {' AND '.join(clauses)} "
+                "ORDER BY sort_at DESC, created_at DESC, id LIMIT ?"
+            )
+            rows = conn.execute(sql, params + [max(1, min(int(limit), 500))]).fetchall()
         return [_summary(r) for r in rows]
+
+    def count_runs(
+        self,
+        team_id: int,
+        user: Optional[str] = None,
+        project: Optional[str] = None,
+        min_risk: Optional[int] = None,
+        agent: Optional[str] = None,
+        min_quality: Optional[int] = None,
+        max_quality: Optional[int] = None,
+        ai_verdict: Optional[str] = None,
+    ) -> int:
+        """How many runs list_runs would page through with the same filters."""
+        clauses, params = _run_filters(
+            team_id, user=user, project=project, min_risk=min_risk, agent=agent,
+            min_quality=min_quality, max_quality=max_quality, ai_verdict=ai_verdict,
+        )
+        with self._reading() as conn:
+            return conn.execute(f"SELECT COUNT(*) FROM runs WHERE {' AND '.join(clauses)}", params).fetchone()[0]
 
     def get_run(self, team_id: int, run_id: str) -> Optional[Dict[str, Any]]:
         """One run with its receipt (parsed) and risk reasons. The HTML is fetched separately."""
@@ -1707,7 +1858,7 @@ class Database:
         with self._reading() as conn:
             rows = conn.execute(
                 "SELECT id, user, project, agent, models, started_at, created_at, steps, tokens, "
-                "files_changed, cost, risk_score, risk_level, title, quality_score, quality_grade, "
+                "files_changed, cost, cost_partial, risk_score, risk_level, title, quality_score, quality_grade, "
                 "ai_verdict, est_savings_usd FROM runs "
                 "WHERE team_id = ? AND sort_at >= ? "
                 "ORDER BY sort_at, id",
@@ -1754,7 +1905,7 @@ class Database:
                 args,
             ).fetchall()
             model_rows = conn.execute(
-                f"SELECT models, quality_score FROM runs WHERE {window}", args,
+                f"SELECT models, quality_score, cost_partial FROM runs WHERE {window}", args,
             ).fetchall()
             recommendation_rows = conn.execute(
                 f"SELECT recommendations FROM runs WHERE {window} AND recommendations IS NOT NULL", args,
