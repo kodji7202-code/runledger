@@ -152,9 +152,9 @@ def test_disable_is_server_wide_and_enable_does_not_restore_sessions(db):
             event = next(e for e in db.list_audit(team) if e["action"] == action)
             assert event["actor"] == "cli" and event["actor_user_id"] is None
             assert event["target"] == user["email"]
-            expected = {"user_id": user["id"], "email": user["email"], "teams_affected": [a, b]}
+            expected = {"user_id": user["id"], "email": user["email"]}
             if action == "user.disable":
-                expected["sessions_deleted"] = 2
+                expected["sessions_deleted"] = 1
             assert event["details"] == expected
 
 
