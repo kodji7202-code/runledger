@@ -11,10 +11,17 @@ SHA-256 hash of the key, plus its first 8 characters (the prefix) for display.
 Rotating a key replaces the hash and revoking it sets revoked_at; both take effect
 at once.
 
+Each key is either "personal" (held by one person) or "service" (a CI job or another system).
+A service key works on the API only: it cannot sign in to the dashboard. A key may carry an
+expires_at; after that moment it is refused with 401 key_expired, until an admin rotates it,
+which gives it a new secret and a new lifetime. A team can cap the lifetime of each kind of key
+(key_max_ttl_days, service_key_max_ttl_days) and choose how many days before the end a key is
+warned about (key_expiry_warn_days).
+
 The dashboard signs in with a key once and keeps an opaque session token in a cookie.
 The server stores only the SHA-256 hash of that token, in the sessions table (db.py), so
 a restart does not sign anyone out. A session carries the role of its key and ends on
-sign-out, revocation, key rotation or revocation, or expiry (absolute or idle).
+sign-out, revocation, expiry (absolute or idle), or when its key expires, rotates or is revoked.
 
 Rejected API keys and failed sign-ins are counted per client address, in memory. More
 than 20 within five minutes and that address gets 429 until enough of them age out.
@@ -31,9 +38,13 @@ import threading
 import time
 from collections import OrderedDict, deque
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Deque, Dict, Mapping, Optional
 
 ROLES = ("admin", "member", "viewer")
+KEY_KINDS = ("personal", "service")
+MAX_KEY_TTL_DAYS = 3650
+DEFAULT_EXPIRY_WARN_DAYS = 14
 _RANK = {"viewer": 0, "member": 1, "admin": 2}
 
 KEY_PREFIX = "rl_"
@@ -102,6 +113,38 @@ def validate_role(value: Any) -> str:
     return value
 
 
+def validate_kind(value: Any) -> str:
+    if value is None:
+        return "personal"
+    if value not in KEY_KINDS:
+        raise InvalidKey("'kind' must be one of personal, service.")
+    return value
+
+
+def validate_ttl_days(value: Any, name: str = "expires_in_days") -> Optional[int]:
+    """A whole number of days from 1 to MAX_KEY_TTL_DAYS, or None for "not given"."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= MAX_KEY_TTL_DAYS:
+        raise InvalidKey(f"'{name}' must be a whole number of days from 1 to {MAX_KEY_TTL_DAYS}.")
+    return value
+
+
+def key_lifetime_days(requested: Optional[int], max_days: Optional[int], kind: str) -> Optional[int]:
+    """The lifetime a new or rotated key gets: what was asked for, else the team's cap for its
+    kind, else none (the key never expires). Asking for more than the cap is refused."""
+    if max_days is None:
+        return requested
+    if requested is None:
+        return max_days
+    if requested > max_days:
+        raise InvalidKey(
+            f"This team allows {kind} keys to live at most {max_days} days; "
+            f"'expires_in_days' must be {max_days} or less."
+        )
+    return requested
+
+
 @dataclass(frozen=True)
 class Identity:
     """Who is making a request. Built from the key row on every request, so a revoked
@@ -115,6 +158,9 @@ class Identity:
     prefix: Optional[str]
     via: str  # "key" for an API key, "session" for a dashboard cookie
     session_id: Optional[str] = None
+    kind: str = "personal"
+    expires_at: Optional[str] = None
+    expires_soon: bool = False  # inside the team's warning window
 
     def actor(self) -> str:
         """Who did it, as written to the audit log. Never the key itself."""
@@ -133,7 +179,19 @@ def identity_from_row(row: Mapping[str, Any], via: str) -> Identity:
         prefix=row["prefix"],
         via=via,
         session_id=row.get("session_id") if via == "session" else None,
+        kind=row.get("kind") or "personal",
+        expires_at=row.get("expires_at"),
+        expires_soon=expires_within(row.get("expires_at"), row.get("expiry_warn_days")),
     )
+
+
+def expires_within(expires_at: Optional[str], days: Optional[int], now: Optional[datetime] = None) -> bool:
+    """True when a key with this expires_at ("%Y-%m-%dT%H:%M:%SZ") ends within `days` days."""
+    if not expires_at or not days:
+        return False
+    moment = now or datetime.now(timezone.utc)
+    limit = (moment + timedelta(days=int(days))).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return expires_at <= limit
 
 
 class FailureLimiter:
