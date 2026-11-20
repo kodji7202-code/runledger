@@ -1416,6 +1416,38 @@ def test_unauthenticated_post_rejected_without_reading_body(env):
     assert srv.db.list_runs(team_id) == []
 
 
+@pytest.mark.parametrize("fields", [
+    {"totals": {"cost_usd": 10 ** 400}},
+    {"models": {"m": {"cost_usd": 10 ** 400}}},
+    {"steps": [{"cost_usd": 10 ** 400}]},
+    {"quality": {"score": 10 ** 400}},
+    {"totals": {"cost_usd": float("inf")}},
+    {"user": "\ud800"},
+    {"html": "\udfff"},
+    {"extra": [{"\ud800": "value"}]},
+    {"extra": [{"text": "\ud800"}]},
+])
+def test_ingest_rejects_unrepresentable_json_values(env, fields):
+    srv, base = env
+    team_id, key = srv.db.create_team("alpha")
+    status, body = _push(base, key, {"session_id": "invalid-values", **fields})
+    assert status == 400
+    assert body["error"]["code"] == "invalid_json"
+    assert body["error"]["message"]
+    assert srv.db.list_runs(team_id) == []
+
+
+@pytest.mark.parametrize("fields", [
+    {},
+    {"extra": {"empty": [], "null": None}},
+    {"user": "Ana \U0001f600", "totals": {"cost_usd": 1.5}, "quality": {"score": 80}},
+])
+def test_ingest_accepts_representable_json_values(env, fields):
+    srv, base = env
+    _, key = srv.db.create_team("alpha")
+    assert _push(base, key, {"session_id": "valid-values", **fields})[0] == 201
+
+
 def test_bad_bodies_are_rejected_with_json_errors(env):
     srv, base = env
     _, key = srv.db.create_team("alpha")

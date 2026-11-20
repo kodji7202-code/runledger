@@ -747,6 +747,7 @@ class _Handler(BaseHTTPRequestHandler):
             raise _HttpError(400, "invalid_json", "The body must be UTF-8 JSON.") from None
         if not isinstance(payload, dict):
             raise _HttpError(400, "invalid_json", "The body must be a JSON object.")
+        _validate_json_values(payload)
         run = receipt_to_run(
             payload,
             attribution=self.server.db.team_attribution(ident.team_id),
@@ -1271,6 +1272,29 @@ def _masked_url(url: Optional[str]) -> Optional[str]:
         return None
     parts = urlsplit(url)
     return f"{parts.scheme}://{parts.netloc.rsplit('@', 1)[-1]}/[hidden]"
+
+
+def _validate_json_values(payload: Dict[str, Any]) -> None:
+    pending: List[Any] = [payload]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, dict):
+            pending.extend(value.keys())
+            pending.extend(value.values())
+        elif isinstance(value, list):
+            pending.extend(value)
+        elif isinstance(value, str):
+            try:
+                value.encode("utf-8")
+            except UnicodeEncodeError:
+                raise _HttpError(400, "invalid_json", "JSON strings must not contain lone Unicode surrogates.") from None
+        elif isinstance(value, (int, float)):
+            try:
+                finite = math.isfinite(value)
+            except OverflowError:
+                finite = False
+            if not finite:
+                raise _HttpError(400, "invalid_json", "JSON numbers must be finite and representable as floats.")
 
 
 def _json_object(raw: bytes) -> Dict[str, Any]:
