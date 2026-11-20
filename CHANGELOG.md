@@ -9,6 +9,7 @@ change behavior, so read the entry before you upgrade.
 
 ### Fixed
 
+- Team statistics, Insights, and receipt exports exclude future-dated runs from their reporting windows.
 - Team server request logging handles oversized URLs rejected before parsing, returning HTTP 414
   instead of dropping the connection with an internal error.
 - Team receipt ingest rejects numbers outside the finite float range and JSON strings with

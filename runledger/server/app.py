@@ -64,6 +64,7 @@ import ssl
 import sys
 import threading
 import traceback
+from datetime import timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from html import escape as _escape
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
@@ -853,8 +854,10 @@ class _Handler(BaseHTTPRequestHandler):
     def _insights(self, query: Dict[str, List[str]]) -> None:
         ident = self._identify()
         days = _int_param(query, "days", 30, 1, 3650)
-        since = exports.since_for(budgets.now(), days)
-        self._send_json(200, insights.compute(self.server.db, ident.team_id, since, days))
+        moment = budgets.now()
+        since = exports.since_for(moment, days)
+        until = moment.astimezone(timezone.utc).strftime(TIME_FORMAT)
+        self._send_json(200, insights.compute(self.server.db, ident.team_id, since, days, until))
 
     def _get_run(self, raw_id: str) -> None:
         ident = self._identify()
