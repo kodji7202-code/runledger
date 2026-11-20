@@ -40,8 +40,9 @@ For Okta or Microsoft Entra provisioning:
 Deprovisioning with `active:false` blocks personal keys and deletes sessions for that team
 without revoking keys or disabling the server-wide user. Re-enabling restores keys, not sessions.
 Deleting a SCIM user removes membership and revokes its team personal keys. Users belonging to
-other teams retain access there. **Email and name are global attributes**: editing them via
-one team's provisioning also changes the user's profile in other teams. `externalId`, role
+other teams retain access there. **Email and name are global attributes**: provisioning cannot
+change them if the user belongs to another team. Adding an existing user keeps their name.
+Okta given/family name parts are combined when no formatted name is supplied. `externalId`, role
 and active status are team-local. The last working admin cannot be deactivated, demoted or deleted.
 
 Revoke provisioning access with `DELETE /api/scim/token` or the local `scim-token revoke` command.

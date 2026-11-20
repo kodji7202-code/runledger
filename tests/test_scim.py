@@ -145,3 +145,54 @@ def test_validation_is_atomic_and_bodies_are_bounded(scim):
     assert call("GET", "/Groups/member")[1]["members"]
     assert call("PATCH", "/Groups/member", {"Operations": [{"op": "remove", "path": 'members[value eq "' + other + '"]'}]})[0] == 200
     assert call("GET", "/Users/" + other)[1]["roles"] == [{"value": "viewer"}]
+
+
+def test_shared_user_profile_is_immutable_and_post_preserves_name(scim):
+    db, team, key, token, base, call = scim
+    other_team, _ = db.create_team("other")
+    original = db.add_member(other_team, "shared@example.com", "member", "Original Name")
+    status, user = call("POST", body={"userName": "shared@example.com", "displayName": "Different Name"})
+    assert status == 201 and user["id"] == original["id"]
+    assert user["displayName"] == "Original Name"
+    assert db.list_members(other_team)[0]["name"] == "Original Name"
+    path = "/Users/" + user["id"]
+    for method, body in (
+            ("PUT", {"userName": "renamed@example.com", "displayName": "Original Name"}),
+            ("PATCH", {"Operations": [{"op": "replace", "path": "userName", "value": "renamed@example.com"}]}),
+            ("PUT", {"userName": "shared@example.com", "displayName": "Changed"}),
+            ("PATCH", {"Operations": [{"op": "replace", "path": "displayName", "value": "Changed"}]})):
+        status, error = call(method, path, body)
+        assert status == 400 and error["scimType"] == "mutability"
+        assert "belongs to other teams" in error["detail"]
+        assert db.get_user(user["id"])["email"] == "shared@example.com"
+        assert db.get_user(user["id"])["name"] == "Original Name"
+    assert call("PUT", path, {"userName": "SHARED@example.com", "displayName": "Original Name"})[0] == 200
+
+
+def test_okta_name_parts(scim):
+    db, team, key, token, base, call = scim
+    status, user = call("POST", body={"userName": "parts@example.com", "name": {"givenName": " Ana ", "familyName": " Smith "}})
+    assert status == 201 and user["displayName"] == "Ana Smith"
+    path = "/Users/" + user["id"]
+    assert call("PATCH", path, {"Operations": [
+        {"op": "Replace", "path": "name.givenName", "value": "Anne"},
+        {"op": "Replace", "path": "active", "value": True},
+        {"op": "Replace", "path": "name.familyName", "value": "Jones"}]})[1]["displayName"] == "Anne Jones"
+    assert call("PATCH", path, {"Operations": [{"op": "replace", "path": "name.givenName", "value": "Only"}]})[1]["displayName"] == "Only"
+    assert call("PUT", path, {"userName": "parts@example.com", "name": {"givenName": "", "familyName": " "}})[0] == 200
+    assert db.get_user(user["id"])["name"] is None
+    assert call("PUT", path, {"userName": "parts@example.com", "name": {"formatted": "Formatted", "givenName": "Ignored"}})[1]["displayName"] == "Formatted"
+    assert call("POST", body={"userName": "badparts@example.com", "name": {"givenName": []}})[0] == 400
+
+
+def test_scim_writes_accept_existing_transaction(scim):
+    db, team, key, token, base, call = scim
+    user = db.add_member(team, "transaction@example.com", "member")
+    with db._lock, db._conn:
+        db._conn.execute("BEGIN IMMEDIATE")
+        db.scim_update(team, user["id"], {"name": "Updated"})
+    with db._lock, db._conn:
+        db._conn.execute("BEGIN IMMEDIATE")
+        db.scim_group_update(team, "viewer", {user["id"]: "viewer"})
+    assert db.get_user(user["id"])["name"] == "Updated"
+    assert db.list_members(team)[0]["role"] == "viewer"

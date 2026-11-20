@@ -3,7 +3,6 @@ import re
 from urllib.parse import quote
 
 from .auth import InvalidKey
-from .db import utc_now
 
 CORE = "urn:ietf:params:scim:schemas:core:2.0:"
 MESSAGES = "urn:ietf:params:scim:api:messages:2.0:"
@@ -37,6 +36,13 @@ def resource(member):
                      "lastModified": member["updated_at"] or member["joined_at"], "location": location}}
 
 
+def name_from_parts(parts):
+    names = [parts.get(key) for key in ("givenName", "familyName")]
+    if any(name is not None and not isinstance(name, str) for name in names):
+        raise Error(400, "Name parts must be strings.", "invalidValue")
+    return " ".join((name or "").strip() for name in names).strip() or None
+
+
 def values(body):
     result = {}
     for key, value in body.items():
@@ -54,7 +60,7 @@ def values(body):
         elif key == "name":
             if not isinstance(value, dict):
                 raise Error(400, "name must be an object.", "invalidValue")
-            result["name"] = value.get("formatted")
+            result["name"] = value["formatted"] if "formatted" in value else name_from_parts(value)
         elif key == "externalid":
             if value is not None and not isinstance(value, str):
                 raise Error(400, "externalId must be a string.", "invalidValue")
@@ -164,6 +170,7 @@ def dispatch(h, method, path, query):
                     raise Error(400, "userName is required.", "invalidValue")
             else:
                 data = {}
+                name_parts = {}
                 for op in operations(body):
                     path = op.get("path")
                     if path is None:
@@ -171,14 +178,18 @@ def dispatch(h, method, path, query):
                             raise Error(400, "A value object is required.", "invalidValue")
                         data.update(values(op["value"]))
                     else:
-                        if not isinstance(path, str) or path.lower() not in ("active", "name.formatted", "displayname", "username", "externalid", "roles"):
+                        if not isinstance(path, str) or path.lower() not in ("active", "name.formatted", "name.givenname", "name.familyname", "displayname", "username", "externalid", "roles"):
                             raise Error(400, "Unsupported patch path.", "invalidPath")
                         value = op.get("value")
                         if op["op"].lower() == "remove":
                             if path.lower() in ("active", "username"):
                                 raise Error(400, "Cannot remove required attribute.", "mutability")
                             value = [{"value": "member"}] if path.lower() == "roles" else None
-                        data.update(values({path: value}))
+                        if path.lower() in ("name.givenname", "name.familyname"):
+                            name_parts["givenName" if path.lower() == "name.givenname" else "familyName"] = value
+                            data["name"] = name_from_parts(name_parts)
+                        else:
+                            data.update(values({path: value}))
             db.scim_update(team, rid, data)
             send(h, 200, resource(next(m for m in db.list_members(team) if m["id"] == rid)))
             return
@@ -186,7 +197,7 @@ def dispatch(h, method, path, query):
     except InvalidKey as exc:
         detail = str(exc)
         error(h, Error(409 if "already" in detail else 400, detail,
-                       "uniqueness" if "already" in detail else "mutability" if "last working admin" in detail else "invalidValue"))
+                       "uniqueness" if "already" in detail else "mutability" if "last working admin" in detail or "belongs to other teams" in detail else "invalidValue"))
     except Error as exc:
         error(h, exc)
     except _HttpError as exc:
@@ -231,14 +242,5 @@ def groups(h, db, team, method, rid, body, members):
                     changes[user_id] = "viewer" if rid == "member" else "member"
             else:
                 changes[user_id] = rid
-    # Validate the complete patch before making any changes.
-    with db._lock, db._conn:
-        db._conn.execute("BEGIN IMMEDIATE")
-        had_admin = db._working_admins(team)
-        for user_id, role in changes.items():
-            db._conn.execute("UPDATE memberships SET role = ?, updated_at = ? WHERE team_id = ? AND user_id = ?",
-                             (role, utc_now(), team, user_id))
-        if had_admin and not db._working_admins(team):
-            raise InvalidKey("Cannot remove the team's last working admin key.")
-        db._audit(team, "scim", "scim.group.update", rid, {})
+    db.scim_group_update(team, rid, changes)
     groups(h, db, team, "GET", rid, {}, db.list_members(team))
