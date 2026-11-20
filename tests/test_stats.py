@@ -301,7 +301,9 @@ def test_parse_since_units_and_dates():
     assert stats.parse_since("2026-05-01", now) == datetime(2026, 5, 1)
 
 
-@pytest.mark.parametrize("bad", ["banana", "7x", "2026-13-45", "", "  ", "7", "d7", "1y", "-3d"])
+@pytest.mark.parametrize("bad", ["banana", "7x", "2026-13-45", "", "  ", "7", "d7", "1y", "-3d",
+                               "99999999999d", "999999999d", "999999999w", "999999999m",
+                               "9" * 5000 + "d"])
 def test_parse_since_rejects_bad_values(bad):
     with pytest.raises(stats.SinceError) as exc:
         stats.parse_since(bad, datetime(2026, 10, 19))
@@ -434,13 +436,15 @@ def test_since_accepts_a_date_and_until_bounds_the_window(capsys, fixture_a):
     assert rc == 1 and out == "" and "No sessions found" in err
 
 
-@pytest.mark.parametrize("bad", ["banana", "7x", "2026-13-45", ""])
+@pytest.mark.parametrize("bad", ["banana", "7x", "2026-13-45", "", "99999999999d",
+                               "999999999d", "999999999w", "999999999m", "9" * 5000 + "d"])
 def test_invalid_since_is_a_usage_error(capsys, bad):
     with pytest.raises(SystemExit) as exc:
         main(["stats", "--all", "--since", bad])
     assert exc.value.code == 2
     captured = capsys.readouterr()
     assert captured.out == ""
+    assert "usage:" in captured.err and "error: argument --since:" in captured.err
     assert bad in captured.err or repr(bad) in captured.err
     assert "7d" in captured.err and "4w" in captured.err and "YYYY-MM-DD" in captured.err
     assert "Traceback" not in captured.err
