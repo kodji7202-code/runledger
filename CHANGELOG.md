@@ -7,16 +7,20 @@ change behavior, so read the entry before you upgrade.
 
 ## [Unreleased]
 
-### Fixed
-
-- Team stats and Insights count model aliases sharing a friendly label once per receipt,
-  keeping additive tokens and costs and preserving partly priced lower bounds.
-- Team server request logging handles oversized URLs rejected before parsing, returning HTTP 414
-  instead of dropping the connection with an internal error.
-- Team receipt ingest rejects numbers outside the finite float range and JSON strings with
-  lone Unicode surrogates with HTTP 400 instead of an internal server error.
-
 ### Added
+
+- Dashboard OIDC sign-in for Okta, Entra ID and Google Workspace using standard-library
+  Authorization Code + PKCE and RS256 verification. Person-bound, keyless sessions use live
+  membership roles; optional SSO-only dashboard login leaves API keys working.
+
+- Team-scoped SCIM 2.0 user provisioning, deactivation/reactivation and fixed role groups,
+  dedicated rotating bearer tokens with admin API/local CLI, discovery and audit events.
+  Membership deactivation blocks personal keys without disabling users in other teams.
+
+- Server-wide user accounts, team memberships and optional personal API keys. Personal keys and
+  dashboard sessions check enabled membership and effective role on every request. Admin member
+  API and local `user` commands support onboarding, role changes and offboarding, with last-admin
+  protection and person attribution in the audit API/CSV. Existing unowned keys remain unchanged.
 
 - **Paging for the dashboard runs list:** the list no longer stops at 200 runs. Below the table it
   shows `Showing 200 of 1,240 runs` and a `Load 200 more` button that appends the next page, with
@@ -47,6 +51,13 @@ change behavior, so read the entry before you upgrade.
   publishing. PyPI publishing in `release.yml` is unchanged.
 
 ### Fixed
+
+- Team stats and Insights count model aliases sharing a friendly label once per receipt,
+  keeping additive tokens and costs and preserving partly priced lower bounds.
+- Team server request logging handles oversized URLs rejected before parsing, returning HTTP 414
+  instead of dropping the connection with an internal error.
+- Team receipt ingest rejects numbers outside the finite float range and JSON strings with
+  lone Unicode surrogates with HTTP 400 instead of an internal server error.
 
 - **An out-of-range `runledger stats --since` is a usage error (`runledger.stats`):** a relative
   window too large for the calendar (`--since 99999999999d`) made `parse_since()` raise

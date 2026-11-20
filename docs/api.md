@@ -12,11 +12,58 @@ Contents:
 - [Approvals](#approvals)
 - [Team settings](#team-settings)
 - [API keys](#api-keys)
+- [Members](#members)
+- [SCIM provisioning](#scim-provisioning)
 - [Audit log](#audit-log)
 - [Budgets](#budgets)
 - [Exports](#exports)
 - [Dashboard pages](#dashboard-pages)
 - [Error codes](#error-codes)
+
+## SCIM provisioning
+
+SCIM uses a **dedicated per-team bearer token**, not an API key or session cookie.
+An admin creates/rotates it with `POST /api/scim/token` (201, `token` shown once),
+inspects non-secret metadata with `GET /api/scim/token`, and revokes it with
+`DELETE /api/scim/token`. These admin endpoints use normal API authentication;
+cookie writes require `X-Requested-With: runledger`. Rotation invalidates the old token immediately.
+Local alternative: `runledger scim-token create|revoke --team NAME --db runledger.db`.
+
+Provisioning base URL: `https://<host>/scim/v2`. Send `Authorization: Bearer <token>`
+and `Content-Type: application/scim+json` (`application/json` also accepted).
+Responses and SCIM Error objects use `application/scim+json`. Request bodies are limited to 64 KiB.
+
+| Method | Path under `/scim/v2` | Purpose |
+| --- | --- | --- |
+| GET | `/ServiceProviderConfig`, `/ResourceTypes`, `/Schemas` | Minimal discovery |
+| GET, POST | `/Users` | List or create a team membership |
+| GET, PUT, PATCH, DELETE | `/Users/{id}` | Read, replace, patch or remove membership |
+| GET | `/Groups`, `/Groups/{admin,member,viewer}` | Fixed role groups and their members |
+| PATCH | `/Groups/{admin,member,viewer}` | Add/remove role group members |
+
+Lists support 1-based `startIndex`, `count` (maximum 200), and filters
+`userName eq "email"` (case-insensitive) and `externalId eq "id"`.
+Other filters return 400 `invalidFilter`. Duplicate user names return 409 `uniqueness`.
+User fields: `userName`/primary email, `name.formatted` or `displayName`, `active`,
+`externalId` (per membership), and `roles: [{"value":"member"}]` (admin/member/viewer).
+POST defaults to member. PATCH accepts add/replace/remove and no-path value objects;
+operation names are case-insensitive and `active` accepts boolean strings for Entra.
+PUT replaces mutable fields; omitted name/externalId are cleared and role/active default to member/true.
+
+Deactivation deletes sessions and blocks personal-key authentication **only in this team**;
+reactivation restores personal-key access, not deleted sessions. It does not disable the global user.
+DELETE removes membership and revokes its personal keys/sessions. Email and name are server-wide:
+SCIM cannot change them when the user belongs to other teams (400 `mutability`);
+unchanged values remain accepted. Existing global users are reused by email and keep their
+existing name on POST. Okta `name.givenName` and `name.familyName` are joined when `formatted`
+is absent; PATCH name-part paths use the parts supplied in that request.
+No operation may remove the last working admin.
+All changes are audited with actor `scim`; token administration uses its admin actor.
+
+Groups cannot be created/deleted. Adding a member sets their role to that group.
+Removing from their current group sets member (or viewer when removing from member);
+removing from a different role group is a no-op. Group patches accept `members` arrays
+or removal paths `members[value eq "user-id"]`. Bulk, sort, ETags and password changes are unsupported.
 
 ## Conventions
 
@@ -464,6 +511,36 @@ internal-network requests and DNS rebinding. Redirects and proxy routing are not
 Errors: `400` `invalid_settings` (unknown field, an empty body, a bad URL, a TTL out of range, an
 attribution other than `client` or `key`, a key lifetime or warning out of range); `401`; `403` (not admin); `411`; `413` (over 16 KB).
 
+## Members
+
+All member endpoints require **admin**. Cookie writes require `X-Requested-With: runledger`.
+
+| Method and path | Body | Result |
+| --- | --- | --- |
+| `GET /api/members` | none | `200 {"members": [...]}` |
+| `POST /api/members` | `{"email":"ana@example.com", "name":"Ana", "role":"member"}` | `201` member |
+| `PATCH /api/members/{user_id}` | `{"role":"viewer"}` | `200 {"ok":true}` |
+| `DELETE /api/members/{user_id}` | none | `200 {"ok":true}` |
+
+Members include `id` (the server-wide user id), normalized lowercase `email`, optional `name`,
+`created_at`, nullable `disabled_at`, and membership `role`. Lists also include `joined_at`.
+`name` is optional on creation. Adding an existing email reuses that person, but adding an existing
+membership is an error. Invalid email/name/role, missing member, duplicate membership and last-admin
+refusals return `400 invalid_member`. Empty lists return `{"members":[]}`.
+
+Removing a member revokes their keys and deletes their sessions in this team. Role changes take
+effect on every request: personal keys and sessions use the weaker of key and membership roles.
+Disabled users cannot authenticate. Server-wide disable/enable is available only through
+`runledger user disable|enable --email EMAIL [--db FILE]`.
+
+`POST /api/keys` accepts optional `user` (user id or email). That user must be a member, and the
+key role must not exceed their membership role (`400 invalid_key` otherwise). Omitting `user`
+creates an unowned key, unchanged from earlier releases. A key with `user` must have kind `personal`;
+combining `user` with `kind: "service"` returns `400 invalid_key`. `GET /api/keys` includes nullable
+`user_id` and `user` (id, email, name, created_at, disabled_at). `/api/me` includes nullable `user`
+with id/email/name, alongside the key and effective role. Audit API events and audit CSV exports
+include nullable `actor_user_id`; the actor text names the person when present.
+
 ## API keys
 
 Key fields in responses (never the secret, except as noted):
@@ -701,7 +778,7 @@ A run whose cost is unknown has an empty `cost_usd` cell, never `0`; `quality_sc
 `cost_usd` is a lower bound (some of the run's tokens had no price), `false` when it is complete, and
 empty when the cost is unknown.
 
-**`audit.csv`** has the header `id,at,actor,action,target,details_json`. `details_json` is the event's
+**`audit.csv`** has the header `id,at,actor,action,target,details_json,actor_user_id`. `details_json` is the event's
 details as JSON text.
 
 **`report.html`** is one self-contained page with no scripts and no outside resources. Its sections are
@@ -767,6 +844,42 @@ non-browser client sends no such headers (`Sec-Fetch-Site: none`), so those keep
 At most 20 sessions are kept per key; signing in again past that cap drops the oldest session of that
 key, and other keys are unaffected.
 
+### OIDC dashboard sign-in
+
+With `runledger serve --oidc-config PATH` (or `RUNLEDGER_OIDC_CONFIG`),
+`GET /auth/oidc/<provider>/start` sets a short-lived HttpOnly SameSite=Lax pre-auth cookie and
+redirects to the configured provider with state, nonce and PKCE S256.
+`GET /auth/oidc/<provider>/callback?code=...&state=...` consumes that cookie-bound, single-use
+state, exchanges the code and verifies the signed identity. Invalid callbacks return the sign-in
+page (401) and count toward the existing failure limiter (429 when blocked).
+
+Existing enabled accounts only: an email must already have at least one team membership.
+Multiple memberships produce a team form; `POST /auth/oidc/team` accepts form fields `state`
+and `team`. Its state is single-use and pre-auth-cookie bound, and cross-origin submissions
+are rejected. Successful sign-in returns a 200 meta-refresh continuation page and a normal
+SameSite=Strict session cookie, not a cross-site 302 to the dashboard.
+
+When OIDC is configured, `GET /api/me` includes `user` (id, email, name),
+`sign_in_method` (`oidc` or `key`), and
+`key: null` for SSO sessions. API keys still authenticate normally when dashboard key sign-in
+is disabled. See [enterprise.md](enterprise.md#oidc-single-sign-on) for configuration.
+
+### SAML dashboard sign-in
+
+With `runledger serve --saml-config PATH` (or `RUNLEDGER_SAML_CONFIG`),
+`GET /auth/saml/<provider>/metadata` returns the SP metadata. From the dashboard login page,
+`GET /auth/saml/<provider>/start` redirects to the configured IdP and sets a short-lived,
+host-only Secure cookie. The IdP POSTs form fields `SAMLResponse` and `RelayState` to
+`/auth/saml/<provider>/acs`. The ACS verifies the signature and matches the signed bearer
+confirmation to the pending request and browser. Invalid responses return the sign-in page
+(401) and count toward the failure limiter.
+
+Existing users with multiple memberships use the same single-use team form as OIDC, posted to
+`/auth/saml/team`. The resulting session has `key: null` and `sign_in_method: "saml"` in
+`GET /api/me`. If either SSO config sets `"disable_key_sign_in": true`, the dashboard rejects
+key sign-in without disabling API bearer authentication.
+See [enterprise.md](enterprise.md#saml-20-single-sign-on) for configuration.
+
 ### `POST /session/logout`
 
 End the session in the `rl_session` cookie and clear that cookie. Requires the cookie and
@@ -774,6 +887,11 @@ End the session in the `rl_session` cookie and clear that cookie. Requires the c
 Other sessions and the API key are unaffected.
 
 ### `GET /sessions`
+
+Keyless OIDC/SAML callers below admin can list and revoke only their own keyless sessions in
+the current team. Key-authenticated callers below admin remain scoped to their key; admins
+can manage all active sessions in their team. Disabling a person or deactivating/removing their
+membership ends the affected sessions. Listed roles reflect current membership role caps.
 
 List active dashboard sessions, newest first. Accepts a dashboard cookie or bearer key. Admins see
 their team's sessions; members and viewers see sessions started with their own key. The response has

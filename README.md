@@ -9,7 +9,7 @@ server collects receipts from the whole team.
 Local Git checkpoints let you restore files from before a run, with a safety checkpoint for undo.
 
 RunLedger is fully free and open source, including the self-hosted team server.
-Version 0.7.0. Python 3.9 or later, no runtime dependencies.
+Version 0.7.0. Python 3.9 or later, no runtime dependencies by default.
 
 ## Quickstart
 
