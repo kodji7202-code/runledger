@@ -7,6 +7,15 @@ change behavior, so read the entry before you upgrade.
 
 ## [Unreleased]
 
+### Added
+
+- **Signed release images and SBOMs (`.github/workflows/supply-chain.yml`):** each `v*` tag now
+  pushes the team server image to `ghcr.io/kodji7202-code/runledger`, signs it with keyless cosign,
+  attaches SLSA build provenance and a CycloneDX SBOM attestation to the image digest, and uploads
+  CycloneDX SBOMs of the Python package and the image to the GitHub Release. Pull requests that
+  touch the Dockerfile, `pyproject.toml` or the workflow run the same build and SBOM steps without
+  publishing. PyPI publishing in `release.yml` is unchanged.
+
 ## [0.7.0] - 2026-10-20
 
 ### Added
