@@ -11,7 +11,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 
 import pytest
 
-from runledger.server.oidc import Client, OIDCError
+from runledger.server.oidc import JWKS_TTL_SECONDS, Client, OIDCError
 from test_auth import APPROVAL, CSRF, _http, _json, running, _auth
 
 N = int(
@@ -64,7 +64,7 @@ def env(tmp_path):
                         dict(
                             kty="RSA",
                             kid=state["jwks_kid"],
-                            n=b64(N.to_bytes(256, "big")),
+                            n=b64(state.get("jwks_n", N).to_bytes(256, "big")),
                             e=b64((65537).to_bytes(3, "big")),
                         )
                     ]
@@ -227,6 +227,37 @@ def test_rotation(env):
     env[2]["sign"] = {"kid": "two"}
     assert finish(env)[0] == 200
     assert env[2]["jwks_calls"] == calls + 1
+
+
+def test_jwks_expiry_rejects_revoked_key_with_same_kid(env, monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr("runledger.server.oidc.time.monotonic", lambda: clock[0])
+    assert finish(env)[0] == 200
+    calls = env[2]["jwks_calls"]
+    env[2]["jwks_n"] = N + 2
+    clock[0] += JWKS_TTL_SECONDS - 1
+    assert finish(env)[0] == 200
+    assert env[2]["jwks_calls"] == calls
+    clock[0] += 1
+    assert finish(env)[0] == 401
+    assert env[2]["jwks_calls"] == calls + 1
+
+
+def test_jwks_expiry_fails_closed_when_provider_unavailable(env, monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr("runledger.server.oidc.time.monotonic", lambda: clock[0])
+    assert finish(env)[0] == 200
+    clock[0] += JWKS_TTL_SECONDS
+    client = env[0].oidc
+    original = client._json
+
+    def unavailable_jwks(url, data=None):
+        if url.endswith("/jwks"):
+            raise OIDCError("Identity provider request failed.")
+        return original(url, data)
+
+    monkeypatch.setattr(client, "_json", unavailable_jwks)
+    assert finish(env)[0] == 401
 
 
 @pytest.mark.parametrize("mode", ["disabled", "no_membership", "subject", "domain", "hd"])
