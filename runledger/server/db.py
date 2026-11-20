@@ -28,16 +28,20 @@ from .auth import (
     Identity,
     allows,
     InvalidKey,
+    DEFAULT_EXPIRY_WARN_DAYS,
     INITIAL_KEY_LABEL,
     SESSION_CAP_PER_KEY,
     SESSION_TTL_SECONDS,
     generate_key,
     hash_key,
+    key_lifetime_days,
     key_prefix,
     new_key_id,
     new_session_token,
+    validate_kind,
     validate_label,
     validate_role,
+    validate_ttl_days,
 )
 
 TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
@@ -69,7 +73,20 @@ TEAM_SETTING_COLUMNS = (
     ("per_user_budget_usd", "REAL"),
     ("alert_thresholds", "TEXT NOT NULL DEFAULT '[50, 80, 100]'"),
     ("attribution", "TEXT NOT NULL DEFAULT 'client'"),
+    ("key_max_ttl_days", "INTEGER"),
+    ("service_key_max_ttl_days", "INTEGER"),
+    ("key_expiry_warn_days", f"INTEGER NOT NULL DEFAULT {DEFAULT_EXPIRY_WARN_DAYS}"),
 )
+
+# Key columns added with key kinds and expiry. Keys from before them are personal and never expire.
+API_KEY_COLUMNS = (
+    ("kind", "TEXT NOT NULL DEFAULT 'personal'"),
+    ("expires_at", "TEXT"),
+    ("ttl_days", "INTEGER"),
+    ("expiry_warned_at", "TEXT"),
+)
+
+KEY_POLICY_FIELDS = ("key_max_ttl_days", "service_key_max_ttl_days", "key_expiry_warn_days")
 
 # Run columns added after the first release.
 RUN_COLUMNS = (
@@ -143,7 +160,10 @@ CREATE TABLE IF NOT EXISTS teams (
     monthly_budget_usd  REAL,
     per_user_budget_usd REAL,
     alert_thresholds    TEXT NOT NULL DEFAULT '[50, 80, 100]',
-    attribution         TEXT NOT NULL DEFAULT 'client'
+    attribution         TEXT NOT NULL DEFAULT 'client',
+    key_max_ttl_days         INTEGER,
+    service_key_max_ttl_days INTEGER,
+    key_expiry_warn_days     INTEGER NOT NULL DEFAULT 14
 );
 CREATE TABLE IF NOT EXISTS approvals (
     id           TEXT PRIMARY KEY,
@@ -234,7 +254,11 @@ CREATE TABLE IF NOT EXISTS api_keys (
     prefix        TEXT,
     created_at    TEXT NOT NULL,
     last_used_at  TEXT,
-    revoked_at    TEXT
+    revoked_at    TEXT,
+    kind          TEXT NOT NULL DEFAULT 'personal',
+    expires_at    TEXT,
+    ttl_days      INTEGER,
+    expiry_warned_at TEXT
 );
 CREATE INDEX IF NOT EXISTS api_keys_by_team ON api_keys (team_id);
 CREATE TABLE IF NOT EXISTS audit_log (
@@ -276,15 +300,22 @@ _SUMMARY_COLUMNS = (
     "(receipt_html IS NOT NULL) AS has_html"
 )
 
-_KEY_COLUMNS = "id, label, role, prefix, created_at, last_used_at, revoked_at, user_id"
+_KEY_COLUMNS = "id, label, role, kind, prefix, created_at, last_used_at, revoked_at, expires_at, user_id"
 
 _KEY_JOIN = (
-    "SELECT k.id, k.team_id, t.name AS team_name, k.label, k.role, k.prefix, k.key_hash, "
-    "k.created_at, k.last_used_at, k.revoked_at, k.user_id, u.email, u.name, u.disabled_at, "
-    "m.role AS membership_role FROM api_keys k JOIN teams t ON t.id = k.team_id "
+    "SELECT k.id, k.team_id, t.name AS team_name, k.label, k.role, k.kind, k.prefix, k.key_hash, "
+    "k.created_at, k.last_used_at, k.revoked_at, k.expires_at, t.key_expiry_warn_days AS expiry_warn_days, "
+    "k.user_id, u.email, u.name, u.disabled_at, m.role AS membership_role "
+    "FROM api_keys k JOIN teams t ON t.id = k.team_id "
     "LEFT JOIN users u ON u.id = k.user_id "
     "LEFT JOIN memberships m ON m.user_id = k.user_id AND m.team_id = k.team_id AND m.deactivated_at IS NULL"
 )
+# A key is usable when it is not revoked and has not reached its expires_at.
+_USABLE = "k.revoked_at IS NULL AND (k.expires_at IS NULL OR k.expires_at > ?)"
+
+
+def _days_from(now: datetime, days: Optional[int]) -> Optional[str]:
+    return (now + timedelta(days=days)).strftime(TIME_FORMAT) if days else None
 
 
 def utc_now() -> str:
@@ -472,6 +503,7 @@ class Database:
                 self._add_missing_columns("teams", TEAM_SETTING_COLUMNS)
                 self._add_missing_columns("runs", RUN_COLUMNS)
                 self._add_missing_columns("approvals", APPROVAL_IDENTITY_COLUMNS)
+                self._add_missing_columns("api_keys", API_KEY_COLUMNS)
                 self._upgrade_run_store()
                 self._upgrade_review_columns()
                 self._migrate_api_keys()
@@ -694,7 +726,7 @@ class Database:
             raise InvalidKey("User must be an id or email.")
         with self._lock:
             row = self._conn.execute(
-                "SELECT * FROM users WHERE id = ? OR email = ? COLLATE NOCASE", (user, user.strip())
+                "SELECT * FROM users WHERE id = ? OR email = ? COLLATE NOCASE", (user, user.strip().lower())
             ).fetchone()
         return dict(row) if row else None
 
@@ -825,7 +857,7 @@ class Database:
 
     def _working_admins(self, team_id: int, exclude_user: Optional[str] = None,
                         exclude_key: Optional[str] = None) -> bool:
-        rows = self._conn.execute(_KEY_JOIN + " WHERE k.team_id = ? AND k.revoked_at IS NULL", (team_id,))
+        rows = self._conn.execute(_KEY_JOIN + " WHERE k.team_id = ? AND " + _USABLE, (team_id, utc_now()))
         for row in rows:
             key = self._effective_key(row)
             if (key and key["role"] == "admin" and key["id"] != exclude_key
@@ -907,14 +939,21 @@ class Database:
                     {"label": INITIAL_KEY_LABEL, "role": "admin", "prefix": key_prefix(key)})
         return team_id, key
 
-    def _insert_key(self, team_id: int, label: str, role: str, key: str, created_at: str) -> str:
+    def _insert_key(self, team_id: int, label: str, role: str, key: str, created_at: str,
+                    kind: str = "personal", ttl_days: Optional[int] = None,
+                    expires_at: Optional[str] = None) -> str:
         key_id = new_key_id()
         self._conn.execute(
-            "INSERT INTO api_keys (id, team_id, label, role, key_hash, prefix, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (key_id, team_id, label, role, hash_key(key), key_prefix(key), created_at),
+            "INSERT INTO api_keys (id, team_id, label, role, key_hash, prefix, created_at, kind, ttl_days, expires_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (key_id, team_id, label, role, hash_key(key), key_prefix(key), created_at, kind, ttl_days, expires_at),
         )
         return key_id
+
+    def _max_ttl_days(self, team_id: int, kind: str) -> Optional[int]:
+        column = "service_key_max_ttl_days" if kind == "service" else "key_max_ttl_days"
+        row = self._conn.execute(f"SELECT {column} FROM teams WHERE id = ?", (team_id,)).fetchone()
+        return row[column] if row else None
 
     def team_name(self, team_id: int) -> Optional[str]:
         with self._lock:
@@ -937,18 +976,29 @@ class Database:
         if not token or len(token) > 512:
             return None
         with self._lock, self._conn:
-            row = self._conn.execute(_KEY_JOIN + " WHERE k.key_hash = ? AND k.revoked_at IS NULL",
-                                     (hash_key(token),)).fetchone()
+            row = self._conn.execute(_KEY_JOIN + " WHERE k.key_hash = ? AND " + _USABLE,
+                                     (hash_key(token), utc_now())).fetchone()
             row = self._effective_key(row)
             if row is None:
                 return None
             self._touch_key(row["id"])
         return dict(row)
 
+    def expired_key_for_token(self, token: Optional[str]) -> Optional[Dict[str, Any]]:
+        """The key whose secret is `token` when it is not revoked but has expired, else None.
+        Lets the server answer key_expired instead of a plain 401."""
+        if not token or len(token) > 512:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                _KEY_JOIN + " WHERE k.key_hash = ? AND k.revoked_at IS NULL AND k.expires_at IS NOT NULL "
+                "AND k.expires_at <= ?", (hash_key(token), utc_now())).fetchone()
+        return self._effective_key(row)
+
     def active_key(self, key_id: str) -> Optional[Dict[str, Any]]:
         """The active key with this id (used to check a dashboard session), or None."""
         with self._lock, self._conn:
-            row = self._conn.execute(_KEY_JOIN + " WHERE k.id = ? AND k.revoked_at IS NULL", (key_id,)).fetchone()
+            row = self._conn.execute(_KEY_JOIN + " WHERE k.id = ? AND " + _USABLE, (key_id, utc_now())).fetchone()
             row = self._effective_key(row)
             if row is None:
                 return None
@@ -986,6 +1036,9 @@ class Database:
         now_text = now.strftime(TIME_FORMAT)
         expires = (now + timedelta(seconds=ttl_s)).strftime(TIME_FORMAT)
         with self._lock, self._conn:
+            key_end = self._conn.execute("SELECT expires_at FROM api_keys WHERE id = ?", (key_id,)).fetchone()
+            if key_end is not None and key_end["expires_at"] and key_end["expires_at"] < expires:
+                expires = key_end["expires_at"]  # a session never outlives its key
             self._conn.execute("DELETE FROM sessions WHERE expires_at <= ?", (now_text,))
             self._conn.execute(
                 "DELETE FROM sessions WHERE token_hash IN ("
@@ -1016,8 +1069,8 @@ class Database:
                 self._conn.execute("DELETE FROM sessions WHERE token_hash = ?", (token_hash,))
                 return None
             key = self._conn.execute(
-                _KEY_JOIN + " WHERE k.id = ? AND k.team_id = ? AND k.revoked_at IS NULL",
-                (row["key_id"], row["team_id"]),
+                _KEY_JOIN + " WHERE k.id = ? AND k.team_id = ? AND " + _USABLE,
+                (row["key_id"], row["team_id"], utc_now()),
             ).fetchone()
             key = self._effective_key(key)
             if key is None:
@@ -1047,13 +1100,20 @@ class Database:
         return dict(row) if row else None
 
     def create_key(self, team_id: int, label: Any, role: Any, actor: Union[str, Identity],
-                   user: Optional[str] = None) -> Dict[str, Any]:
+                   kind: Any = None, expires_in_days: Any = None, user: Optional[str] = None) -> Dict[str, Any]:
         """Create a key. The returned dict includes "key", the only time the plaintext is available.
-        Raises InvalidKey for a bad label or role, ValueError for an unknown team."""
+        kind is "personal" (the default) or "service". expires_in_days defaults to the team's cap
+        for that kind; with no cap and no value the key never expires.
+        Raises InvalidKey for a bad label, role, kind or lifetime, ValueError for an unknown team."""
         label = validate_label(label)
         role = validate_role(role)
+        kind = validate_kind(kind)
+        if user is not None and kind == "service":
+            raise InvalidKey("A service key cannot be owned by a person.")
+        requested = validate_ttl_days(expires_in_days)
         key = generate_key()
-        now = utc_now()
+        moment = datetime.now(timezone.utc)
+        now = moment.strftime(TIME_FORMAT)
         with self._lock, self._conn:
             if not self._conn.in_transaction:
                 self._conn.execute("BEGIN IMMEDIATE")
@@ -1068,12 +1128,16 @@ class Database:
                 ).fetchone()
                 if membership is None or not allows(membership["role"], role):
                     raise InvalidKey("The user must be a member with at least the key's role.")
-            key_id = self._insert_key(team_id, label, role, key, now)
+            ttl_days = key_lifetime_days(requested, self._max_ttl_days(team_id, kind), kind)
+            expires_at = _days_from(moment, ttl_days)
+            key_id = self._insert_key(team_id, label, role, key, now, kind, ttl_days, expires_at)
             if owner:
                 self._conn.execute("UPDATE api_keys SET user_id = ? WHERE id = ?", (owner["id"], key_id))
             prefix = key_prefix(key)
-            self._audit(team_id, actor, "key.create", key_id, {"label": label, "role": role, "prefix": prefix})
-        return {"id": key_id, "label": label, "role": role, "prefix": prefix, "created_at": now, "key": key,
+            self._audit(team_id, actor, "key.create", key_id,
+                        {"label": label, "role": role, "prefix": prefix, "kind": kind, "expires_at": expires_at})
+        return {"id": key_id, "label": label, "role": role, "kind": kind, "prefix": prefix,
+                "created_at": now, "expires_at": expires_at, "key": key,
                 "user_id": owner["id"] if owner else None, "user": owner}
 
     def revoke_key(self, team_id: int, key_id: str, actor: Union[str, Identity]) -> Tuple[str, Optional[Dict[str, Any]]]:
@@ -1102,14 +1166,33 @@ class Database:
                 return "already_revoked", row
             return "last_admin", row
 
-    def rotate_key(self, team_id: int, key_id: str, actor: Union[str, Identity]) -> Tuple[str, Optional[Dict[str, Any]]]:
-        """Replace a key's secret. The id, label and role stay; the old secret stops working at once.
-        Returns (outcome, view) where view includes the new "key". Outcomes: "ok", "missing", "revoked"."""
+    def rotate_key(self, team_id: int, key_id: str, actor: Union[str, Identity],
+                   expires_in_days: Any = None) -> Tuple[str, Optional[Dict[str, Any]]]:
+        """Replace a key's secret. The id, label, role and kind stay; the old secret stops working
+        at once. Rotation also renews the key's lifetime, so it is how an expired key comes back:
+        expires_in_days, else the lifetime the key was given, both held to the team's current cap.
+        Returns (outcome, view) where view includes the new "key". Outcomes: "ok", "missing", "revoked".
+        Raises InvalidKey for a lifetime over the cap."""
+        requested = validate_ttl_days(expires_in_days)
         new_key = generate_key()
+        moment = datetime.now(timezone.utc)
         with self._lock, self._conn:
+            current = self._conn.execute(
+                "SELECT kind, ttl_days FROM api_keys WHERE id = ? AND team_id = ?", (key_id, team_id)
+            ).fetchone()
+            expires_at = None
+            if current is not None:
+                kind = current["kind"] or "personal"
+                cap = self._max_ttl_days(team_id, kind)
+                if requested is None and current["ttl_days"] is not None:
+                    requested = min(current["ttl_days"], cap) if cap else current["ttl_days"]
+                ttl_days = key_lifetime_days(requested, cap, kind)
+                expires_at = _days_from(moment, ttl_days)
             cur = self._conn.execute(
-                "UPDATE api_keys SET key_hash = ?, prefix = ? WHERE id = ? AND team_id = ? AND revoked_at IS NULL",
-                (hash_key(new_key), key_prefix(new_key), key_id, team_id),
+                "UPDATE api_keys SET key_hash = ?, prefix = ?, expires_at = ?, ttl_days = ?, "
+                "expiry_warned_at = NULL WHERE id = ? AND team_id = ? AND revoked_at IS NULL",
+                (hash_key(new_key), key_prefix(new_key), expires_at,
+                 ttl_days if current is not None else None, key_id, team_id),
             )
             row = self._key_row(team_id, key_id)
             if row is None:
@@ -1119,7 +1202,8 @@ class Database:
             # The old secret is gone, so every dashboard session it started ends with it.
             self._conn.execute("DELETE FROM sessions WHERE key_id = ?", (key_id,))
             self._audit(team_id, actor, "key.rotate", key_id,
-                        {"label": row["label"], "role": row["role"], "prefix": row["prefix"]})
+                        {"label": row["label"], "role": row["role"], "prefix": row["prefix"],
+                         "expires_at": row["expires_at"]})
         return "ok", dict(row, key=new_key)
 
     def list_audit(
@@ -1689,7 +1773,8 @@ class Database:
     def approval_settings(self, team_id: int) -> Dict[str, Any]:
         with self._lock:
             row = self._conn.execute(
-                "SELECT slack_webhook_url, webhook_url, approval_ttl_s, attribution FROM teams WHERE id = ?",
+                "SELECT slack_webhook_url, webhook_url, approval_ttl_s, attribution, "
+                "key_max_ttl_days, service_key_max_ttl_days, key_expiry_warn_days FROM teams WHERE id = ?",
                 (team_id,),
             ).fetchone()
         return {
@@ -1697,6 +1782,9 @@ class Database:
             "webhook_url": row["webhook_url"],
             "approval_ttl_s": int(row["approval_ttl_s"]),
             "attribution": row["attribution"] or "client",
+            "key_max_ttl_days": row["key_max_ttl_days"],
+            "service_key_max_ttl_days": row["service_key_max_ttl_days"],
+            "key_expiry_warn_days": int(row["key_expiry_warn_days"]),
         }
 
     def team_attribution(self, team_id: int) -> str:
@@ -1714,19 +1802,70 @@ class Database:
         """Apply validated settings. Only the known column names can reach the SQL text.
         The audit entry names the fields that changed; the webhook URLs are never written to it."""
         columns = [c for c in ("slack_webhook_url", "webhook_url", "approval_ttl_s", "attribution")
-                   if c in changes]
+                   + KEY_POLICY_FIELDS if c in changes]
         if columns:
             sql = "UPDATE teams SET " + ", ".join(f"{c} = ?" for c in columns) + " WHERE id = ?"
             with self._lock, self._conn:
                 self._conn.execute(sql, [changes[c] for c in columns] + [team_id])
+                shortened = self._apply_key_caps(team_id, changes)
                 if actor is not None:
                     details: Dict[str, Any] = {"fields": sorted(columns)}
-                    if "approval_ttl_s" in changes:
-                        details["approval_ttl_s"] = changes["approval_ttl_s"]
-                    if "attribution" in changes:
-                        details["attribution"] = changes["attribution"]
+                    for name in ("approval_ttl_s", "attribution") + KEY_POLICY_FIELDS:
+                        if name in changes:
+                            details[name] = changes[name]
+                    if shortened:
+                        details["keys_shortened"] = shortened
                     self._audit(team_id, actor, "team.settings", "settings", details)
         return self.approval_settings(team_id)
+
+    def _apply_key_caps(self, team_id: int, changes: Dict[str, Any]) -> int:
+        """A new or lower cap also binds keys that already exist: a key of that kind that would
+        outlive the cap from now (or never expire) now expires that many days from now. Nothing
+        expires at once, so the holders get the warning window to rotate. Returns the count."""
+        moment = datetime.now(timezone.utc)
+        count = 0
+        for column, kind in (("key_max_ttl_days", "personal"), ("service_key_max_ttl_days", "service")):
+            days = changes.get(column)
+            if not days:
+                continue
+            limit = _days_from(moment, days)
+            cur = self._conn.execute(
+                "UPDATE api_keys SET expires_at = ?, ttl_days = MIN(COALESCE(ttl_days, ?), ?) "
+                "WHERE team_id = ? AND kind = ? AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)",
+                (limit, days, days, team_id, kind, limit),
+            )
+            count += cur.rowcount
+        return count
+
+    def keys_expiring(self, now: Optional[datetime] = None) -> List[Dict[str, Any]]:
+        """Usable keys inside their team's warning window that have not been warned about yet.
+        Marks each one warned, so a key is reported once per lifetime (rotation clears the mark).
+        Never returns a secret or a hash."""
+        moment = now or datetime.now(timezone.utc)
+        stamp = moment.strftime(TIME_FORMAT)
+        with self._lock, self._conn:
+            rows = self._conn.execute(
+                "SELECT k.id, k.team_id, t.name AS team_name, k.label, k.role, k.kind, k.prefix, "
+                "k.expires_at, t.key_expiry_warn_days FROM api_keys k JOIN teams t ON t.id = k.team_id "
+                "WHERE k.revoked_at IS NULL AND k.expiry_warned_at IS NULL AND k.expires_at IS NOT NULL "
+                "AND k.expires_at > ? ORDER BY k.expires_at", (stamp,),
+            ).fetchall()
+            due = [dict(r) for r in rows
+                   if r["key_expiry_warn_days"] > 0
+                   and r["expires_at"] <= _days_from(moment, int(r["key_expiry_warn_days"]))]
+            for row in list(due):
+                # Only the lifetime that was read: a rotation in between gave the key a new one.
+                cur = self._conn.execute(
+                    "UPDATE api_keys SET expiry_warned_at = ? WHERE id = ? AND expiry_warned_at IS NULL "
+                    "AND expires_at = ? AND revoked_at IS NULL", (stamp, row["id"], row["expires_at"]))
+                if cur.rowcount != 1:
+                    due.remove(row)
+                    continue
+                self._audit(row["team_id"], "system", "key.expiring", row["id"],
+                            {"label": row["label"], "kind": row["kind"], "prefix": row["prefix"],
+                             "expires_at": row["expires_at"]})
+                del row["key_expiry_warn_days"]
+        return due
 
     # Approvals
 
