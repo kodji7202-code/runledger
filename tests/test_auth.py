@@ -311,6 +311,7 @@ def test_me_reports_team_role_and_key_for_a_bearer_key_and_a_session(env):
         "role": "member",
         "key": {"id": member["id"], "label": "laptop", "prefix": member["key"][:8],
                 "kind": "personal", "expires_at": None, "expires_soon": False},
+        "user": None,
     }
     cookie = _cookie_for(base, member["key"])
     assert _json(_http(base, "GET", "/api/me", headers={"Cookie": cookie})[2]) == me
@@ -320,7 +321,7 @@ def test_create_key_returns_the_secret_once_and_listing_never_does(env):
     srv, base = env
     _, admin = srv.db.create_team("alpha")
     created = _create_key(base, admin, "laptop", "member")
-    assert set(created) == {"id", "label", "role", "kind", "prefix", "created_at", "expires_at", "key"}
+    assert set(created) == {"id", "label", "role", "kind", "prefix", "created_at", "expires_at", "key", "user_id", "user"}
     assert created["label"] == "laptop" and created["role"] == "member"
     assert KEY_RE.fullmatch(created["key"]) and created["prefix"] == created["key"][:8]
 
@@ -330,7 +331,7 @@ def test_create_key_returns_the_secret_once_and_listing_never_does(env):
     assert {k["label"] for k in keys} == {"initial", "laptop"}
     assert all("key" not in k and "key_hash" not in k for k in keys)
     assert set(keys[0]) == {"id", "label", "role", "kind", "prefix", "created_at", "last_used_at",
-                            "revoked_at", "expires_at"}
+                            "revoked_at", "expires_at", "user_id", "user"}
     assert _http(base, "GET", "/api/me", headers=_auth(created["key"]))[0] == 200
 
 
@@ -1102,7 +1103,7 @@ def test_obsolete_service_settings_cannot_enable_removed_routes(tmp_path, monkey
             assert _http(base, method, path, body={})[0] == 404
         status, _, raw = _http(base, "GET", "/api/me", headers=_auth(admin))
         assert status == 200
-        assert set(_json(raw)) == {"team", "role", "key"}
+        assert set(_json(raw)) == {"team", "role", "key", "user"}
         with sqlite3.connect(srv.db.path) as conn:
             tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
         assert "billing_subscriptions" not in tables

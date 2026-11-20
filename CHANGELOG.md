@@ -16,6 +16,19 @@ change behavior, so read the entry before you upgrade.
 
 ### Added
 
+- Dashboard OIDC sign-in for Okta, Entra ID and Google Workspace using standard-library
+  Authorization Code + PKCE and RS256 verification. Person-bound, keyless sessions use live
+  membership roles; optional SSO-only dashboard login leaves API keys working.
+
+- Team-scoped SCIM 2.0 user provisioning, deactivation/reactivation and fixed role groups,
+  dedicated rotating bearer tokens with admin API/local CLI, discovery and audit events.
+  Membership deactivation blocks personal keys without disabling users in other teams.
+
+- Server-wide user accounts, team memberships and optional personal API keys. Personal keys and
+  dashboard sessions check enabled membership and effective role on every request. Admin member
+  API and local `user` commands support onboarding, role changes and offboarding, with last-admin
+  protection and person attribution in the audit API/CSV. Existing unowned keys remain unchanged.
+
 - **Paging for the dashboard runs list:** the list no longer stops at 200 runs. Below the table it
   shows `Showing 200 of 1,240 runs` and a `Load 200 more` button that appends the next page, with
   the filters kept. `GET /api/runs` takes `after` (the id of the last run on a page) and reports
