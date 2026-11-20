@@ -577,6 +577,7 @@ def parse(path: Path, git_root: bool = True) -> Run:
         if call_id in results:
             for step in steps:
                 step.result_text, step.is_error = results[call_id]
+                step.has_result = True
     for mid, steps in issued.items():
         for step in steps:
             step.usage_known = mid in message_usage
