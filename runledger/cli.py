@@ -8,10 +8,11 @@
                   [--trusted-proxy CIDR ...]
   runledger team create NAME [--db runledger.db]
   runledger backup [--db runledger.db] [--dir backups] [--keep 14]
-  runledger key create --team-id N --label L --role admin|member|viewer [--db runledger.db]
+  runledger key create --team-id N --label L --role admin|member|viewer [--kind personal|service]
+                       [--expires-in-days N] [--db runledger.db]
   runledger key list --team-id N [--db runledger.db]
   runledger key revoke ID [--db runledger.db]
-  runledger key rotate ID [--db runledger.db]
+  runledger key rotate ID [--expires-in-days N] [--db runledger.db]
   runledger push [SESSION | --latest] [--project PATH] [--agent AGENT] [--server URL] [--key KEY] [--user NAME]
                  [--review] [--review-model MODEL] [--safe | --no-safe]
   runledger guard [--agent claude-code|droid|codex]   PreToolUse hook (reads the event on stdin)
@@ -40,7 +41,7 @@ import re
 import sqlite3
 import sys
 import webbrowser
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Tuple
 from urllib.parse import quote
@@ -531,6 +532,7 @@ def cmd_serve(args) -> int:
     elif server.audit_retention_days:
         print(f"Retention: audit events older than {server.audit_retention_days} days are deleted")
     server.start_maintenance()
+    server.start_key_expiry_warnings()
     print("Create a team with: runledger team create NAME   (Ctrl+C to stop)")
     try:
         server.serve_forever()
@@ -743,11 +745,14 @@ def cmd_key(args) -> int:
                 print(f"error: no team with id {args.team_id}", file=sys.stderr)
                 return 1
             try:
-                view = db.create_key(args.team_id, args.label, args.role, actor="cli")
+                view = db.create_key(args.team_id, args.label, args.role, actor="cli",
+                                     kind=args.kind, expires_in_days=args.expires_in_days)
             except (InvalidKey, ValueError) as exc:
                 print(f"error: {exc}", file=sys.stderr)
                 return 1
-            print(f"Created {view['role']} key '{view['label']}' (id {view['id']}) for team {args.team_id}.")
+            print(f"Created {view['kind']} {view['role']} key '{view['label']}' (id {view['id']}) "
+                  f"for team {args.team_id}.")
+            print(f"Expires: {view['expires_at'] or 'never'}")
             print("API key (shown once, store it safely):")
             print(view["key"])
             return 0
@@ -766,11 +771,17 @@ def cmd_key(args) -> int:
                 print("error: this is the team's last active admin key. Create or rotate another admin key first.",
                       file=sys.stderr)
             return 1
-        outcome, view = db.rotate_key(team_id, args.key_id, actor="cli")
+        try:
+            outcome, view = db.rotate_key(team_id, args.key_id, actor="cli",
+                                          expires_in_days=args.expires_in_days)
+        except InvalidKey as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
         if outcome != "ok":
             print("error: a revoked key cannot be rotated", file=sys.stderr)
             return 1
         print(f"Rotated key '{view['label']}' (id {args.key_id}). The old key no longer works.")
+        print(f"Expires: {view['expires_at'] or 'never'}")
         print("New API key (shown once, store it safely):")
         print(view["key"])
         return 0
@@ -786,11 +797,19 @@ def _key_list(db, team_id: int) -> int:
     if not keys:
         print(f"No keys for team {team_id}.", file=sys.stderr)
         return 1
-    print(f"{'id':<16}  {'label':<20}  {'role':<7}  {'prefix':<8}  {'created':<20}  {'last used':<20}  status")
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    print(f"{'id':<16}  {'label':<20}  {'role':<7}  {'kind':<8}  {'prefix':<8}  {'created':<20}  "
+          f"{'last used':<20}  {'expires':<20}  status")
     for k in keys:
-        status = f"revoked {k['revoked_at']}" if k["revoked_at"] else "active"
-        print(f"{k['id']:<16}  {k['label'][:20]:<20}  {k['role']:<7}  {(k['prefix'] or '-'):<8}  "
-              f"{k['created_at']:<20}  {(k['last_used_at'] or 'never'):<20}  {status}")
+        if k["revoked_at"]:
+            status = f"revoked {k['revoked_at']}"
+        elif k["expires_at"] and k["expires_at"] <= now:
+            status = "expired"
+        else:
+            status = "active"
+        print(f"{k['id']:<16}  {k['label'][:20]:<20}  {k['role']:<7}  {k['kind']:<8}  {(k['prefix'] or '-'):<8}  "
+              f"{k['created_at']:<20}  {(k['last_used_at'] or 'never'):<20}  {(k['expires_at'] or 'never'):<20}  "
+              f"{status}")
     return 0
 
 
@@ -830,6 +849,9 @@ def cmd_push(args) -> int:
     else:
         print(f"Pushed {result.get('id', '?')}  ·  risk {result.get('risk_score', '?')}/100 "
               f"({result.get('risk_level', '?')})  ·  {server.rstrip('/')}{result.get('url', '')}")
+    if result.get("key_expires_at"):
+        print(f"warning: this API key expires at {result['key_expires_at']}. "
+              "Ask a team admin to rotate it before then.", file=sys.stderr)
     hint = safe_hint(server or "", safe)
     if hint:
         print(hint, file=sys.stderr)
@@ -1064,6 +1086,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     pkc.add_argument("--team-id", type=int, required=True)
     pkc.add_argument("--label", required=True, help="what the key is for, e.g. 'laptop' or 'CI'")
     pkc.add_argument("--role", required=True, choices=["admin", "member", "viewer"])
+    pkc.add_argument("--kind", choices=["personal", "service"], default="personal",
+                     help="personal (one person, may sign in to the dashboard) or service (API only)")
+    pkc.add_argument("--expires-in-days", type=int, metavar="N",
+                     help="days until the key expires (default: the team's cap for its kind, else never)")
     pkc.add_argument("--db", default="runledger.db", help="SQLite database file (default runledger.db)")
     pkc.set_defaults(func=cmd_key)
     pkl = ksub.add_parser("list", help="list a team's keys (never their secrets)")
@@ -1076,6 +1102,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     pkr.set_defaults(func=cmd_key)
     pkt = ksub.add_parser("rotate", help="replace a key's secret; the old one stops working at once")
     pkt.add_argument("key_id")
+    pkt.add_argument("--expires-in-days", type=int, metavar="N",
+                     help="new lifetime in days (default: the key's previous lifetime, held to the team's cap)")
     pkt.add_argument("--db", default="runledger.db", help="SQLite database file (default runledger.db)")
     pkt.set_defaults(func=cmd_key)
 
