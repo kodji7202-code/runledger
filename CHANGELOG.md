@@ -16,6 +16,10 @@ change behavior, so read the entry before you upgrade.
 
 ### Added
 
+- **Paging for the dashboard runs list:** the list no longer stops at 200 runs. Below the table it
+  shows `Showing 200 of 1,240 runs` and a `Load 200 more` button that appends the next page, with
+  the filters kept. `GET /api/runs` takes `after` (the id of the last run on a page) and reports
+  `total`, the number of runs the filters match.
 - **Dashboard session controls:** Sign out of the current session or list and revoke active sessions
   from the Sessions tab. Admins can manage any session in their team; other roles can manage sessions
   started with their key. Operators can optionally configure an inactivity timeout.
