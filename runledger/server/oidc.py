@@ -7,8 +7,8 @@ uses the existing Strict cookie, not this pre-authentication cookie.
 
 Discovery pins the configured issuer. Token exchange uses client_secret_post over
 urllib, and ID tokens require RS256 with a full PKCS#1 v1.5 encoded-message comparison.
-Discovery and JWKS are cached; an unknown key id triggers one JWKS refresh. Token
-errors are deliberately generic so credentials never reach pages or request logs.
+Discovery is cached and JWKS are cached for one hour; an unknown key id triggers one
+refresh. Token errors are deliberately generic so credentials never reach pages or logs.
 """
 
 from __future__ import annotations
@@ -27,6 +27,8 @@ from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Tuple, Union
 from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
+
+JWKS_TTL_SECONDS = 3600
 
 
 class OIDCError(ValueError):
@@ -127,6 +129,7 @@ class Client:
             raise OIDCError("Invalid OIDC configuration: " + str(exc)) from None
         self._discovery: Dict[str, Dict[str, Any]] = {}
         self._jwks: Dict[str, Dict[str, Any]] = {}
+        self._jwks_expires: Dict[str, float] = {}
         self._pending: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.Lock()
 
@@ -249,8 +252,13 @@ class Client:
             uri = self.discovery(provider)["jwks_uri"]
             key = None
             for refresh in (False, True):
-                if refresh or provider not in self._jwks:
+                if (
+                    refresh
+                    or provider not in self._jwks
+                    or time.monotonic() >= self._jwks_expires.get(provider, 0)
+                ):
                     self._jwks[provider] = self._json(uri)
+                    self._jwks_expires[provider] = time.monotonic() + JWKS_TTL_SECONDS
                 key = next(
                     (k for k in self._jwks[provider]["keys"] if k.get("kid") == header["kid"]), None
                 )
