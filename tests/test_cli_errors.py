@@ -108,6 +108,37 @@ def test_list_skips_a_session_that_vanishes_after_listing(tmp_path, monkeypatch,
     assert len([line for line in out.splitlines() if "steps" in line and "when" not in line]) == 1
 
 
+@pytest.mark.parametrize("failure", ["invalid", "unreadable", "vanished"])
+def test_list_limit_counts_printed_sessions(tmp_path, monkeypatch, capsys, failure):
+    bad = tmp_path / "bad.jsonl"
+    keep = tmp_path / "keep.jsonl"
+    extra = tmp_path / "extra.jsonl"
+    bad.write_text("not a session\n", encoding="utf-8")
+    keep.write_bytes(SAMPLE.read_bytes())
+    extra.write_text("not a session\n", encoding="utf-8")
+    if failure == "vanished":
+        bad.unlink()
+    elif failure == "unreadable":
+        real_detect = adapters.detect
+
+        def detect(path):
+            if path == bad:
+                raise OSError("cannot read session")
+            return real_detect(path)
+
+        monkeypatch.setattr(adapters, "detect", detect)
+    monkeypatch.setattr(adapters, "find_sessions", lambda project, agent: [bad, keep, extra])
+
+    for _ in range(2):  # cold and warm session cache
+        assert main(["list", "--project", str(tmp_path), "--limit", "1"]) == 0
+        captured = capsys.readouterr()
+        rows = captured.out.splitlines()
+        assert len(rows) == 2
+        assert "7f3c2a10" in rows[1]
+        assert captured.err.count("skipped:") == (0 if failure == "vanished" else 1)
+        assert str(extra) not in captured.err
+
+
 def test_find_sessions_tolerates_a_file_removed_during_sort(tmp_path, monkeypatch):
     a, b = tmp_path / "a.jsonl", tmp_path / "b.jsonl"
     a.write_text("", encoding="utf-8")
