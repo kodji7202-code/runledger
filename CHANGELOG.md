@@ -9,6 +9,8 @@ change behavior, so read the entry before you upgrade.
 
 ### Fixed
 
+- Team stats and Insights count model aliases sharing a friendly label once per receipt,
+  keeping additive tokens and costs and preserving partly priced lower bounds.
 - Team server request logging handles oversized URLs rejected before parsing, returning HTTP 414
   instead of dropping the connection with an internal error.
 - Team receipt ingest rejects numbers outside the finite float range and JSON strings with

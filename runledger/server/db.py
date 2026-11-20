@@ -23,7 +23,7 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 from uuid import uuid4
 
-from ..pricing import friendly_model
+from .model_rollup import receipt_models
 from .insights import AI_REVIEW_LIKE, QUALITY_LIKE, RECOMMENDATIONS_LIKE, review_fields
 from .auth import (
     DEFAULT_EXPIRY_WARN_DAYS,
@@ -1356,8 +1356,7 @@ class Database:
         models: Dict[str, Dict[str, Any]] = {}
         for row in model_rows:
             partial = bool(row["cost_partial"])
-            for name, info in json.loads(row["models"] or "{}").items():
-                label = friendly_model(name)
+            for label, info in receipt_models(json.loads(row["models"] or "{}"), partial).items():
                 slot = models.setdefault(
                     label, {"model": label, "runs": 0, "tokens": 0, "cost_usd": None,
                             "priced_runs": 0, "unpriced_runs": 0},
@@ -1370,7 +1369,7 @@ class Database:
                     slot["cost_usd"] = round((slot["cost_usd"] or 0.0) + float(info["cost_usd"]), 6)
                 # A model bucket with no price and a partly priced run both leave the model
                 # figure below the real spend, exactly as they do for the other group rows.
-                if not priced or partial:
+                if not priced or info["partial"]:
                     slot["unpriced_runs"] += 1
         by_model = sorted(
             models.values(),

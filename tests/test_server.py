@@ -22,6 +22,7 @@ from runledger.cli import main
 from runledger.server.app import MAX_BODY_BYTES, RECEIPT_CSP, _money, make_server, receipt_to_run
 from runledger.server.dashboard import DASHBOARD_HTML
 from runledger.server.db import Database
+from runledger.server.model_rollup import receipt_models
 
 FIX = Path(__file__).parent / "fixtures" / "sample_session.jsonl"
 DROID_FIX = Path(__file__).parent / "fixtures" / "droid_session.jsonl"
@@ -137,6 +138,54 @@ def _stored(payload, run_id, *, steps=4, ended=_UNSET, cost=0.1, risk=20, **extr
 def _push(base, key, payload):
     status, _, raw = _http(base, "POST", "/api/runs", body=payload, headers=_auth(key))
     return status, _json(raw)
+
+
+@pytest.mark.parametrize("endpoint,field", [("stats", "by_model"), ("insights", "models")])
+@pytest.mark.parametrize("alias_cost", [0.3, None])
+def test_model_aliases_count_once_per_receipt(env, endpoint, field, alias_cost):
+    srv, base = env
+    _, key = srv.db.create_team("aliases")
+    payload = _stored(client.build_payload(NATIVE), "aliases", cost=0.6 + (alias_cost or 0))
+    payload["steps"] = []
+    payload["quality"] = {"score": 80, "grade": "B", "signals": []}
+    payload["totals"]["cost_partial"] = alias_cost is None
+    payload["models"] = {
+        "claude-sonnet-4-5-20250929": {"tokens": 1000, "cost_usd": 0.6},
+        "claude-sonnet-4-5": {"tokens": 500, "cost_usd": alias_cost},
+    }
+    assert _push(base, key, payload)[0] == 201
+    status, _, raw = _http(base, "GET", f"/api/{endpoint}?days=30", headers=_auth(key))
+    assert status == 200
+    rows = _json(raw)[field]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["model"] == "Sonnet 4.5"
+    assert row["runs"] == 1
+    assert row["priced_runs"] == 1
+    assert row["cost_usd"] == pytest.approx(0.6 + (alias_cost or 0))
+    assert row["cost_is_lower_bound"] is (alias_cost is None)
+    if endpoint == "stats":
+        assert row["tokens"] == 1500
+        assert row["unpriced_runs"] == int(alias_cost is None)
+    else:
+        assert row["partial_runs"] == int(alias_cost is None)
+        assert row["cost_per_run"] == row["cost_usd"]
+        second = _stored(payload, "single-model", cost=0.6)
+        second["quality"] = {"score": 40, "grade": "D", "signals": []}
+        assert _push(base, key, second)[0] == 201
+        row = _json(_http(base, "GET", "/api/insights?days=30", headers=_auth(key))[2])["models"][0]
+        assert row["runs"] == 2
+        assert row["avg_quality"] == 60
+
+
+@pytest.mark.parametrize("models,expected", [
+    ({}, {}),
+    ({"claude-sonnet-4-5": None}, {
+        "Sonnet 4.5": {"tokens": 0, "cost_usd": None, "partial": False},
+    }),
+])
+def test_receipt_models_empty_and_malformed_bucket(models, expected):
+    assert receipt_models(models) == expected
 
 
 def _run_row(db_path, run_id):
@@ -1681,4 +1730,3 @@ def test_push_needs_server_and_key(monkeypatch, tmp_path):
     with pytest.raises(client.PushError):
         client.push("http://127.0.0.1:9", "rl_x", tmp_path / "missing.jsonl")
     assert client.default_user()
-
