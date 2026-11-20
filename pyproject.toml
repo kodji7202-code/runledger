@@ -30,6 +30,9 @@ classifiers = [
 ]
 dependencies = []
 
+[project.optional-dependencies]
+saml = ["python3-saml>=1.16,<2"]
+
 [project.urls]
 Homepage = "https://runledger.site"
 Source = "https://github.com/kodji7202-code/runledger"

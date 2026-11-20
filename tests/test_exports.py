@@ -30,7 +30,7 @@ RUN_HEADER = [
     "files_changed", "cost_usd", "risk_score", "risk_level", "title",
     "quality_score", "quality_grade", "ai_verdict", "est_savings_usd", "cost_partial",
 ]
-AUDIT_HEADER = ["id", "at", "actor", "action", "target", "details_json"]
+AUDIT_HEADER = ["id", "at", "actor", "action", "target", "details_json", "actor_user_id"]
 KINDS = {"runs": "/api/export/runs.csv", "audit": "/api/export/audit.csv", "report": "/api/export/report.html"}
 APPROVAL = {
     "session_id": "7f3c2a10-9b1e-4c55-a1d2-0e6f8b3c9d42",
