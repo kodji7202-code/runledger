@@ -3,10 +3,10 @@
 Server data is rendered with DOM text APIs only, so a developer name such as
 <script> shows up as plain text. The server sends this page with a
 per-response nonce CSP that allows only the script below. The script calls the
-API with cookie credentials; every POST or PUT sends X-Requested-With, which a
+API with cookie credentials; every write sends X-Requested-With, which a
 cross-site form cannot set.
 
-Views are switched by location hash (#runs, #insights, #approvals, and for admins #keys,
+Views are switched by location hash (#runs, #insights, #approvals, #sessions, and for admins #keys,
 #audit, #settings), and the runs filters live in that hash too, so a reload keeps them. Only the
 runs route reads or writes that query: switching to another view leaves the filter bar untouched,
 and returning to runs writes the filters back into the hash. Members
@@ -131,6 +131,7 @@ button.small.btn-danger{color:var(--red);border-color:var(--red)}
 .progress-fill.danger{background:var(--red)}
 .budget-form{margin-top:12px;border-top:1px solid var(--line);padding-top:12px}
 .section-gap{margin-top:8px}
+.runs-foot{display:flex;flex-wrap:wrap;align-items:center;justify-content:center;gap:12px;margin-top:14px}
 .link-row{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 8px}
 .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
 dialog{background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:12px;padding:0;width:min(92vw,420px);max-width:92vw}
@@ -189,6 +190,7 @@ tr.pickable:hover{background:var(--chip)}
       <option value="365">1 year</option>
     </select>
     <button type="button" id="refresh">Refresh</button>
+    <button type="button" id="sign-out">Sign out</button>
   </div>
 </header>
 
@@ -198,6 +200,7 @@ tr.pickable:hover{background:var(--chip)}
   <button type="button" role="tab" class="tab" id="tab-runs" data-view="runs" aria-controls="view-runs" aria-selected="true" tabindex="0">Runs</button>
   <button type="button" role="tab" class="tab" id="tab-insights" data-view="insights" aria-controls="view-insights" aria-selected="false" tabindex="-1">Insights</button>
   <button type="button" role="tab" class="tab" id="tab-approvals" data-view="approvals" aria-controls="view-approvals" aria-selected="false" tabindex="-1">Approvals <span class="count" id="tab-approvals-count">0</span></button>
+  <button type="button" role="tab" class="tab" id="tab-sessions" data-view="sessions" aria-controls="view-sessions" aria-selected="false" tabindex="-1">Sessions</button>
   <button type="button" role="tab" class="tab" id="tab-keys" data-view="keys" aria-controls="view-keys" aria-selected="false" tabindex="-1" hidden>API keys</button>
   <button type="button" role="tab" class="tab" id="tab-audit" data-view="audit" aria-controls="view-audit" aria-selected="false" tabindex="-1" hidden>Audit log</button>
   <button type="button" role="tab" class="tab" id="tab-settings" data-view="settings" aria-controls="view-settings" aria-selected="false" tabindex="-1" hidden>Settings</button>
@@ -218,6 +221,19 @@ tr.pickable:hover{background:var(--chip)}
 <div id="notice" class="notice" role="alert"></div>
 
 <p class="msg error" id="key-expiry-banner" role="status" hidden></p>
+
+<section class="view" id="view-sessions" role="tabpanel" aria-labelledby="tab-sessions" tabindex="-1" hidden>
+  <h2>Dashboard sessions</h2>
+  <p class="msg">Revoking a session signs it out without changing its API key.</p>
+  <div class="table-wrap">
+    <table aria-label="Active dashboard sessions">
+      <thead><tr><th scope="col">Key</th><th scope="col">Role</th><th scope="col">Signed in</th><th scope="col">Last active</th><th scope="col">Expires</th><th scope="col">Action</th></tr></thead>
+      <tbody id="sessions-body"></tbody>
+    </table>
+  </div>
+  <p class="msg" id="sessions-msg" role="status" aria-live="polite"></p>
+</section>
+
 <section class="view" id="view-runs" role="tabpanel" aria-labelledby="tab-runs" tabindex="-1">
 <section class="kpis">
   <div class="card"><div class="kpi-label">Total cost</div><div class="kpi-value" id="k-cost">-</div><div class="kpi-sub" id="k-cost-sub"></div></div>
@@ -291,6 +307,10 @@ tr.pickable:hover{background:var(--chip)}
 </table>
 </div>
 <div id="runs-empty" class="empty"></div>
+<div class="runs-foot" id="runs-foot" hidden>
+  <span class="label-inline" id="runs-count" role="status" aria-live="polite"></span>
+  <button type="button" id="runs-more" hidden>Load more</button>
+</div>
 </section>
 
 <section class="view" id="view-insights" role="tabpanel" aria-labelledby="tab-insights" tabindex="-1" hidden>
@@ -495,10 +515,11 @@ tr.pickable:hover{background:var(--chip)}
 
   var APPROVAL_POLL_MS = 3000;
   var APPROVAL_POLL_MAX_MS = 30000;
-  var VIEWS = ["runs", "insights", "approvals", "keys", "audit", "settings"];
+  var VIEWS = ["runs", "insights", "approvals", "sessions", "keys", "audit", "settings"];
   var ADMIN_VIEWS = { keys: true, audit: true, settings: true };
   var ROLES = ["admin", "member", "viewer"];
   var AUDIT_PAGE = 100;
+  var RUNS_PAGE = 200;
   var MAX_BUDGET_USD = 1000000000;
   var MAX_TTL_S = 604800;
   var EXPORT_PATHS = {
@@ -507,11 +528,13 @@ tr.pickable:hover{background:var(--chip)}
     report: "/api/export/report.html"
   };
 
-  var state = { days: 30, role: null, keyRef: null, meLoaded: false, view: null, thresholds: [50, 80, 100] };
+  var state = { days: 30, role: null, keyRef: null, keyId: null, selfRotation: false,
+    meLoaded: false, view: null, thresholds: [50, 80, 100] };
   var budgetState = { edited: false, settings: null, status: null };
   var approvalsView = { seq: 0, signature: null, items: [], failed: false };
   var keysView = { items: [] };
   var auditView = { events: [], busy: false, more: false };
+  var runsView = { runs: [], total: 0, more: false, busy: false, seq: 0 };
   var exportReady = {};
 
   function $(id) { return document.getElementById(id); }
@@ -542,6 +565,7 @@ tr.pickable:hover{background:var(--chip)}
     var v = Number(value);
     if (!isFinite(v)) { return "n/a"; }
     if (v === 0) { return "$0.00"; }
+    if (v > 0 && v < 0.0001) { return "<$0.0001"; }
     if (v < 0.01) { return "$" + v.toFixed(4); }
     if (v < 1) { return "$" + v.toFixed(3); }
     return "$" + v.toFixed(2);
@@ -582,7 +606,14 @@ tr.pickable:hover{background:var(--chip)}
     node.className = "msg" + (message ? (isError ? " error" : " ok") : "");
   }
 
+  function goToSignIn() {
+    if (state.selfRotation) { return; }
+    history.replaceState(null, "", "/");
+    location.reload();
+  }
+
   function parseBody(res) {
+    if (res.status === 401) { goToSignIn(); }
     return res.text().then(function (text) {
       var body = {};
       try { body = text ? JSON.parse(text) : {}; } catch (e) { body = {}; }
@@ -598,17 +629,20 @@ tr.pickable:hover{background:var(--chip)}
   }
 
   // The only place that sends API requests. Anything other than GET carries the CSRF header.
-  function request(method, url, payload) {
+  function request(method, url, payload, background) {
     var opts = { method: method, credentials: "same-origin", cache: "no-store", headers: { "Accept": "application/json" } };
     if (method !== "GET") {
-      opts.headers["Content-Type"] = "application/json";
       opts.headers["X-Requested-With"] = "runledger";
-      opts.body = JSON.stringify(payload === undefined ? {} : payload);
+      if (payload !== undefined) {
+        opts.headers["Content-Type"] = "application/json";
+        opts.body = JSON.stringify(payload);
+      }
     }
+    if (background) { opts.headers["X-RunLedger-Background"] = "1"; }
     return fetch(url, opts).then(parseBody);
   }
 
-  function getJSON(url) { return request("GET", url); }
+  function getJSON(url, background) { return request("GET", url, undefined, background); }
   function postJSON(url, payload) { return request("POST", url, payload); }
   function putJSON(url, payload) { return request("PUT", url, payload); }
 
@@ -687,6 +721,7 @@ tr.pickable:hover{background:var(--chip)}
   // tokens out is a lower bound, so it reads "≥$X". A group with no priced run stays "n/a".
 
   function costText(value, lowerBound) {
+    if (lowerBound && Number(value) > 0 && Number(value) < 0.0001) { return ">$0.00"; }
     var text = money(value);
     return (lowerBound && text !== "n/a") ? "≥" + text : text;
   }
@@ -731,14 +766,18 @@ tr.pickable:hover{background:var(--chip)}
   // The unpriced hint names the cause: the agent recorded no usage, the model has no known
   // price, or both.
   function unpricedHint(t) {
-    var unpriced = Number(t.unpriced_runs) || 0;
-    if (!unpriced) { return ""; }
+    var partial = Number(t.partial_runs) || 0;
+    var unpriced = Math.max(0, (Number(t.unpriced_runs) || 0) - partial);
+    var notes = [];
+    if (partial) { notes.push("Includes " + runCount(partial) + " partly priced (known cost only)."); }
+    if (!unpriced) { return notes.join(" "); }
     var missing = Math.min(Number(t.missing_usage_runs) || 0, unpriced);
     var unknown = unpriced - missing;
     var causes = [];
     if (missing) { causes.push(runCount(missing) + " without recorded token usage"); }
     if (unknown) { causes.push(runCount(unknown) + " with an unknown model price"); }
-    return runCount(unpriced) + " left out: " + causes.join(", ") + ".";
+    notes.push(runCount(unpriced) + " left out: " + causes.join(", ") + ".");
+    return notes.join(" ");
   }
 
   function notify(message, isError) {
@@ -831,14 +870,27 @@ tr.pickable:hover{background:var(--chip)}
       "No risky actions recorded.");
   }
 
-  function renderRuns(body) {
-    var runs = (body && body.runs) || [];
+  function formatCount(n) {
+    return Number(n).toLocaleString();
+  }
+
+  // Appends `rows` to the runs table (after clearing it unless `append`), then updates the
+  // footer from runsView.
+  function renderRuns(rows, append) {
     var tbody = $("runs");
-    clear(tbody);
-    $("runs-empty").textContent = runs.length
+    if (!append) { clear(tbody); }
+    var loaded = runsView.runs.length;
+    $("runs-empty").textContent = loaded
       ? ""
       : "No runs match these filters. Push a session with: runledger push --server URL --key KEY";
-    runs.forEach(function (r) {
+    $("runs-foot").hidden = loaded === 0;
+    $("runs-count").textContent = runsView.more
+      ? "Showing " + formatCount(loaded) + " of " + formatCount(runsView.total) + " runs"
+      : formatCount(loaded) + (loaded === 1 ? " run" : " runs");
+    var more = $("runs-more");
+    more.hidden = !runsView.more;
+    more.textContent = "Load " + formatCount(Math.min(RUNS_PAGE, runsView.total - loaded)) + " more";
+    rows.forEach(function (r) {
       var lv = level(r.risk_level);
       var tr = el("tr", "pickable");
       tr.title = "Show run detail";
@@ -936,7 +988,7 @@ tr.pickable:hover{background:var(--chip)}
     return String(Math.min(100, Math.max(0, Math.floor(Number(raw)) || 0)));
   }
 
-  function runQuery() {
+  function runQuery(after) {
     var params = new URLSearchParams();
     var user = $("f-user").value.trim();
     if (user) { params.set("user", user); }
@@ -952,7 +1004,8 @@ tr.pickable:hover{background:var(--chip)}
     if (maxQuality !== "") { params.set("max_quality", boundedNumber(maxQuality)); }
     var verdict = $("f-verdict").value.trim();
     if (verdict) { params.set("ai_verdict", verdict); }
-    params.set("limit", "200");
+    params.set("limit", String(RUNS_PAGE));
+    if (after) { params.set("after", after); }
     return params.toString();
   }
 
@@ -960,8 +1013,27 @@ tr.pickable:hover{background:var(--chip)}
     return getJSON("/api/stats?days=" + encodeURIComponent(String(state.days))).then(renderStats);
   }
 
-  function loadRuns() {
-    return getJSON("/api/runs?" + runQuery()).then(renderRuns);
+  // Loads the first page of runs, or with `more` the page after the last loaded run. A newer
+  // load (a filter change, a refresh) wins over one still in flight.
+  function loadRuns(more) {
+    var last = runsView.runs[runsView.runs.length - 1];
+    if (more && (runsView.busy || !last)) { return Promise.resolve(); }
+    var seq = ++runsView.seq;
+    runsView.busy = true;
+    $("runs-more").disabled = true;
+    function done() {
+      if (seq !== runsView.seq) { return; }
+      runsView.busy = false;
+      $("runs-more").disabled = false;
+    }
+    return getJSON("/api/runs?" + runQuery(more ? last.id : null)).then(function (body) {
+      if (seq !== runsView.seq) { return; }
+      var rows = Array.isArray(body && body.runs) ? body.runs : [];
+      runsView.runs = more ? runsView.runs.concat(rows) : rows;
+      runsView.total = Math.max(Number(body && body.total) || 0, runsView.runs.length);
+      runsView.more = rows.length >= RUNS_PAGE && runsView.runs.length < runsView.total;
+      renderRuns(rows, more);
+    }).then(done, function (err) { done(); throw err; });
   }
 
   function refresh() {
@@ -1184,9 +1256,9 @@ tr.pickable:hover{background:var(--chip)}
     items.forEach(function (a) { list.appendChild(approvalCard(a)); });
   }
 
-  function loadApprovals() {
+  function loadApprovals(background) {
     var mine = ++approvalsView.seq;
-    return getJSON("/api/approvals?status=pending&limit=50").then(function (body) {
+    return getJSON("/api/approvals?status=pending&limit=50", background).then(function (body) {
       if (mine !== approvalsView.seq) { return; }
       approvalsView.failed = false;
       notifyApproval("");
@@ -1260,6 +1332,7 @@ tr.pickable:hover{background:var(--chip)}
     $("key-value").textContent = "";
     $("key-once-label").textContent = "";
     $("key-once").hidden = true;
+    $("key-dismiss").textContent = "I have copied it";
     setMsg($("key-copy-msg"), "", false);
   }
 
@@ -1283,6 +1356,50 @@ tr.pickable:hover{background:var(--chip)}
     selection.removeAllRanges();
     selection.addRange(range);
     try { return document.execCommand("copy"); } catch (e) { return false; }
+  }
+
+  function loadSessions() {
+    var body = $("sessions-body");
+    var msg = $("sessions-msg");
+    return getJSON("/sessions").then(function (result) {
+      clear(body);
+      result.sessions.forEach(function (session) { body.appendChild(sessionRow(session)); });
+      setMsg(msg, result.sessions.length ? "" : "No active dashboard sessions.", false);
+    }, function (err) {
+      clear(body);
+      setMsg(msg, explain(err), true);
+    });
+  }
+
+  function sessionRow(session) {
+    var row = el("tr");
+    var key = nameOf(session.key_label, session.key_id);
+    row.appendChild(cell(session.current ? key + " (This session)" : key));
+    row.appendChild(cell(session.role));
+    row.appendChild(cell(when(session.created_at), "mono"));
+    row.appendChild(cell(when(session.last_seen_at), "mono"));
+    row.appendChild(cell(when(session.expires_at), "mono"));
+    var action = cell("", "num");
+    var revoke = el("button", "small btn-danger", "Revoke");
+    revoke.type = "button";
+    revoke.setAttribute("aria-label", session.current ? "Revoke this session" :
+      "Revoke session for " + key + ", signed in " + when(session.created_at));
+    revoke.addEventListener("click", function () {
+      var target = session.current ? "your current session" : "the session";
+      confirmAction("Revoke " + target + " for '" + key + "'?",
+        "This immediately signs out the session started " + when(session.created_at) + ".", "Revoke session", true)
+        .then(function (yes) {
+          if (!yes) { return; }
+          return request("DELETE", "/sessions/" + encodeURIComponent(session.id)).then(function () {
+            if (session.current) { goToSignIn(); } else { return loadSessions(); }
+          }, function (err) {
+            setMsg($("sessions-msg"), explain(err), true);
+          });
+        });
+    });
+    action.appendChild(revoke);
+    row.appendChild(action);
+    return row;
   }
 
   function renderKeys() {
@@ -1354,17 +1471,29 @@ tr.pickable:hover{background:var(--chip)}
   }
 
   function rotateKey(key) {
+    if (state.selfRotation) { return; }
     var name = nameOf(key.label, String(key.id));
     confirmAction("Rotate this key?",
       "A new key replaces '" + name + "'. The old key may stop working. The new key is shown once, and its expiry is renewed.",
       "Rotate key", false)
       .then(function (yes) {
         if (!yes) { return; }
+        var ownKey = key.id === state.keyId;
+        state.selfRotation = ownKey;
         return postJSON("/api/keys/" + encodeURIComponent(key.id) + "/rotate", {}).then(function (created) {
+          if (ownKey) {
+            showKeyOnce(created, "Your session ended. Copy the replacement key to sign in again.");
+            $("key-dismiss").textContent = "I have copied it — sign in";
+            return;
+          }
           showKeyOnce(created, "New key for '" + name + "'.");
           setMsg($("keys-msg"), "Key rotated.", false);
           return loadKeys();
         }, function (err) {
+          if (ownKey) {
+            state.selfRotation = false;
+            if (err.status === 401) { goToSignIn(); }
+          }
           setMsg($("keys-msg"), keyError(err), true);
         });
       });
@@ -1453,6 +1582,7 @@ tr.pickable:hover{background:var(--chip)}
     return fetch(EXPORT_PATHS[name] + "?days=7", {
       method: "HEAD", credentials: "same-origin", cache: "no-store"
     }).then(function (res) {
+      if (res.status === 401) { goToSignIn(); }
       if (res.body && typeof res.body.cancel === "function") { res.body.cancel().catch(function () {}); }
       return res.ok || res.status >= 500;
     }, function () {
@@ -1806,6 +1936,7 @@ tr.pickable:hover{background:var(--chip)}
     }
     if (name === "settings") { loadSettings(); }
     if (name === "approvals") { loadApprovals(); }
+    if (name === "sessions") { loadSessions(); }
   }
 
   function showView(requested) {
@@ -1823,7 +1954,7 @@ tr.pickable:hover{background:var(--chip)}
       tab.classList.toggle("active", on);
     });
     if (state.view !== name) {
-      if (state.view === "keys") { clearKeyOnce(); }
+      if (state.view === "keys" && !state.selfRotation) { clearKeyOnce(); }
       state.view = name;
       enterView(name);
     }
@@ -1857,6 +1988,7 @@ tr.pickable:hover{background:var(--chip)}
       state.role = ROLES.indexOf(me && me.role) >= 0 ? me.role : null;
       state.keyRef = me && me.key ? (me.key.prefix || me.key.id || null) : null;
       $("signed-in-person").textContent = me && me.user ? (me.user.name || me.user.email) : (me && me.key ? me.key.label : "");
+      state.keyId = me && me.key ? me.key.id : null;
       var banner = $("key-expiry-banner");
       if (me && me.key && me.key.expires_soon && me.key.expires_at) {
         banner.textContent = "The key you signed in with expires " + when(me.key.expires_at) +
@@ -1872,6 +2004,7 @@ tr.pickable:hover{background:var(--chip)}
       state.meLoaded = true;
       state.role = null;
       state.keyRef = null;
+      state.keyId = null;
       applyRole();
     });
   }
@@ -1884,6 +2017,7 @@ tr.pickable:hover{background:var(--chip)}
     if (state.view === "keys") { loadKeys(); }
     if (state.view === "audit") { loadAudit(true); probeExport("audit").then(refreshExportLinks); }
     if (state.view === "settings") { loadSettings(); }
+    if (state.view === "sessions") { loadSessions(); }
   }
 
   // Event wiring
@@ -1894,6 +2028,14 @@ tr.pickable:hover{background:var(--chip)}
     if (state.view === "insights") { loadInsights(); }
   });
   $("refresh").addEventListener("click", refreshAll);
+  $("sign-out").addEventListener("click", function () {
+    var button = this;
+    button.disabled = true;
+    postJSON("/session/logout").then(goToSignIn, function (err) {
+      button.disabled = false;
+      notify(explain(err), true);
+    });
+  });
   ["f-user", "f-project", "f-agent", "f-min", "f-quality", "f-max-quality"].forEach(function (id) {
     $(id).addEventListener("input", applyFilters);
   });
@@ -1971,11 +2113,17 @@ tr.pickable:hover{background:var(--chip)}
   });
   $("key-dismiss").addEventListener("click", function () {
     clearKeyOnce();
+    if (state.selfRotation) {
+      state.selfRotation = false;
+      goToSignIn();
+      return;
+    }
     $("key-label").focus();
   });
 
   $("audit-filter").addEventListener("input", renderAudit);
   $("audit-more").addEventListener("click", function () { loadAudit(false); });
+  $("runs-more").addEventListener("click", function () { report(loadRuns(true)); });
   $("audit-days").addEventListener("change", refreshExportLinks);
   $("exp-days").addEventListener("change", refreshExportLinks);
 
@@ -2096,7 +2244,7 @@ tr.pickable:hover{background:var(--chip)}
   loadBudget();
   loadApprovals();
   var approvalPoller = makePoller(function () {
-    return loadApprovals().then(function () { return !approvalsView.failed; });
+    return loadApprovals(true).then(function () { return !approvalsView.failed; });
   }, APPROVAL_POLL_MS, APPROVAL_POLL_MAX_MS);
   pollWhileVisible(approvalPoller);
   approvalPoller.start();
@@ -2240,6 +2388,7 @@ a{color:var(--accent)}
   }
 
   function parseBody(res) {
+    if (res.status === 401) { location.replace("/"); }
     return res.text().then(function (text) {
       var body = {};
       try { body = text ? JSON.parse(text) : {}; } catch (e) { body = {}; }
@@ -2252,8 +2401,9 @@ a{color:var(--accent)}
     });
   }
 
-  function request(method, url, payload) {
+  function request(method, url, payload, background) {
     var opts = { method: method, credentials: "same-origin", headers: { "Accept": "application/json" } };
+    if (background) { opts.headers["X-RunLedger-Background"] = "1"; }
     if (payload !== undefined) {
       opts.headers["Content-Type"] = "application/json";
       opts.headers["X-Requested-With"] = "runledger";
@@ -2400,8 +2550,8 @@ a{color:var(--accent)}
     };
   }
 
-  function load() {
-    return request("GET", "/api/approvals/" + encodeURIComponent(approvalId)).then(function (a) {
+  function load(background) {
+    return request("GET", "/api/approvals/" + encodeURIComponent(approvalId), undefined, background).then(function (a) {
       failed = false;
       notice("");
       render(a);
@@ -2442,7 +2592,7 @@ a{color:var(--accent)}
   $("approve").addEventListener("click", function () { decide("approve"); });
   $("deny").addEventListener("click", function () { decide("deny"); });
   var poller = makePoller(function () {
-    return load().then(function () { return !failed; });
+    return load(true).then(function () { return !failed; });
   }, POLL_MS, POLL_MAX_MS);
   document.addEventListener("visibilitychange", function () {
     if (document.hidden) { poller.stop(); } else { poller.resume(); }

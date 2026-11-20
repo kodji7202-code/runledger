@@ -1,7 +1,7 @@
 """HTTP server for the RunLedger team dashboard and the push API.
 
   POST /api/runs                              push a receipt -> 201 (admin, member)
-  GET  /api/runs[?user&project&agent&min_risk&min_quality&max_quality&ai_verdict&limit]  list runs (any role)
+  GET  /api/runs[?user&project&agent&min_risk&min_quality&max_quality&ai_verdict&limit&after]  list runs (any role)
   GET  /api/runs/<id>                         one run with its receipt JSON and risk reasons
   GET  /api/stats[?days=30]                   team totals; cost by developer, model, project, agent
   GET  /api/insights[?days=30]                quality, cost by model and agent, recommendations, AI review (any role)
@@ -42,13 +42,16 @@
   GET  /auth/saml/<provider>/start            start SP-initiated sign-in
   POST /auth/saml/<provider>/acs              validate SAML response and sign in
   POST /auth/saml/team                        single-use, cookie-bound team choice
+  POST /session/logout                        sign out of the current dashboard session (204)
+  GET  /sessions                              list active sessions (own key, or whole team for admin)
+  DELETE /sessions/<id>                       revoke one session in the same scope (204)
   GET  /?key=API_KEY                          legacy sign-in: redirects to strip the key; never
                                               replaces a session of another team without confirmation
   GET  /health                                liveness, no auth
 
 Credentials are "Authorization: Bearer KEY", or the dashboard session cookie. A cookie
-session has the role of the key it was signed in with, and survives a restart. A POST or
-PUT that uses a cookie must also send the header "X-Requested-With: runledger".
+session has the role of the key it was signed in with, and survives a restart. A write
+that uses a cookie must also send the header "X-Requested-With: runledger".
 
 A request that needs a role is authenticated before its body is read, so an oversized
 unauthenticated body gets 401, not 413, and the connection is closed without reading it.
@@ -94,6 +97,7 @@ from .auth import (
 )
 from .dashboard import APPROVAL_HTML, DASHBOARD_HTML
 from .db import TIME_FORMAT, Database, normalize_missing_costs
+from .insights import MAX_COST_USD
 
 MAX_BODY_BYTES = 10 * 1024 * 1024
 SIGN_IN_BODY_LIMIT = 4096
@@ -106,12 +110,14 @@ SEVERITIES = ("low", "medium", "high")
 USAGE_SOURCES = ("messages", "settings", "missing")
 CSRF_HEADER = "X-Requested-With"
 CSRF_VALUE = "runledger"
+BACKGROUND_HEADER = "X-RunLedger-Background"
 # Sec-Fetch-Site values that mean the request comes from another origin. "same-site" is another
 # origin by definition (another port or scheme, or a subdomain), so a sign-in POST is refused too.
 CROSS_ORIGIN_FETCH_SITES = ("cross-site", "same-site")
 PUBLIC_URL_ENV = "RUNLEDGER_PUBLIC_URL"
 SECURE_COOKIES_ENV = "RUNLEDGER_SECURE_COOKIES"
 TRUSTED_PROXIES_ENV = "RUNLEDGER_TRUSTED_PROXIES"
+SESSION_IDLE_TIMEOUT_ENV = "RUNLEDGER_SESSION_IDLE_TIMEOUT"
 HSTS_VALUE = "max-age=31536000"
 MAINTENANCE_INTERVAL_S = 3600
 KEY_EXPIRES_HEADER = "X-RunLedger-Key-Expires"
@@ -240,6 +246,7 @@ class RunLedgerServer(ThreadingHTTPServer):
         audit_retention_days: Optional[int] = None,
         oidc_client: Optional[oidc.Client] = None,
         saml_client: Optional[saml.Client] = None,
+        session_idle_timeout: int = 0,
     ) -> None:
         self.db = db
         self.oidc = oidc_client
@@ -252,6 +259,7 @@ class RunLedgerServer(ThreadingHTTPServer):
         self.limiter = FailureLimiter()
         self.retention_days = retention_days
         self.audit_retention_days = audit_retention_days
+        self.session_idle_timeout = session_idle_timeout
         self._query_key_warned = False
         self._query_key_lock = threading.Lock()
         self._maintenance_stop = threading.Event()
@@ -379,10 +387,10 @@ class RunLedgerServer(ThreadingHTTPServer):
         row = self.db.key_for_token(token)
         return identity_from_row(row, "key") if row else None
 
-    def identify_session(self, token: Optional[str]) -> Optional[Identity]:
+    def identify_session(self, token: Optional[str], touch: bool = True) -> Optional[Identity]:
         """The identity behind a dashboard cookie. The session is stored in the database, so it
         survives a restart, and it ends when its key is revoked or rotated (see db.session_key)."""
-        row = self.db.session_key(token)
+        row = self.db.session_key(token, idle_timeout=self.session_idle_timeout, touch=touch)
         return identity_from_row(row, "session") if row else None
 
     def warn_query_key_once(self) -> None:
@@ -432,6 +440,7 @@ def make_server(
     audit_retention_days: Optional[int] = None,
     oidc_config: Optional[str] = None,
     saml_config: Optional[str] = None,
+    session_idle_timeout: Optional[int] = None,
 ) -> RunLedgerServer:
     """Open the database and bind the server. Port 0 picks a free port (see server_address).
     The caller owns the server: call shutdown(), server_close() and db.close() when done.
@@ -445,6 +454,7 @@ def make_server(
     below the 35-day floor is raised to it with a warning). audit_retention_days defaults to
     RUNLEDGER_AUDIT_RETENTION_DAYS: unset keeps audit events for 365 days while runs are being
     pruned, and 0 keeps them forever.
+    session_idle_timeout defaults to RUNLEDGER_SESSION_IDLE_TIMEOUT, in seconds (0 disables it).
     Raises ValueError for an invalid address, range or retention setting before the
     database is opened."""
     if bool(tls_cert) != bool(tls_key):
@@ -454,6 +464,14 @@ def make_server(
         retention_days = maintenance.retention_from_env()
     if audit_retention_days is None:
         audit_retention_days = maintenance.audit_retention_from_env()
+    idle_error = f"{SESSION_IDLE_TIMEOUT_ENV} / --session-idle-timeout must be a non-negative integer in seconds."
+    if session_idle_timeout is None:
+        try:
+            session_idle_timeout = int(os.environ.get(SESSION_IDLE_TIMEOUT_ENV, "").strip() or "0")
+        except ValueError:
+            raise ValueError(idle_error) from None
+    if session_idle_timeout < 0:
+        raise ValueError(idle_error)
     tls_context = make_tls_context(tls_cert, tls_key) if tls_cert else None
     secure = bool(secure_cookies) or _env_flag(SECURE_COOKIES_ENV)
     config_path = oidc_config or os.environ.get("RUNLEDGER_OIDC_CONFIG")
@@ -472,6 +490,7 @@ def make_server(
             audit_retention_days=audit_retention_days,
             oidc_client=oidc_client,
             saml_client=saml_client,
+            session_idle_timeout=session_idle_timeout,
         )
     except Exception:
         db.close()
@@ -516,7 +535,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     def log_request(self, code: Any = "-", size: Any = "-") -> None:
         if self.server.log_requests:
-            sys.stderr.write(f"{self.command} {urlsplit(self.path).path} {code}\n")
+            command = getattr(self, "command", "-") or "-"
+            path = urlsplit(getattr(self, "path", "")).path or "-"
+            sys.stderr.write(f"{command} {path} {code}\n")
 
     def send_error(self, code: int, message: Optional[str] = None, explain: Optional[str] = None) -> None:
         # The stdlib calls this for malformed requests; keep the reply JSON.
@@ -568,6 +589,15 @@ class _Handler(BaseHTTPRequestHandler):
         elif path == "/session":
             self._only(method, ("POST",))
             self._session_post()
+        elif path == "/session/logout":
+            self._only(method, ("POST",))
+            self._session_logout()
+        elif path == "/sessions":
+            self._only(method, ("GET",))
+            self._list_sessions()
+        elif path.startswith("/sessions/"):
+            self._only(method, ("DELETE",))
+            self._revoke_session(path[len("/sessions/"):])
         elif path == "/api/me":
             self._only(method, ("GET",))
             self._me()
@@ -849,7 +879,8 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _sso_sign_in(self, method: str, user_id: str, team_id: int, provider: str) -> None:
         """Issue the Strict session cookie on a same-site continuation document."""
-        token = self.server.db.issue_sso_session(method, team_id, user_id, provider)
+        token = self.server.db.issue_sso_session(method, team_id, user_id, provider,
+                                                 idle_timeout=self.server.session_idle_timeout)
         identity = self.server.identify_session(token)
         if identity is None:
             error = saml.SAMLError if method == "saml" else oidc.OIDCError
@@ -905,6 +936,11 @@ class _Handler(BaseHTTPRequestHandler):
                 return value
         return None
 
+    def _session_identity(self) -> Optional[Identity]:
+        return self.server.identify_session(
+            self._cookie(COOKIE_NAME), touch=(self.headers.get(BACKGROUND_HEADER) or "").strip() != "1",
+        )
+
     def _identify(self) -> Identity:
         """Who is calling: an API key first, then the dashboard session.
 
@@ -921,11 +957,9 @@ class _Handler(BaseHTTPRequestHandler):
                     self._extra_headers[KEY_EXPIRES_HEADER] = ident.expires_at or ""
                 return ident
         expired = self.server.db.expired_key_for_token(token) if token is not None else None
-        cookie = self._cookie(COOKIE_NAME)
-        if cookie:
-            ident = self.server.identify_session(cookie)
-            if ident is not None:
-                return ident
+        ident = self._session_identity()
+        if ident is not None:
+            return ident
         if expired is not None:
             # The right secret, past its end: not a guess, so not counted as a failure.
             raise _HttpError(
@@ -1018,6 +1052,7 @@ class _Handler(BaseHTTPRequestHandler):
             raise _HttpError(400, "invalid_json", "The body must be UTF-8 JSON.") from None
         if not isinstance(payload, dict):
             raise _HttpError(400, "invalid_json", "The body must be a JSON object.")
+        _validate_json_values(payload)
         run = receipt_to_run(
             payload,
             attribution=self.server.db.team_attribution(ident.team_id),
@@ -1063,18 +1098,24 @@ class _Handler(BaseHTTPRequestHandler):
         ai_verdict = _text_param(query, "ai_verdict", 20)
         if ai_verdict is not None and ai_verdict not in insights.VERDICTS:
             raise _HttpError(400, "bad_request", "'ai_verdict' must be one of looks_safe, needs_review, dangerous.")
-        runs = self.server.db.list_runs(
-            ident.team_id,
-            user=_text_param(query, "user"),
-            project=_text_param(query, "project"),
-            min_risk=_int_param(query, "min_risk", None, 0, 100),
-            limit=_int_param(query, "limit", 100, 1, 500),
-            agent=_text_param(query, "agent"),
-            min_quality=_int_param(query, "min_quality", None, 0, 100),
-            max_quality=_int_param(query, "max_quality", None, 0, 100),
-            ai_verdict=ai_verdict,
-        )
-        self._send_json(200, {"runs": runs})
+        filters = {
+            "user": _text_param(query, "user"),
+            "project": _text_param(query, "project"),
+            "min_risk": _int_param(query, "min_risk", None, 0, 100),
+            "agent": _text_param(query, "agent"),
+            "min_quality": _int_param(query, "min_quality", None, 0, 100),
+            "max_quality": _int_param(query, "max_quality", None, 0, 100),
+            "ai_verdict": ai_verdict,
+        }
+        after = (query.get("after") or [""])[0] or None  # a run id, kept verbatim: ids may hold spaces
+        db = self.server.db
+        try:
+            if after is not None and not _valid_id(after):
+                raise KeyError(after)
+            runs = db.list_runs(ident.team_id, limit=_int_param(query, "limit", 100, 1, 500), after=after, **filters)
+        except KeyError:
+            raise _HttpError(400, "bad_request", "'after' must be the id of one of the team's runs.") from None
+        self._send_json(200, {"runs": runs, "total": db.count_runs(ident.team_id, **filters)})
 
     def _stats(self, query: Dict[str, List[str]]) -> None:
         ident = self._identify()
@@ -1207,14 +1248,59 @@ class _Handler(BaseHTTPRequestHandler):
             self._sign_in_page("Service keys work on the API only and cannot sign in to the dashboard. "
                                "Sign in with a personal key.")
             return
-        token = self.server.db.issue_session(row["team_id"], row["id"], row["role"])
+        token = self.server.db.issue_session(
+            row["team_id"], row["id"], row["role"], idle_timeout=self.server.session_idle_timeout,
+        )
         session = identity_from_row(row, "session")
         self.server.db.record_audit(row["team_id"], session, "auth.sign_in", row["id"],
                                     {"role": row["role"], "ip": self._client_ip()})
-        cookie = f"{COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_TTL_SECONDS}"
+        cookie = self._session_cookie(token, SESSION_TTL_SECONDS)
+        self._send(302, b"", "text/plain; charset=utf-8", {"Location": "/", "Set-Cookie": cookie})
+
+    def _session_cookie(self, token: str, max_age: int) -> str:
+        cookie = f"{COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}"
         if self._secure():
             cookie += "; Secure"
-        self._send(302, b"", "text/plain; charset=utf-8", {"Location": "/", "Set-Cookie": cookie})
+        return cookie
+
+    def _session_logout(self) -> None:
+        ident = self._session_identity()
+        if ident is None or ident.session_id is None:
+            raise _HttpError(401, "unauthorized", "Sign in to the dashboard to sign out.")
+        self._require(ident, "viewer", "sign out", write=True)
+        self.server.db.revoke_session(
+            ident.team_id, ident.key_id, ident.session_id, ident,
+            "auth.sign_out", self.server.session_idle_timeout,
+        )
+        self._session_ended(clear_cookie=True)
+
+    def _list_sessions(self) -> None:
+        ident = self._identify()
+        key_id = None if ident.role == "admin" else ident.key_id
+        user_id = ident.user_id if ident.role != "admin" and ident.key_id is None else None
+        sessions = self.server.db.list_sessions(ident.team_id, key_id, self.server.session_idle_timeout, user_id=user_id)
+        for session in sessions:
+            session["current"] = session["id"] == ident.session_id
+        self._send_json(200, {"sessions": sessions})
+
+    def _revoke_session(self, raw_id: str) -> None:
+        ident = self._identify()
+        self._require(ident, "viewer", "revoke sessions", write=True)
+        session_id = unquote(raw_id)
+        if not re.fullmatch(r"[0-9a-f]{32}", session_id):
+            raise _not_found("Session not found.")
+        key_id = None if ident.role == "admin" else ident.key_id
+        user_id = ident.user_id if ident.role != "admin" and ident.key_id is None else None
+        if not self.server.db.revoke_session(
+            ident.team_id, key_id, session_id, ident, "auth.session_revoked", self.server.session_idle_timeout,
+            user_id=user_id,
+        ):
+            raise _not_found("Session not found.")
+        self._session_ended(clear_cookie=(session_id == ident.session_id))
+
+    def _session_ended(self, clear_cookie: bool) -> None:
+        headers = {"Set-Cookie": self._session_cookie("", 0)} if clear_cookie else None
+        self._start(204, "text/plain; charset=utf-8", headers, length=None)
 
     def _switch_team_page(self, row: Mapping[str, Any], current: Identity, key: str) -> None:
         """A ?key= link for another team is a switch, not a sign-in: ask for one click first."""
@@ -1579,6 +1665,29 @@ def _masked_url(url: Optional[str]) -> Optional[str]:
     return f"{parts.scheme}://{parts.netloc.rsplit('@', 1)[-1]}/[hidden]"
 
 
+def _validate_json_values(payload: Dict[str, Any]) -> None:
+    pending: List[Any] = [payload]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, dict):
+            pending.extend(value.keys())
+            pending.extend(value.values())
+        elif isinstance(value, list):
+            pending.extend(value)
+        elif isinstance(value, str):
+            try:
+                value.encode("utf-8")
+            except UnicodeEncodeError:
+                raise _HttpError(400, "invalid_json", "JSON strings must not contain lone Unicode surrogates.") from None
+        elif isinstance(value, (int, float)):
+            try:
+                finite = math.isfinite(value)
+            except OverflowError:
+                finite = False
+            if not finite:
+                raise _HttpError(400, "invalid_json", "JSON numbers must be finite and representable as floats.")
+
+
 def _json_object(raw: bytes) -> Dict[str, Any]:
     """Parse a request body that must be one JSON object."""
     if not raw:
@@ -1678,7 +1787,7 @@ def _int(value: Any, default: Optional[int], lo: int = 0, hi: int = 10 ** 12) ->
 
 
 def _money(value: Any) -> Optional[float]:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value > MAX_COST_USD or not math.isfinite(value):
         return None
     return round(max(0.0, float(value)), 6)
 
@@ -1758,7 +1867,7 @@ def receipt_to_run(
                 c for c in (_money(s.get("cost_usd")) for s in steps if s.get("model") == name)
                 if c is not None
             ]
-            cost = round(sum(step_costs), 6) if step_costs else None
+            cost = _money(sum(step_costs)) if step_costs else None
         models[label] = {"tokens": _int(info.get("tokens"), 0) or 0, "cost_usd": cost}
 
     risks: List[Dict[str, Any]] = []

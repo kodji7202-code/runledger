@@ -63,7 +63,7 @@ Token administration and SCIM changes appear in the audit log. Automated updates
 
 | Role | Can do |
 | --- | --- |
-| **viewer** | Read everything a team member can read: runs, receipts, statistics, approvals, and team settings with webhook URLs masked. Read only. |
+| **viewer** | Read everything a team member can read: runs, receipts, statistics, approvals, and team settings with webhook URLs masked. Manage dashboard sessions started with this key. |
 | **member** | Everything a viewer can do, plus push runs and request approvals. |
 | **admin** | Everything a member can do, plus decide approvals, change team settings, manage keys, read the audit log, set budgets and download exports. An admin cannot decide an approval created with the same key. |
 
@@ -81,6 +81,7 @@ Access matrix (HTTP endpoints; see [api.md](api.md)):
 | Decide approvals (`POST /api/approvals/{id}/decision`) | no | no | yes, with a different key from requester |
 | Change team settings (`PUT /api/team/settings`) | no | no | yes |
 | List, create, rotate and revoke keys (`/api/keys`) | no | no | yes |
+| List and revoke dashboard sessions (`/sessions`) | this key | this key | this team |
 | Read the audit log (`GET /api/audit`) | no | no | yes |
 | Read budgets (`GET /api/budgets`, `/api/budgets/status`) | yes | yes | yes |
 | Set budgets (`PUT /api/budgets`) | no | no | yes |
@@ -345,6 +346,8 @@ target and details. Details never include a key secret or a webhook URL.
 | `approval.decide` | An approval is approved or denied | Approval id | status |
 | `team.settings` | Team settings change | `settings` | the names of the fields changed, and the values of `approval_ttl_s`, `attribution` and the key policy fields that changed, plus `keys_shortened` when a new cap shortened keys. Never the URLs. |
 | `auth.sign_in` | A dashboard sign-in with a key succeeds | Key id | role, and the client address (`ip`) |
+| `auth.sign_out` | The caller signs out of the dashboard | Session id | — |
+| `auth.session_revoked` | The caller revokes a dashboard session | Session id | — |
 | `budget.update` | This release: the team's budget changes | `budget` | monthly_usd, per_user_monthly_usd, alert_thresholds |
 | `budget.alert` | This release: a threshold fires | Scope (`team` or `user:<name>`) | month, threshold, spend_usd, limit_usd, pct |
 | `export.runs`, `export.audit`, `export.report` | This release: an admin downloads an export (GET only, not HEAD) | `null` | days, rows |
@@ -449,7 +452,7 @@ to 3650, counted back from now in UTC):
 
 | Endpoint | Format | Contents |
 | --- | --- | --- |
-| `GET /api/export/runs.csv?days=N` | CSV | One row per run that started (or was pushed) in the window, oldest first: id, started_at, user, project, agent, models, steps, tokens, files_changed, cost_usd, risk_score, risk_level, title, quality_score, quality_grade, ai_verdict, est_savings_usd. Never the receipt JSON or HTML. |
+| `GET /api/export/runs.csv?days=N` | CSV | One row per run that started (or was pushed) in the window, oldest first: id, started_at, user, project, agent, models, steps, tokens, files_changed, cost_usd, risk_score, risk_level, title, quality_score, quality_grade, ai_verdict, est_savings_usd, cost_partial. Never the receipt JSON or HTML. |
 | `GET /api/export/audit.csv?days=N` | CSV | Every audit event in the window, oldest first: id, at, actor, action, target, details_json. |
 | `GET /api/export/report.html?days=N` | HTML | A report for the window: totals, runs by risk level, top risk codes, high-risk runs, approvals decided, key lifecycle events, this month's budget status, and a note on the method. Each long table shows at most 200 rows. |
 
@@ -458,7 +461,8 @@ is written as text. The report contains no scripts and no outside resources. Eac
 the audit log.
 
 A run whose cost is unknown leaves the `cost_usd` cell empty rather than writing `0`; `quality_score`
-and `est_savings_usd` are empty in the same way. The report states the window's cost as `n/a` when no
+and `est_savings_usd` are empty in the same way. `cost_partial` is `true` when the run's `cost_usd` is a lower bound
+because some of its tokens had no price. The report states the window's cost as `n/a` when no
 run in it could be priced, and as a lower bound (`≥ $X`, with the number of runs it leaves out) when
 some runs are unpriced or only partly priced; the month's developer rows follow the same rule, so a
 developer whose runs are only partly priced reads `≥ $X` too.
@@ -486,9 +490,14 @@ exports as confidential.
 - A session carries the role of its key. It ends after 12 hours, at its key's `expires_at` if that is
   sooner, or at once when its key is revoked or rotated. Service keys cannot sign in. Each key keeps at most 20 sessions; signing in past that cap drops that key's oldest
   session and leaves other keys alone.
-- *This release:* the server keeps sessions in the team database as hashes of their tokens, so a
-  server restart does not sign anyone out. Until this release, sessions were held in memory.
-- There is no sign-out endpoint. To end a session, rotate or revoke its key.
+- The server keeps sessions in the team database as hashes of their tokens, so restarting it does
+  not sign anyone out.
+- **Sign out** ends the current session without changing its API key. The **Sessions** tab shows
+  active sessions and lets you revoke them. Admins see the entire team's sessions; members and
+  viewers see only sessions started with their key.
+- An operator may set an inactivity timeout in seconds with `RUNLEDGER_SESSION_IDLE_TIMEOUT` or
+  `runledger serve --session-idle-timeout`. The default `0` disables idle expiry. Dashboard
+  background polling does not count as activity, and the 12-hour absolute limit still applies.
 - Changes made from the dashboard must send the header `X-Requested-With: runledger`. A cross-site form
   cannot set it, so a forged request is refused with `csrf_required`. Requests that use an API key in
   the `Authorization` header do not need it.

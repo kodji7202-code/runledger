@@ -50,9 +50,11 @@ def test_old_database_migrates_and_reopens_without_changing_credentials(tmp_path
 
 def test_pre_accounts_keys_sessions_and_audit_migrate(tmp_path):
     path = str(tmp_path / "before-users.db")
-    # SCHEMA intentionally keeps the original key/session/audit layouts; columns are migrated.
     with sqlite3.connect(path) as conn:
         conn.executescript(SCHEMA)
+        conn.execute("DROP TABLE sessions")
+        conn.execute("CREATE TABLE sessions (token_hash TEXT PRIMARY KEY, team_id INTEGER NOT NULL, "
+                     "key_id TEXT NOT NULL, role TEXT NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL)")
         conn.execute("INSERT INTO teams (name, api_key_hash, created_at) VALUES ('old', ?, '2026')", (hash_key(OLD_KEY),))
         conn.execute("INSERT INTO api_keys (id, team_id, label, role, key_hash, created_at) "
                      "VALUES ('key', 1, 'old', 'admin', ?, '2026')", (hash_key(OLD_KEY),))
@@ -124,6 +126,82 @@ def test_live_auth_gating_for_keys_and_dashboard(tmp_path, action, via):
         else:
             assert status == 401
         assert _http(base, "GET", "/api/me", headers=_auth(service))[0] == 200
+
+
+@pytest.mark.parametrize("method", ["key", "oidc", "saml"])
+@pytest.mark.parametrize("mutation", ["disabled", "removed", "lowered", "scim-deactivated"])
+def test_session_management_applies_live_membership_gates(db, method, mutation):
+    team, _ = db.create_team("a")
+    user, key = personal(db, team)
+    token = (db.issue_session(team, key["id"], "admin") if method == "key" else
+             db.issue_sso_session(method, team, user["id"], "provider"))
+    session, = db.list_sessions(team, None, 0)
+    assert db._conn.execute("SELECT user_id FROM sessions").fetchone()[0] == user["id"]
+    assert db.session_key(token)["session_id"] == session["id"]
+    with db._conn:
+        if mutation == "disabled":
+            db._conn.execute("UPDATE users SET disabled_at = '2026' WHERE id = ?", (user["id"],))
+        elif mutation == "removed":
+            db._conn.execute("DELETE FROM memberships WHERE user_id = ?", (user["id"],))
+        elif mutation == "scim-deactivated":
+            db._conn.execute("UPDATE memberships SET deactivated_at = '2026' WHERE user_id = ?", (user["id"],))
+        else:
+            db._conn.execute("UPDATE memberships SET role = 'viewer' WHERE user_id = ?", (user["id"],))
+    if mutation == "lowered":
+        assert db.list_sessions(team, None, 0)[0]["role"] == "viewer"
+        assert db.session_key(token)["role"] == "viewer"
+        assert db.revoke_session(team, None, session["id"], "test", "auth.session_revoked", 0)
+    else:
+        assert db.list_sessions(team, None, 0) == []
+        assert not db.revoke_session(team, None, session["id"], "test", "auth.session_revoked", 0)
+        assert db.session_key(token) is None
+
+
+@pytest.mark.parametrize("method", ["key", "oidc", "saml"])
+@pytest.mark.parametrize("logout", [True, False])
+def test_person_session_controls_preserve_scope_and_audit(tmp_path, method, logout):
+    with running(tmp_path / "sessions.db") as (srv, base):
+        team, admin = srv.db.create_team("a")
+        user, key = personal(srv.db, team, role="viewer")
+        other, _ = personal(srv.db, team, role="viewer", email="other@example.com")
+        foreign_token = srv.db.issue_sso_session("oidc", team, other["id"], "provider")
+        foreign_id = srv.db.session_key(foreign_token)["session_id"]
+        cookie = (_cookie_for(base, key["key"]) if method == "key" else
+                  "rl_session=" + srv.db.issue_sso_session(method, team, user["id"], "provider"))
+        headers = {"Cookie": cookie, "X-Requested-With": "runledger"}
+        session, = _json(_http(base, "GET", "/sessions", headers=headers)[2])["sessions"]
+        assert session["current"]
+        assert _http(base, "DELETE", "/sessions/" + foreign_id, headers=headers)[0] == 404
+        assert len(_json(_http(base, "GET", "/sessions", headers=_auth(admin))[2])["sessions"]) == 2
+        verb, path = ("POST", "/session/logout") if logout else ("DELETE", "/sessions/" + session["id"])
+        assert _http(base, verb, path, headers=headers)[0] == 204
+        event = srv.db.list_audit(team)[0]
+        assert event["action"] == ("auth.sign_out" if logout else "auth.session_revoked")
+        assert event["actor_user_id"] == user["id"]
+        assert user["email"] in event["actor"]
+        assert _http(base, "GET", "/sessions", headers=headers)[0] == 401
+        assert srv.db.session_key(foreign_token)
+
+
+@pytest.mark.parametrize("method", ["key", "oidc", "saml"])
+def test_scim_deactivation_only_deletes_sessions_in_its_team(db, method):
+    a, _ = db.create_team("a")
+    b, _ = db.create_team("b")
+    user, ka = personal(db, a)
+    db.add_member(b, user["email"], "member")
+    kb = db.create_key(b, "b", "member", "cli", user=user["id"])
+    def issue(team, key):
+        return (db.issue_session(team, key["id"], key["role"]) if method == "key" else
+                db.issue_sso_session(method, team, user["id"], "provider"))
+    ta, tb = issue(a, ka), issue(b, kb)
+    db.scim_update(a, user["id"], {"active": False})
+    assert db.list_sessions(a, None, 0) == []
+    assert db.session_key(ta) is None
+    assert db.session_key(tb)["user_id"] == user["id"]
+    assert len(db.list_sessions(b, None, 0)) == 1
+    db.scim_update(a, user["id"], {"active": True})
+    assert db.session_key(ta) is None
+    assert db.key_for_token(ka["key"])
 
 
 def test_disable_is_server_wide_and_enable_does_not_restore_sessions(db):

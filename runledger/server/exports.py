@@ -37,7 +37,7 @@ REPORT_CSP = (
 RUN_HEADER = [
     "id", "started_at", "user", "project", "agent", "models", "steps", "tokens",
     "files_changed", "cost_usd", "risk_score", "risk_level", "title",
-    "quality_score", "quality_grade", "ai_verdict", "est_savings_usd",
+    "quality_score", "quality_grade", "ai_verdict", "est_savings_usd", "cost_partial",
 ]
 AUDIT_HEADER = ["id", "at", "actor", "action", "target", "details_json", "actor_user_id"]
 
@@ -102,6 +102,7 @@ def _runs_csv(db: Database, team_id: int, since: str) -> Tuple[bytes, int]:
             "" if run["quality_score"] is None else run["quality_score"],
             run["quality_grade"] or "", run["ai_verdict"] or "",
             "" if savings is None else round(savings, 6),
+            "" if cost is None else ("true" if run["cost_partial"] else "false"),
         ])
     return _csv_bytes(RUN_HEADER, rows), len(rows)
 

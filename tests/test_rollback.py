@@ -9,6 +9,7 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unicodedata import east_asian_width
 
 import pytest
 
@@ -724,6 +725,28 @@ def test_listing_counts_differing_files_that_must_remain_ignored(repo, monkeypat
     output = capsys.readouterr().out
     assert "(1 file(s) differ)" in output
     assert "keep ignored '.secret'" in output
+
+
+def _display_width(text):
+    return sum(2 if east_asian_width(char) in ("F", "W") else 1 for char in text)
+
+
+@pytest.mark.parametrize("label", [
+    "Before refactoring the authentication middleware and adding integration test coverage",
+    " ".join(["界" * 12] * 6),
+], ids=["ascii", "wide"])
+def test_checkpoint_listing_wraps_long_labels_between_words(repo, capsys, label):
+    checkpoint = repo.create(label)
+
+    assert main(["checkpoints", "--cwd", str(repo.root)]) == 0
+    header, timestamp, *label_lines = capsys.readouterr().out.splitlines()
+    assert header == f"{checkpoint.id}  (0 file(s) differ)"
+    assert timestamp == f"  {checkpoint.created_at}"
+    assert len(label_lines) > 1
+    assert label_lines[0].startswith("  '")
+    assert all(len(line) - len(line.lstrip()) == 3 for line in label_lines[1:])
+    assert all(_display_width(line) <= 80 for line in [header, timestamp, *label_lines])
+    assert " ".join(line.strip() for line in label_lines) == repr(label)
 
 
 def test_actual_cli_yes_restore_with_safety_and_undo(committed_repo, capsys):
