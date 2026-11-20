@@ -9,6 +9,9 @@ change behavior, so read the entry before you upgrade.
 
 ### Fixed
 
+- The HTML receipt fits phone screens (375px and up) instead of scrolling sideways and hiding the
+  Tokens and Cost columns: on screens up to 600px wide, step rows put the model, tokens and cost on
+  a line under the step, and the quality score and AI review tables move their notes under each row.
 - Team server request logging handles oversized URLs rejected before parsing, returning HTTP 414
   instead of dropping the connection with an internal error.
 - Team receipt ingest rejects numbers outside the finite float range and JSON strings with
