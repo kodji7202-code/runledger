@@ -62,6 +62,16 @@ change behavior, so read the entry before you upgrade.
 - Dashboard costs below $0.0001 display as `<$0.0001` instead of rounding to zero;
   the Cost KPI clarifies that partly priced runs contribute their known cost.
 
+### Fixed
+
+- **Insights model rows keep the lower-bound mark (`runledger.server.insights`):** a model used in
+  a partly priced run (`cost_partial`) now reports `partial_runs` and `cost_is_lower_bound`, so the
+  dashboard shows its cost as `≥ $X` like the agent row and the `/api/stats` `by_model` rows,
+  instead of a figure that reads as complete.
+- **`runs.csv` keeps the cost coverage (`runledger.server.exports`):** a new last column,
+  `cost_partial`, is `true` when `cost_usd` is a lower bound, `false` when it is complete, and
+  empty when the cost is unknown. Existing columns keep their positions.
+
 ## [0.7.0] - 2026-10-20
 
 ### Added

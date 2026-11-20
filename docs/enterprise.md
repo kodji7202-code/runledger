@@ -274,7 +274,7 @@ to 3650, counted back from now in UTC):
 
 | Endpoint | Format | Contents |
 | --- | --- | --- |
-| `GET /api/export/runs.csv?days=N` | CSV | One row per run that started (or was pushed) in the window, oldest first: id, started_at, user, project, agent, models, steps, tokens, files_changed, cost_usd, risk_score, risk_level, title, quality_score, quality_grade, ai_verdict, est_savings_usd. Never the receipt JSON or HTML. |
+| `GET /api/export/runs.csv?days=N` | CSV | One row per run that started (or was pushed) in the window, oldest first: id, started_at, user, project, agent, models, steps, tokens, files_changed, cost_usd, risk_score, risk_level, title, quality_score, quality_grade, ai_verdict, est_savings_usd, cost_partial. Never the receipt JSON or HTML. |
 | `GET /api/export/audit.csv?days=N` | CSV | Every audit event in the window, oldest first: id, at, actor, action, target, details_json. |
 | `GET /api/export/report.html?days=N` | HTML | A report for the window: totals, runs by risk level, top risk codes, high-risk runs, approvals decided, key lifecycle events, this month's budget status, and a note on the method. Each long table shows at most 200 rows. |
 
@@ -283,7 +283,8 @@ is written as text. The report contains no scripts and no outside resources. Eac
 the audit log.
 
 A run whose cost is unknown leaves the `cost_usd` cell empty rather than writing `0`; `quality_score`
-and `est_savings_usd` are empty in the same way. The report states the window's cost as `n/a` when no
+and `est_savings_usd` are empty in the same way. `cost_partial` is `true` when the run's `cost_usd` is a lower bound
+because some of its tokens had no price. The report states the window's cost as `n/a` when no
 run in it could be priced, and as a lower bound (`≥ $X`, with the number of runs it leaves out) when
 some runs are unpriced or only partly priced; the month's developer rows follow the same rule, so a
 developer whose runs are only partly priced reads `≥ $X` too.

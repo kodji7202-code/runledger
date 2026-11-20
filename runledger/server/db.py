@@ -1367,7 +1367,7 @@ class Database:
         with self._reading() as conn:
             rows = conn.execute(
                 "SELECT id, user, project, agent, models, started_at, created_at, steps, tokens, "
-                "files_changed, cost, risk_score, risk_level, title, quality_score, quality_grade, "
+                "files_changed, cost, cost_partial, risk_score, risk_level, title, quality_score, quality_grade, "
                 "ai_verdict, est_savings_usd FROM runs "
                 "WHERE team_id = ? AND sort_at >= ? "
                 "ORDER BY sort_at, id",
@@ -1414,7 +1414,7 @@ class Database:
                 args,
             ).fetchall()
             model_rows = conn.execute(
-                f"SELECT models, quality_score FROM runs WHERE {window}", args,
+                f"SELECT models, quality_score, cost_partial FROM runs WHERE {window}", args,
             ).fetchall()
             recommendation_rows = conn.execute(
                 f"SELECT recommendations FROM runs WHERE {window} AND recommendations IS NOT NULL", args,
