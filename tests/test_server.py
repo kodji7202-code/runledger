@@ -72,6 +72,24 @@ def _auth(key):
     return {"Authorization": f"Bearer {key}"}
 
 
+def test_oversized_url_with_request_logging(tmp_path, capsys):
+    with running_server(tmp_path / "rl.db", log_requests=True) as (_, base):
+        status, _, body = _http(base, "GET", "/" + "a" * 80000 + "?key=secret")
+    assert status == 414
+    assert _json(body)["error"]["code"] == "bad_request"
+    stderr = capsys.readouterr().err
+    assert "414\n" in stderr
+    assert "secret" not in stderr
+    assert "Traceback" not in stderr
+
+
+def test_request_logging_redacts_query(tmp_path, capsys):
+    with running_server(tmp_path / "rl.db", log_requests=True) as (_, base):
+        status, _, _ = _http(base, "GET", "/health?key=secret")
+    assert status == 200
+    assert capsys.readouterr().err == "GET /health 200\n"
+
+
 def _json(raw):
     return json.loads(raw.decode("utf-8"))
 
