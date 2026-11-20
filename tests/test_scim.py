@@ -295,3 +295,13 @@ def test_deactivation_and_key_expiry_are_independent(scim):
     assert call("PATCH", path, {"Operations": [{"op": "replace", "path": "active", "value": True}]})[0] == 200
     assert _http(base, "GET", "/api/me", headers=_auth(personal["key"]))[0] == 401
     assert call("GET", path)[0] == 200
+
+
+def test_eq_filter_parses_without_regex():
+    from runledger.server.scim import eq_filter
+    assert eq_filter('userName eq "ana@example.com"', ("username",)) == ("username", "ana@example.com")
+    assert eq_filter('  displayName   EQ   "Two Words"  ', ("displayname",)) == ("displayname", "Two Words")
+    assert eq_filter('userName co "a"', ("username",)) is None
+    assert eq_filter('title eq "a"', ("username",)) is None
+    assert eq_filter('userName eq "a"b"', ("username",)) is None
+    assert eq_filter("userName eq " + " " * 50000 + "x", ("username",)) is None

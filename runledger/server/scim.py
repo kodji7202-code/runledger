@@ -19,6 +19,17 @@ def send(h, status, body, headers=None):
     h._send(status, b"" if status == 204 else _json_bytes(body), "application/scim+json; charset=utf-8", headers)
 
 
+def eq_filter(text, attrs):
+    """Parse `<attr> eq "<value>"` without regex backtracking. Returns (attr, value) or None."""
+    parts = text.split(None, 2)
+    if len(parts) != 3 or parts[1].lower() != "eq" or parts[0].lower() not in attrs:
+        return None
+    value = parts[2].rstrip()
+    if len(value) < 2 or value[0] != '"' or value[-1] != '"' or '"' in value[1:-1] or "\\" in value[1:-1]:
+        return None
+    return parts[0].lower(), value[1:-1]
+
+
 def listing(resources, start=1, count=200):
     return {"schemas": [MESSAGES + "ListResponse"], "totalResults": len(resources),
             "startIndex": start, "itemsPerPage": len(resources[start - 1:start - 1 + count]),
@@ -149,12 +160,12 @@ def dispatch(h, method, path, query):
                 result = resource(member)
             else:
                 if "filter" in query:
-                    match = re.fullmatch(r'\s*(userName|externalId)\s+eq\s+"([^"\\]*)"\s*', query["filter"][0], re.I)
+                    match = eq_filter(query["filter"][0], ("username", "externalid"))
                     if not match:
                         raise Error(400, "Unsupported filter.", "invalidFilter")
-                    key = "email" if match[1].lower() == "username" else "external_id"
+                    key = "email" if match[0] == "username" else "external_id"
                     members = [m for m in members if
-                               (m[key].lower() == match[2].lower() if key == "email" else m[key] == match[2])]
+                               (m[key].lower() == match[1].lower() if key == "email" else m[key] == match[1])]
                 result = paginated([resource(m) for m in members], query)
             send(h, 200, result)
             return
@@ -231,7 +242,7 @@ def groups(h, db, team, method, rid, body, members, query=None):
         resources = [{"schemas": [CORE + "Group"], "id": role, "displayName": role,
                       "members": [{"value": m["id"], "display": m["email"]} for m in members if m["role"] == role]} for role in ROLES]
         if not rid and "filter" in query:
-            match = re.fullmatch(r'\s*displayName\s+eq\s+"([^"\\]*)"\s*', query["filter"][0], re.I)
+            match = eq_filter(query["filter"][0], ("displayname",))
             if not match:
                 raise Error(400, "Unsupported filter.", "invalidFilter")
             resources = [g for g in resources if g["displayName"].lower() == match[1].lower()]
