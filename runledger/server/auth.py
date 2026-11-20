@@ -152,7 +152,7 @@ class Identity:
 
     team_id: int
     team_name: str
-    key_id: str
+    key_id: Optional[str]
     label: str
     role: str
     prefix: Optional[str]
@@ -163,10 +163,13 @@ class Identity:
     kind: str = "personal"
     expires_at: Optional[str] = None
     expires_soon: bool = False  # inside the team's warning window
+    sign_in_method: str = "key"
 
     def actor(self) -> str:
         """Who did it, as written to the audit log. Never the key itself."""
         if self.user_id:
+            if self.key_id is None:
+                return f"{self.email} via {self.label}"
             return f"{self.email} via {self.label} ({self.prefix or self.key_id})"
         if self.via == "session":
             return f"dashboard:{self.label}"
@@ -188,6 +191,7 @@ def identity_from_row(row: Mapping[str, Any], via: str) -> Identity:
         kind=row.get("kind") or "personal",
         expires_at=row.get("expires_at"),
         expires_soon=expires_within(row.get("expires_at"), row.get("expiry_warn_days")),
+        sign_in_method=row.get("sign_in_method", "key"),
     )
 
 
