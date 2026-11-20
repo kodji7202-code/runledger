@@ -352,3 +352,14 @@ def test_bare_run_renders_without_analysis_data():
     data = json.loads(render(run, 0, "Low", [], "json"))
     assert "<!doctype html>" in html and "## Overview" in md
     assert data["quality"] is None and data["recommendations"] == [] and data["ai_review"] is None
+
+
+def test_html_tables_reflow_on_narrow_screens():
+    run, score, level, risks = _analysed()
+    html = render(run, score, level, risks, "html")
+    assert '<table class="steps">' in html
+    assert "<table class='signals'>" in html and "<table class='assess'>" in html
+    narrow = "".join(block.split("}\n}", 1)[0] for block in html.split("@media (max-width:600px){")[1:])
+    for table in ("steps", "signals", "assess"):
+        assert f".{table} tr{{display:grid" in narrow or f".{table} tr," in narrow
+    assert ".steps .sev{white-space:normal" in narrow
