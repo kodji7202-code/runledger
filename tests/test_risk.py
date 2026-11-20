@@ -45,6 +45,18 @@ def test_leading_global_options_read_only(command):
     assert not any(r.severity == "high" for r in _risks("Bash", command=command))
 
 
+@pytest.mark.parametrize("command", [
+    "! git -C . push --force",
+    "if git -C . push -f; then echo pushed; fi",
+    "env -u X git -C . push -f",
+    "time git -C . push -f",
+])
+def test_leading_global_options_with_shell_prefixes(command):
+    assert any(r.code == "command" and r.severity == "high"
+               and r.reason == "Force-pushed to a git remote"
+               for r in _risks("Bash", command=command))
+
+
 @pytest.mark.parametrize("command,expected", [
     ("", ""),
     ("git", "git"),
