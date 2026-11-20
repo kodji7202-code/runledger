@@ -730,6 +730,24 @@ def cmd_backup(args) -> int:
     return 0
 
 
+def cmd_scim_token(args) -> int:
+    """Manage the dedicated provisioning credential locally."""
+    from .server.db import Database
+
+    db = Database(args.db)
+    try:
+        with db._lock:
+            team = db._conn.execute("SELECT id FROM teams WHERE name = ?", (args.team,)).fetchone()
+        if team is None:
+            print("error: Team not found.", file=sys.stderr)
+            return 1
+        result = db.scim_token(team["id"], args.scim_cmd)
+        print(result.get("token", "SCIM token revoked."))
+        return 0
+    finally:
+        db.close()
+
+
 def cmd_user(args) -> int:
     """Local user and membership administration."""
     from .server.auth import InvalidKey
@@ -745,7 +763,8 @@ def cmd_user(args) -> int:
             if db.team_name(args.team_id) is None:
                 raise InvalidKey("Team not found.")
             for member in db.list_members(args.team_id):
-                status = "disabled" if member["disabled_at"] else "active"
+                status = ("disabled" if member["disabled_at"] else
+                          "deactivated" if member.get("deactivated_at") else "active")
                 print(f"{member['id']}  {member['email']}  {member['name'] or '-'}  {member['role']}  {status}")
         elif args.user_cmd == "add":
             member = db.add_member(args.team_id, args.email, args.role, args.name)
@@ -1109,6 +1128,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     ptc.add_argument("name")
     ptc.add_argument("--db", default="runledger.db", help="SQLite database file (default runledger.db)")
     ptc.set_defaults(func=cmd_team_create)
+
+    ps = sub.add_parser("scim-token", help="manage dedicated team provisioning tokens")
+    ss = ps.add_subparsers(dest="scim_cmd", required=True)
+    for action in ("create", "revoke"):
+        sp = ss.add_parser(action)
+        sp.add_argument("--team", required=True)
+        sp.add_argument("--db", default="runledger.db")
+        sp.set_defaults(func=cmd_scim_token)
 
     pu = sub.add_parser("user", help="manage people and team memberships on a team database")
     usub = pu.add_subparsers(dest="user_cmd", required=True)
