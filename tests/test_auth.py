@@ -508,6 +508,148 @@ def test_cookie_writes_need_the_csrf_header(env):
                  headers={"Cookie": cookie, **CSRF})[0] == 201
 
 
+def _sessions(base, headers):
+    status, _, raw = _http(base, "GET", "/sessions", headers=headers)
+    assert status == 200
+    return _json(raw)["sessions"]
+
+
+def test_logout_ends_only_the_current_cookie_session(tmp_path):
+    with running(tmp_path / "sessions.db", secure_cookies=True) as (srv, base):
+        team_id, admin = srv.db.create_team("alpha")
+        viewer = srv.db.create_key(team_id, "reader", "viewer", "test")
+        first = {"Cookie": _cookie_for(base, viewer["key"])}
+        second = {"Cookie": _cookie_for(base, viewer["key"])}
+        current_id = next(s["id"] for s in _sessions(base, first) if s["current"])
+        assert _http(base, "GET", "/session/logout", headers=first)[0] == 405
+        assert _http(base, "POST", "/session/logout", headers={**_auth(admin), **CSRF})[0] == 401
+        status, _, raw = _http(base, "POST", "/session/logout", headers={**first, **_auth(admin)})
+        assert status == 403 and _json(raw)["error"]["code"] == "csrf_required"
+        status, headers, raw = _http(base, "POST", "/session/logout", headers={**first, **CSRF})
+        assert status == 204 and raw == b""
+        assert headers["set-cookie"] == "rl_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0; Secure"
+        assert _http(base, "GET", "/api/me", headers=first)[0] == 401
+        assert _http(base, "GET", "/api/me", headers=second)[0] == 200
+        assert _http(base, "GET", "/api/me", headers=_auth(viewer["key"]))[0] == 200
+        events = srv.db.list_audit(team_id, action="auth.sign_out")
+        assert [(e["actor"], e["target"]) for e in events] == [("dashboard:reader", current_id)]
+
+
+def test_session_listing_and_revocation_are_scoped_to_the_key_or_admin_team(env):
+    srv, base = env
+    team_id, admin = srv.db.create_team("alpha")
+    _, foreign_admin = srv.db.create_team("beta")
+    member = srv.db.create_key(team_id, "engineer", "member", "test")
+    viewer = srv.db.create_key(team_id, "reader", "viewer", "test")
+    admin_cookie = {"Cookie": _cookie_for(base, admin)}
+    foreign_cookie = {"Cookie": _cookie_for(base, foreign_admin)}
+    member_cookie = {"Cookie": _cookie_for(base, member["key"])}
+    other_member_cookie = {"Cookie": _cookie_for(base, member["key"])}
+    viewer_cookie = {"Cookie": _cookie_for(base, viewer["key"])}
+
+    admin_sessions = _sessions(base, admin_cookie)
+    member_sessions = _sessions(base, member_cookie)
+    viewer_session, = _sessions(base, viewer_cookie)
+    foreign_session, = _sessions(base, foreign_cookie)
+    current = next(s for s in member_sessions if s["current"])
+    other = next(s for s in member_sessions if not s["current"])
+    assert len(admin_sessions) == 4 and len(member_sessions) == 2
+    assert sum(s["current"] for s in admin_sessions) == 1
+    assert foreign_session["id"] not in {s["id"] for s in admin_sessions}
+    assert {s["key_id"] for s in member_sessions} == {member["id"]}
+    assert viewer_session["key_id"] == viewer["id"] and viewer_session["current"]
+    assert set(current) == {"id", "key_id", "key_label", "role", "created_at", "last_seen_at", "expires_at", "current"}
+    assert current["key_label"] == "engineer" and current["role"] == "member"
+    token = member_cookie["Cookie"].split("=", 1)[1]
+    assert token not in str(admin_sessions) and hash_key(token) not in str(admin_sessions)
+    assert not any(s["current"] for s in _sessions(base, _auth(admin)))
+    assert _http(base, "GET", "/sessions")[0] == 401
+
+    def revoke(session, headers):
+        return _http(base, "DELETE", f"/sessions/{session['id']}", headers=headers)
+
+    assert revoke(other, member_cookie)[0] == 403
+    assert revoke(other, {**viewer_cookie, **CSRF})[0] == 404
+    assert revoke(foreign_session, {**admin_cookie, **CSRF})[0] == 404
+    status, headers, _ = revoke(other, {**member_cookie, **CSRF})
+    assert status == 204 and "set-cookie" not in headers
+    assert revoke(other, {**member_cookie, **CSRF})[0] == 404
+    assert _http(base, "GET", "/api/me", headers=other_member_cookie)[0] == 401
+    assert revoke(viewer_session, {**admin_cookie, **CSRF})[0] == 204
+    assert _http(base, "GET", "/api/me", headers=viewer_cookie)[0] == 401
+    status, headers, _ = revoke(current, {**member_cookie, **CSRF})
+    assert status == 204
+    assert headers["set-cookie"] == "rl_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"
+    assert _http(base, "GET", "/api/me", headers=member_cookie)[0] == 401
+    assert _http(base, "GET", "/api/me", headers=foreign_cookie)[0] == 200
+    events = srv.db.list_audit(team_id, action="auth.session_revoked")
+    assert {e["target"] for e in events} == {current["id"], other["id"], viewer_session["id"]}
+
+
+def test_idle_timeout_tracks_interactive_activity_not_background_polling(tmp_path, monkeypatch):
+    db_path = tmp_path / "sessions.db"
+    monkeypatch.setenv("RUNLEDGER_SESSION_IDLE_TIMEOUT", "120")
+    with running(db_path) as (srv, base):
+        _, admin = srv.db.create_team("alpha")
+        cookie = {"Cookie": _cookie_for(base, admin)}
+        background = {**cookie, "X-RunLedger-Background": "1"}
+        session, = _sessions(base, cookie)
+
+        def age_session(seconds):
+            stamp = (datetime.now(timezone.utc) - timedelta(seconds=seconds)).strftime(TIME_FORMAT)
+            with closing(sqlite3.connect(db_path)) as conn, conn:
+                conn.execute("UPDATE sessions SET last_seen_at = ? WHERE id = ?", (stamp, session["id"]))
+            return stamp
+
+        old = age_session(60)
+        assert _http(base, "GET", "/api/approvals", headers=background)[0] == 200
+        assert _sessions(base, _auth(admin))[0]["last_seen_at"] == old
+        assert _http(base, "GET", "/api/approvals", headers=cookie)[0] == 200
+        refreshed, = _sessions(base, _auth(admin))
+        assert refreshed["last_seen_at"] > old
+        assert refreshed["expires_at"] == session["expires_at"]
+        age_session(121)
+        assert _http(base, "GET", "/api/approvals", headers=background)[0] == 401
+        with closing(sqlite3.connect(db_path)) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 0
+
+
+def test_idle_timeout_flag_overrides_environment(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("RUNLEDGER_SESSION_IDLE_TIMEOUT", "invalid")
+    with pytest.raises(ValueError, match="non-negative integer"):
+        make_server(str(tmp_path / "invalid.db"), port=0)
+    with running(tmp_path / "override.db", session_idle_timeout=0) as (srv, _):
+        assert srv.session_idle_timeout == 0
+    assert main(["serve", "--session-idle-timeout", "-1", "--db", str(tmp_path / "bad.db")]) == 1
+    assert "non-negative integer" in capsys.readouterr().err
+
+
+def test_existing_dashboard_sessions_are_migrated_without_signing_out(tmp_path):
+    path = tmp_path / "existing.db"
+    with running(path) as (srv, base):
+        _, admin = srv.db.create_team("alpha")
+        cookie = {"Cookie": _cookie_for(base, admin)}
+        before, = _sessions(base, cookie)
+    with closing(sqlite3.connect(path)) as conn, conn:
+        conn.execute("ALTER TABLE sessions RENAME TO new_sessions")
+        conn.execute(
+            "CREATE TABLE sessions (token_hash TEXT PRIMARY KEY, team_id INTEGER NOT NULL REFERENCES teams(id), "
+            "key_id TEXT NOT NULL REFERENCES api_keys(id), role TEXT NOT NULL, "
+            "created_at TEXT NOT NULL, expires_at TEXT NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO sessions SELECT token_hash, team_id, key_id, role, created_at, expires_at FROM new_sessions"
+        )
+        conn.execute("DROP TABLE new_sessions")
+    with running(path) as (_, base):
+        migrated, = _sessions(base, {**cookie, "X-RunLedger-Background": "1"})
+        assert migrated["id"] and migrated["id"] != before["id"]
+        assert migrated["current"] and migrated["last_seen_at"] == before["created_at"]
+        assert migrated["expires_at"] == before["expires_at"]
+    with running(path) as (_, base):
+        assert _sessions(base, cookie)[0]["id"] == migrated["id"]
+
+
 def test_admin_only_endpoints_refuse_member_sessions(env):
     srv, base = env
     _, admin = srv.db.create_team("alpha")

@@ -14,6 +14,10 @@ change behavior, so read the entry before you upgrade.
 
 ### Added
 
+- **Dashboard session controls:** Sign out of the current session or list and revoke active sessions
+  from the Sessions tab. Admins can manage any session in their team; other roles can manage sessions
+  started with their key. Operators can optionally configure an inactivity timeout.
+
 - **API key expiry, kinds and a team key policy:** keys are `personal` (default; may sign in to the
   dashboard) or `service` (API only) and may carry an `expires_at`. `POST /api/keys` and
   `runledger key create` take `kind` / `--kind` and `expires_in_days` / `--expires-in-days`. Team

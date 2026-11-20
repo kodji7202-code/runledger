@@ -21,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 from urllib.parse import quote
+from uuid import uuid4
 
 from ..pricing import friendly_model
 from .insights import AI_REVIEW_LIKE, QUALITY_LIKE, RECOMMENDATIONS_LIKE, review_fields
@@ -251,10 +252,12 @@ CREATE TABLE IF NOT EXISTS audit_log (
 CREATE INDEX IF NOT EXISTS audit_by_team ON audit_log (team_id, id);
 CREATE TABLE IF NOT EXISTS sessions (
     token_hash  TEXT PRIMARY KEY,
+    id          TEXT NOT NULL,
     team_id     INTEGER NOT NULL REFERENCES teams (id),
     key_id      TEXT NOT NULL REFERENCES api_keys (id),
     role        TEXT NOT NULL,
     created_at  TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
     expires_at  TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS sessions_by_key ON sessions (key_id);
@@ -295,6 +298,15 @@ def _days_from(now: datetime, days: Optional[int]) -> Optional[str]:
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).strftime(TIME_FORMAT)
+
+
+def _idle_cutoff(now: datetime, idle_timeout: int) -> str:
+    if idle_timeout:
+        try:
+            return (now - timedelta(seconds=idle_timeout)).strftime(TIME_FORMAT)
+        except OverflowError:
+            pass
+    return ""
 
 
 def _contains(text: str) -> str:
@@ -475,6 +487,7 @@ class Database:
                 self._add_missing_columns("runs", RUN_COLUMNS)
                 self._add_missing_columns("approvals", APPROVAL_IDENTITY_COLUMNS)
                 self._add_missing_columns("api_keys", API_KEY_COLUMNS)
+                self._upgrade_sessions()
                 self._upgrade_run_store()
                 self._upgrade_review_columns()
                 self._migrate_api_keys()
@@ -791,7 +804,31 @@ class Database:
 
     # Dashboard sessions
 
-    def issue_session(self, team_id: int, key_id: str, role: str, ttl_s: int = SESSION_TTL_SECONDS) -> str:
+    def _upgrade_sessions(self) -> None:
+        with self._conn:
+            self._conn.execute("BEGIN IMMEDIATE")
+            present = {row["name"] for row in self._conn.execute("PRAGMA table_info(sessions)")}
+            if "id" not in present:
+                self._conn.execute("ALTER TABLE sessions ADD COLUMN id TEXT")
+                for row in self._conn.execute("SELECT token_hash FROM sessions").fetchall():
+                    self._conn.execute("UPDATE sessions SET id = ? WHERE token_hash = ?",
+                                       (uuid4().hex, row["token_hash"]))
+            if "last_seen_at" not in present:
+                self._conn.execute("ALTER TABLE sessions ADD COLUMN last_seen_at TEXT")
+                self._conn.execute("UPDATE sessions SET last_seen_at = created_at")
+            self._conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS sessions_by_id ON sessions (id)")
+
+    def _purge_sessions(self, now: datetime, idle_timeout: int) -> None:
+        now_text = now.strftime(TIME_FORMAT)
+        self._conn.execute(
+            "DELETE FROM sessions WHERE expires_at <= ? OR last_seen_at <= ? "
+            "OR key_id IN (SELECT id FROM api_keys WHERE expires_at <= ?)",
+            (now_text, _idle_cutoff(now, idle_timeout), now_text),
+        )
+
+    def issue_session(
+        self, team_id: int, key_id: str, role: str, ttl_s: int = SESSION_TTL_SECONDS, idle_timeout: int = 0,
+    ) -> str:
         """Start a dashboard session for a key. Returns the plaintext token (for the cookie);
         only its hash is stored. Expired sessions are purged here, and a key keeps only its
         SESSION_CAP_PER_KEY newest sessions, so the table stays small."""
@@ -803,7 +840,7 @@ class Database:
             key_end = self._conn.execute("SELECT expires_at FROM api_keys WHERE id = ?", (key_id,)).fetchone()
             if key_end is not None and key_end["expires_at"] and key_end["expires_at"] < expires:
                 expires = key_end["expires_at"]  # a session never outlives its key
-            self._conn.execute("DELETE FROM sessions WHERE expires_at <= ?", (now_text,))
+            self._purge_sessions(now, idle_timeout)
             self._conn.execute(
                 "DELETE FROM sessions WHERE token_hash IN ("
                 "SELECT token_hash FROM sessions WHERE key_id = ? "
@@ -811,36 +848,69 @@ class Database:
                 (key_id, SESSION_CAP_PER_KEY - 1),
             )
             self._conn.execute(
-                "INSERT INTO sessions (token_hash, team_id, key_id, role, created_at, expires_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (hash_key(token), team_id, key_id, role, now_text, expires),
+                "INSERT INTO sessions (token_hash, id, team_id, key_id, role, created_at, last_seen_at, expires_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (hash_key(token), uuid4().hex, team_id, key_id, role, now_text, now_text, expires),
             )
         return token
 
-    def session_key(self, token: Optional[str]) -> Optional[Dict[str, Any]]:
+    def session_key(self, token: Optional[str], idle_timeout: int = 0, touch: bool = True) -> Optional[Dict[str, Any]]:
         """The active key behind a dashboard session token, or None. A session that has
-        expired, or whose key was revoked or rotated, is deleted here."""
+        expired, or whose key expired, was revoked or was rotated, is deleted here."""
         if not token or len(token) > 512:
             return None
         token_hash = hash_key(token)
         with self._lock, self._conn:
             row = self._conn.execute(
-                "SELECT key_id, team_id, expires_at FROM sessions WHERE token_hash = ?", (token_hash,)
+                "SELECT id, key_id, team_id, last_seen_at, expires_at FROM sessions WHERE token_hash = ?", (token_hash,)
             ).fetchone()
             if row is None:
                 return None
-            if row["expires_at"] <= datetime.now(timezone.utc).strftime(TIME_FORMAT):
+            now = datetime.now(timezone.utc)
+            now_text = now.strftime(TIME_FORMAT)
+            if row["expires_at"] <= now_text or row["last_seen_at"] <= _idle_cutoff(now, idle_timeout):
                 self._conn.execute("DELETE FROM sessions WHERE token_hash = ?", (token_hash,))
                 return None
             key = self._conn.execute(
                 _KEY_JOIN + " WHERE k.id = ? AND k.team_id = ? AND " + _USABLE,
-                (row["key_id"], row["team_id"], utc_now()),
+                (row["key_id"], row["team_id"], now_text),
             ).fetchone()
             if key is None:
                 self._conn.execute("DELETE FROM sessions WHERE token_hash = ?", (token_hash,))
                 return None
+            if touch and row["last_seen_at"] < now_text:
+                self._conn.execute(
+                    "UPDATE sessions SET last_seen_at = ? WHERE token_hash = ? AND last_seen_at < ?",
+                    (now_text, token_hash, now_text),
+                )
             self._touch_key(key["id"])
-        return dict(key)
+        return dict(key, session_id=row["id"])
+
+    def list_sessions(self, team_id: int, key_id: Optional[str], idle_timeout: int) -> List[Dict[str, Any]]:
+        with self._lock, self._conn:
+            self._purge_sessions(datetime.now(timezone.utc), idle_timeout)
+            rows = self._conn.execute(
+                "SELECT s.id, s.key_id, k.label AS key_label, k.role, s.created_at, s.last_seen_at, s.expires_at "
+                "FROM sessions s JOIN api_keys k ON k.id = s.key_id AND k.team_id = s.team_id "
+                "WHERE s.team_id = ? AND (? IS NULL OR s.key_id = ?) AND k.revoked_at IS NULL "
+                "ORDER BY s.created_at DESC, s.rowid DESC",
+                (team_id, key_id, key_id),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def revoke_session(
+        self, team_id: int, key_id: Optional[str], session_id: str, actor: str, action: str, idle_timeout: int,
+    ) -> bool:
+        with self._lock, self._conn:
+            self._purge_sessions(datetime.now(timezone.utc), idle_timeout)
+            deleted = self._conn.execute(
+                "DELETE FROM sessions WHERE id = ? AND team_id = ? AND (? IS NULL OR key_id = ?)",
+                (session_id, team_id, key_id, key_id),
+            )
+            if deleted.rowcount != 1:
+                return False
+            self._audit(team_id, actor, action, session_id, {})
+            return True
 
 
     def list_keys(self, team_id: int) -> List[Dict[str, Any]]:

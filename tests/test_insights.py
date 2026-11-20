@@ -796,7 +796,7 @@ def test_the_page_has_an_insights_tab_wired_to_its_panel_and_the_api():
     assert 'id="view-insights"' in DASHBOARD_HTML and 'role="tabpanel"' in DASHBOARD_HTML
     js = _script(DASHBOARD_HTML)
     assert "/api/insights" in js
-    assert 'var VIEWS = ["runs", "insights", "approvals", "keys", "audit", "settings"];' in js
+    assert 'var VIEWS = ["runs", "insights", "approvals", "sessions", "keys", "audit", "settings"];' in js
     assert 'if (name === "insights") { loadInsights(); }' in js
 
 

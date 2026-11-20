@@ -28,13 +28,16 @@
   GET  /                                      dashboard; sign in with the form, which posts the key
   POST /session                               sign in: form field "key" -> session cookie (302);
                                               from another origin (Origin/Sec-Fetch-Site) -> 403
+  POST /session/logout                        sign out of the current dashboard session (204)
+  GET  /sessions                              list active sessions (own key, or whole team for admin)
+  DELETE /sessions/<id>                       revoke one session in the same scope (204)
   GET  /?key=API_KEY                          legacy sign-in: redirects to strip the key; never
                                               replaces a session of another team without confirmation
   GET  /health                                liveness, no auth
 
 Credentials are "Authorization: Bearer KEY", or the dashboard session cookie. A cookie
-session has the role of the key it was signed in with, and survives a restart. A POST or
-PUT that uses a cookie must also send the header "X-Requested-With: runledger".
+session has the role of the key it was signed in with, and survives a restart. A write
+that uses a cookie must also send the header "X-Requested-With: runledger".
 
 A request that needs a role is authenticated before its body is read, so an oversized
 unauthenticated body gets 401, not 413, and the connection is closed without reading it.
@@ -90,12 +93,14 @@ SEVERITIES = ("low", "medium", "high")
 USAGE_SOURCES = ("messages", "settings", "missing")
 CSRF_HEADER = "X-Requested-With"
 CSRF_VALUE = "runledger"
+BACKGROUND_HEADER = "X-RunLedger-Background"
 # Sec-Fetch-Site values that mean the request comes from another origin. "same-site" is another
 # origin by definition (another port or scheme, or a subdomain), so a sign-in POST is refused too.
 CROSS_ORIGIN_FETCH_SITES = ("cross-site", "same-site")
 PUBLIC_URL_ENV = "RUNLEDGER_PUBLIC_URL"
 SECURE_COOKIES_ENV = "RUNLEDGER_SECURE_COOKIES"
 TRUSTED_PROXIES_ENV = "RUNLEDGER_TRUSTED_PROXIES"
+SESSION_IDLE_TIMEOUT_ENV = "RUNLEDGER_SESSION_IDLE_TIMEOUT"
 HSTS_VALUE = "max-age=31536000"
 MAINTENANCE_INTERVAL_S = 3600
 KEY_EXPIRES_HEADER = "X-RunLedger-Key-Expires"
@@ -209,6 +214,7 @@ class RunLedgerServer(ThreadingHTTPServer):
         trusted_proxies: Sequence[_IPNetwork] = (),
         retention_days: Optional[int] = None,
         audit_retention_days: Optional[int] = None,
+        session_idle_timeout: int = 0,
     ) -> None:
         self.db = db
         self.log_requests = log_requests
@@ -219,6 +225,7 @@ class RunLedgerServer(ThreadingHTTPServer):
         self.limiter = FailureLimiter()
         self.retention_days = retention_days
         self.audit_retention_days = audit_retention_days
+        self.session_idle_timeout = session_idle_timeout
         self._query_key_warned = False
         self._query_key_lock = threading.Lock()
         self._maintenance_stop = threading.Event()
@@ -334,10 +341,10 @@ class RunLedgerServer(ThreadingHTTPServer):
         row = self.db.key_for_token(token)
         return identity_from_row(row, "key") if row else None
 
-    def identify_session(self, token: Optional[str]) -> Optional[Identity]:
+    def identify_session(self, token: Optional[str], touch: bool = True) -> Optional[Identity]:
         """The identity behind a dashboard cookie. The session is stored in the database, so it
         survives a restart, and it ends when its key is revoked or rotated (see db.session_key)."""
-        row = self.db.session_key(token)
+        row = self.db.session_key(token, idle_timeout=self.session_idle_timeout, touch=touch)
         return identity_from_row(row, "session") if row else None
 
     def warn_query_key_once(self) -> None:
@@ -385,6 +392,7 @@ def make_server(
     trusted_proxies: Optional[Sequence[str]] = None,
     retention_days: Optional[int] = None,
     audit_retention_days: Optional[int] = None,
+    session_idle_timeout: Optional[int] = None,
 ) -> RunLedgerServer:
     """Open the database and bind the server. Port 0 picks a free port (see server_address).
     The caller owns the server: call shutdown(), server_close() and db.close() when done.
@@ -398,6 +406,7 @@ def make_server(
     below the 35-day floor is raised to it with a warning). audit_retention_days defaults to
     RUNLEDGER_AUDIT_RETENTION_DAYS: unset keeps audit events for 365 days while runs are being
     pruned, and 0 keeps them forever.
+    session_idle_timeout defaults to RUNLEDGER_SESSION_IDLE_TIMEOUT, in seconds (0 disables it).
     Raises ValueError for an invalid address, range or retention setting before the
     database is opened."""
     if bool(tls_cert) != bool(tls_key):
@@ -407,6 +416,14 @@ def make_server(
         retention_days = maintenance.retention_from_env()
     if audit_retention_days is None:
         audit_retention_days = maintenance.audit_retention_from_env()
+    idle_error = f"{SESSION_IDLE_TIMEOUT_ENV} / --session-idle-timeout must be a non-negative integer in seconds."
+    if session_idle_timeout is None:
+        try:
+            session_idle_timeout = int(os.environ.get(SESSION_IDLE_TIMEOUT_ENV, "").strip() or "0")
+        except ValueError:
+            raise ValueError(idle_error) from None
+    if session_idle_timeout < 0:
+        raise ValueError(idle_error)
     tls_context = make_tls_context(tls_cert, tls_key) if tls_cert else None
     secure = bool(secure_cookies) or _env_flag(SECURE_COOKIES_ENV)
     db = Database(db_path)
@@ -416,7 +433,7 @@ def make_server(
             (host, port), db, log_requests=log_requests, public_url=public_url,
             tls_context=tls_context, secure_cookies=secure, trust_proxy=bool(trust_proxy),
             trusted_proxies=networks, retention_days=retention_days,
-            audit_retention_days=audit_retention_days,
+            audit_retention_days=audit_retention_days, session_idle_timeout=session_idle_timeout,
         )
     except Exception:
         db.close()
@@ -497,6 +514,15 @@ class _Handler(BaseHTTPRequestHandler):
         elif path == "/session":
             self._only(method, ("POST",))
             self._session_post()
+        elif path == "/session/logout":
+            self._only(method, ("POST",))
+            self._session_logout()
+        elif path == "/sessions":
+            self._only(method, ("GET",))
+            self._list_sessions()
+        elif path.startswith("/sessions/"):
+            self._only(method, ("DELETE",))
+            self._revoke_session(path[len("/sessions/"):])
         elif path == "/api/me":
             self._only(method, ("GET",))
             self._me()
@@ -646,6 +672,11 @@ class _Handler(BaseHTTPRequestHandler):
                 return value
         return None
 
+    def _session_identity(self) -> Optional[Identity]:
+        return self.server.identify_session(
+            self._cookie(COOKIE_NAME), touch=(self.headers.get(BACKGROUND_HEADER) or "").strip() != "1",
+        )
+
     def _identify(self) -> Identity:
         """Who is calling: an API key first, then the dashboard session.
 
@@ -662,11 +693,9 @@ class _Handler(BaseHTTPRequestHandler):
                     self._extra_headers[KEY_EXPIRES_HEADER] = ident.expires_at or ""
                 return ident
         expired = self.server.db.expired_key_for_token(token) if token is not None else None
-        cookie = self._cookie(COOKIE_NAME)
-        if cookie:
-            ident = self.server.identify_session(cookie)
-            if ident is not None:
-                return ident
+        ident = self._session_identity()
+        if ident is not None:
+            return ident
         if expired is not None:
             # The right secret, past its end: not a guess, so not counted as a failure.
             raise _HttpError(
@@ -931,14 +960,56 @@ class _Handler(BaseHTTPRequestHandler):
             self._sign_in_page("Service keys work on the API only and cannot sign in to the dashboard. "
                                "Sign in with a personal key.")
             return
-        token = self.server.db.issue_session(row["team_id"], row["id"], row["role"])
+        token = self.server.db.issue_session(
+            row["team_id"], row["id"], row["role"], idle_timeout=self.server.session_idle_timeout,
+        )
         session = identity_from_row(row, "session")
         self.server.db.record_audit(row["team_id"], session.actor(), "auth.sign_in", row["id"],
                                     {"role": row["role"], "ip": self._client_ip()})
-        cookie = f"{COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_TTL_SECONDS}"
+        cookie = self._session_cookie(token, SESSION_TTL_SECONDS)
+        self._send(302, b"", "text/plain; charset=utf-8", {"Location": "/", "Set-Cookie": cookie})
+
+    def _session_cookie(self, token: str, max_age: int) -> str:
+        cookie = f"{COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}"
         if self._secure():
             cookie += "; Secure"
-        self._send(302, b"", "text/plain; charset=utf-8", {"Location": "/", "Set-Cookie": cookie})
+        return cookie
+
+    def _session_logout(self) -> None:
+        ident = self._session_identity()
+        if ident is None or ident.session_id is None:
+            raise _HttpError(401, "unauthorized", "Sign in to the dashboard to sign out.")
+        self._require(ident, "viewer", "sign out", write=True)
+        self.server.db.revoke_session(
+            ident.team_id, ident.key_id, ident.session_id, ident.actor(),
+            "auth.sign_out", self.server.session_idle_timeout,
+        )
+        self._session_ended(clear_cookie=True)
+
+    def _list_sessions(self) -> None:
+        ident = self._identify()
+        key_id = None if ident.role == "admin" else ident.key_id
+        sessions = self.server.db.list_sessions(ident.team_id, key_id, self.server.session_idle_timeout)
+        for session in sessions:
+            session["current"] = session["id"] == ident.session_id
+        self._send_json(200, {"sessions": sessions})
+
+    def _revoke_session(self, raw_id: str) -> None:
+        ident = self._identify()
+        self._require(ident, "viewer", "revoke sessions", write=True)
+        session_id = unquote(raw_id)
+        if not re.fullmatch(r"[0-9a-f]{32}", session_id):
+            raise _not_found("Session not found.")
+        key_id = None if ident.role == "admin" else ident.key_id
+        if not self.server.db.revoke_session(
+            ident.team_id, key_id, session_id, ident.actor(), "auth.session_revoked", self.server.session_idle_timeout,
+        ):
+            raise _not_found("Session not found.")
+        self._session_ended(clear_cookie=(session_id == ident.session_id))
+
+    def _session_ended(self, clear_cookie: bool) -> None:
+        headers = {"Set-Cookie": self._session_cookie("", 0)} if clear_cookie else None
+        self._start(204, "text/plain; charset=utf-8", headers, length=None)
 
     def _switch_team_page(self, row: Mapping[str, Any], current: Identity, key: str) -> None:
         """A ?key= link for another team is a switch, not a sign-in: ask for one click first."""
