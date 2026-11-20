@@ -271,6 +271,10 @@ class RunLedgerServer(ThreadingHTTPServer):
             self.server_close()
             raise
 
+    @property
+    def dashboard_key_sign_in_disabled(self) -> bool:
+        return any(client.disable_key_sign_in for client in (self.oidc, self.saml) if client is not None)
+
     def get_request(self) -> Tuple[socket.socket, Any]:
         # The handshake runs in the request's own thread (see _Handler.setup), so a slow
         # client cannot stall the accept loop.
@@ -671,15 +675,13 @@ class _Handler(BaseHTTPRequestHandler):
     def _sign_in_page(self, error: Optional[str] = None) -> None:
         message = f'<p class="error" role="alert">{_escape(error)}</p>' if error else ""
         buttons = []
-        key_form = SIGN_IN_KEY_FORM
+        key_form = "" if self.server.dashboard_key_sign_in_disabled else SIGN_IN_KEY_FORM
         if self.server.oidc:
             for provider in self.server.oidc.providers.values():
                 buttons.append(
                     f'<p><a class="sso" href="/auth/oidc/{provider["id"]}/start">'
                     f'Sign in with {_escape(provider["name"])}</a></p>'
                 )
-            if self.server.oidc.disable_key_sign_in:
-                key_form = ""
         if self.server.saml:
             for provider in self.server.saml.providers.values():
                 buttons.append(
@@ -1087,7 +1089,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _dashboard(self, query: Dict[str, List[str]]) -> None:
         key = (query.get("key") or [""])[0].strip()
-        if key and self.server.oidc and self.server.oidc.disable_key_sign_in:
+        if key and self.server.dashboard_key_sign_in_disabled:
             self._sign_in_page("Key sign-in is disabled; use your identity provider.")
             return
         if key:
@@ -1159,7 +1161,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _session_post(self) -> None:
         """The sign-in form: the key travels in the body, never in the URL."""
-        if self.server.oidc and self.server.oidc.disable_key_sign_in:
+        if self.server.dashboard_key_sign_in_disabled:
             self._sign_in_page("Key sign-in is disabled; use your identity provider.")
             self.close_connection = True
             return

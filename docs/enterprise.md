@@ -128,8 +128,9 @@ HTTP is allowed only for loopback testing.
 Email lookup is case-insensitive. First sign-in binds the user's issuer and subject; another
 identity cannot take over that email. A different issuer is also rejected once bound. People
 with several memberships choose a team before receiving a session. Sessions have no API key;
-membership roles and disabled status are checked on every request. Disabling dashboard key
-sign-in does not disable API/CLI keys. Failed sign-ins count toward the address failure limit
+membership roles and disabled status are checked on every request. Setting
+`"disable_key_sign_in": true` in either the OIDC or SAML config disables dashboard key sign-in
+without disabling API/CLI keys. Failed sign-ins count toward the address failure limit
 and are audited only in the resolved user's membership teams, without tokens or supplied email
 addresses. Unresolved identities and invalid states or tokens are not written to team audit logs.
 
@@ -153,6 +154,7 @@ Store a server-wide JSON configuration outside the repository:
 ```json
 {
   "public_url": "https://ledger.example.com",
+  "disable_key_sign_in": true,
   "providers": [{
     "id": "work",
     "name": "Company SAML",
@@ -172,6 +174,10 @@ public URL (including any OIDC override), or the bound address for local use.
 HTTP is only allowed on loopback for testing; the browser must allow a Secure cookie on the
 loopback origin. Multiple providers are supported; set `sp_entity_id` if the IdP requires an
 entity ID different from the provider's metadata URL. OIDC can remain enabled in parallel.
+
+`disable_key_sign_in` defaults to `false`. Set it to `true` to remove the dashboard key form
+and reject key sign-in at `POST /session` and `/?key=...`, even without OIDC configured. The SAML
+config must still define at least one provider. This setting does not disable API or CLI keys.
 
 Pre-provision each person and their team memberships; SAML does not create users or grant roles.
 `email_attribute` defaults to `email` and must be a single, IdP-controlled email value.
