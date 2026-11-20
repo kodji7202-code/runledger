@@ -363,6 +363,9 @@ def test_whole_name_operations_reset_name_parts(scim):
         ([given, {"op": "replace", "value": {"name": {"formatted": "Whole"}}}, family], "Smith"),
         ([given, {"op": "replace", "value": {"name": {"givenName": "Cy"}}}, family], "Cy Smith"),
         ([given, family], "Ana Smith"),
+        ([{"op": "replace", "value": {"name": {"givenName": "Dee"}, "displayName": "Shown"}}, family], "Smith"),
+        ([{"op": "replace", "value": {"name": {"givenName": "Dee"}, "name.formatted": "Whole"}}, family], "Smith"),
+        ([{"op": "replace", "value": {"displayName": "Shown", "name": {"givenName": "Eve"}}}, family], "Eve Smith"),
     ]
     for operations, expected in cases:
         status, body = call("PATCH", path, {"Operations": operations})
