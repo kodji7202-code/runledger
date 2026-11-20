@@ -229,7 +229,7 @@ def _head_word(word: str) -> str:
     return w[:-4] if w.endswith(".exe") else w
 
 
-def _split_commands(command: str) -> List[List[str]]:
+def _split_commands(command: str, dialect: str = "posix") -> List[List[str]]:
     """Split unquoted shell separators and whitespace: a quoted executable
     keeps its spaces (`& "C:\\Program Files\\Python312\\python.exe" -m pytest` is one word).
     Quotes stay in the word; _head_word strips them."""
@@ -251,8 +251,10 @@ def _split_commands(command: str) -> List[List[str]]:
                 word.append(ch)
             escaped = False
             continue
-        if ch == "\\" and (not quote or (quote == '"' and command[i + 1:i + 2] in
-                                             ('"', "\\", "$", "`", "\n"))):
+        if ((dialect == "powershell" and ch == "`" and quote != "'") or
+                (dialect != "powershell" and ch == "\\" and
+                 (not quote or (quote == '"' and command[i + 1:i + 2] in
+                                ('"', "\\", "$", "`", "\n"))))):
             escaped = True
             word.append(ch)
             continue
@@ -361,10 +363,10 @@ def _inspecting(words: List[str]) -> bool:
     return False
 
 
-def _test_runner(command: str) -> Optional[str]:
+def _test_runner(command: str, dialect: str = "posix") -> Optional[str]:
     """The test runner a shell command runs, or None when it only installs, inspects or
     mentions one. Each `&&`/`;`/`|`/newline segment is judged on its own command word."""
-    for words in _split_commands(command):
+    for words in _split_commands(command, dialect):
         if not words or _inspecting(words):
             continue
         runner = _runner_of(words)
@@ -373,8 +375,8 @@ def _test_runner(command: str) -> Optional[str]:
     return None
 
 
-def _is_test_command(command: str) -> bool:
-    return _test_runner(command) is not None
+def _is_test_command(command: str, dialect: str = "posix") -> bool:
+    return _test_runner(command, dialect) is not None
 
 
 @dataclass
@@ -410,7 +412,7 @@ def _test_runs(run: Run) -> List[_TestRun]:
     for s in run.steps:
         if s.tool not in SHELL_TOOLS:
             continue
-        runner = _test_runner(str(s.input.get("command") or ""))
+        runner = _test_runner(str(s.input.get("command") or ""), shell_kind(s))
         if runner is None:
             continue
         counts = parse_test_output(s.result_text or "", runner)
@@ -418,11 +420,14 @@ def _test_runs(run: Run) -> List[_TestRun]:
     return found
 
 
-def _shell_commands(run: Run) -> List[str]:
+def _non_test_shell_commands(run: Run) -> List[str]:
     out = []
     for s in run.steps:
         if s.tool in SHELL_TOOLS:
-            text = " ".join(str(s.input.get("command") or "").split())
+            command = str(s.input.get("command") or "")
+            if _is_test_command(command, shell_kind(s)):
+                continue
+            text = " ".join(command.split())
             if text:
                 out.append(text)
     return out
@@ -554,7 +559,7 @@ def score_run(run: Run, risks: Optional[Sequence[Risk]] = None) -> Dict[str, Any
         add("error_rate", round(rate, 3), max(-15, min(5, round(5 - 60 * rate))),
             f"{errors} of {len(run.steps)} steps returned an error.")
 
-        command_counts = Counter(c for c in _shell_commands(run) if not _is_test_command(c))
+        command_counts = Counter(_non_test_shell_commands(run))
         repeated = [c for c, n in command_counts.items() if n >= LOOP_COMMAND_REPEATS]
         edits = _edit_counts(run)
         looping_files = [p for p, n in edits.items() if n >= LOOP_FILE_EDITS]

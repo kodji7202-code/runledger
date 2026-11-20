@@ -288,6 +288,24 @@ def test_bash_line_continuations_do_not_hide_test_runs(command):
     assert _is_test_command(command)
 
 
+@pytest.mark.parametrize("tool", ["PowerShell", "Bash"])
+@pytest.mark.parametrize("command", [
+    'Set-Location "C:\\repo\\"; pytest -q',
+    'Set-Location .; echo "one `"quote"; pytest -q',
+    'Set-Location .; python -m `\npytest -q',
+])
+def test_powershell_escaping_uses_the_step_dialect(tool, command):
+    steps = [_step(i, tool, {"command": command}, result="3 passed") for i in range(3)]
+    quality = score_run(_run(steps), [])
+    assert _sig(quality, "tests_run")["value"] == 3
+    assert _sig(quality, "retry_loops")["value"] == 0
+
+
+def test_powershell_escaped_separator_is_not_a_test_run():
+    quality = score_run(_run([_step(1, "PowerShell", {"command": "echo hi`; pytest"})]), [])
+    assert _sig(quality, "tests_run") is None
+
+
 @pytest.mark.parametrize("command, expected", [
     ("echo hi # don't skip tests\npytest", True),
     ('echo hi # "pytest;\npytest', True),
