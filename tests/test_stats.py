@@ -1038,6 +1038,33 @@ def test_request_tiered_cost_matches_the_receipt_cold_and_warm(capsys, isolated_
     assert warm["totals"] == cold["totals"]
 
 
+def test_warm_report_prices_each_model_bucket_once(capsys, isolated_settings, monkeypatch):
+    """The totals, the groups, the partial-cost notes and the top-models line all read a
+    session's cost, yet each model bucket is priced once per run, still per request: two
+    sessions of two short 60000-token Haiku requests cost $0.024, not a long-context $0.12."""
+    project = isolated_settings / "once"
+    project.mkdir()
+    for name in ("first", "second"):
+        claude_session(isolated_settings, project, name, _started(1), model=HAIKU,
+                       usage=(60000, 0, 0, 0),
+                       calls=(("Read", {"file_path": "a.py"}),
+                              ("Read", {"file_path": "b.py"})))
+    cold, _ = _json(capsys, "stats", "--all", "--by", "model", "--format", "json")
+
+    priced = []
+    cost_of = pricing.cost_of
+
+    def counted(usage, model, *args, **kwargs):
+        priced.append(model)
+        return cost_of(usage, model, *args, **kwargs)
+
+    monkeypatch.setattr(pricing, "cost_of", counted)
+    warm, _ = _json(capsys, "stats", "--all", "--by", "model", "--format", "json")
+    assert priced == [HAIKU, HAIKU]
+    assert warm["totals"]["cost"] == pytest.approx(0.024, abs=1e-9)
+    assert (warm["totals"], warm["groups"]) == (cold["totals"], cold["groups"])
+
+
 def test_stats_starts_no_process_for_a_relative_droid_cwd(capsys, isolated_settings, monkeypatch):
     started = _no_process_spy(monkeypatch)
     project = isolated_settings / "relative"

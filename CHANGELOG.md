@@ -41,6 +41,13 @@ change behavior, so read the entry before you upgrade.
   `OverflowError`, so the command printed a traceback and exited 1. It now prints the usual
   `argument --since: invalid value ...` usage error and exits 2, like any other bad value.
 
+### Changed
+
+- **A warm `runledger stats` prices each model bucket once (`runledger.stats`):** the totals, the
+  groups, the partial-cost notes and the top-models line share one per-request priced cost per
+  session model instead of repricing it up to nine times, so a warm report over 500 sessions
+  runs in well under half the time with the same figures.
+
 ## [0.7.0] - 2026-10-20
 
 ### Added

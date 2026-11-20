@@ -26,6 +26,7 @@ import sys
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
+from functools import cached_property
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -256,6 +257,12 @@ class SessionSummary:
             for name in TOKEN_FIELDS:
                 out[name] += int(bucket.get(name) or 0)
         return out
+
+    @cached_property
+    def costs(self) -> Dict[str, Optional[float]]:
+        """Each model bucket's cost, priced once per summary: a report reads it for the
+        totals, every grouping and the partial-cost notes. `None` means no tokens or no price."""
+        return {model: _bucket_cost(model, bucket) for model, bucket in self.models.items()}
 
 
 class StatsCache:
@@ -592,8 +599,7 @@ def session_cost(summary: SessionSummary) -> Optional[float]:
         return None
     total = 0.0
     known = False
-    for model, bucket in summary.models.items():
-        cost = _bucket_cost(model, bucket)
+    for cost in summary.costs.values():
         if cost is not None:
             total += cost
             known = True
@@ -847,7 +853,7 @@ def _model_groups(summaries: Sequence[SessionSummary]) -> List[Dict[str, Any]]:
                 row["steps"] += summary.steps
             for name in TOKEN_FIELDS:
                 row["tokens"][name] += int(bucket.get(name) or 0)
-            cost = _bucket_cost(model, bucket) if summary.has_usage else None
+            cost = summary.costs.get(model) if summary.has_usage else None
             if cost is not None:
                 row["cost"] += cost
                 row["known"] = True
@@ -944,7 +950,7 @@ def model_blocks(summaries: Sequence[SessionSummary]) -> List[Dict[str, Any]]:
             block["sessions"] += 1
             for name in TOKEN_FIELDS:
                 block["tokens"][name] += int(bucket.get(name) or 0)
-            cost = _bucket_cost(model, bucket) if summary.has_usage else None
+            cost = summary.costs.get(model) if summary.has_usage else None
             if cost is not None:
                 block["cost"] += cost
                 block["known"] = True
