@@ -64,10 +64,14 @@ def name_from_parts(parts):
 
 def parts_of(body):
     """Name parts a whole-name value leaves for later name-part operations in the same PATCH."""
-    name = next((v for k, v in body.items() if k.lower() == "name"), None)
-    if not isinstance(name, dict) or "formatted" in name:
-        return {}
-    return {k: name[k] for k in ("givenName", "familyName") if k in name}
+    parts = {}
+    for key, value in body.items():
+        if key.lower() in ("displayname", "name.formatted"):
+            parts = {}
+        elif key.lower() == "name":
+            parts = {} if not isinstance(value, dict) or "formatted" in value else \
+                {k: value[k] for k in ("givenName", "familyName") if k in value}
+    return parts
 
 
 def values(body):
