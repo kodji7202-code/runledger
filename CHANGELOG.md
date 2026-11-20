@@ -52,6 +52,11 @@ change behavior, so read the entry before you upgrade.
   session model instead of repricing it up to nine times, so a warm report over 500 sessions
   runs in well under half the time with the same figures.
 
+### Fixed
+
+- Droid tool calls with an empty successful result now show **Approved by user** rather than
+  **Rejected by user** for Guard ask decisions.
+
 ## [0.7.0] - 2026-10-20
 
 ### Added
