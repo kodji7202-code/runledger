@@ -735,6 +735,8 @@ def test_checkpoint_listing_wraps_long_labels_between_words(repo, capsys):
     assert header == f"{checkpoint.id}  (0 file(s) differ)"
     assert timestamp == f"  {checkpoint.created_at}"
     assert len(label_lines) > 1
+    assert label_lines[0].startswith("  '")
+    assert all(len(line) - len(line.lstrip()) == 3 for line in label_lines[1:])
     assert all(len(line) <= 80 for line in [header, timestamp, *label_lines])
     assert " ".join(line.strip() for line in label_lines) == repr(label)
 
