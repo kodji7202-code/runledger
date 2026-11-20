@@ -9,6 +9,8 @@ change behavior, so read the entry before you upgrade.
 
 ### Fixed
 
+- `list --limit` counts displayed sessions, so invalid, unreadable, or vanished sessions
+  no longer consume limit slots.
 - Team server request logging handles oversized URLs rejected before parsing, returning HTTP 414
   instead of dropping the connection with an internal error.
 - Team receipt ingest rejects numbers outside the finite float range and JSON strings with
