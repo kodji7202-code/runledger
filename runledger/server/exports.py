@@ -64,7 +64,7 @@ def build(kind: str, db: Database, team_id: int, team_name: str, days: int, now:
     """The body of an export, and how many rows or runs it holds (for the audit entry)."""
     since = since_for(now, days)
     if kind == "runs":
-        return _runs_csv(db, team_id, since)
+        return _runs_csv(db, team_id, since, now.astimezone(timezone.utc).strftime(TIME_FORMAT))
     if kind == "audit":
         return _audit_csv(db, team_id, since)
     if kind == "report":
@@ -89,9 +89,9 @@ def _csv_bytes(header: Sequence[str], rows: Iterable[Sequence[Any]]) -> bytes:
     return BOM + out.getvalue().encode("utf-8")
 
 
-def _runs_csv(db: Database, team_id: int, since: str) -> Tuple[bytes, int]:
+def _runs_csv(db: Database, team_id: int, since: str, until: str) -> Tuple[bytes, int]:
     rows: List[List[Any]] = []
-    for run in db.export_runs(team_id, since):
+    for run in db.export_runs(team_id, since, until):
         models = json.loads(run["models"] or "{}")
         cost = run["cost"]
         savings = run["est_savings_usd"]
@@ -255,14 +255,15 @@ def _quality_block(review: Dict[str, Any]) -> str:
 
 def _report(db: Database, team_id: int, team_name: str, days: int, now: datetime) -> Tuple[bytes, int]:
     since = since_for(now, days)
+    until = now.astimezone(timezone.utc).strftime(TIME_FORMAT)
     stats = db.stats(team_id, days, now=now)
     totals = stats["totals"]
-    levels = db.risk_level_counts(team_id, since)
-    high = db.high_risk_runs(team_id, since, REPORT_LIMIT + 1)
+    levels = db.risk_level_counts(team_id, since, until)
+    high = db.high_risk_runs(team_id, since, REPORT_LIMIT + 1, until)
     decided = db.decided_approvals(team_id, since, REPORT_LIMIT + 1)
     events = db.audit_events(team_id, limit=REPORT_LIMIT + 1, since=since, action="key.")
     budget = budgets.status(db, team_id, now)
-    quality_html = _quality_block(insights.compute(db, team_id, since, days))
+    quality_html = _quality_block(insights.compute(db, team_id, since, days, until))
 
     moment = now.astimezone(timezone.utc)
     since_text = datetime.strptime(since, TIME_FORMAT).strftime("%Y-%m-%d %H:%M")
