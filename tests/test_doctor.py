@@ -13,6 +13,7 @@ import re
 import subprocess
 import sys
 import time
+import unicodedata
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -290,6 +291,30 @@ def test_text_output_falls_back_for_nonpositive_terminal_width(monkeypatch, colu
     assert all(len(line) <= 80 for line in lines)
     assert lines[2].startswith("       Diagnostic")
     assert lines[-1] == "Summary: 0 ok, 0 warnings, 0 failures"
+
+
+def _display_width(text):
+    return sum(2 if unicodedata.east_asian_width(char) in ("F", "W") else 1
+               for char in text if unicodedata.category(char) not in ("Mn", "Me"))
+
+
+def test_text_output_wraps_wide_characters(monkeypatch):
+    monkeypatch.setenv("COLUMNS", "80")
+    path = "/home/プロジェクト/runledger-デモ"
+    detail = f"Configuration for {path}: " + "日本語の診断 😀 cafe\u0301 " * 8
+    report = doctor.Report(path, [doctor.Check("config", "info", "config", detail)])
+
+    lines = doctor.render_text(report).splitlines()
+
+    assert all(_display_width(line) <= 80 for line in lines), [
+        (_display_width(line), line) for line in lines]
+    start = next(i for i, line in enumerate(lines) if line.startswith("[info]"))
+    assert " ".join(line.strip() for line in lines[start:-1]) == f"[info] config: {detail.strip()}"
+
+
+@pytest.mark.parametrize("text, width", [("日本語", 6), ("😀", 2), ("cafe\u0301", 4), ("Ａ", 2)])
+def test_display_width(text, width):
+    assert doctor._display_width(text) == width
 
 
 def test_text_output_wraps_with_hanging_indents(monkeypatch):
