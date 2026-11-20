@@ -177,7 +177,7 @@ tr.pickable:hover{background:var(--chip)}
 <div class="wrap">
 <header>
   <div>
-    <div class="brand"><span class="mark">RL</span><span>RunLedger team</span><span class="role-badge" id="role-badge" hidden></span></div>
+    <div class="brand"><span class="mark">RL</span><span>RunLedger team</span><span class="role-badge" id="role-badge" hidden></span><span id="signed-in-person"></span></div>
     <h1 id="team-name">Team runs</h1>
   </div>
   <div class="controls">
@@ -1808,6 +1808,7 @@ tr.pickable:hover{background:var(--chip)}
       state.meLoaded = true;
       state.role = ROLES.indexOf(me && me.role) >= 0 ? me.role : null;
       state.keyRef = me && me.key ? (me.key.prefix || me.key.id || null) : null;
+      $("signed-in-person").textContent = me && me.user ? (me.user.name || me.user.email) : (me && me.key ? me.key.label : "");
       if (me && me.team && me.team.name) { setTeam(me.team.name); }
       applyRole();
     }, function () {

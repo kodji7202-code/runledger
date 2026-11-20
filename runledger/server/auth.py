@@ -114,9 +114,14 @@ class Identity:
     role: str
     prefix: Optional[str]
     via: str  # "key" for an API key, "session" for a dashboard cookie
+    user_id: Optional[str] = None
+    email: Optional[str] = None
+    name: Optional[str] = None
 
     def actor(self) -> str:
         """Who did it, as written to the audit log. Never the key itself."""
+        if self.user_id:
+            return f"{self.email} via {self.label} ({self.prefix or self.key_id})"
         if self.via == "session":
             return f"dashboard:{self.label}"
         return f"{self.label} ({self.prefix})" if self.prefix else self.label
@@ -131,6 +136,9 @@ def identity_from_row(row: Mapping[str, Any], via: str) -> Identity:
         role=row["role"],
         prefix=row["prefix"],
         via=via,
+        user_id=row.get("user_id"),
+        email=row.get("email"),
+        name=row.get("name"),
     )
 
 

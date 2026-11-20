@@ -19,12 +19,15 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 from urllib.parse import quote
 
 from ..pricing import friendly_model
 from .insights import AI_REVIEW_LIKE, QUALITY_LIKE, RECOMMENDATIONS_LIKE, review_fields
 from .auth import (
+    Identity,
+    allows,
+    InvalidKey,
     INITIAL_KEY_LABEL,
     SESSION_CAP_PER_KEY,
     SESSION_TTL_SECONDS,
@@ -110,6 +113,20 @@ REVIEW_COLUMNS = (
 )
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    id TEXT PRIMARY KEY,
+    email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    name TEXT,
+    created_at TEXT NOT NULL,
+    disabled_at TEXT
+);
+CREATE TABLE IF NOT EXISTS memberships (
+    team_id INTEGER NOT NULL REFERENCES teams (id),
+    user_id TEXT NOT NULL REFERENCES users (id),
+    role TEXT NOT NULL CHECK (role IN ('admin', 'member', 'viewer')),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (team_id, user_id)
+);
 CREATE TABLE IF NOT EXISTS teams (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     name            TEXT NOT NULL UNIQUE,
@@ -254,11 +271,14 @@ _SUMMARY_COLUMNS = (
     "(receipt_html IS NOT NULL) AS has_html"
 )
 
-_KEY_COLUMNS = "id, label, role, prefix, created_at, last_used_at, revoked_at"
+_KEY_COLUMNS = "id, label, role, prefix, created_at, last_used_at, revoked_at, user_id"
 
 _KEY_JOIN = (
     "SELECT k.id, k.team_id, t.name AS team_name, k.label, k.role, k.prefix, k.key_hash, "
-    "k.created_at, k.last_used_at, k.revoked_at FROM api_keys k JOIN teams t ON t.id = k.team_id"
+    "k.created_at, k.last_used_at, k.revoked_at, k.user_id, u.email, u.name, u.disabled_at, "
+    "m.role AS membership_role FROM api_keys k JOIN teams t ON t.id = k.team_id "
+    "LEFT JOIN users u ON u.id = k.user_id "
+    "LEFT JOIN memberships m ON m.user_id = k.user_id AND m.team_id = k.team_id"
 )
 
 
@@ -440,6 +460,9 @@ class Database:
                 except sqlite3.DatabaseError:
                     pass  # some filesystems refuse WAL; the default journal still works
                 self._conn.executescript(SCHEMA)
+                self._add_missing_columns("api_keys", (("user_id", "TEXT REFERENCES users (id)"),))
+                self._add_missing_columns("sessions", (("user_id", "TEXT REFERENCES users (id)"),))
+                self._add_missing_columns("audit_log", (("actor_user_id", "TEXT REFERENCES users (id)"),))
                 self._add_missing_columns("teams", TEAM_SETTING_COLUMNS)
                 self._add_missing_columns("runs", RUN_COLUMNS)
                 self._add_missing_columns("approvals", APPROVAL_IDENTITY_COLUMNS)
@@ -640,16 +663,19 @@ class Database:
                     (new_key_id(), row["id"], INITIAL_KEY_LABEL, row["api_key_hash"], row["created_at"]),
                 )
 
-    def _audit(self, team_id: int, actor: str, action: str, target: Optional[str], details: Dict[str, Any]) -> None:
+    def _audit(self, team_id: int, actor: Union[str, Identity], action: str, target: Optional[str], details: Dict[str, Any]) -> None:
         """Write one audit row. The caller holds the lock and the transaction. Details must
         never carry a key or a webhook URL."""
         self._conn.execute(
-            "INSERT INTO audit_log (team_id, at, actor, action, target, details) VALUES (?, ?, ?, ?, ?, ?)",
-            (team_id, utc_now(), actor, action, target, json.dumps(details, sort_keys=True)),
+            "INSERT INTO audit_log (team_id, at, actor, action, target, details, actor_user_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (team_id, utc_now(), actor.actor() if isinstance(actor, Identity) else actor,
+             action, target, json.dumps(details, sort_keys=True),
+             actor.user_id if isinstance(actor, Identity) else None),
         )
 
     def record_audit(
-        self, team_id: int, actor: str, action: str, target: Optional[str] = None,
+        self, team_id: int, actor: Union[str, Identity], action: str, target: Optional[str] = None,
         details: Optional[Dict[str, Any]] = None,
     ) -> None:
         with self._lock, self._conn:
@@ -657,7 +683,111 @@ class Database:
 
     # Teams and keys
 
-    def create_team(self, name: str, actor: str = "cli") -> Tuple[int, str]:
+    def get_user(self, user: str) -> Optional[Dict[str, Any]]:
+        if not isinstance(user, str):
+            raise InvalidKey("User must be an id or email.")
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM users WHERE id = ? OR email = ? COLLATE NOCASE", (user, user.strip())
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_members(self, team_id: int) -> List[Dict[str, Any]]:
+        with self._reading() as conn:
+            rows = conn.execute(
+                "SELECT u.*, m.role, m.created_at AS joined_at FROM memberships m "
+                "JOIN users u ON u.id = m.user_id WHERE m.team_id = ? ORDER BY u.email", (team_id,)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def add_member(self, team_id: int, email: Any, role: Any, name: Any = None,
+                   actor: Union[str, Identity] = "cli") -> Dict[str, Any]:
+        role = validate_role(role)
+        if (not isinstance(email, str) or any(c.isspace() or ord(c) < 33 or 127 <= ord(c) <= 159 for c in email)
+                or len(email) > 254 or email.count("@") != 1):
+            raise InvalidKey("A valid email is required.")
+        email = email.lower()
+        local, domain = email.split("@")
+        if not local or not domain or domain.startswith(".") or domain.endswith(".") or "." not in domain:
+            raise InvalidKey("A valid email is required.")
+        if name is not None:
+            name = validate_label(name)
+        with self._lock, self._conn:
+            if not self._conn.in_transaction:
+                self._conn.execute("BEGIN IMMEDIATE")
+            if self.team_name(team_id) is None:
+                raise InvalidKey("Team not found.")
+            user = self.get_user(email)
+            if user is None:
+                user_id = new_key_id()
+                self._conn.execute("INSERT INTO users (id, email, name, created_at) VALUES (?, ?, ?, ?)",
+                                   (user_id, email, name, utc_now()))
+                user = self.get_user(user_id)
+            if self._conn.execute("SELECT 1 FROM memberships WHERE team_id = ? AND user_id = ?",
+                                  (team_id, user["id"])).fetchone():
+                raise InvalidKey("User is already a member.")
+            self._conn.execute("INSERT INTO memberships (team_id, user_id, role, created_at) VALUES (?, ?, ?, ?)",
+                               (team_id, user["id"], role, utc_now()))
+            self._audit(team_id, actor, "member.add", user["id"], {"email": email, "role": role})
+        return dict(user, role=role)
+
+    def _working_admins(self, team_id: int, exclude_user: Optional[str] = None,
+                        exclude_key: Optional[str] = None) -> bool:
+        rows = self._conn.execute(_KEY_JOIN + " WHERE k.team_id = ? AND k.revoked_at IS NULL", (team_id,))
+        for row in rows:
+            key = self._effective_key(row)
+            if (key and key["role"] == "admin" and key["id"] != exclude_key
+                    and (exclude_user is None or key["user_id"] != exclude_user)):
+                return True
+        return False
+
+    def change_member(self, team_id: int, user: str, role: Optional[str] = None,
+                      actor: Union[str, Identity] = "cli") -> None:
+        if role is not None:
+            role = validate_role(role)
+        with self._lock, self._conn:
+            if not self._conn.in_transaction:
+                self._conn.execute("BEGIN IMMEDIATE")
+            person = self.get_user(user)
+            membership = self._conn.execute("SELECT role FROM memberships WHERE team_id = ? AND user_id = ?",
+                                            (team_id, person["id"] if person else None)).fetchone()
+            if membership is None:
+                raise InvalidKey("Member not found.")
+            if role != "admin" and not self._working_admins(team_id, exclude_user=person["id"]):
+                raise InvalidKey("Cannot remove the team's last working admin key.")
+            if role is None:
+                self._conn.execute("DELETE FROM memberships WHERE team_id = ? AND user_id = ?",
+                                   (team_id, person["id"]))
+                self._conn.execute("UPDATE api_keys SET revoked_at = ? WHERE team_id = ? AND user_id = ? "
+                                   "AND revoked_at IS NULL", (utc_now(), team_id, person["id"]))
+                self._conn.execute("DELETE FROM sessions WHERE team_id = ? AND user_id = ?", (team_id, person["id"]))
+            else:
+                self._conn.execute("UPDATE memberships SET role = ? WHERE team_id = ? AND user_id = ?",
+                                   (role, team_id, person["id"]))
+            self._audit(team_id, actor, "member.remove" if role is None else "member.role", person["id"],
+                        {"email": person["email"], "role": role})
+
+    def set_user_disabled(self, user: str, disabled: bool) -> None:
+        with self._lock, self._conn:
+            if not self._conn.in_transaction:
+                self._conn.execute("BEGIN IMMEDIATE")
+            person = self.get_user(user)
+            if person is None:
+                raise InvalidKey("User not found.")
+            teams = [r[0] for r in self._conn.execute("SELECT team_id FROM memberships WHERE user_id = ?",
+                                                    (person["id"],))]
+            if disabled:
+                for team_id in teams:
+                    if not self._working_admins(team_id, exclude_user=person["id"]):
+                        raise InvalidKey("Cannot disable the team's last working admin key.")
+            self._conn.execute("UPDATE users SET disabled_at = ? WHERE id = ?",
+                               (utc_now() if disabled else None, person["id"]))
+            if disabled:
+                self._conn.execute("DELETE FROM sessions WHERE user_id = ?", (person["id"],))
+            for team_id in teams:
+                self._audit(team_id, "cli", "user.disable" if disabled else "user.enable", person["id"], {})
+
+    def create_team(self, name: str, actor: Union[str, Identity] = "cli") -> Tuple[int, str]:
         """Create a team and its first admin key ("initial"). Returns (team_id, key).
         The key is not stored, only its hash."""
         name = (name or "").strip()
@@ -666,7 +796,7 @@ class Database:
         with self._lock, self._conn:
             return self._create_team_locked(name, actor)
 
-    def _create_team_locked(self, name: str, actor: str) -> Tuple[int, str]:
+    def _create_team_locked(self, name: str, actor: Union[str, Identity]) -> Tuple[int, str]:
         """create_team() inside the caller's lock and transaction."""
         key = generate_key()
         now = utc_now()
@@ -717,6 +847,7 @@ class Database:
         with self._lock, self._conn:
             row = self._conn.execute(_KEY_JOIN + " WHERE k.key_hash = ? AND k.revoked_at IS NULL",
                                      (hash_key(token),)).fetchone()
+            row = self._effective_key(row)
             if row is None:
                 return None
             self._touch_key(row["id"])
@@ -726,10 +857,23 @@ class Database:
         """The active key with this id (used to check a dashboard session), or None."""
         with self._lock, self._conn:
             row = self._conn.execute(_KEY_JOIN + " WHERE k.id = ? AND k.revoked_at IS NULL", (key_id,)).fetchone()
+            row = self._effective_key(row)
             if row is None:
                 return None
             self._touch_key(row["id"])
         return dict(row)
+
+    @staticmethod
+    def _effective_key(row) -> Optional[Dict[str, Any]]:
+        if row is None:
+            return None
+        key = dict(row)
+        if key["user_id"] is not None:
+            if key["email"] is None or key["disabled_at"] is not None or key["membership_role"] is None:
+                return None
+            if not allows(key["membership_role"], key["role"]):
+                key["role"] = key["membership_role"]
+        return key
 
     def _touch_key(self, key_id: str) -> None:
         now = datetime.now(timezone.utc)
@@ -758,9 +902,9 @@ class Database:
                 (key_id, SESSION_CAP_PER_KEY - 1),
             )
             self._conn.execute(
-                "INSERT INTO sessions (token_hash, team_id, key_id, role, created_at, expires_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (hash_key(token), team_id, key_id, role, now_text, expires),
+                "INSERT INTO sessions (token_hash, team_id, key_id, role, created_at, expires_at, user_id) "
+                "SELECT ?, ?, ?, ?, ?, ?, user_id FROM api_keys WHERE id = ? AND team_id = ?",
+                (hash_key(token), team_id, key_id, role, now_text, expires, key_id, team_id),
             )
         return token
 
@@ -783,6 +927,7 @@ class Database:
                 _KEY_JOIN + " WHERE k.id = ? AND k.team_id = ? AND k.revoked_at IS NULL",
                 (row["key_id"], row["team_id"]),
             ).fetchone()
+            key = self._effective_key(key)
             if key is None:
                 self._conn.execute("DELETE FROM sessions WHERE token_hash = ?", (token_hash,))
                 return None
@@ -797,7 +942,11 @@ class Database:
                 f"SELECT {_KEY_COLUMNS} FROM api_keys WHERE team_id = ? ORDER BY created_at, rowid",
                 (team_id,),
             ).fetchall()
-        return [dict(r) for r in rows]
+        return [self._key_owner(dict(r)) for r in rows]
+
+    def _key_owner(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        row["user"] = self.get_user(row["user_id"]) if row["user_id"] else None
+        return row
 
     def _key_row(self, team_id: int, key_id: str) -> Optional[Dict[str, Any]]:
         row = self._conn.execute(
@@ -805,7 +954,8 @@ class Database:
         ).fetchone()
         return dict(row) if row else None
 
-    def create_key(self, team_id: int, label: Any, role: Any, actor: str) -> Dict[str, Any]:
+    def create_key(self, team_id: int, label: Any, role: Any, actor: Union[str, Identity],
+                   user: Optional[str] = None) -> Dict[str, Any]:
         """Create a key. The returned dict includes "key", the only time the plaintext is available.
         Raises InvalidKey for a bad label or role, ValueError for an unknown team."""
         label = validate_label(label)
@@ -813,21 +963,39 @@ class Database:
         key = generate_key()
         now = utc_now()
         with self._lock, self._conn:
+            if not self._conn.in_transaction:
+                self._conn.execute("BEGIN IMMEDIATE")
             if self._conn.execute("SELECT 1 FROM teams WHERE id = ?", (team_id,)).fetchone() is None:
                 raise ValueError(f"No team with id {team_id}.")
+            owner = None
+            if user is not None:
+                owner = self.get_user(user)
+                membership = self._conn.execute(
+                    "SELECT role FROM memberships WHERE team_id = ? AND user_id = ?",
+                    (team_id, owner["id"] if owner else None),
+                ).fetchone()
+                if membership is None or not allows(membership["role"], role):
+                    raise InvalidKey("The user must be a member with at least the key's role.")
             key_id = self._insert_key(team_id, label, role, key, now)
+            if owner:
+                self._conn.execute("UPDATE api_keys SET user_id = ? WHERE id = ?", (owner["id"], key_id))
             prefix = key_prefix(key)
             self._audit(team_id, actor, "key.create", key_id, {"label": label, "role": role, "prefix": prefix})
-        return {"id": key_id, "label": label, "role": role, "prefix": prefix, "created_at": now, "key": key}
+        return {"id": key_id, "label": label, "role": role, "prefix": prefix, "created_at": now, "key": key,
+                "user_id": owner["id"] if owner else None, "user": owner}
 
-    def revoke_key(self, team_id: int, key_id: str, actor: str) -> Tuple[str, Optional[Dict[str, Any]]]:
+    def revoke_key(self, team_id: int, key_id: str, actor: Union[str, Identity]) -> Tuple[str, Optional[Dict[str, Any]]]:
         """Revoke a key. Returns (outcome, view): "ok", "missing", "already_revoked", or
         "last_admin" (the team's only active admin key cannot be revoked)."""
         with self._lock, self._conn:
+            if not self._conn.in_transaction:
+                self._conn.execute("BEGIN IMMEDIATE")
+            candidate = self._key_row(team_id, key_id)
+            if candidate and candidate["revoked_at"] is None and candidate["role"] == "admin":
+                if not self._working_admins(team_id, exclude_key=key_id):
+                    return "last_admin", candidate
             cur = self._conn.execute(
-                "UPDATE api_keys SET revoked_at = ? WHERE id = ? AND team_id = ? AND revoked_at IS NULL "
-                "AND (role != 'admin' OR EXISTS (SELECT 1 FROM api_keys o WHERE o.team_id = api_keys.team_id "
-                "AND o.role = 'admin' AND o.revoked_at IS NULL AND o.id != api_keys.id))",
+                "UPDATE api_keys SET revoked_at = ? WHERE id = ? AND team_id = ? AND revoked_at IS NULL",
                 (utc_now(), key_id, team_id),
             )
             row = self._key_row(team_id, key_id)
@@ -842,7 +1010,7 @@ class Database:
                 return "already_revoked", row
             return "last_admin", row
 
-    def rotate_key(self, team_id: int, key_id: str, actor: str) -> Tuple[str, Optional[Dict[str, Any]]]:
+    def rotate_key(self, team_id: int, key_id: str, actor: Union[str, Identity]) -> Tuple[str, Optional[Dict[str, Any]]]:
         """Replace a key's secret. The id, label and role stay; the old secret stops working at once.
         Returns (outcome, view) where view includes the new "key". Outcomes: "ok", "missing", "revoked"."""
         new_key = generate_key()
@@ -880,7 +1048,7 @@ class Database:
     ) -> List[Dict[str, Any]]:
         """The general form of list_audit. `since` is a TIME_FORMAT text bound on the event time.
         limit=None returns every match (used by the export)."""
-        sql = "SELECT id, at, actor, action, target, details FROM audit_log WHERE team_id = ?"
+        sql = "SELECT id, at, actor, actor_user_id, action, target, details FROM audit_log WHERE team_id = ?"
         params: List[Any] = [team_id]
         if since is not None:
             sql += " AND at >= ?"
@@ -899,7 +1067,7 @@ class Database:
         with self._reading() as conn:
             rows = conn.execute(sql, params).fetchall()
         return [
-            {"id": r["id"], "at": r["at"], "actor": r["actor"], "action": r["action"],
+            {"id": r["id"], "at": r["at"], "actor": r["actor"], "actor_user_id": r["actor_user_id"], "action": r["action"],
              "target": r["target"], "details": json.loads(r["details"] or "{}")}
             for r in rows
         ]
@@ -910,7 +1078,7 @@ class Database:
         self,
         team_id: int,
         run: Dict[str, Any],
-        actor: Optional[str] = None,
+        actor: Optional[Union[str, Identity]] = None,
         *,
         key_id: Optional[str] = None,
         role: Optional[str] = None,
@@ -1337,7 +1505,7 @@ class Database:
             "alert_thresholds": json.loads(row["alert_thresholds"] or DEFAULT_ALERT_THRESHOLDS),
         }
 
-    def update_budget_settings(self, team_id: int, values: Dict[str, Any], actor: str) -> Dict[str, Any]:
+    def update_budget_settings(self, team_id: int, values: Dict[str, Any], actor: Union[str, Identity]) -> Dict[str, Any]:
         """Replace the team's budget. The change and its audit row are one transaction."""
         with self._lock, self._conn:
             self._conn.execute(
@@ -1449,7 +1617,7 @@ class Database:
         return self.approval_settings(team_id)["approval_ttl_s"]
 
     def update_approval_settings(
-        self, team_id: int, changes: Dict[str, Any], actor: Optional[str] = None
+        self, team_id: int, changes: Dict[str, Any], actor: Optional[Union[str, Identity]] = None
     ) -> Dict[str, Any]:
         """Apply validated settings. Only the known column names can reach the SQL text.
         The audit entry names the fields that changed; the webhook URLs are never written to it."""
@@ -1546,7 +1714,7 @@ class Database:
         reason: Optional[str],
         ttl_s: int,
         approver_key_id: Optional[str] = None,
-        actor: Optional[str] = None,
+        actor: Optional[Union[str, Identity]] = None,
     ) -> Tuple[str, Optional[Dict[str, Any]]]:
         """Record approved/denied on a pending, unexpired approval, atomically. With an actor,
         the decision is audited in the same transaction.

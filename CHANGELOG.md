@@ -7,6 +7,13 @@ change behavior, so read the entry before you upgrade.
 
 ## [Unreleased]
 
+### Added
+
+- Server-wide user accounts, team memberships and optional personal API keys. Personal keys and
+  dashboard sessions check enabled membership and effective role on every request. Admin member
+  API and local `user` commands support onboarding, role changes and offboarding, with last-admin
+  protection and person attribution in the audit API/CSV. Existing unowned keys remain unchanged.
+
 ## [0.7.0] - 2026-10-20
 
 ### Added
