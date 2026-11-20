@@ -110,7 +110,7 @@ def _js_call(functions, expression):
         helpers.append(match.group(0))
     result = subprocess.run(
         [node, "-e", "\n".join(helpers) + "\nconsole.log(JSON.stringify(" + expression + "));"],
-        capture_output=True, text=True, check=True,
+        capture_output=True, text=True, encoding="utf-8", check=True,
     )
     return json.loads(result.stdout)
 
