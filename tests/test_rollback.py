@@ -726,6 +726,19 @@ def test_listing_counts_differing_files_that_must_remain_ignored(repo, monkeypat
     assert "keep ignored '.secret'" in output
 
 
+def test_checkpoint_listing_wraps_long_labels_between_words(repo, capsys):
+    label = "Before refactoring the authentication middleware and adding integration test coverage"
+    checkpoint = repo.create(label)
+
+    assert main(["checkpoints", "--cwd", str(repo.root)]) == 0
+    header, timestamp, *label_lines = capsys.readouterr().out.splitlines()
+    assert header == f"{checkpoint.id}  (0 file(s) differ)"
+    assert timestamp == f"  {checkpoint.created_at}"
+    assert len(label_lines) > 1
+    assert all(len(line) <= 80 for line in [header, timestamp, *label_lines])
+    assert " ".join(line.strip() for line in label_lines) == repr(label)
+
+
 def test_actual_cli_yes_restore_with_safety_and_undo(committed_repo, capsys):
     repo = committed_repo
     head = git(repo.root, "rev-parse", "HEAD")
