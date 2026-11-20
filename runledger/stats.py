@@ -80,8 +80,11 @@ def parse_since(value: str, now: Optional[datetime] = None) -> datetime:
         raise SinceError(f"invalid value {value!r}: use {ACCEPTED_WINDOW}")
     match = _RELATIVE.match(raw.lower())
     if match:
-        days = int(match.group(1)) * _UNITS[match.group(2)]
-        return (now or local_now()) - timedelta(days=days)
+        try:
+            days = int(match.group(1)) * _UNITS[match.group(2)]
+            return (now or local_now()) - timedelta(days=days)
+        except (OverflowError, ValueError):
+            raise SinceError(f"invalid value {value!r}: use {ACCEPTED_WINDOW}") from None
     if _ISO_DAY.match(raw):
         try:
             day = date.fromisoformat(raw)
