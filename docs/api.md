@@ -24,13 +24,14 @@ Contents:
 cookie instead: `rl_session`, set by the sign-in form (`POST /session`).
 
 - A request with an API key needs no extra header.
-- A `POST` or `PUT` that uses the session cookie must also send `X-Requested-With: runledger`. Without
+- A write that uses the session cookie must also send `X-Requested-With: runledger`. Without
   it, the response is `403 csrf_required`.
-- A valid API key is checked first. The session cookie is used when the request carries no valid key.
+- A valid API key is checked first, except for `POST /session/logout`, which requires the cookie.
 - Endpoints that require a role authenticate before they read the request body, so a large body sent
   with a bad key gets `401` (or `403` for a role that is too low) instead of `413`.
 
-**Roles.** Each key has one role: `viewer` (read only), `member` (also pushes runs and requests
+**Roles.** Each key has one role: `viewer` (reads team data and manages its own dashboard sessions),
+`member` (also pushes runs and requests
 approvals) or `admin` (also decides approvals, manages settings, keys, the audit log, budgets and exports).
 An approval requires an admin key other than the requesting key. Each endpoint
 below names the minimum role. A higher role always works. See [enterprise.md](enterprise.md#model-teams-keys-and-roles).
@@ -732,7 +733,30 @@ non-browser client sends no such headers (`Sec-Fetch-Site: none`), so those keep
 At most 20 sessions are kept per key; signing in again past that cap drops the oldest session of that
 key, and other keys are unaffected.
 
-There is no sign-out endpoint. Revoke or rotate the key to end a session.
+### `POST /session/logout`
+
+End the session in the `rl_session` cookie and clear that cookie. Requires the cookie and
+`X-Requested-With: runledger`; a bearer key alone returns `401`. Returns `204 No Content` on success.
+Other sessions and the API key are unaffected.
+
+### `GET /sessions`
+
+List active dashboard sessions, newest first. Accepts a dashboard cookie or bearer key. Admins see
+their team's sessions; members and viewers see sessions started with their own key. The response has
+a `sessions` array. Each item contains `id` (a public session identifier), `key_id`, `key_label`,
+`role`, `created_at`, `last_seen_at`, `expires_at`, and `current` (true only for the authenticated
+cookie's session). No token or token hash is returned.
+
+### `DELETE /sessions/<id>`
+
+Revoke one session within the same scope as listing. Returns `204 No Content` on success or `404`
+if the session does not exist or is outside the caller's scope. When the caller authenticates
+with the session being revoked, the response also clears the cookie. Cookie-authenticated calls
+require `X-Requested-With: runledger`.
+
+The server can additionally enforce an [idle timeout](self-hosting.md#security-checklist). An
+authenticated cookie request refreshes `last_seen_at` unless it sends
+`X-RunLedger-Background: 1`, as the dashboard's background polls do.
 
 ## Error codes
 

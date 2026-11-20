@@ -30,7 +30,7 @@ Contents:
 
 | Role | Can do |
 | --- | --- |
-| **viewer** | Read everything a team member can read: runs, receipts, statistics, approvals, and team settings with webhook URLs masked. Read only. |
+| **viewer** | Read everything a team member can read: runs, receipts, statistics, approvals, and team settings with webhook URLs masked. Manage dashboard sessions started with this key. |
 | **member** | Everything a viewer can do, plus push runs and request approvals. |
 | **admin** | Everything a member can do, plus decide approvals, change team settings, manage keys, read the audit log, set budgets and download exports. An admin cannot decide an approval created with the same key. |
 
@@ -48,6 +48,7 @@ Access matrix (HTTP endpoints; see [api.md](api.md)):
 | Decide approvals (`POST /api/approvals/{id}/decision`) | no | no | yes, with a different key from requester |
 | Change team settings (`PUT /api/team/settings`) | no | no | yes |
 | List, create, rotate and revoke keys (`/api/keys`) | no | no | yes |
+| List and revoke dashboard sessions (`/sessions`) | this key | this key | this team |
 | Read the audit log (`GET /api/audit`) | no | no | yes |
 | Read budgets (`GET /api/budgets`, `/api/budgets/status`) | yes | yes | yes |
 | Set budgets (`PUT /api/budgets`) | no | no | yes |
@@ -135,6 +136,8 @@ target and details. Details never include a key secret or a webhook URL.
 | `approval.decide` | An approval is approved or denied | Approval id | status |
 | `team.settings` | Team settings change | `settings` | the names of the fields changed, and `approval_ttl_s` if it changed. Never the URLs. |
 | `auth.sign_in` | A dashboard sign-in with a key succeeds | Key id | role, and the client address (`ip`) |
+| `auth.sign_out` | The caller signs out of the dashboard | Session id | — |
+| `auth.session_revoked` | The caller revokes a dashboard session | Session id | — |
 | `budget.update` | This release: the team's budget changes | `budget` | monthly_usd, per_user_monthly_usd, alert_thresholds |
 | `budget.alert` | This release: a threshold fires | Scope (`team` or `user:<name>`) | month, threshold, spend_usd, limit_usd, pct |
 | `export.runs`, `export.audit`, `export.report` | This release: an admin downloads an export (GET only, not HEAD) | `null` | days, rows |
@@ -276,9 +279,14 @@ exports as confidential.
 - A session carries the role of its key. It ends after 12 hours, or at once when its key is revoked or
   rotated. Each key keeps at most 20 sessions; signing in past that cap drops that key's oldest
   session and leaves other keys alone.
-- *This release:* the server keeps sessions in the team database as hashes of their tokens, so a
-  server restart does not sign anyone out. Until this release, sessions were held in memory.
-- There is no sign-out endpoint. To end a session, rotate or revoke its key.
+- The server keeps sessions in the team database as hashes of their tokens, so restarting it does
+  not sign anyone out.
+- **Sign out** ends the current session without changing its API key. The **Sessions** tab shows
+  active sessions and lets you revoke them. Admins see the entire team's sessions; members and
+  viewers see only sessions started with their key.
+- An operator may set an inactivity timeout in seconds with `RUNLEDGER_SESSION_IDLE_TIMEOUT` or
+  `runledger serve --session-idle-timeout`. The default `0` disables idle expiry. Dashboard
+  background polling does not count as activity, and the 12-hour absolute limit still applies.
 - Changes made from the dashboard must send the header `X-Requested-With: runledger`. A cross-site form
   cannot set it, so a forged request is refused with `csrf_required`. Requests that use an API key in
   the `Authorization` header do not need it.
