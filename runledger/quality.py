@@ -229,19 +229,29 @@ def _head_word(word: str) -> str:
     return w[:-4] if w.endswith(".exe") else w
 
 
-def _split_words(segment: str) -> List[str]:
-    """The words of one shell segment, split on unquoted whitespace only: a quoted executable
+def _split_commands(command: str) -> List[List[str]]:
+    """Split unquoted shell separators and whitespace: a quoted executable
     keeps its spaces (`& "C:\\Program Files\\Python312\\python.exe" -m pytest` is one word).
     Quotes stay in the word; _head_word strips them."""
+    commands: List[List[str]] = []
     words: List[str] = []
     word: List[str] = []
     quote = ""
-    for ch in segment:
+    for i, ch in enumerate(command):
         if quote:
             if ch == quote:
                 quote = ""
         elif ch in "'\"":
             quote = ch
+        elif ch in ";|\n" or (ch == "&" and
+                (command[i:i + 2] == "&&" or command[max(0, i - 1):i + 1] == "&&")):
+            if word:
+                words.append("".join(word))
+                word = []
+            if words:
+                commands.append(words)
+                words = []
+            continue
         elif ch.isspace():
             if word:
                 words.append("".join(word))
@@ -250,7 +260,9 @@ def _split_words(segment: str) -> List[str]:
         word.append(ch)
     if word:
         words.append("".join(word))
-    return words
+    if words:
+        commands.append(words)
+    return commands
 
 
 def _test_script(rest: List[str]) -> bool:
@@ -331,8 +343,7 @@ def _inspecting(words: List[str]) -> bool:
 def _test_runner(command: str) -> Optional[str]:
     """The test runner a shell command runs, or None when it only installs, inspects or
     mentions one. Each `&&`/`;`/`|`/newline segment is judged on its own command word."""
-    for segment in re.split(r"&&|\|\||;|\||\n", command):
-        words = _split_words(segment)
+    for words in _split_commands(command):
         if not words or _inspecting(words):
             continue
         runner = _runner_of(words)

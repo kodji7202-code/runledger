@@ -249,6 +249,26 @@ def test_other_commands_are_not_test_runs(command):
     assert not _is_test_command(command)
 
 
+@pytest.mark.parametrize("quote", ["'", '"'])
+@pytest.mark.parametrize("separator", [";", "|", "&&", "||", "\n"])
+def test_quoted_separators_do_not_start_test_runs(quote, separator):
+    command = f"echo {quote}note{separator} pytest{quote}"
+    assert not _is_test_command(command)
+    quality = score_run(_run([_bash(1, command)]), [])
+    assert (quality["score"], quality["grade"]) == (75, "B")
+
+
+@pytest.mark.parametrize("separator", [";", "|", "&&", "||", "\n"])
+def test_unquoted_separators_still_start_test_runs(separator):
+    assert _is_test_command(f"echo hi{separator} pytest")
+    assert _is_test_command(f"echo 'note; pytest'{separator} pytest")
+
+
+@pytest.mark.parametrize("command", ["", "echo 'note; pytest", 'echo "note| pytest'])
+def test_empty_or_unbalanced_commands_do_not_start_test_runs(command):
+    assert not _is_test_command(command)
+
+
 @pytest.mark.parametrize("command", [
     "pip install pytest", "pip3 install pytest", "python -m pip install pytest",
     "npm install --save-dev jest", "npm uninstall -y pytest", "npm i jest", "yarn remove jest",
