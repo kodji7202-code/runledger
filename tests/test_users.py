@@ -297,3 +297,11 @@ def test_cli_user_lifecycle_and_personal_key(tmp_path, capsys):
     assert main(["user", "remove"] + scoped + email) == 1
     assert main(["user", "disable"] + common + ["--email", "missing@example.com"]) == 1
     assert main(["key", "create"] + scoped + ["--label", "bad", "--role", "member", "--user", "ana@example.com"]) == 1
+
+
+def test_non_ascii_uppercase_email_lookup_matches_stored_user(db):
+    team, _ = db.create_team("unicode")
+    db.add_member(team, "Ärni@Example.com", "member")
+    assert db.get_user("ÄRNI@example.com")["email"] == "ärni@example.com"
+    view = db.create_key(team, "laptop", "member", actor="cli", user="Ärni@Example.com")
+    assert view["user"]["email"] == "ärni@example.com"
