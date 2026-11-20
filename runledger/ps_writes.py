@@ -47,7 +47,6 @@ _DOTNET_WRITE_RE = re.compile(
 )
 
 _REDIR_OP_RE = re.compile(r"^(?:[1-6*]?>>|[1-6*]?>(?!&))$")
-_REDIR_MERGE_RE = re.compile(r"^[1-6*]?>>&?[0-9]?$|^[1-6*]?✨$")
 _STREAM_MERGE_PREFIX_RE = re.compile(r"^(?:[1-6*]?>>|[1-6*]?>)(?:&[1-6]?)?(.*)$")
 
 # A PowerShell provider qualifier (`HKLM:\Software`, `HKCU:\...`, `Cert:\LocalMachine`,
