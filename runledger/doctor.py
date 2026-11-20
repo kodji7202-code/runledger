@@ -1179,12 +1179,12 @@ def render_text(report: Report, verbose: bool = False) -> str:
     width = shutil.get_terminal_size(fallback=(80, 24)).columns
     lines = []
 
-    def append(text: str, prefix: str = "") -> None:
-        if not text:
-            lines.append(prefix)
+    def append(text: str, prefix: str = "", indent: int = 2) -> None:
+        if len(prefix + text) <= width:
+            lines.append(prefix + text)
             return
         lines.append(textwrap.fill(text, width=width, initial_indent=prefix,
-                                   subsequent_indent=" " * len(prefix),
+                                   subsequent_indent=" " * indent,
                                    break_long_words=False, break_on_hyphens=False))
 
     append(f"RunLedger doctor {__version__}  |  python {platform.python_version()}  |  "
@@ -1192,12 +1192,13 @@ def render_text(report: Report, verbose: bool = False) -> str:
     for check in report.checks:
         who = f" {check.agent}" if check.agent else ""
         who += f" {check.scope}" if check.scope else ""
-        append(check.detail, f"[{check.status}] {check.title}{who}: ")
+        append(f"[{check.status}] {check.title}{who}: {check.detail}",
+               indent=len(f"[{check.status}] "))
         if check.fix and check.status in (WARN, FAIL):
-            append(check.fix, "        -> ")
+            append(check.fix, "        -> ", indent=11)
         if verbose:
             for extra in check_extra(report, check):
-                append(extra, "        ")
+                append(extra, "        ", indent=8)
     counts = summary(report.checks)
     append(f"{counts['ok']} ok, {counts['warn']} warnings, {counts['fail']} failures", "Summary: ")
     return "\n".join(lines) + "\n"

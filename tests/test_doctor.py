@@ -290,15 +290,15 @@ def test_text_output_wraps_with_hanging_indents(monkeypatch):
     lines = doctor.render_text(report, verbose=True).splitlines()
 
     assert all(len(line) <= 80 for line in lines)
-    for content, prefix in ((detail, "[warn] config codex project: "),
-                            (fix, "        -> "), (extra, "        ")):
+    for content, prefix, indent in ((detail, "[warn] config codex project: ", 7),
+                                    (fix, "        -> ", 11), (extra, "        ", 8)):
         start = next(i for i, line in enumerate(lines)
                      if line.startswith(prefix + content.split()[0]))
         wrapped = [lines[start][len(prefix):]]
         for line in lines[start + 1:]:
-            if not line.startswith(" " * len(prefix)):
+            if len(line) - len(line.lstrip()) != indent:
                 break
-            wrapped.append(line[len(prefix):])
+            wrapped.append(line[indent:])
         assert len(wrapped) > 1
         assert " ".join(wrapped) == content.strip()
 
@@ -311,8 +311,12 @@ def test_text_output_preserves_short_lines_and_long_tokens(monkeypatch, detail):
 
     lines = doctor.render_text(report).splitlines()
 
-    assert lines[1] == f"[ok] config: {detail}"
-    assert len(lines) == 3
+    if len(detail) <= 80 - len("[ok] config: "):
+        assert lines[1] == f"[ok] config: {detail}"
+        assert len(lines) == 3
+    else:
+        assert lines[1:3] == ["[ok] config:", "     " + detail]
+        assert len(lines) == 4
     assert lines[-1] == "Summary: 1 ok, 0 warnings, 0 failures"
 
 
@@ -1670,7 +1674,7 @@ def doc_text_samples():
 
 def report_head(line):
     """`[ok] guard hooks claude-code project: ...` -> `guard hooks claude-code project`."""
-    match = re.match(r"^\[(?:ok|warn|fail|info|skip)\] ([^:]+): ", line)
+    match = re.match(r"^\[(?:ok|warn|fail|info|skip)\] ([^:]+):(?: |$)", line)
     return match.group(1) if match else None
 
 
@@ -1714,5 +1718,3 @@ def test_the_doc_says_the_log_check_cannot_check_git_outside_a_repo():
     section = text.split("### `log`", 1)[1].split("### `rollback`", 1)[0]
     assert re.search(r"outside a Git (work tree|repository)", section, re.I), section
     assert "`info`" in section, section
-
-
