@@ -9,6 +9,8 @@ change behavior, so read the entry before you upgrade.
 
 ### Fixed
 
+- `runledger stats --until YYYY-MM-DD` includes sessions and guard events in the final
+  fractional second of the day, while still excluding the next day's midnight.
 - Team server request logging handles oversized URLs rejected before parsing, returning HTTP 414
   instead of dropping the connection with an internal error.
 - Team receipt ingest rejects numbers outside the finite float range and JSON strings with
