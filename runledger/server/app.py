@@ -478,7 +478,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     def log_request(self, code: Any = "-", size: Any = "-") -> None:
         if self.server.log_requests:
-            sys.stderr.write(f"{self.command} {urlsplit(self.path).path} {code}\n")
+            command = getattr(self, "command", "-") or "-"
+            path = urlsplit(getattr(self, "path", "")).path or "-"
+            sys.stderr.write(f"{command} {path} {code}\n")
 
     def send_error(self, code: int, message: Optional[str] = None, explain: Optional[str] = None) -> None:
         # The stdlib calls this for malformed requests; keep the reply JSON.
