@@ -40,7 +40,6 @@ import os
 import re
 import sqlite3
 import sys
-import unicodedata
 import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
@@ -50,6 +49,7 @@ from urllib.parse import quote
 from . import __version__
 from . import adapters
 from . import hook_targets
+from ._text import wrap_text
 from .ai_defaults import DEFAULT_AI_MODEL, DEFAULT_REVIEW_MODEL
 from .gitinfo import current_branch, file_diffs, repo_context, session_base, toplevel, working_changes
 from .guard import load_user_config, redact
@@ -204,19 +204,7 @@ def _prune_scope(keep, older_than) -> str:
 
 
 def _wrap_checkpoint_label(label: str) -> str:
-    lines = []
-    line, columns = "  ", 2
-    for match in re.finditer(r"( *)([^ ]+)", repr(redact(label))):
-        gap, word = match.groups()
-        width = sum(2 if unicodedata.east_asian_width(char) in ("F", "W") else 1
-                    for char in word if unicodedata.category(char) not in ("Mn", "Me"))
-        if line.strip() and columns + len(gap) + width > 80:
-            lines.append(line)
-            line, columns = "   " + word, 3 + width
-        else:
-            line += gap + word
-            columns += len(gap) + width
-    return "\n".join([*lines, line])
+    return wrap_text(repr(redact(label)), initial_indent="  ", subsequent_indent="   ")
 
 
 def cmd_checkpoints(args) -> int:

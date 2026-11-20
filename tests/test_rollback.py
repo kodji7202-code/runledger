@@ -6,6 +6,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,7 +15,7 @@ from unicodedata import east_asian_width
 import pytest
 
 from runledger import guard, redirects, rollback
-from runledger.cli import build, main
+from runledger.cli import _wrap_checkpoint_label, build, main
 from runledger.receipt import render
 
 
@@ -729,6 +730,12 @@ def test_listing_counts_differing_files_that_must_remain_ignored(repo, monkeypat
 
 def _display_width(text):
     return sum(2 if east_asian_width(char) in ("F", "W") else 1 for char in text)
+
+
+def test_checkpoint_label_wrapping_handles_long_space_runs_quickly():
+    start = time.perf_counter()
+    assert _wrap_checkpoint_label("a" + " " * 200_000 + "b") == "  'a\n   b'"
+    assert time.perf_counter() - start < 1
 
 
 @pytest.mark.parametrize("label", [
