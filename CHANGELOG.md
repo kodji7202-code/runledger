@@ -52,6 +52,8 @@ change behavior, so read the entry before you upgrade.
 
 ### Fixed
 
+- `list --limit` counts displayed sessions, so invalid, unreadable, or vanished sessions
+  no longer consume limit slots.
 - The HTML receipt fits phone screens (375px and up) instead of scrolling sideways and hiding the
   Tokens and Cost columns: on screens up to 600px wide, step rows put the model, tokens and cost on
   a line under the step, and the quality score and AI review tables move their notes under each row.
