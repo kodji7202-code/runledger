@@ -59,6 +59,11 @@ def test_idp_lifecycle(scim):
     assert _http(base, "GET", "/api/me", headers=_auth(personal["key"]))[0] == 401
     actions = {e["action"] for e in db.list_audit(team) if e["actor"] == "scim"}
     assert {"scim.user.create", "scim.user.update", "scim.user.deactivate", "scim.user.reactivate", "scim.user.delete", "scim.group.update"} <= actions
+    for event in db.list_audit(team):
+        if event["action"].startswith("scim.user."):
+            assert event["details"]["user_id"] == uid
+            assert event["target"] == event["details"]["email"]
+            assert event["details"]["role"] in ("admin", "member", "viewer")
 
 
 def test_credentials_rotation_revocation_and_csrf(scim):
