@@ -79,6 +79,7 @@ from .auth import (
 )
 from .dashboard import APPROVAL_HTML, DASHBOARD_HTML
 from .db import TIME_FORMAT, Database, normalize_missing_costs
+from .insights import MAX_COST_USD
 
 MAX_BODY_BYTES = 10 * 1024 * 1024
 SIGN_IN_BODY_LIMIT = 4096
@@ -1320,10 +1321,8 @@ def _int(value: Any, default: Optional[int], lo: int = 0, hi: int = 10 ** 12) ->
     return max(lo, min(hi, number))
 
 
-def _money(value: Any, hi: int = 10 ** 12) -> Optional[float]:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value > hi:
-        return None
-    if not math.isfinite(value):
+def _money(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value > MAX_COST_USD or not math.isfinite(value):
         return None
     return round(max(0.0, float(value)), 6)
 
@@ -1424,15 +1423,7 @@ def receipt_to_run(
 
     # The quality, recommendations and AI review keys are checked leniently: a bad value is
     # stored as null (or dropped item by item) and never rejects the push.
-    review_payload = dict(payload)
-    review_payload["recommendations"] = [
-        dict(item, est_savings_usd=_money(item.get("est_savings_usd")))
-        if isinstance(item, dict) and isinstance(item.get("est_savings_usd"), (int, float))
-        and item["est_savings_usd"] >= 0 else item
-        for item in _list(payload.get("recommendations"))[:insights.MAX_ITEMS]
-    ]
-    review = insights.review_fields(review_payload)
-    review["est_savings_usd"] = _money(review["est_savings_usd"])
+    review = insights.review_fields(payload)
     receipt = {k: v for k, v in payload.items() if k != "html"}
     receipt["user"] = client_user
     receipt["project"] = project
