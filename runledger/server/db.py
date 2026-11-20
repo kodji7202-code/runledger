@@ -462,6 +462,26 @@ class Database:
                 self._conn.executescript(SCHEMA)
                 self._add_missing_columns("api_keys", (("user_id", "TEXT REFERENCES users (id)"),))
                 self._add_missing_columns("sessions", (("user_id", "TEXT REFERENCES users (id)"),))
+                self._add_missing_columns("users", (("oidc_issuer", "TEXT"), ("oidc_subject", "TEXT")))
+                self._add_missing_columns("sessions", (("oidc_provider", "TEXT"),))
+                if any(
+                    row["name"] == "key_id" and row["notnull"]
+                    for row in self._conn.execute("PRAGMA table_info(sessions)")
+                ):
+                    self._conn.execute("ALTER TABLE sessions RENAME TO sessions_old")
+                    self._conn.execute(
+                        "CREATE TABLE sessions ("
+                        "token_hash TEXT PRIMARY KEY, team_id INTEGER NOT NULL REFERENCES teams (id), "
+                        "key_id TEXT REFERENCES api_keys (id), role TEXT NOT NULL, created_at TEXT NOT NULL, "
+                        "expires_at TEXT NOT NULL, user_id TEXT REFERENCES users (id), oidc_provider TEXT)"
+                    )
+                    self._conn.execute(
+                        "INSERT INTO sessions SELECT token_hash, team_id, key_id, role, created_at, "
+                        "expires_at, user_id, oidc_provider FROM sessions_old"
+                    )
+                    self._conn.execute("DROP TABLE sessions_old")
+                    self._conn.execute("CREATE INDEX sessions_by_key ON sessions (key_id)")
+                    self._conn.commit()
                 self._add_missing_columns("audit_log", (("actor_user_id", "TEXT REFERENCES users (id)"),))
                 self._add_missing_columns("teams", TEAM_SETTING_COLUMNS)
                 self._add_missing_columns("runs", RUN_COLUMNS)
@@ -885,6 +905,88 @@ class Database:
 
     # Dashboard sessions
 
+    def audit_oidc_rejection(self, user_id: Optional[str], provider: Optional[str], ip: str) -> None:
+        """Record a rejected, resolved identity only in its own membership teams."""
+        if user_id is None:
+            return
+        with self._lock, self._conn:
+            teams = self._conn.execute(
+                "SELECT team_id FROM memberships WHERE user_id = ?", (user_id,)
+            ).fetchall()
+            for row in teams:
+                self._audit(
+                    row["team_id"],
+                    "oidc",
+                    "auth.sign_in_rejected",
+                    user_id,
+                    {"method": "oidc", "provider": provider, "ip": ip},
+                )
+
+    def oidc_user(self, email: str, issuer: str, subject: str) -> Dict[str, Any]:
+        """Resolve an enabled member by email and bind its first provider identity."""
+        with self._lock, self._conn:
+            person = self.get_user(email)
+            if not person or person["disabled_at"] or not self.user_teams(person["id"]):
+                raise ValueError(f"No RunLedger account for {email}; ask a team admin to add you")
+            if person["oidc_issuer"] and (
+                person["oidc_issuer"] != issuer or person["oidc_subject"] != subject
+            ):
+                raise ValueError(
+                    "This email is bound to a different identity provider account; ask a team admin."
+                )
+            if not person["oidc_issuer"]:
+                existing = self._conn.execute(
+                    "SELECT id FROM users WHERE oidc_issuer = ? AND oidc_subject = ?", (issuer, subject)
+                ).fetchone()
+                if existing and existing["id"] != person["id"]:
+                    raise ValueError("This identity provider account is already bound to another user.")
+                self._conn.execute(
+                    "UPDATE users SET oidc_issuer = ?, oidc_subject = ? WHERE id = ?",
+                    (issuer, subject, person["id"]),
+                )
+            return person
+
+    def user_teams(self, user_id: str) -> List[Dict[str, Any]]:
+        """Return the enabled user's current teams and membership roles."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT t.id, t.name, m.role FROM memberships m "
+                "JOIN teams t ON t.id = m.team_id JOIN users u ON u.id = m.user_id "
+                "WHERE m.user_id = ? AND u.disabled_at IS NULL ORDER BY t.name",
+                (user_id,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def issue_oidc_session(self, team_id: int, user_id: str, provider: str) -> str:
+        """Issue a keyless dashboard token only while the membership is active."""
+        token = new_session_token()
+        now = datetime.now(timezone.utc)
+        with self._lock, self._conn:
+            self._conn.execute(
+                "DELETE FROM sessions WHERE expires_at <= ?", (now.strftime(TIME_FORMAT),)
+            )
+            self._conn.execute(
+                "DELETE FROM sessions WHERE token_hash IN ("
+                "SELECT token_hash FROM sessions WHERE user_id = ? AND key_id IS NULL "
+                "ORDER BY created_at DESC, rowid DESC LIMIT -1 OFFSET ?)",
+                (user_id, SESSION_CAP_PER_KEY - 1),
+            )
+            self._conn.execute(
+                "INSERT INTO sessions (token_hash, team_id, key_id, role, created_at, expires_at, "
+                "user_id, oidc_provider) SELECT ?, m.team_id, NULL, m.role, ?, ?, m.user_id, ? "
+                "FROM memberships m JOIN users u ON u.id = m.user_id "
+                "WHERE m.team_id = ? AND m.user_id = ? AND u.disabled_at IS NULL",
+                (
+                    hash_key(token),
+                    now.strftime(TIME_FORMAT),
+                    (now + timedelta(seconds=SESSION_TTL_SECONDS)).strftime(TIME_FORMAT),
+                    provider,
+                    team_id,
+                    user_id,
+                ),
+            )
+        return token
+
     def issue_session(self, team_id: int, key_id: str, role: str, ttl_s: int = SESSION_TTL_SECONDS) -> str:
         """Start a dashboard session for a key. Returns the plaintext token (for the cookie);
         only its hash is stored. Expired sessions are purged here, and a key keeps only its
@@ -916,13 +1018,26 @@ class Database:
         token_hash = hash_key(token)
         with self._lock, self._conn:
             row = self._conn.execute(
-                "SELECT key_id, team_id, expires_at FROM sessions WHERE token_hash = ?", (token_hash,)
+                "SELECT key_id, team_id, expires_at, user_id, oidc_provider "
+                "FROM sessions WHERE token_hash = ?", (token_hash,)
             ).fetchone()
             if row is None:
                 return None
             if row["expires_at"] <= datetime.now(timezone.utc).strftime(TIME_FORMAT):
                 self._conn.execute("DELETE FROM sessions WHERE token_hash = ?", (token_hash,))
                 return None
+            if row["key_id"] is None:
+                person = self._conn.execute(
+                    "SELECT u.id AS user_id, u.email, u.name, m.role, t.id AS team_id, t.name AS team_name "
+                    "FROM users u JOIN memberships m ON m.user_id = u.id "
+                    "JOIN teams t ON t.id = m.team_id "
+                    "WHERE u.id = ? AND m.team_id = ? AND u.disabled_at IS NULL",
+                    (row["user_id"], row["team_id"]),
+                ).fetchone()
+                if person is None:
+                    self._conn.execute("DELETE FROM sessions WHERE token_hash = ?", (token_hash,))
+                    return None
+                return dict(person, id=None, prefix=None, label="sso:" + row["oidc_provider"])
             key = self._conn.execute(
                 _KEY_JOIN + " WHERE k.id = ? AND k.team_id = ? AND k.revoked_at IS NULL",
                 (row["key_id"], row["team_id"]),

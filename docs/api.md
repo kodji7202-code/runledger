@@ -762,7 +762,28 @@ non-browser client sends no such headers (`Sec-Fetch-Site: none`), so those keep
 At most 20 sessions are kept per key; signing in again past that cap drops the oldest session of that
 key, and other keys are unaffected.
 
-There is no sign-out endpoint. Revoke or rotate the key to end a session.
+There is no sign-out endpoint. Clear the dashboard cookie to sign out locally. Revoke or rotate
+the key to end key-backed sessions; disable a user or remove their membership to end SSO access.
+
+### OIDC dashboard sign-in
+
+With `runledger serve --oidc-config PATH` (or `RUNLEDGER_OIDC_CONFIG`),
+`GET /auth/oidc/<provider>/start` sets a short-lived HttpOnly SameSite=Lax pre-auth cookie and
+redirects to the configured provider with state, nonce and PKCE S256.
+`GET /auth/oidc/<provider>/callback?code=...&state=...` consumes that cookie-bound, single-use
+state, exchanges the code and verifies the signed identity. Invalid callbacks return the sign-in
+page (401) and count toward the existing failure limiter (429 when blocked).
+
+Existing enabled accounts only: an email must already have at least one team membership.
+Multiple memberships produce a team form; `POST /auth/oidc/team` accepts form fields `state`
+and `team`. Its state is single-use and pre-auth-cookie bound, and cross-origin submissions
+are rejected. Successful sign-in returns a 200 meta-refresh continuation page and a normal
+SameSite=Strict session cookie, not a cross-site 302 to the dashboard.
+
+When OIDC is configured, `GET /api/me` includes `user` (id, email, name),
+`sign_in_method` (`oidc` or `key`), and
+`key: null` for SSO sessions. API keys still authenticate normally when dashboard key sign-in
+is disabled. See [enterprise.md](enterprise.md#oidc-single-sign-on) for configuration.
 
 ## Error codes
 

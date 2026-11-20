@@ -9,6 +9,10 @@ change behavior, so read the entry before you upgrade.
 
 ### Added
 
+- Dashboard OIDC sign-in for Okta, Entra ID and Google Workspace using standard-library
+  Authorization Code + PKCE and RS256 verification. Person-bound, keyless sessions use live
+  membership roles; optional SSO-only dashboard login leaves API keys working.
+
 - Server-wide user accounts, team memberships and optional personal API keys. Personal keys and
   dashboard sessions check enabled membership and effective role on every request. Admin member
   API and local `user` commands support onboarding, role changes and offboarding, with last-admin
