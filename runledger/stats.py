@@ -271,7 +271,8 @@ class StatsCache:
     A record is valid while the session file's `(mtime_ns, size)`, every path the parse read or
     looked for beside it is still in the state the record was built from (a path that was
     missing then must still be missing, so one that appears drops the record), the record
-    version and the policy files it was scored with are unchanged."""
+    version and the policy files it was scored with are unchanged. Start-only records
+    depend solely on the transcript's mtime and size and cannot stand in for a summary."""
 
     def __init__(self, entries: Optional[Dict[str, Dict[str, Any]]] = None,
                  path: Optional[Path] = None, dirty: bool = False):
@@ -290,12 +291,8 @@ class StatsCache:
         return cache
 
     def get(self, path: Path, stat_result: os.stat_result) -> Optional[SessionSummary]:
-        record = self.entries.get(str(path))
-        if not isinstance(record, dict) or record.get("version") != RECORD_VERSION:
-            return None
-        if record.get("mtime_ns") != stat_result.st_mtime_ns:
-            return None
-        if record.get("size") != stat_result.st_size:
+        record = self._matching_record(path, stat_result)
+        if record is None or record.get("kind") == "start":
             return None
         if record.get("policy") != policy_signature(record.get("cwd")):
             return None
@@ -305,6 +302,32 @@ class StatsCache:
             return _summary_from_record(str(path), record)
         except (KeyError, TypeError, ValueError):
             return None
+
+    def _matching_record(self, path: Path, stat_result: os.stat_result
+                         ) -> Optional[Dict[str, Any]]:
+        record = self.entries.get(str(path))
+        if not isinstance(record, dict) or record.get("version") != RECORD_VERSION:
+            return None
+        if record.get("mtime_ns") != stat_result.st_mtime_ns:
+            return None
+        if record.get("size") != stat_result.st_size:
+            return None
+        return record
+
+    def get_start(self, path: Path, stat_result: os.stat_result) -> Optional[datetime]:
+        record = self._matching_record(path, stat_result)
+        if record is None or record.get("kind") != "start":
+            return None
+        try:
+            started = datetime.fromisoformat(record["started"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        return started if started.tzinfo is None else None
+
+    def put_start(self, path: Path, stat_result: os.stat_result, started: datetime) -> None:
+        self._put(path, {"version": RECORD_VERSION, "kind": "start",
+                         "mtime_ns": stat_result.st_mtime_ns, "size": stat_result.st_size,
+                         "started": started.isoformat()})
 
     def put(self, path: Path, stat_result: os.stat_result, summary: SessionSummary) -> None:
         """Store one summary - unless the parse could not track every path it depends on
@@ -316,7 +339,10 @@ class StatsCache:
         if not summary.complete:
             self.drop(path)
             return
-        self.entries[str(path)] = _record(stat_result, summary)
+        self._put(path, _record(stat_result, summary))
+
+    def _put(self, path: Path, record: Dict[str, Any]) -> None:
+        self.entries[str(path)] = record
         self.dirty = True
         if len(self.entries) > MAX_CACHE_ENTRIES:
             self._trim()
@@ -672,7 +698,7 @@ def _session_start(path: Path) -> Optional[datetime]:
     codex = (kind == "session_meta" or "instructions" in record or
              (path.name.startswith("rollout-") and
               any(part.lower() == "sessions" for part in path.parent.parts)))
-    if codex and adapters.get("codex")._envelope(record) is None:
+    if codex and (kind != "session_meta" or not isinstance(record.get("payload"), dict)):
         return None
     stamp = record.get("timestamp")
     return _local(_ts(stamp)) if isinstance(stamp, str) else None
@@ -697,7 +723,11 @@ def collect(files: Sequence[Path], since: datetime, until: datetime,
             continue
         summary = cache.get(path, stat_result) if cache is not None else None
         if summary is None and stat_result.st_mtime < since.timestamp():
-            started = _session_start(path)
+            started = cache.get_start(path, stat_result) if cache is not None else None
+            if started is None:
+                started = _session_start(path)
+                if started is not None and cache is not None:
+                    cache.put_start(path, stat_result, started)
             if started is not None and not since <= started <= until:
                 continue
         if summary is None:
