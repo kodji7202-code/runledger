@@ -90,11 +90,16 @@ Role: any. Returns the caller's team, role and key (never the secret).
 {
   "team": {"id": 1, "name": "demo"},
   "role": "admin",
-  "key": {"id": "0TQATVTcRECFJjNL", "label": "initial", "prefix": "rl_Xk3vN"}
+  "key": {"id": "0TQATVTcRECFJjNL", "label": "initial", "prefix": "rl_Xk3vN",
+          "kind": "personal", "expires_at": "2027-02-18T09:00:00Z", "expires_soon": false}
 }
 ```
 
-Errors: `401`.
+`expires_soon` is `true` when the key is inside the team's `key_expiry_warn_days` window. Every
+response to a request made with such a key also carries `X-RunLedger-Key-Expires: <expires_at>`;
+`runledger push` prints a warning when it sees it.
+
+Errors: `401` (`key_expired` when the key is past its `expires_at`).
 
 ## Receipts (runs)
 
@@ -414,7 +419,8 @@ Role: any. Webhook URLs, the approval timeout, and which name a run is attribute
 than admin, the URLs show only the scheme, host and port, followed by `/[hidden]`.
 
 ```json
-{"team": "demo", "slack_webhook_url": null, "webhook_url": "http://127.0.0.1:8798/[hidden]", "approval_ttl_s": 600, "attribution": "client"}
+{"team": "demo", "slack_webhook_url": null, "webhook_url": "http://127.0.0.1:8798/[hidden]", "approval_ttl_s": 600, "attribution": "client",
+ "key_max_ttl_days": 90, "service_key_max_ttl_days": 365, "key_expiry_warn_days": 14}
 ```
 
 Errors: `401`.
@@ -429,6 +435,13 @@ Role: `admin`. Changes only the fields you send.
 | `webhook_url` | string or `null` | As above. |
 | `approval_ttl_s` | integer | 1 to 604800 (seven days). The time a pending approval stays open. |
 | `attribution` | string | `client` (default) or `key`. See below. |
+| `key_max_ttl_days` | integer or `null` | 1 to 3650. The longest lifetime of a personal key, and the lifetime a new one gets by default. `null` (default) is no limit. |
+| `service_key_max_ttl_days` | integer or `null` | As above, for service keys. |
+| `key_expiry_warn_days` | integer | 0 to 365, default 14. How many days before `expires_at` a key is warned about. 0 turns warnings off. |
+
+A new or lower cap also binds existing keys of that kind: a key that would outlive it (or never
+expire) now expires that many days from now, so nothing stops working at once and its holder gets the
+warning window to rotate. The audit event counts them in `keys_shortened`.
 
 `attribution` decides whose name a pushed run is stored under. With `client`, `user` is what the
 client sent (its default is the Git email), which a member can change on every push. With `key`, the
@@ -446,7 +459,7 @@ Webhook delivery validates all DNS answers and connects to a checked address to 
 internal-network requests and DNS rebinding. Redirects and proxy routing are not followed.
 
 Errors: `400` `invalid_settings` (unknown field, an empty body, a bad URL, a TTL out of range, an
-attribution other than `client` or `key`); `401`; `403` (not admin); `411`; `413` (over 16 KB).
+attribution other than `client` or `key`, a key lifetime or warning out of range); `401`; `403` (not admin); `411`; `413` (over 16 KB).
 
 ## Members
 
@@ -472,7 +485,8 @@ Disabled users cannot authenticate. Server-wide disable/enable is available only
 
 `POST /api/keys` accepts optional `user` (user id or email). That user must be a member, and the
 key role must not exceed their membership role (`400 invalid_key` otherwise). Omitting `user`
-creates an unowned service key, unchanged from earlier releases. `GET /api/keys` includes nullable
+creates an unowned key, unchanged from earlier releases. A key with `user` must have kind `personal`;
+combining `user` with `kind: "service"` returns `400 invalid_key`. `GET /api/keys` includes nullable
 `user_id` and `user` (id, email, name, created_at, disabled_at). `/api/me` includes nullable `user`
 with id/email/name, alongside the key and effective role. Audit API events and audit CSV exports
 include nullable `actor_user_id`; the actor text names the person when present.
@@ -482,17 +496,24 @@ include nullable `actor_user_id`; the actor text names the person when present.
 Key fields in responses (never the secret, except as noted):
 
 ```json
-{"id": "wEhJBN8WRNfvQQEC", "label": "dave", "role": "member", "prefix": "rl_Qm7aZ",
- "created_at": "2026-10-08T16:37:38Z", "last_used_at": "2026-10-08T16:37:38Z", "revoked_at": null}
+{"id": "wEhJBN8WRNfvQQEC", "label": "dave", "role": "member", "kind": "personal", "prefix": "rl_Qm7aZ",
+ "created_at": "2026-10-08T16:37:38Z", "last_used_at": "2026-10-08T16:37:38Z", "revoked_at": null,
+ "expires_at": "2027-01-06T16:37:38Z"}
 ```
+
+`kind` is `personal` (one person; may sign in to the dashboard) or `service` (CI or another system;
+API only, refused by `POST /session` and `/?key=`). `expires_at` is `null` for a key that never
+expires. After `expires_at` the key is refused with `401` `key_expired` until an admin rotates it; it is
+not revoked, and the refusal does not count toward the failed sign-in limit.
 
 ### `GET /api/keys`
 
 Role: `admin`. Lists the team's keys, oldest first.
 
 ```json
-{"keys": [{"id": "0TQATVTcRECFJjNL", "label": "initial", "role": "admin", "prefix": "rl_Xk3vN",
-           "created_at": "2026-10-08T16:36:12Z", "last_used_at": "2026-10-08T16:37:33Z", "revoked_at": null}]}
+{"keys": [{"id": "0TQATVTcRECFJjNL", "label": "initial", "role": "admin", "kind": "personal",
+           "prefix": "rl_Xk3vN", "created_at": "2026-10-08T16:36:12Z",
+           "last_used_at": "2026-10-08T16:37:33Z", "revoked_at": null, "expires_at": null}]}
 ```
 
 Errors: `401`; `403` (not admin).
@@ -502,30 +523,38 @@ Errors: `401`; `403` (not admin).
 Role: `admin`. Creates a key. The response is the only time the secret is shown.
 
 ```json
-{"label": "ci-nightly", "role": "member"}
+{"label": "ci-nightly", "role": "member", "kind": "service", "expires_in_days": 180}
 ```
 
 `label` is 1 to 100 characters with no control characters. `role` is `admin`, `member` or `viewer`.
+`kind` is `personal` (default) or `service`. `expires_in_days` is optional, 1 to 3650; it defaults to
+the team's cap for that kind (`key_max_ttl_days` or `service_key_max_ttl_days`), and with no cap the
+key never expires. A value over the cap is refused.
 
 Response `201`:
 
 ```json
-{"id": "DtbXyrhvdmBKxuuu", "label": "carol", "role": "admin", "prefix": "rl_Xk3vN",
- "created_at": "2026-10-08T16:37:38Z",
+{"id": "DtbXyrhvdmBKxuuu", "label": "carol", "role": "admin", "kind": "personal", "prefix": "rl_Xk3vN",
+ "created_at": "2026-10-08T16:37:38Z", "expires_at": "2027-01-06T16:37:38Z",
  "key": "rl_Xk3vN9pQ2rT7wY1zB5cD8fG4hJ6mL0sA2eU9iO3p"}
 ```
 
 Errors: `400` `invalid_key` (for example `'label' is required.`, or `'role' must be one of admin, member,
-viewer.`); `401`; `403`; `411`; `413`.
+viewer.`, a bad `kind`, or an `expires_in_days` out of range or over the team's cap); `401`; `403`;
+`411`; `413`.
 
 ### `POST /api/keys/{id}/rotate`
 
-Role: `admin`. Replaces the key's secret. The id, label and role stay. The old secret stops working at
-once, and dashboard sessions that used the key end. The response contains the new secret once.
+Role: `admin`. Replaces the key's secret. The id, label, role and kind stay. The old secret stops working
+at once, and dashboard sessions that used the key end. The response contains the new secret once.
+
+Rotation also renews the key's lifetime, and is how an expired key is brought back. The optional body
+`{"expires_in_days": N}` sets the new lifetime; without it the key gets the lifetime it was created
+with, held to the team's current cap.
 
 Response `200`: the key fields, with `"key"` set to the new secret.
 
-Errors: `401`; `403`; `404` `not_found` ("Key not found."); `409` `key_revoked` (a revoked key cannot be
+Errors: `400` `invalid_key` (an `expires_in_days` out of range or over the cap); `401`; `403`; `404` `not_found` ("Key not found."); `409` `key_revoked` (a revoked key cannot be
 rotated).
 
 ### `POST /api/keys/{id}/revoke`
@@ -535,7 +564,7 @@ Role: `admin`. Revokes the key permanently. Its sessions end at once.
 Response `200`: the key fields, with `revoked_at` set.
 
 Errors: `401`; `403`; `404` `not_found`; `409` `already_revoked`; `409` `last_admin` (the team's last
-active admin key cannot be revoked).
+active admin key cannot be revoked; an expired admin key does not count as active).
 
 ## Audit log
 
@@ -775,8 +804,9 @@ There is no sign-out endpoint. Revoke or rotate the key to end a session.
 | 400 | `invalid_approval` | An approval request has a missing or malformed field. |
 | 400 | `invalid_decision` | `decision` is not `approve` or `deny`. |
 | 400 | `invalid_settings` | Unknown setting, empty settings, a bad URL, or a TTL out of range. |
-| 400 | `invalid_key` | A key `label` or `role` is missing or invalid. |
+| 400 | `invalid_key` | A key `label`, `role`, `kind` or `expires_in_days` is missing or invalid, or the lifetime is over the team's cap. |
 | 400 | `invalid_budget` | A budget value or threshold is invalid (in this release). |
+| 401 | `key_expired` | The API key is past its `expires_at`. An admin must rotate it. Not counted toward the failed-credential limit. |
 | 401 | `unauthorized` | No valid API key or session. Sent with `WWW-Authenticate: Bearer realm="RunLedger"`. |
 | 403 | `forbidden` | The role is too low for the action. The message names the role needed. |
 | 403 | `self_approval` | The same authenticated key requested and attempted to decide an approval. |

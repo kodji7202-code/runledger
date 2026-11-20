@@ -2,12 +2,13 @@
 import csv
 import io
 import sqlite3
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from runledger.cli import main
 from runledger.server.auth import InvalidKey, hash_key, identity_from_row
-from runledger.server.db import Database, SCHEMA
+from runledger.server.db import Database, SCHEMA, TIME_FORMAT
 from test_auth import OLD_KEY, OLD_SCHEMA, _auth, _cookie_for, _http, _json, running
 
 
@@ -297,6 +298,63 @@ def test_cli_user_lifecycle_and_personal_key(tmp_path, capsys):
     assert main(["user", "remove"] + scoped + email) == 1
     assert main(["user", "disable"] + common + ["--email", "missing@example.com"]) == 1
     assert main(["key", "create"] + scoped + ["--label", "bad", "--role", "member", "--user", "ana@example.com"]) == 1
+
+
+def test_person_cannot_own_a_service_key(db):
+    team, _ = db.create_team("a")
+    user = db.add_member(team, "ana@example.com", "member")
+    before = db.list_audit(team)
+    for owner in (user["id"], user["email"]):
+        with pytest.raises(InvalidKey, match="service key cannot be owned"):
+            db.create_key(team, "bad", "member", "cli", kind="service", user=owner)
+    assert len(db.list_keys(team)) == 1
+    assert db.list_audit(team) == before
+
+
+def test_owned_keys_keep_expiry_rotation_and_person_audit(tmp_path):
+    with running(tmp_path / "owned-expiry.db") as (srv, base):
+        team, admin = srv.db.create_team("a")
+        user = srv.db.add_member(team, "ana@example.com", "admin")
+        status, _, raw = _http(base, "POST", "/api/keys", body={"label": "ana", "role": "admin",
+                               "user": user["email"], "kind": "personal", "expires_in_days": 1}, headers=_auth(admin))
+        assert status == 201
+        owned = _json(raw)
+        cookie = {"Cookie": _cookie_for(base, owned["key"])}
+        me = _json(_http(base, "GET", "/api/me", headers=cookie)[2])
+        assert me["user"]["id"] == user["id"]
+        assert me["key"]["expires_soon"] and me["key"]["kind"] == "personal"
+        status, _, _ = _http(base, "POST", "/api/keys", body={"label": "bad", "role": "member",
+                             "user": user["id"], "kind": "service"}, headers=_auth(admin))
+        assert status == 400
+        target = srv.db.create_key(team, "target", "member", "cli")
+        status, _, raw = _http(base, "POST", "/api/keys/" + target["id"] + "/rotate",
+                               body={"expires_in_days": 3}, headers=_auth(owned["key"]))
+        assert status == 200 and _json(raw)["expires_at"]
+        event = srv.db.list_audit(team)[0]
+        assert event["action"] == "key.rotate" and event["actor_user_id"] == user["id"]
+        srv.db.keys_expiring()
+        warning = next(e for e in srv.db.list_audit(team) if e["action"] == "key.expiring")
+        assert warning["actor"] == "system" and warning["actor_user_id"] is None
+        past = (datetime.now(timezone.utc) - timedelta(seconds=5)).strftime(TIME_FORMAT)
+        with srv.db._lock, srv.db._conn:
+            srv.db._conn.execute("UPDATE api_keys SET expires_at = ? WHERE id = ?", (past, owned["id"]))
+        assert _http(base, "GET", "/api/me", headers=cookie)[0] == 401
+        status, _, raw = _http(base, "GET", "/api/me", headers=_auth(owned["key"]))
+        assert status == 401 and _json(raw)["error"]["code"] == "key_expired"
+
+
+def test_expired_key_does_not_satisfy_membership_last_admin_safety(db):
+    team, service = db.create_team("a")
+    user, owned = personal(db, team)
+    past = (datetime.now(timezone.utc) - timedelta(seconds=5)).strftime(TIME_FORMAT)
+    with db._conn:
+        db._conn.execute("UPDATE api_keys SET expires_at = ? WHERE key_hash = ?", (past, hash_key(service)))
+    for operation in (lambda: db.change_member(team, user["id"]),
+                      lambda: db.change_member(team, user["id"], "member"),
+                      lambda: db.set_user_disabled(user["id"], True)):
+        with pytest.raises(InvalidKey, match="last working admin"):
+            operation()
+    assert db.revoke_key(team, owned["id"], "cli")[0] == "last_admin"
 
 
 def test_non_ascii_uppercase_email_lookup_matches_stored_user(db):
