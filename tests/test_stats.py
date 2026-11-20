@@ -402,11 +402,33 @@ def test_start_probe_matches_summary(isolated_settings, factory):
     project = isolated_settings / "probe"
     project.mkdir()
     path = factory(isolated_settings, project, "probe", datetime(2026, 5, 10, 12))
-    if factory is droid_session:
-        rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
-        rows[0]["timestamp"] = rows[1]["timestamp"]
-        _write(path, rows)
     assert stats._session_start(path) == stats.summarize(path).started
+
+
+@pytest.mark.parametrize("header", [{"instructions": "Follow the project rules"}, {"id": "old"}])
+def test_legacy_codex_probe_matches_summary(isolated_settings, header):
+    project = isolated_settings / "legacy"
+    project.mkdir()
+    path = codex_session(isolated_settings, project, "old", datetime(2020, 1, 1))
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    rows[0] = {**rows[0]["payload"], **header, "timestamp": rows[0]["timestamp"]}
+    _write(path, rows)
+    assert stats._session_start(path) == stats.summarize(path).started
+
+
+@pytest.mark.parametrize("factory", [droid_session, codex_session])
+def test_old_agent_sessions_are_not_fully_parsed(isolated_settings, monkeypatch, factory):
+    project = isolated_settings / "old-agent"
+    project.mkdir()
+    path = factory(isolated_settings, project, "old", datetime(2020, 1, 1))
+    if factory is codex_session:
+        rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        rows[0] = {**rows[0]["payload"], "instructions": "Be helpful",
+                   "timestamp": rows[0]["timestamp"]}
+        _write(path, rows)
+    os.utime(path, (1, 1))
+    monkeypatch.setattr(stats, "summarize", lambda path: pytest.fail("old session fully parsed"))
+    assert stats.collect([path], datetime(2026, 1, 1), datetime(2026, 2, 1)) == ([], [], 0)
 
 
 def test_old_start_cache_survives_reload_without_reading_transcript(isolated_settings, monkeypatch):

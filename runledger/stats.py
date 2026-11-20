@@ -683,13 +683,28 @@ def _aider_history(project: Optional[str], history_file: str) -> List[Path]:
 # ---------------------------------------------------------------- collecting
 
 def _session_start(path: Path) -> Optional[datetime]:
-    """Read a standard JSONL header; uncertainty falls back to the full parser."""
+    """Read a bounded JSONL prefix; uncertainty falls back to the full parser."""
     if path.suffix != ".jsonl" or path.name.lower().endswith(".runledger.jsonl"):
         return None
     try:
         with path.open("r", encoding="utf-8", errors="replace") as handle:
             line = handle.readline(EMPTY_FILE_BYTES)
-        record = json.loads(line)
+            record = json.loads(line)
+            if (isinstance(record, dict) and record.get("type") == "session_start"
+                    and isinstance(record.get("id"), str)
+                    and isinstance(record.get("cwd"), str)):
+                remaining = EMPTY_FILE_BYTES - len(line)
+                while not record.get("timestamp") and remaining:
+                    line = handle.readline(remaining)
+                    if not line:
+                        return None
+                    remaining -= len(line)
+                    try:
+                        candidate = json.loads(line)
+                    except (ValueError, RecursionError):
+                        continue
+                    if isinstance(candidate, dict):
+                        record = candidate
     except (OSError, ValueError, RecursionError):
         return None
     if not isinstance(record, dict) or "runledger_format" in record:
@@ -698,8 +713,11 @@ def _session_start(path: Path) -> Optional[datetime]:
     codex = (kind == "session_meta" or "instructions" in record or
              (path.name.startswith("rollout-") and
               any(part.lower() == "sessions" for part in path.parent.parts)))
-    if codex and (kind != "session_meta" or not isinstance(record.get("payload"), dict)):
-        return None
+    if codex:
+        modern = kind == "session_meta" and isinstance(record.get("payload"), dict)
+        legacy = not isinstance(kind, str) and ("instructions" in record or "id" in record)
+        if not modern and not legacy:
+            return None
     stamp = record.get("timestamp")
     return _local(_ts(stamp)) if isinstance(stamp, str) else None
 
