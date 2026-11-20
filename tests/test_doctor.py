@@ -278,6 +278,20 @@ def test_fix_hints_appear_on_warnings_and_failures(tmp_path):
     assert "->" in text
 
 
+@pytest.mark.parametrize("columns", [0, -1])
+def test_text_output_falls_back_for_nonpositive_terminal_width(monkeypatch, columns):
+    monkeypatch.setattr(doctor.shutil, "get_terminal_size",
+                        lambda **kwargs: os.terminal_size((columns, 0)))
+    report = doctor.Report("/project", [doctor.Check(
+        "config", "info", "config", "Diagnostic context. " * 12)])
+
+    lines = doctor.render_text(report).splitlines()
+
+    assert all(len(line) <= 80 for line in lines)
+    assert lines[2].startswith("       Diagnostic")
+    assert lines[-1] == "Summary: 0 ok, 0 warnings, 0 failures"
+
+
 def test_text_output_wraps_with_hanging_indents(monkeypatch):
     monkeypatch.setenv("COLUMNS", "80")
     detail = "A long diagnostic message with useful context. " * 4
