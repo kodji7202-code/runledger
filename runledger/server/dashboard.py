@@ -217,6 +217,7 @@ tr.pickable:hover{background:var(--chip)}
 
 <div id="notice" class="notice" role="alert"></div>
 
+<p class="msg error" id="key-expiry-banner" role="status" hidden></p>
 <section class="view" id="view-runs" role="tabpanel" aria-labelledby="tab-runs" tabindex="-1">
 <section class="kpis">
   <div class="card"><div class="kpi-label">Total cost</div><div class="kpi-value" id="k-cost">-</div><div class="kpi-sub" id="k-cost-sub"></div></div>
@@ -343,6 +344,15 @@ tr.pickable:hover{background:var(--chip)}
         <option value="viewer">viewer</option>
       </select>
     </label>
+    <label class="field">Kind
+      <select id="key-kind">
+        <option value="personal" selected>personal</option>
+        <option value="service">service (API only)</option>
+      </select>
+    </label>
+    <label class="field">Expires in (days)
+      <input id="key-days" type="number" min="1" max="3650" step="1" inputmode="numeric" placeholder="Team default">
+    </label>
     <button type="submit" class="btn primary" id="key-create">Create key</button>
   </form>
   <div class="key-once" id="key-once" tabindex="-1" hidden>
@@ -354,7 +364,7 @@ tr.pickable:hover{background:var(--chip)}
   <p class="msg" id="keys-msg" role="status" aria-live="polite"></p>
   <div class="table-wrap" id="keys-table">
   <table aria-labelledby="keys-title">
-    <thead><tr><th>Label</th><th>Role</th><th>Key</th><th>Created</th><th>Last used</th><th>Status</th><th><span class="sr-only">Actions</span></th></tr></thead>
+    <thead><tr><th>Label</th><th>Role</th><th>Kind</th><th>Key</th><th>Created</th><th>Last used</th><th>Expires</th><th>Status</th><th><span class="sr-only">Actions</span></th></tr></thead>
     <tbody id="keys-body"></tbody>
   </table>
   </div>
@@ -430,6 +440,25 @@ tr.pickable:hover{background:var(--chip)}
       </form>
       <p class="msg" id="notify-msg" role="status" aria-live="polite"></p>
     </div>
+  </section>
+  <section id="key-policy-section" hidden>
+    <h3>API key lifetimes</h3>
+    <form id="key-policy-form" novalidate>
+      <div class="form-row">
+        <label class="field">Personal keys live at most (days)
+          <input id="policy-personal" type="number" min="1" max="3650" step="1" inputmode="numeric" placeholder="No limit">
+        </label>
+        <label class="field">Service keys live at most (days)
+          <input id="policy-service" type="number" min="1" max="3650" step="1" inputmode="numeric" placeholder="No limit">
+        </label>
+        <label class="field">Warn this many days before expiry
+          <input id="policy-warn" type="number" min="0" max="365" step="1" inputmode="numeric">
+        </label>
+        <button type="submit" class="btn primary" id="policy-save">Save key lifetimes</button>
+      </div>
+      <p class="msg">A new limit also shortens existing keys of that kind to that many days from now. Rotating a key renews it.</p>
+    </form>
+    <p class="msg" id="policy-msg" role="status" aria-live="polite"></p>
   </section>
 </section>
 
@@ -1265,10 +1294,13 @@ tr.pickable:hover{background:var(--chip)}
       var tr = el("tr");
       tr.appendChild(cell(k.label || "-"));
       tr.appendChild(cell(k.role || "-"));
+      tr.appendChild(cell(k.kind || "personal"));
       tr.appendChild(cell(k.prefix ? k.prefix + "..." : "-", "mono"));
       tr.appendChild(cell(when(k.created_at), "mono"));
       tr.appendChild(cell(k.last_used_at ? when(k.last_used_at) : "never", "mono"));
-      tr.appendChild(cell(revoked ? "revoked " + when(k.revoked_at) : "active", "mono"));
+      tr.appendChild(cell(k.expires_at ? when(k.expires_at) : "never", "mono"));
+      var expired = !revoked && !!k.expires_at && Date.parse(k.expires_at) <= Date.now();
+      tr.appendChild(cell(revoked ? "revoked " + when(k.revoked_at) : (expired ? "expired" : "active"), "mono"));
       var actions = cell("", "num");
       if (!revoked) {
         var rotate = el("button", "small", "Rotate");
@@ -1324,7 +1356,7 @@ tr.pickable:hover{background:var(--chip)}
   function rotateKey(key) {
     var name = nameOf(key.label, String(key.id));
     confirmAction("Rotate this key?",
-      "A new key replaces '" + name + "'. The old key may stop working. The new key is shown once.",
+      "A new key replaces '" + name + "'. The old key may stop working. The new key is shown once, and its expiry is renewed.",
       "Rotate key", false)
       .then(function (yes) {
         if (!yes) { return; }
@@ -1460,6 +1492,22 @@ tr.pickable:hover{background:var(--chip)}
     $("notify-slack").value = s.slack_webhook_url || "";
     $("notify-webhook").value = s.webhook_url || "";
     $("notify-ttl").value = (s.approval_ttl_s === null || s.approval_ttl_s === undefined) ? "" : String(s.approval_ttl_s);
+    setPolicyFields(s);
+  }
+
+  function setPolicyFields(s) {
+    var text = function (v) { return (v === null || v === undefined) ? "" : String(v); };
+    $("policy-personal").value = text(s.key_max_ttl_days);
+    $("policy-service").value = text(s.service_key_max_ttl_days);
+    $("policy-warn").value = text(s.key_expiry_warn_days);
+    $("key-policy-section").hidden = false;
+  }
+
+  function wholeDays(id, low, high, blankOk) {
+    var t = $(id).value.trim();
+    if (t === "") { return blankOk ? null : undefined; }
+    var n = Number(t);
+    return (isFinite(n) && Math.floor(n) === n && n >= low && n <= high) ? n : undefined;
   }
 
   function loadNotifications() {
@@ -1808,6 +1856,14 @@ tr.pickable:hover{background:var(--chip)}
       state.meLoaded = true;
       state.role = ROLES.indexOf(me && me.role) >= 0 ? me.role : null;
       state.keyRef = me && me.key ? (me.key.prefix || me.key.id || null) : null;
+      var banner = $("key-expiry-banner");
+      if (me && me.key && me.key.expires_soon && me.key.expires_at) {
+        banner.textContent = "The key you signed in with expires " + when(me.key.expires_at) +
+          ". Ask a team admin to rotate it.";
+        banner.hidden = false;
+      } else {
+        banner.hidden = true;
+      }
       if (me && me.team && me.team.name) { setTeam(me.team.name); }
       applyRole();
     }, function () {
@@ -1870,6 +1926,13 @@ tr.pickable:hover{background:var(--chip)}
     ev.preventDefault();
     var label = $("key-label").value.trim();
     var role = $("key-role").value;
+    var kind = $("key-kind").value;
+    var days = wholeDays("key-days", 1, 3650, true);
+    if (days === undefined) {
+      setMsg($("keys-msg"), "Expiry must be a whole number of days from 1 to 3650, or blank for the team default.", true);
+      $("key-days").focus();
+      return;
+    }
     if (!label) {
       setMsg($("keys-msg"), "Enter a label for the key, such as the developer's name.", true);
       $("key-label").focus();
@@ -1881,9 +1944,13 @@ tr.pickable:hover{background:var(--chip)}
     }
     var button = $("key-create");
     button.disabled = true;
-    postJSON("/api/keys", { label: label, role: role }).then(function (created) {
+    var payload = { label: label, role: role, kind: kind };
+    if (days !== null) { payload.expires_in_days = days; }
+    postJSON("/api/keys", payload).then(function (created) {
       $("key-label").value = "";
-      showKeyOnce(created, "New key for '" + label + "' (" + role + ").");
+      $("key-days").value = "";
+      showKeyOnce(created, "New " + kind + " key for '" + label + "' (" + role + "), expires " +
+        (created && created.expires_at ? when(created.expires_at) : "never") + ".");
       setMsg($("keys-msg"), "Key created.", false);
       return loadKeys();
     }, function (err) {
@@ -1913,6 +1980,35 @@ tr.pickable:hover{background:var(--chip)}
 
   $("budget-form").addEventListener("input", function () { budgetState.edited = true; });
   $("budget-form").addEventListener("submit", saveBudget);
+
+  $("key-policy-form").addEventListener("submit", function (ev) {
+    ev.preventDefault();
+    var msg = $("policy-msg");
+    var personal = wholeDays("policy-personal", 1, 3650, true);
+    var service = wholeDays("policy-service", 1, 3650, true);
+    var warn = wholeDays("policy-warn", 0, 365, false);
+    if (personal === undefined || service === undefined) {
+      setMsg(msg, "Key lifetimes must be whole numbers of days from 1 to 3650, or blank for no limit.", true);
+      return;
+    }
+    if (warn === undefined) {
+      setMsg(msg, "The warning must be a whole number of days from 0 to 365.", true);
+      $("policy-warn").focus();
+      return;
+    }
+    var button = $("policy-save");
+    button.disabled = true;
+    putJSON("/api/team/settings", {
+      key_max_ttl_days: personal, service_key_max_ttl_days: service, key_expiry_warn_days: warn
+    }).then(function (s) {
+      setPolicyFields(s);
+      setMsg(msg, "Key lifetimes saved.", false);
+    }, function (err) {
+      setMsg(msg, saveError(err), true);
+    }).then(function () {
+      button.disabled = false;
+    });
+  });
 
   $("notify-form").addEventListener("submit", function (ev) {
     ev.preventDefault();
