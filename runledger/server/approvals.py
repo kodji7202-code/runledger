@@ -176,7 +176,10 @@ def check_webhook_url(field: str, value: Any) -> Optional[str]:
     )
 
 
-_SETTING_NAMES = ("slack_webhook_url", "webhook_url", "approval_ttl_s", "attribution")
+_SETTING_NAMES = ("slack_webhook_url", "webhook_url", "approval_ttl_s", "attribution",
+                  "key_max_ttl_days", "service_key_max_ttl_days", "key_expiry_warn_days")
+MAX_KEY_TTL_DAYS = 3650
+MAX_EXPIRY_WARN_DAYS = 365
 ATTRIBUTIONS = ("client", "key")
 
 
@@ -194,6 +197,20 @@ def validate_settings(payload: Any) -> Dict[str, Any]:
             if text not in ATTRIBUTIONS:
                 raise InvalidInput(f"'attribution' must be one of: {', '.join(ATTRIBUTIONS)}.")
             changes[key] = text
+        elif key in ("key_max_ttl_days", "service_key_max_ttl_days"):
+            # null removes the cap: keys of that kind may then be created without an expiry.
+            if value is not None and (isinstance(value, bool) or not isinstance(value, int)
+                                      or not 1 <= value <= MAX_KEY_TTL_DAYS):
+                raise InvalidInput(
+                    f"'{key}' must be null or a whole number of days from 1 to {MAX_KEY_TTL_DAYS}."
+                )
+            changes[key] = value
+        elif key == "key_expiry_warn_days":
+            if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= MAX_EXPIRY_WARN_DAYS:
+                raise InvalidInput(
+                    f"'key_expiry_warn_days' must be a whole number of days from 0 to {MAX_EXPIRY_WARN_DAYS}."
+                )
+            changes[key] = value
         else:
             shown = str(key)[:50]
             raise InvalidInput(
@@ -384,5 +401,39 @@ def notify_new_approval(settings: Dict[str, Any], approval: Dict[str, Any], publ
     hook = settings.get("webhook_url")
     if hook:
         jobs.append(("webhook", hook, dict(approval, url=link)))
+    if jobs:
+        threading.Thread(target=_deliver, args=(jobs,), name="runledger-notify", daemon=True).start()
+
+
+def key_expiry_slack_text(key: Dict[str, Any]) -> str:
+    return (f"RunLedger: the {key['kind']} {key['role']} key '{_slack_escape(key['label'])}' "
+            f"({key['prefix'] or 'no prefix'}) of team {_slack_escape(key['team_name'])} expires at "
+            f"{key['expires_at']}. Rotate it before then: runledger key rotate {key['id']}")
+
+
+def key_expiry_payload(key: Dict[str, Any]) -> Dict[str, Any]:
+    """The generic-webhook body for an expiring key. Never carries the secret or its hash."""
+    return {
+        "type": "key_expiring",
+        "team": key["team_name"],
+        "key_id": key["id"],
+        "label": key["label"],
+        "role": key["role"],
+        "kind": key["kind"],
+        "prefix": key["prefix"],
+        "expires_at": key["expires_at"],
+    }
+
+
+def notify_key_expiry(settings: Dict[str, Any], keys: List[Dict[str, Any]]) -> None:
+    """Queue Slack and generic-webhook messages for keys about to expire. Returns at once."""
+    jobs: List[Tuple[str, str, Any]] = []
+    slack = settings.get("slack_webhook_url")
+    hook = settings.get("webhook_url")
+    for key in keys:
+        if slack:
+            jobs.append(("Slack", slack, {"text": key_expiry_slack_text(key)}))
+        if hook:
+            jobs.append(("webhook", hook, key_expiry_payload(key)))
     if jobs:
         threading.Thread(target=_deliver, args=(jobs,), name="runledger-notify", daemon=True).start()
