@@ -237,7 +237,17 @@ def _split_commands(command: str) -> List[List[str]]:
     words: List[str] = []
     word: List[str] = []
     quote = ""
+    escaped = False
     for i, ch in enumerate(command):
+        if escaped:
+            word.append(ch)
+            escaped = False
+            continue
+        if ch == "\\" and (not quote or (quote == '"' and command[i + 1:i + 2] in
+                                             ('"', "\\", "$", "`", "\n"))):
+            escaped = True
+            word.append(ch)
+            continue
         if quote:
             if ch == quote:
                 quote = ""

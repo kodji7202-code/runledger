@@ -269,6 +269,18 @@ def test_empty_or_unbalanced_commands_do_not_start_test_runs(command):
     assert not _is_test_command(command)
 
 
+@pytest.mark.parametrize("command, expected", [
+    (r'echo "one \"quote" && pytest', True),
+    (r'echo one\"quote && pytest', True),
+    (r'echo "one \\" && pytest', True),
+    (r"echo 'one \' && pytest", True),
+    (r'echo "note\"; pytest"', False),
+    (r'echo note\; pytest', False),
+])
+def test_escaped_quotes_and_separators(command, expected):
+    assert _is_test_command(command) is expected
+
+
 @pytest.mark.parametrize("command", [
     "pip install pytest", "pip3 install pytest", "python -m pip install pytest",
     "npm install --save-dev jest", "npm uninstall -y pytest", "npm i jest", "yarn remove jest",
