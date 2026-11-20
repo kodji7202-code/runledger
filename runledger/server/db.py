@@ -130,6 +130,11 @@ REVIEW_COLUMNS = (
 )
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS scim_tokens (
+    id TEXT PRIMARY KEY, team_id INTEGER NOT NULL REFERENCES teams(id),
+    token_hash TEXT NOT NULL UNIQUE, prefix TEXT NOT NULL, created_at TEXT NOT NULL,
+    last_used_at TEXT, revoked_at TEXT
+);
 CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
     email TEXT NOT NULL UNIQUE COLLATE NOCASE,
@@ -303,7 +308,7 @@ _KEY_JOIN = (
     "k.user_id, u.email, u.name, u.disabled_at, m.role AS membership_role "
     "FROM api_keys k JOIN teams t ON t.id = k.team_id "
     "LEFT JOIN users u ON u.id = k.user_id "
-    "LEFT JOIN memberships m ON m.user_id = k.user_id AND m.team_id = k.team_id"
+    "LEFT JOIN memberships m ON m.user_id = k.user_id AND m.team_id = k.team_id AND m.deactivated_at IS NULL"
 )
 # A key is usable when it is not revoked and has not reached its expires_at.
 _USABLE = "k.revoked_at IS NULL AND (k.expires_at IS NULL OR k.expires_at > ?)"
@@ -492,6 +497,7 @@ class Database:
                     pass  # some filesystems refuse WAL; the default journal still works
                 self._conn.executescript(SCHEMA)
                 self._add_missing_columns("api_keys", (("user_id", "TEXT REFERENCES users (id)"),))
+                self._add_missing_columns("memberships", (("deactivated_at", "TEXT"), ("external_id", "TEXT"), ("updated_at", "TEXT")))
                 self._add_missing_columns("sessions", (("user_id", "TEXT REFERENCES users (id)"),))
                 self._add_missing_columns("users", (("oidc_issuer", "TEXT"), ("oidc_subject", "TEXT")))
                 self._add_missing_columns("sessions", (("oidc_provider", "TEXT"),))
@@ -747,13 +753,96 @@ class Database:
     def list_members(self, team_id: int) -> List[Dict[str, Any]]:
         with self._reading() as conn:
             rows = conn.execute(
-                "SELECT u.*, m.role, m.created_at AS joined_at FROM memberships m "
+                "SELECT u.*, m.role, m.deactivated_at, m.external_id, m.updated_at, m.created_at AS joined_at FROM memberships m "
                 "JOIN users u ON u.id = m.user_id WHERE m.team_id = ? ORDER BY u.email", (team_id,)
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def scim_token(self, team_id, operation="get", actor="cli"):
+        with self._lock, self._conn:
+            secret = None
+            if operation in ("create", "revoke"):
+                self._conn.execute("UPDATE scim_tokens SET revoked_at = ? WHERE team_id = ? AND revoked_at IS NULL",
+                                   (utc_now(), team_id))
+                if operation == "create":
+                    secret = "scim_" + generate_key()
+                    self._conn.execute("INSERT INTO scim_tokens (id, team_id, token_hash, prefix, created_at) VALUES (?, ?, ?, ?, ?)",
+                                       (new_key_id(), team_id, hash_key(secret), secret[:12], utc_now()))
+                self._audit(team_id, actor, "scim.token." + operation, None, {})
+            row = self._conn.execute("SELECT id, prefix, created_at, last_used_at, revoked_at FROM scim_tokens WHERE team_id = ? AND revoked_at IS NULL",
+                                     (team_id,)).fetchone()
+            result = dict(row) if row else {}
+            if secret:
+                result["token"] = secret
+            return result
+
+    def scim_team(self, token):
+        if not token:
+            return None
+        with self._lock, self._conn:
+            row = self._conn.execute("SELECT team_id FROM scim_tokens WHERE token_hash = ? AND revoked_at IS NULL",
+                                     (hash_key(token),)).fetchone()
+            if row:
+                self._conn.execute("UPDATE scim_tokens SET last_used_at = ? WHERE token_hash = ?", (utc_now(), hash_key(token)))
+            return row[0] if row else None
+
+    def scim_update(self, team_id, user_id, values):
+        with self._lock, self._conn:
+            if not self._conn.in_transaction:
+                self._conn.execute("BEGIN IMMEDIATE")
+            row = self._conn.execute("SELECT u.*, m.role, m.deactivated_at, m.external_id FROM users u JOIN memberships m ON m.user_id = u.id WHERE m.team_id = ? AND u.id = ?", (team_id, user_id)).fetchone()
+            old = dict(row) if row else None
+            if old is None:
+                raise InvalidKey("Member not found.")
+            role = validate_role(values.get("role", old["role"]))
+            active = values.get("active", old["deactivated_at"] is None)
+            if old["role"] == "admin" and old["deactivated_at"] is None and (role != "admin" or not active) and not self._working_admins(team_id, exclude_user=user_id):
+                raise InvalidKey("Cannot remove the team's last working admin key.")
+            email = values.get("email", old["email"])
+            if (not isinstance(email, str) or len(email) > 254 or email.count("@") != 1
+                    or any(c.isspace() or ord(c) < 33 or 127 <= ord(c) <= 159 for c in email)):
+                raise InvalidKey("A valid email is required.")
+            local, domain = email.split("@")
+            if not local or not domain or domain.startswith(".") or domain.endswith(".") or "." not in domain:
+                raise InvalidKey("A valid email is required.")
+            name = values.get("name", old["name"])
+            if name is not None:
+                name = validate_label(name)
+            if (email.lower() != old["email"] or name != old["name"]) and self._conn.execute(
+                    "SELECT 1 FROM memberships WHERE user_id = ? AND team_id != ?", (user_id, team_id)).fetchone():
+                raise InvalidKey("Cannot change this user's email or name: the user belongs to other teams.")
+            other = self.get_user(email)
+            if other and other["id"] != user_id:
+                raise InvalidKey("User name already exists.")
+            self._conn.execute("UPDATE users SET email = ?, name = ? WHERE id = ?", (email.lower(), name, user_id))
+            self._conn.execute("UPDATE memberships SET role = ?, deactivated_at = ?, external_id = ?, updated_at = ? WHERE team_id = ? AND user_id = ?",
+                               (role, None if active else old["deactivated_at"] or utc_now(), values.get("external_id", old["external_id"]), utc_now(), team_id, user_id))
+            if not active:
+                self._conn.execute("DELETE FROM sessions WHERE team_id = ? AND user_id = ?", (team_id, user_id))
+            action = "update"
+            if active != (old["deactivated_at"] is None):
+                action = "reactivate" if active else "deactivate"
+            self._audit(team_id, "scim", "scim.user." + action, email.lower(),
+                        {"user_id": user_id, "email": email.lower(), "role": role})
+
+    def scim_group_update(self, team_id, group, changes):
+        with self._lock, self._conn:
+            if not self._conn.in_transaction:
+                self._conn.execute("BEGIN IMMEDIATE")
+            had_admin = self._working_admins(team_id)
+            for user_id, role in changes.items():
+                role = validate_role(role)
+                updated = self._conn.execute(
+                    "UPDATE memberships SET role = ?, updated_at = ? WHERE team_id = ? AND user_id = ?",
+                    (role, utc_now(), team_id, user_id))
+                if not updated.rowcount:
+                    raise InvalidKey("Member not found.")
+            if had_admin and not self._working_admins(team_id):
+                raise InvalidKey("Cannot remove the team's last working admin key.")
+            self._audit(team_id, "scim", "scim.group.update", group, {})
+
     def add_member(self, team_id: int, email: Any, role: Any, name: Any = None,
-                   actor: Union[str, Identity] = "cli") -> Dict[str, Any]:
+                   actor: Union[str, Identity] = "cli", scim_data=None) -> Dict[str, Any]:
         role = validate_role(role)
         if (not isinstance(email, str) or any(c.isspace() or ord(c) < 33 or 127 <= ord(c) <= 159 for c in email)
                 or len(email) > 254 or email.count("@") != 1):
@@ -780,7 +869,13 @@ class Database:
                 raise InvalidKey("User is already a member.")
             self._conn.execute("INSERT INTO memberships (team_id, user_id, role, created_at) VALUES (?, ?, ?, ?)",
                                (team_id, user["id"], role, utc_now()))
-            self._audit(team_id, actor, "member.add", user["id"], {"email": email, "role": role})
+            if scim_data is not None:
+                self._conn.execute("UPDATE memberships SET deactivated_at = ?, external_id = ?, updated_at = ? WHERE team_id = ? AND user_id = ?",
+                                   (None if scim_data.get("active", True) else utc_now(), scim_data.get("external_id"), utc_now(), team_id, user["id"]))
+                self._audit(team_id, actor, "scim.user.create", email,
+                            {"user_id": user["id"], "email": email, "role": role})
+            self._audit(team_id, actor, "member.add", email,
+                        {"user_id": user["id"], "email": email, "role": role})
         return dict(user, role=role)
 
     def _working_admins(self, team_id: int, exclude_user: Optional[str] = None,
@@ -816,8 +911,8 @@ class Database:
             else:
                 self._conn.execute("UPDATE memberships SET role = ? WHERE team_id = ? AND user_id = ?",
                                    (role, team_id, person["id"]))
-            self._audit(team_id, actor, "member.remove" if role is None else "member.role", person["id"],
-                        {"email": person["email"], "role": role})
+            self._audit(team_id, actor, "member.remove" if role is None else "member.role", person["email"],
+                        {"user_id": person["id"], "email": person["email"], "role": role})
 
     def set_user_disabled(self, user: str, disabled: bool) -> None:
         with self._lock, self._conn:
@@ -826,7 +921,7 @@ class Database:
             person = self.get_user(user)
             if person is None:
                 raise InvalidKey("User not found.")
-            teams = [r[0] for r in self._conn.execute("SELECT team_id FROM memberships WHERE user_id = ?",
+            teams = [r[0] for r in self._conn.execute("SELECT team_id FROM memberships WHERE user_id = ? ORDER BY team_id",
                                                     (person["id"],))]
             if disabled:
                 for team_id in teams:
@@ -834,10 +929,15 @@ class Database:
                         raise InvalidKey("Cannot disable the team's last working admin key.")
             self._conn.execute("UPDATE users SET disabled_at = ? WHERE id = ?",
                                (utc_now() if disabled else None, person["id"]))
+            for team_id in teams:
+                details = {"user_id": person["id"], "email": person["email"]}
+                if disabled:
+                    deleted = self._conn.execute("DELETE FROM sessions WHERE team_id = ? AND user_id = ?",
+                                                 (team_id, person["id"]))
+                    details["sessions_deleted"] = deleted.rowcount
+                self._audit(team_id, "cli", "user.disable" if disabled else "user.enable", person["email"], details)
             if disabled:
                 self._conn.execute("DELETE FROM sessions WHERE user_id = ?", (person["id"],))
-            for team_id in teams:
-                self._audit(team_id, "cli", "user.disable" if disabled else "user.enable", person["id"], {})
 
     def create_team(self, name: str, actor: Union[str, Identity] = "cli") -> Tuple[int, str]:
         """Create a team and its first admin key ("initial"). Returns (team_id, key).
