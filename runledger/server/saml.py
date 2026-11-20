@@ -71,6 +71,9 @@ class Client:
             if not isinstance(config, dict) or not isinstance(config.get("providers"), list) or not config["providers"]:
                 raise ValueError("Expected a non-empty providers array.")
             self.public_url = _url(config["public_url"]).rstrip("/") if "public_url" in config else None
+            self.disable_key_sign_in = config.get("disable_key_sign_in", False)
+            if not isinstance(self.disable_key_sign_in, bool):
+                raise ValueError("disable_key_sign_in must be boolean.")
             for raw in config["providers"]:
                 if not isinstance(raw, dict):
                     raise ValueError("Each provider must be an object.")

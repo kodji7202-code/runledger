@@ -12,7 +12,9 @@ import zlib
 
 import pytest
 
-from test_auth import CSRF, _http, _json, running
+from runledger import client
+from runledger.server.saml import SAMLError
+from test_auth import CSRF, FIX, _auth, _http, _json, running
 
 etree = pytest.importorskip("lxml.etree")
 xmlsec = pytest.importorskip("xmlsec")
@@ -47,7 +49,7 @@ def keys(tmp_path_factory):
 
 
 @pytest.fixture
-def env(tmp_path, keys, monkeypatch, request):
+def saml_config(tmp_path, keys, request):
     config = tmp_path / "saml.json"
     config.write_text(json.dumps({"providers": [{
         "id": "work", "name": "Company SAML", "idp_entity_id": ISSUER,
@@ -55,13 +57,23 @@ def env(tmp_path, keys, monkeypatch, request):
         "idp_cert": str(keys[0][1]),
         "email_attribute": "workEmail", "name_attribute": "displayName",
     }]}))
+    return config
+
+
+@pytest.fixture
+def oidc_config(tmp_path, monkeypatch):
     oidc_config = tmp_path / "oidc.json"
     oidc_config.write_text(json.dumps({"providers": [{
         "id": "oidc", "name": "Company OIDC", "issuer": "https://oidc.example.test",
         "client_id": "oidc-client", "client_secret_env": "TEST_OIDC_CLIENT_SECRET",
     }]}))
     monkeypatch.setenv("TEST_OIDC_CLIENT_SECRET", "test-only")
-    with running(tmp_path / "db", saml_config=str(config), oidc_config=str(oidc_config)) as (server, base):
+    return oidc_config
+
+
+@pytest.fixture
+def env(tmp_path, saml_config, oidc_config):
+    with running(tmp_path / "db", saml_config=str(saml_config), oidc_config=str(oidc_config)) as (server, base):
         team, _ = server.db.create_team("Engineering")
         person = server.db.add_member(team, "ana@example.com", "viewer")
         yield server, base, team, person
@@ -83,7 +95,9 @@ def _start(base, expected_sso_url="https://idp.example.test/sso"):
     return query["RelayState"][0], headers["set-cookie"].split(";")[0], request.get("ID")
 
 
-@pytest.mark.parametrize("env", ["https://idp.example.test/sso?tenant=acme&connection=Work%20SSO"], indirect=True)
+@pytest.mark.parametrize(
+    "saml_config", ["https://idp.example.test/sso?tenant=acme&connection=Work%20SSO"], indirect=True,
+)
 def test_saml_start_preserves_idp_query(env):
     _, base, _, _ = env
     state, _, request_id = _start(base, "https://idp.example.test/sso?tenant=acme&connection=Work%20SSO")
@@ -187,6 +201,55 @@ def test_saml_sign_in(env, keys, sign):
     assert _acs(base, state, encoded, cookie)[0] == 401
     new_state, new_cookie, _ = _start(base)
     assert _acs(base, new_state, encoded, new_cookie)[0] == 401
+
+
+@pytest.mark.parametrize("with_oidc", [False, True], ids=["saml-only", "saml-and-oidc"])
+def test_saml_disables_dashboard_key_sign_in(tmp_path, saml_config, oidc_config, monkeypatch, keys, with_oidc):
+    config = json.loads(saml_config.read_text())
+    config["disable_key_sign_in"] = True
+    saml_config.write_text(json.dumps(config))
+    monkeypatch.delenv("RUNLEDGER_OIDC_CONFIG", raising=False)
+    with running(tmp_path / "db", saml_config=str(saml_config),
+                 oidc_config=str(oidc_config) if with_oidc else None) as (server, base):
+        team, admin = server.db.create_team("Engineering")
+        server.db.add_member(team, "ana@example.com", "admin")
+        assert (server.oidc is not None) == with_oidc
+
+        status, _, body = _http(base, "GET", "/")
+        assert status == 401
+        assert b"Sign in with Company SAML" in body
+        assert b'action="/session"' not in body
+        requests = (
+            _http(base, "GET", "/?" + urlencode({"key": admin})),
+            _post(base, "/session", {"key": admin}, ""),
+        )
+        for status, headers, body in requests:
+            assert status == 401
+            assert "set-cookie" not in headers
+            assert b"Key sign-in is disabled" in body
+
+        state, cookie, request_id = _start(base)
+        status, headers, _ = _acs(base, state, _response(base, request_id, keys), cookie)
+        assert status == 200
+        status, _, body = _http(base, "GET", "/api/me", headers={"Cookie": headers["set-cookie"].split(";")[0]})
+        assert status == 200
+        assert _json(body)["sign_in_method"] == "saml"
+
+        payload = client.build_payload(FIX, user="ana@example.com")
+        assert _http(base, "POST", "/api/runs", body=payload, headers=_auth(admin))[0] == 201
+
+
+@pytest.mark.parametrize(("override", "error"), [
+    ({"providers": [], "disable_key_sign_in": True}, "non-empty providers array"),
+    ({"disable_key_sign_in": "true"}, "disable_key_sign_in must be boolean"),
+])
+def test_saml_rejects_invalid_key_sign_in_policy(tmp_path, saml_config, override, error):
+    config = json.loads(saml_config.read_text())
+    config.update(override)
+    saml_config.write_text(json.dumps(config))
+    with pytest.raises(SAMLError, match=error):
+        with running(tmp_path / "db", saml_config=str(saml_config)):
+            pytest.fail("invalid SAML config must not start the server")
 
 
 @pytest.mark.parametrize("role", ["member", "admin"])

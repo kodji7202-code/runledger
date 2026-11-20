@@ -826,7 +826,9 @@ confirmation to the pending request and browser. Invalid responses return the si
 
 Existing users with multiple memberships use the same single-use team form as OIDC, posted to
 `/auth/saml/team`. The resulting session has `key: null` and `sign_in_method: "saml"` in
-`GET /api/me`. See [enterprise.md](enterprise.md#saml-20-single-sign-on) for configuration.
+`GET /api/me`. If either SSO config sets `"disable_key_sign_in": true`, the dashboard rejects
+key sign-in without disabling API bearer authentication.
+See [enterprise.md](enterprise.md#saml-20-single-sign-on) for configuration.
 
 ## Error codes
 
