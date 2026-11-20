@@ -12,6 +12,7 @@ Contents:
 - [Approvals](#approvals)
 - [Team settings](#team-settings)
 - [API keys](#api-keys)
+- [Members](#members)
 - [Audit log](#audit-log)
 - [Budgets](#budgets)
 - [Exports](#exports)
@@ -24,7 +25,7 @@ Contents:
 cookie instead: `rl_session`, set by the sign-in form (`POST /session`).
 
 - A request with an API key needs no extra header.
-- A `POST` or `PUT` that uses the session cookie must also send `X-Requested-With: runledger`. Without
+- A `POST`, `PUT`, `PATCH` or `DELETE` that uses the session cookie must also send `X-Requested-With: runledger`. Without
   it, the response is `403 csrf_required`.
 - A valid API key is checked first. The session cookie is used when the request carries no valid key.
 - Endpoints that require a role authenticate before they read the request body, so a large body sent
@@ -447,6 +448,35 @@ internal-network requests and DNS rebinding. Redirects and proxy routing are not
 Errors: `400` `invalid_settings` (unknown field, an empty body, a bad URL, a TTL out of range, an
 attribution other than `client` or `key`); `401`; `403` (not admin); `411`; `413` (over 16 KB).
 
+## Members
+
+All member endpoints require **admin**. Cookie writes require `X-Requested-With: runledger`.
+
+| Method and path | Body | Result |
+| --- | --- | --- |
+| `GET /api/members` | none | `200 {"members": [...]}` |
+| `POST /api/members` | `{"email":"ana@example.com", "name":"Ana", "role":"member"}` | `201` member |
+| `PATCH /api/members/{user_id}` | `{"role":"viewer"}` | `200 {"ok":true}` |
+| `DELETE /api/members/{user_id}` | none | `200 {"ok":true}` |
+
+Members include `id` (the server-wide user id), normalized lowercase `email`, optional `name`,
+`created_at`, nullable `disabled_at`, and membership `role`. Lists also include `joined_at`.
+`name` is optional on creation. Adding an existing email reuses that person, but adding an existing
+membership is an error. Invalid email/name/role, missing member, duplicate membership and last-admin
+refusals return `400 invalid_member`. Empty lists return `{"members":[]}`.
+
+Removing a member revokes their keys and deletes their sessions in this team. Role changes take
+effect on every request: personal keys and sessions use the weaker of key and membership roles.
+Disabled users cannot authenticate. Server-wide disable/enable is available only through
+`runledger user disable|enable --email EMAIL [--db FILE]`.
+
+`POST /api/keys` accepts optional `user` (user id or email). That user must be a member, and the
+key role must not exceed their membership role (`400 invalid_key` otherwise). Omitting `user`
+creates an unowned service key, unchanged from earlier releases. `GET /api/keys` includes nullable
+`user_id` and `user` (id, email, name, created_at, disabled_at). `/api/me` includes nullable `user`
+with id/email/name, alongside the key and effective role. Audit API events and audit CSV exports
+include nullable `actor_user_id`; the actor text names the person when present.
+
 ## API keys
 
 Key fields in responses (never the secret, except as noted):
@@ -666,7 +696,7 @@ id,started_at,user,project,agent,models,steps,tokens,files_changed,cost_usd,risk
 A run whose cost is unknown has an empty `cost_usd` cell, never `0`; `quality_score` and
 `est_savings_usd` are empty in the same way when they are unknown.
 
-**`audit.csv`** has the header `id,at,actor,action,target,details_json`. `details_json` is the event's
+**`audit.csv`** has the header `id,at,actor,action,target,details_json,actor_user_id`. `details_json` is the event's
 details as JSON text.
 
 **`report.html`** is one self-contained page with no scripts and no outside resources. Its sections are

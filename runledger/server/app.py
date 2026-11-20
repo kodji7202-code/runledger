@@ -15,7 +15,11 @@
   PUT  /api/team/settings                     change them (admin)
   GET  /api/me                                the caller's team, role and key (any role)
   GET  /api/keys                              the team's keys, never their secrets (admin)
-  POST /api/keys                              {label, role} -> 201; the key is shown once (admin)
+  POST /api/keys                              {label, role, user?} -> 201; secret shown once (admin)
+  GET  /api/members                           team members (admin)
+  POST /api/members                           {email, name?, role} -> 201 (admin)
+  PATCH /api/members/<user_id>                 {role} (admin)
+  DELETE /api/members/<user_id>                remove member and revoke their team keys (admin)
   POST /api/keys/<id>/revoke                  revoke a key (admin)
   POST /api/keys/<id>/rotate                  new secret for a key, same id, label and role (admin)
   GET  /api/audit[?limit&before&action]       audit log, newest first; action= keeps a prefix, e.g. key. (admin)
@@ -76,6 +80,7 @@ from .auth import (
     InvalidKey,
     allows,
     identity_from_row,
+    validate_role,
 )
 from .dashboard import APPROVAL_HTML, DASHBOARD_HTML
 from .db import TIME_FORMAT, Database, normalize_missing_costs
@@ -524,6 +529,12 @@ class _Handler(BaseHTTPRequestHandler):
                 self._create_key()
             else:
                 self._list_keys()
+        elif path == "/api/members":
+            self._only(method, ("GET", "POST"))
+            self._members(method)
+        elif path.startswith("/api/members/"):
+            self._only(method, ("PATCH", "DELETE"))
+            self._members(method, _key_id(path[len("/api/members/"):]))
         elif path.startswith("/api/keys/"):
             rest = path[len("/api/keys/"):]
             if rest.endswith("/revoke"):
@@ -702,6 +713,7 @@ class _Handler(BaseHTTPRequestHandler):
             "team": {"id": ident.team_id, "name": ident.team_name},
             "role": ident.role,
             "key": {"id": ident.key_id, "label": ident.label, "prefix": ident.prefix},
+            "user": {"id": ident.user_id, "email": ident.email, "name": ident.name} if ident.user_id else None,
         }
         self._send_json(200, me)
 
@@ -726,7 +738,7 @@ class _Handler(BaseHTTPRequestHandler):
         result = self.server.db.upsert_run(
             ident.team_id,
             run,
-            actor=ident.actor(),
+            actor=ident,
             key_id=ident.key_id,
             role=ident.role,
         )
@@ -889,7 +901,7 @@ class _Handler(BaseHTTPRequestHandler):
     def _sign_in(self, row: Mapping[str, Any]) -> None:
         token = self.server.db.issue_session(row["team_id"], row["id"], row["role"])
         session = identity_from_row(row, "session")
-        self.server.db.record_audit(row["team_id"], session.actor(), "auth.sign_in", row["id"],
+        self.server.db.record_audit(row["team_id"], session, "auth.sign_in", row["id"],
                                     {"role": row["role"], "ip": self._client_ip()})
         cookie = f"{COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_TTL_SECONDS}"
         if self._secure():
@@ -965,7 +977,7 @@ class _Handler(BaseHTTPRequestHandler):
         outcome, view = db.decide_approval(
             ident.team_id, approval_id, status, decided_by, reason, db.approval_ttl_s(ident.team_id),
             approver_key_id=ident.key_id,
-            actor=ident.actor(),
+            actor=ident,
         )
         if outcome == "missing":
             raise _not_found("Approval not found.")
@@ -997,7 +1009,7 @@ class _Handler(BaseHTTPRequestHandler):
                 changes = approvals.validate_settings(_json_object(raw))
             except approvals.InvalidInput as exc:
                 raise _HttpError(400, "invalid_settings", str(exc)) from None
-            db.update_approval_settings(ident.team_id, changes, actor=ident.actor())
+            db.update_approval_settings(ident.team_id, changes, actor=ident)
         else:
             ident = self._identify()
         settings = db.approval_settings(ident.team_id)
@@ -1024,6 +1036,29 @@ class _Handler(BaseHTTPRequestHandler):
 
     # Keys and audit (admin only)
 
+    def _members(self, method: str, user_id: Optional[str] = None) -> None:
+        ident = self._authed("admin", "manage members", write=method != "GET")
+        db = self.server.db
+        if method == "GET":
+            self._send_json(200, {"members": db.list_members(ident.team_id)})
+            return
+        body = {}
+        if method != "DELETE":
+            length = self._content_length(approvals.SMALL_BODY_LIMIT, "Member requests")
+            body = _json_object(self.rfile.read(length) if length else b"")
+        try:
+            if method == "POST":
+                member = db.add_member(ident.team_id, body.get("email"), body.get("role"),
+                                       body.get("name"), actor=ident)
+                self._send_json(201, member)
+                return
+            if method == "PATCH":
+                validate_role(body.get("role"))
+            db.change_member(ident.team_id, user_id, body.get("role") if method == "PATCH" else None, actor=ident)
+        except InvalidKey as exc:
+            raise _HttpError(400, "invalid_member", str(exc)) from None
+        self._send_json(200, {"ok": True})
+
     def _list_keys(self) -> None:
         ident = self._identify()
         self._require(ident, "admin", "list the team's keys")
@@ -1035,7 +1070,8 @@ class _Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length) if length else b""
         body = _json_object(raw)
         try:
-            view = self.server.db.create_key(ident.team_id, body.get("label"), body.get("role"), ident.actor())
+            view = self.server.db.create_key(ident.team_id, body.get("label"), body.get("role"), ident,
+                                             user=body.get("user"))
         except InvalidKey as exc:
             raise _HttpError(400, "invalid_key", str(exc)) from None
         self._send_json(201, view)
@@ -1044,7 +1080,7 @@ class _Handler(BaseHTTPRequestHandler):
         key_id = _key_id(raw_id)
         ident = self._identify()
         self._require(ident, "admin", "revoke keys", write=True)
-        outcome, view = self.server.db.revoke_key(ident.team_id, key_id, ident.actor())
+        outcome, view = self.server.db.revoke_key(ident.team_id, key_id, ident)
         if outcome == "missing":
             raise _HttpError(404, "not_found", "Key not found.")
         if outcome == "already_revoked":
@@ -1060,7 +1096,7 @@ class _Handler(BaseHTTPRequestHandler):
         key_id = _key_id(raw_id)
         ident = self._identify()
         self._require(ident, "admin", "rotate keys", write=True)
-        outcome, view = self.server.db.rotate_key(ident.team_id, key_id, ident.actor())
+        outcome, view = self.server.db.rotate_key(ident.team_id, key_id, ident)
         if outcome == "missing":
             raise _HttpError(404, "not_found", "Key not found.")
         if outcome == "revoked":
@@ -1103,7 +1139,7 @@ class _Handler(BaseHTTPRequestHandler):
                 raise _HttpError(400, "invalid_budget", exc.message) from None
             except budgets.InvalidBudget as exc:
                 raise _HttpError(400, "invalid_budget", str(exc)) from None
-            settings = db.update_budget_settings(ident.team_id, values, ident.actor())
+            settings = db.update_budget_settings(ident.team_id, values, ident)
         else:
             ident = self._identify()
             settings = db.budget_settings(ident.team_id)
@@ -1125,7 +1161,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._start(200, content_type, headers, length=None)
             return
         body, rows = exports.build(kind, self.server.db, ident.team_id, ident.team_name, days, now)
-        self.server.db.record_audit(ident.team_id, ident.actor(), f"export.{kind}", None,
+        self.server.db.record_audit(ident.team_id, ident, f"export.{kind}", None,
                                     {"days": days, "rows": rows})
         self._send(200, body, content_type, headers)
 

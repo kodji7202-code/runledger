@@ -22,8 +22,9 @@ Contents:
 
 - A **team** is the unit of isolation. Teams never see each other's runs, approvals, keys, settings
   or audit events.
-- Access is by **API key**. Each key belongs to one team and has one **role**. There are no
-  per-person accounts and no single sign-on: a person's access is the key they hold.
+- Access is by **API key**. Each key belongs to one team and has one **role**. A key may belong
+  to a server-wide **user**, identified by a unique, lowercase email, with a membership in that team.
+  Users may join several teams. Keys without an owner are service keys; existing keys stay unowned.
 - Use one key per person, or per system (for example a CI job), with the least role that works.
 - Pending approvals created before requester-key attribution was added cannot prove an independent
   approver. For safe separation of duties, agents must submit a fresh request after upgrading.
@@ -59,6 +60,37 @@ every role so that people can see the team's spend; only admins change it.
 The command-line key and team commands (`runledger team create`, `runledger key ...`) work on the
 database file directly and do not check roles. Whoever can read and write the database file can
 create an admin key. Protect the file as you would protect the keys themselves.
+
+### People and offboarding
+
+```bash
+runledger user add --team-id 1 --email ana@example.com --name Ana --role admin
+runledger user list --team-id 1
+runledger key create --team-id 1 --label laptop-ana --role admin --user ana@example.com
+runledger user role --team-id 1 --email ana@example.com --role member
+runledger user remove --team-id 1 --email ana@example.com
+runledger user disable --email ana@example.com
+runledger user enable --email ana@example.com
+```
+
+All these local commands accept `--db FILE`. Adding an email creates a user if needed; an existing
+user is reused across teams. Display names are optional. There are no passwords or interactive
+account registration: people still sign in with their personal key. SSO is not implemented.
+
+Personal keys work only while the user is enabled and is a member of the key's team. The effective
+role is the weaker of the key role and membership role, checked on every API and dashboard request.
+New keys cannot exceed their owner's membership role. Lowering a membership role caps existing
+keys immediately, including dashboard sessions.
+
+For team offboarding, **remove the membership**: this revokes that person's keys in the team and
+deletes their team sessions, without affecting other teams. Re-adding them does not revive revoked
+keys. For server-wide offboarding, **disable the user** (CLI only): their keys stop working everywhere
+and their sessions are deleted. Enabling them restores unrevoked keys, not deleted sessions.
+Membership changes, disable/enable and key changes are audited. Removing or demoting a member,
+disabling a user, or revoking a key is refused if it would leave a team without a working admin key.
+Keep a protected unowned admin key for recovery. Disabling a user does not disable service keys.
+
+Admins can also manage members through `/api/members`; see [api.md](api.md#members).
 
 ## API key lifecycle
 
@@ -399,7 +431,8 @@ teams and API keys remain available.
 
 ## What RunLedger does not do
 
-- It has no single sign-on (SAML or OIDC), no per-person accounts and no multi-factor authentication.
+- It has per-person accounts and team memberships, but no single sign-on (SAML or OIDC), SCIM,
+  passwords or multi-factor authentication.
 - Keys do not expire, and there is no IP allow-list.
 - Without `RUNLEDGER_RETENTION_DAYS`, runs, approvals, budget alerts and audit events are never
   deleted automatically. There is no per-team retention period.
