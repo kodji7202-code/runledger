@@ -53,8 +53,11 @@ PUT replaces mutable fields; omitted name/externalId are cleared and role/active
 Deactivation deletes sessions and blocks personal-key authentication **only in this team**;
 reactivation restores personal-key access, not deleted sessions. It does not disable the global user.
 DELETE removes membership and revokes its personal keys/sessions. Email and name are server-wide:
-updating them through one team's SCIM changes them for every team sharing that user.
-Existing global users are reused by email. No operation may remove the last working admin.
+SCIM cannot change them when the user belongs to other teams (400 `mutability`);
+unchanged values remain accepted. Existing global users are reused by email and keep their
+existing name on POST. Okta `name.givenName` and `name.familyName` are joined when `formatted`
+is absent; PATCH name-part paths use the parts supplied in that request.
+No operation may remove the last working admin.
 All changes are audited with actor `scim`; token administration uses its admin actor.
 
 Groups cannot be created/deleted. Adding a member sets their role to that group.

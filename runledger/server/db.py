@@ -736,7 +736,8 @@ class Database:
 
     def scim_update(self, team_id, user_id, values):
         with self._lock, self._conn:
-            self._conn.execute("BEGIN IMMEDIATE")
+            if not self._conn.in_transaction:
+                self._conn.execute("BEGIN IMMEDIATE")
             row = self._conn.execute("SELECT u.*, m.role, m.deactivated_at, m.external_id FROM users u JOIN memberships m ON m.user_id = u.id WHERE m.team_id = ? AND u.id = ?", (team_id, user_id)).fetchone()
             old = dict(row) if row else None
             if old is None:
@@ -755,6 +756,9 @@ class Database:
             name = values.get("name", old["name"])
             if name is not None:
                 name = validate_label(name)
+            if (email.lower() != old["email"] or name != old["name"]) and self._conn.execute(
+                    "SELECT 1 FROM memberships WHERE user_id = ? AND team_id != ?", (user_id, team_id)).fetchone():
+                raise InvalidKey("Cannot change this user's email or name: the user belongs to other teams.")
             other = self.get_user(email)
             if other and other["id"] != user_id:
                 raise InvalidKey("User name already exists.")
@@ -767,6 +771,22 @@ class Database:
             if active != (old["deactivated_at"] is None):
                 action = "reactivate" if active else "deactivate"
             self._audit(team_id, "scim", "scim.user." + action, user_id, {})
+
+    def scim_group_update(self, team_id, group, changes):
+        with self._lock, self._conn:
+            if not self._conn.in_transaction:
+                self._conn.execute("BEGIN IMMEDIATE")
+            had_admin = self._working_admins(team_id)
+            for user_id, role in changes.items():
+                role = validate_role(role)
+                updated = self._conn.execute(
+                    "UPDATE memberships SET role = ?, updated_at = ? WHERE team_id = ? AND user_id = ?",
+                    (role, utc_now(), team_id, user_id))
+                if not updated.rowcount:
+                    raise InvalidKey("Member not found.")
+            if had_admin and not self._working_admins(team_id):
+                raise InvalidKey("Cannot remove the team's last working admin key.")
+            self._audit(team_id, "scim", "scim.group.update", group, {})
 
     def add_member(self, team_id: int, email: Any, role: Any, name: Any = None,
                    actor: Union[str, Identity] = "cli", scim_data=None) -> Dict[str, Any]:
@@ -799,8 +819,6 @@ class Database:
             if scim_data is not None:
                 self._conn.execute("UPDATE memberships SET deactivated_at = ?, external_id = ?, updated_at = ? WHERE team_id = ? AND user_id = ?",
                                    (None if scim_data.get("active", True) else utc_now(), scim_data.get("external_id"), utc_now(), team_id, user["id"]))
-                if "name" in scim_data:
-                    self._conn.execute("UPDATE users SET name = ? WHERE id = ?", (name, user["id"]))
                 self._audit(team_id, actor, "scim.user.create", user["id"], {})
             self._audit(team_id, actor, "member.add", user["id"], {"email": email, "role": role})
         return dict(user, role=role)
