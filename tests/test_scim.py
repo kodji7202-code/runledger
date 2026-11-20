@@ -347,3 +347,48 @@ def test_user_list_shows_scim_deactivation(scim, capsys):
     assert status() == "deactivated"
     assert call("PATCH", path, {"Operations": [{"op": "replace", "path": "active", "value": True}]})[0] == 200
     assert status() == "active"
+
+
+def test_whole_name_operations_reset_name_parts(scim):
+    db, team, key, token, base, call = scim
+    user = call("POST", body={"userName": "reset@example.com", "name": {"formatted": "Start"}})[1]
+    path = "/Users/" + user["id"]
+    given = {"op": "replace", "path": "name.givenName", "value": "Ana"}
+    family = {"op": "replace", "path": "name.familyName", "value": "Smith"}
+    cases = [
+        ([given, {"op": "remove", "path": "name"}, family], "Smith"),
+        ([given, {"op": "replace", "path": "name", "value": {"formatted": "Whole"}}, family], "Smith"),
+        ([given, {"op": "replace", "path": "displayName", "value": "Shown"}, family], "Smith"),
+        ([given, {"op": "replace", "path": "name", "value": {"givenName": "Bo"}}, family], "Bo Smith"),
+        ([given, {"op": "replace", "value": {"name": {"formatted": "Whole"}}}, family], "Smith"),
+        ([given, {"op": "replace", "value": {"name": {"givenName": "Cy"}}}, family], "Cy Smith"),
+        ([given, family], "Ana Smith"),
+    ]
+    for operations, expected in cases:
+        status, body = call("PATCH", path, {"Operations": operations})
+        assert status == 200 and body["displayName"] == expected, (operations, body)
+
+
+def test_group_patch_reads_roles_inside_transaction(scim):
+    db, team, key, token, base, call = scim
+    first = call("POST", body={"userName": "first@example.com", "roles": [{"value": "admin"}]})[1]
+    second = call("POST", body={"userName": "second@example.com", "roles": [{"value": "admin"}]})[1]
+    original = db.list_members
+    state = {"raced": False}
+
+    def stale_snapshot(team_id):
+        members = original(team_id)
+        if not state["raced"]:
+            state["raced"] = True
+            db.scim_group_update(team_id, "viewer", {second["id"]: "viewer"})
+        return members
+
+    db.list_members = stale_snapshot
+    try:
+        status, _ = call("PATCH", "/Groups/admin", {"Operations": [
+            {"op": "remove", "path": 'members[value eq "%s"]' % second["id"]}]})
+    finally:
+        db.list_members = original
+    assert status == 200 and state["raced"]
+    roles = {m["id"]: m["role"] for m in db.list_members(team)}
+    assert roles[second["id"]] == "viewer" and roles[first["id"]] == "admin"
