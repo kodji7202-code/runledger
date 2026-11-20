@@ -8,6 +8,8 @@ and check what the page is served with.
 import http.client
 import json
 import re
+import shutil
+import subprocess
 import threading
 from contextlib import contextmanager
 from html.parser import HTMLParser
@@ -96,6 +98,69 @@ def _script(html):
     match = re.search(r'<script nonce="__CSP_NONCE__">(.*?)</script>', html, re.S)
     assert match, "the page has one inline script that uses the CSP nonce placeholder"
     return match.group(1)
+
+
+def _js_call(functions, expression):
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required to execute dashboard JavaScript helpers")
+    js = _script(DASHBOARD_HTML)
+    helpers = []
+    for name in functions:
+        match = re.search(r"  function " + name + r"\(.*?\n  }", js, re.S)
+        assert match, name
+        helpers.append(match.group(0))
+    result = subprocess.run(
+        [node, "-e", "\n".join(helpers) + "\nconsole.log(JSON.stringify(" + expression + "));"],
+        capture_output=True, text=True, encoding="utf-8", check=True,
+    )
+    return json.loads(result.stdout)
+
+
+@pytest.mark.parametrize("value, expected", [
+    (0.00003, "<$0.0001"), (0.000001, "<$0.0001"),
+    (0.00009999, "<$0.0001"), (0.0001, "$0.0001"),
+    (0, "$0.00"), (0.005, "$0.0050"), (0.25, "$0.250"), (12.34, "$12.34"),
+    (None, "n/a"), ("invalid", "n/a"),
+])
+def test_money_displays_tiny_nonzero_costs_honestly(value, expected):
+    assert _js_call(["money"], "money(" + json.dumps(value) + ")") == expected
+
+
+@pytest.mark.parametrize("value, partial, expected", [
+    (0.00003, True, ">$0.00"), (0.000001, True, ">$0.00"),
+    (0.00009999, True, ">$0.00"), (0.0001, True, "≥$0.0001"),
+    (0, True, "≥$0.00"), (0.25, True, "≥$0.250"),
+    (0.00003, False, "<$0.0001"), (None, True, "n/a"), ("invalid", True, "n/a"),
+])
+def test_partial_run_cost_uses_a_single_coherent_bound(value, partial, expected):
+    run = {"cost_usd": value, "cost_partial": partial}
+    expression = "(function(r) { return costNode(r.cost_usd, r.cost_partial); })(" + json.dumps(run) + ")"
+    assert _js_call(["money", "costText", "costNode"], expression) == expected
+
+
+def test_partial_tiny_total_uses_a_single_coherent_bound():
+    totals = {"cost_usd": 0.00003, "cost_is_lower_bound": True}
+    expression = "(function(t) { return costText(t.cost_usd, t.cost_is_lower_bound); })(" + json.dumps(totals) + ")"
+    assert _js_call(["money", "costText"], expression) == ">$0.00"
+
+
+@pytest.mark.parametrize("totals, expected", [
+    ({}, ""),
+    ({"unpriced_runs": 0, "partial_runs": 0}, ""),
+    ({"unpriced_runs": 1, "partial_runs": 1},
+     "Includes 1 run partly priced (known cost only)."),
+    ({"unpriced_runs": 2, "partial_runs": 2},
+     "Includes 2 runs partly priced (known cost only)."),
+    ({"unpriced_runs": 3, "partial_runs": 1, "missing_usage_runs": 1},
+     "Includes 1 run partly priced (known cost only). "
+     "2 runs left out: 1 run without recorded token usage, 1 run with an unknown model price."),
+    ({"unpriced_runs": 1, "missing_usage_runs": 1},
+     "1 run left out: 1 run without recorded token usage."),
+    ({"unpriced_runs": 1}, "1 run left out: 1 run with an unknown model price."),
+])
+def test_cost_kpi_hint_distinguishes_included_partial_costs(totals, expected):
+    assert _js_call(["runCount", "unpricedHint"], "unpricedHint(" + json.dumps(totals) + ")") == expected
 
 
 # Static checks on the served HTML string
