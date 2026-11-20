@@ -9,6 +9,8 @@ change behavior, so read the entry before you upgrade.
 
 ### Fixed
 
+- `runledger stats` includes sessions started inside the selected window even when copied or
+  restored transcripts have older file modification times, without fully parsing old sessions.
 - `list --limit` counts displayed sessions, so invalid, unreadable, or vanished sessions
   no longer consume limit slots.
 - The HTML receipt fits phone screens (375px and up) instead of scrolling sideways and hiding the

@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -393,6 +394,263 @@ def test_sessions_only_outside_the_window_hint_at_since(capsys, isolated_setting
     assert rc == 1
     assert out == ""
     assert "No sessions found" in err and "--since" in err and err.count("\n") == 1
+
+
+@pytest.mark.parametrize("factory", [claude_session, codex_session, droid_session])
+@pytest.mark.parametrize("cached", [False, True])
+def test_old_mtime_does_not_hide_in_window_start(isolated_settings, factory, cached, monkeypatch):
+    project = isolated_settings / "restored"
+    project.mkdir()
+    started = datetime(2026, 5, 10, 12)
+    path = factory(isolated_settings, project, "restored", started)
+    old = datetime(2020, 1, 1).timestamp()
+    os.utime(path, (old, old))
+    cache = stats.StatsCache() if cached else None
+    if cache is not None:
+        cache.put(path, path.stat(), stats.summarize(path))
+        monkeypatch.setattr(stats, "summarize", lambda path: pytest.fail("cached session reparsed"))
+    summaries, skipped, total = stats.collect(
+        [path], datetime(2026, 5, 1), datetime(2026, 5, 31), cache)
+    assert total == 1
+    assert summaries[0].started == started
+    assert skipped == []
+
+
+def test_old_sessions_only_read_the_header(isolated_settings, monkeypatch):
+    project = isolated_settings / "old"
+    project.mkdir()
+    path = claude_session(isolated_settings, project, "old", datetime(2020, 1, 1))
+    os.utime(path, (1, 1))
+    monkeypatch.setattr(stats, "summarize", lambda path: pytest.fail("old session fully parsed"))
+    assert stats.collect([path], datetime(2026, 5, 1), datetime(2026, 5, 31)) == ([], [], 0)
+
+
+@pytest.mark.parametrize("factory", [claude_session, codex_session, droid_session])
+def test_start_probe_matches_summary(isolated_settings, factory):
+    project = isolated_settings / "probe"
+    project.mkdir()
+    path = factory(isolated_settings, project, "probe", datetime(2026, 5, 10, 12))
+    assert stats._session_start(path) == stats.summarize(path).started
+
+
+@pytest.mark.parametrize("header", [{"instructions": "Follow the project rules"}, {"id": "old"}])
+def test_legacy_codex_probe_matches_summary(isolated_settings, header):
+    project = isolated_settings / "legacy"
+    project.mkdir()
+    path = codex_session(isolated_settings, project, "old", datetime(2020, 1, 1))
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    rows[0] = {**rows[0]["payload"], **header, "timestamp": rows[0]["timestamp"]}
+    _write(path, rows)
+    assert stats._session_start(path) == stats.summarize(path).started
+
+
+@pytest.mark.parametrize("factory", [droid_session, codex_session])
+def test_old_agent_sessions_are_not_fully_parsed(isolated_settings, monkeypatch, factory):
+    project = isolated_settings / "old-agent"
+    project.mkdir()
+    path = factory(isolated_settings, project, "old", datetime(2020, 1, 1))
+    if factory is codex_session:
+        rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        rows[0] = {**rows[0]["payload"], "instructions": "Be helpful",
+                   "timestamp": rows[0]["timestamp"]}
+        _write(path, rows)
+    os.utime(path, (1, 1))
+    monkeypatch.setattr(stats, "summarize", lambda path: pytest.fail("old session fully parsed"))
+    assert stats.collect([path], datetime(2026, 1, 1), datetime(2026, 2, 1)) == ([], [], 0)
+
+
+def test_old_start_cache_survives_reload_without_reading_transcript(isolated_settings, monkeypatch):
+    project = isolated_settings / "old-cached"
+    project.mkdir()
+    path = claude_session(isolated_settings, project, "old", datetime(2020, 1, 1))
+    os.utime(path, (1, 1))
+    since, until = datetime(2026, 5, 1), datetime(2026, 5, 31)
+    cache = stats.StatsCache()
+    assert stats.collect([path], since, until, cache) == ([], [], 0)
+    cache = stats.StatsCache.load()
+    assert cache.get(path, path.stat()) is None
+    assert cache.get_start(path, path.stat()) == datetime(2020, 1, 1)
+    monkeypatch.setattr(stats, "_session_start", lambda path: pytest.fail("warm session probed"))
+    monkeypatch.setattr(stats, "summarize", lambda path: pytest.fail("warm session parsed"))
+    assert stats.collect([path], since, until, cache) == ([], [], 0)
+
+
+@pytest.mark.parametrize("changed", ["mtime", "size"])
+def test_changed_start_cache_is_reprobed_and_promoted(isolated_settings, changed):
+    project = isolated_settings / "changed-start"
+    project.mkdir()
+    path = claude_session(isolated_settings, project, "changed", datetime(2020, 1, 1))
+    os.utime(path, (1, 1))
+    since, until = datetime(2026, 5, 1), datetime(2026, 5, 31)
+    cache = stats.StatsCache()
+    assert stats.collect([path], since, until, cache) == ([], [], 0)
+    before = path.stat()
+    text = path.read_text(encoding="utf-8").replace("2020-01-01", "2026-05-10")
+    path.write_text(text + ("\n" if changed == "size" else ""), encoding="utf-8")
+    os.utime(path, ns=(before.st_atime_ns,
+                      before.st_mtime_ns + (2_000_000_000 if changed == "mtime" else 0)))
+    after = path.stat()
+    if changed == "mtime":
+        assert after.st_mtime_ns != before.st_mtime_ns
+        assert after.st_size == before.st_size
+    else:
+        assert after.st_mtime_ns == before.st_mtime_ns
+        assert after.st_size != before.st_size
+    assert cache.get_start(path, path.stat()) is None
+    summaries, skipped, total = stats.collect([path], since, until, cache)
+    assert total == 1 and skipped == []
+    assert summaries[0].started == datetime(2026, 5, 10)
+    assert cache.get(path, path.stat()) is not None
+    assert cache.get_start(path, path.stat()) is None
+
+
+def test_start_cache_is_used_when_window_changes(isolated_settings):
+    project = isolated_settings / "widened"
+    project.mkdir()
+    path = claude_session(isolated_settings, project, "old", datetime(2020, 1, 1))
+    os.utime(path, (1, 1))
+    cache = stats.StatsCache()
+    assert stats.collect([path], datetime(2026, 5, 1), datetime(2026, 5, 31), cache) == ([], [], 0)
+    summaries, skipped, total = stats.collect(
+        [path], datetime(2019, 1, 1), datetime(2021, 1, 1), cache)
+    assert total == 1 and skipped == []
+    assert summaries[0].started == datetime(2020, 1, 1)
+    assert cache.get(path, path.stat()) is not None
+
+
+def test_start_and_summary_cache_entries_share_the_limit(isolated_settings, monkeypatch):
+    project = isolated_settings / "trimmed"
+    project.mkdir()
+    paths = [claude_session(isolated_settings, project, str(i), datetime(2020, 1, 1))
+             for i in range(3)]
+    for i, path in enumerate(paths):
+        os.utime(path, (i + 1, i + 1))
+    monkeypatch.setattr(stats, "MAX_CACHE_ENTRIES", 2)
+    cache = stats.StatsCache()
+    cache.put_start(paths[0], paths[0].stat(), datetime(2020, 1, 1))
+    cache.put(paths[1], paths[1].stat(), stats.summarize(paths[1]))
+    cache.put_start(paths[2], paths[2].stat(), datetime(2020, 1, 1))
+    assert set(cache.entries) == {str(path) for path in paths[1:]}
+    assert cache.get(paths[1], paths[1].stat()) is not None
+    assert cache.get_start(paths[2], paths[2].stat()) == datetime(2020, 1, 1)
+
+
+@pytest.mark.parametrize("started", [None, {}, "invalid", "2020-01-01T00:00:00"])
+def test_invalid_start_cache_record_is_a_miss(tmp_path, started):
+    path = tmp_path / "old.jsonl"
+    path.write_text("{}\n", encoding="utf-8")
+    cache = stats.StatsCache()
+    cache.put_start(path, path.stat(), datetime(2020, 1, 1))
+    cache.entries[str(path)]["started"] = started
+    assert cache.get_start(path, path.stat()) is None
+    assert cache.get(path, path.stat()) is None
+
+
+@pytest.mark.skipif(not hasattr(time, "tzset"), reason="requires time.tzset")
+def test_start_cache_follows_timezone_changes(isolated_settings, monkeypatch):
+    project = isolated_settings / "timezone"
+    project.mkdir()
+    path = claude_session(isolated_settings, project, "old", datetime(2020, 1, 1))
+    os.utime(path, (1, 1))
+    try:
+        with monkeypatch.context() as env:
+            env.setenv("TZ", "UTC0")
+            time.tzset()
+            cache = stats.StatsCache()
+            assert stats.collect([path], datetime(2026, 1, 1), datetime(2026, 2, 1),
+                                 cache) == ([], [], 0)
+            env.setenv("TZ", "EST5")
+            time.tzset()
+            cache = stats.StatsCache.load()
+            expected = stats.summarize(path).started
+            assert expected == datetime(2019, 12, 31, 19)
+            assert cache.get_start(path, path.stat()) == expected
+            summaries, skipped, total = stats.collect(
+                [path], datetime(2019, 12, 31, 18), datetime(2019, 12, 31, 20), cache)
+            assert total == 1 and skipped == [] and summaries[0].started == expected
+    finally:
+        time.tzset()
+
+
+def test_start_probe_defers_unrecognized_codex_header(tmp_path):
+    folder = tmp_path / "sessions"
+    folder.mkdir()
+    path = folder / "rollout-old.jsonl"
+    _write(path, [{"type": "unknown", "timestamp": "2020-01-01T00:00:00Z"},
+                  {"type": "session_meta", "timestamp": "2026-05-10T00:00:00Z",
+                   "payload": {"id": "restored"}}])
+    assert stats._session_start(path) is None
+    assert stats.summarize(path).started == stats._local(stats._ts("2026-05-10T00:00:00Z"))
+
+
+def test_old_mtime_with_non_timestamped_prefix(isolated_settings):
+    project = isolated_settings / "prefixed"
+    project.mkdir()
+    path = claude_session(isolated_settings, project, "prefixed", datetime(2026, 5, 10))
+    path.write_text('{}\n' + path.read_text(encoding="utf-8"), encoding="utf-8")
+    os.utime(path, (1, 1))
+    summaries, skipped, total = stats.collect(
+        [path], datetime(2026, 5, 1), datetime(2026, 5, 31))
+    assert total == 1 and len(summaries) == 1 and skipped == []
+
+
+@pytest.mark.parametrize("content", ["", "not json\n", "{}\n", '[1, 2]\n',
+                                     '{"timestamp": "invalid"}\n'])
+def test_start_probe_uncertain_headers_fall_back(tmp_path, content):
+    path = tmp_path / "unknown.jsonl"
+    path.write_text(content, encoding="utf-8")
+    assert stats._session_start(path) is None
+
+
+def test_start_probe_missing_file_falls_back(tmp_path):
+    assert stats._session_start(tmp_path / "missing.jsonl") is None
+
+
+def test_overflowing_probe_timestamp_is_reported_as_skipped(isolated_settings):
+    project = isolated_settings / "overflow"
+    project.mkdir()
+    path = claude_session(isolated_settings, project, "overflow", datetime(2020, 1, 1))
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    rows[0]["timestamp"] = "0001-01-01T00:00:00+01:00"
+    _write(path, rows)
+    os.utime(path, (1, 1))
+    assert stats._session_start(path) is None
+    summaries, skipped, total = stats.collect(
+        [path], datetime(2026, 1, 1), datetime(2026, 2, 1))
+    assert summaries == [] and total == 0
+    assert len(skipped) == 1 and skipped[0]["path"] == str(path)
+
+
+@pytest.mark.skipif(not hasattr(time, "tzset"), reason="requires time.tzset")
+@pytest.mark.parametrize("zone", ["UTC0", "UTC-1"])
+def test_edge_year_start_cache_never_aborts_collection(isolated_settings, monkeypatch, zone):
+    project = isolated_settings / "edge-year"
+    project.mkdir()
+    path = claude_session(isolated_settings, project, "edge", datetime(2020, 1, 1))
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    rows[0]["timestamp"] = "0001-01-01T00:00:00Z"
+    _write(path, rows)
+    os.utime(path, (1, 1))
+    try:
+        with monkeypatch.context() as env:
+            env.setenv("TZ", zone)
+            time.tzset()
+            summaries, skipped, total = stats.collect(
+                [path], datetime(2026, 1, 1), datetime(2026, 2, 1), stats.StatsCache())
+            assert summaries == [] and total == 0
+    finally:
+        time.tzset()
+
+
+@pytest.mark.parametrize("content", ["", "not json\n"])
+def test_old_mtime_invalid_files_are_reported(tmp_path, content):
+    path = tmp_path / "invalid.jsonl"
+    path.write_text(content, encoding="utf-8")
+    os.utime(path, (1, 1))
+    summaries, skipped, total = stats.collect(
+        [path], datetime(2026, 5, 1), datetime(2026, 5, 31))
+    assert summaries == [] and total == 0
+    assert len(skipped) == 1
 
 
 def test_default_window_and_project_scope(capsys, fixture_a, monkeypatch):
