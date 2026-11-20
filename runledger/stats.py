@@ -325,9 +325,14 @@ class StatsCache:
             return None
 
     def put_start(self, path: Path, stat_result: os.stat_result, started: datetime) -> None:
+        try:
+            instant = started.astimezone(timezone.utc).isoformat()
+        except (ValueError, OverflowError, OSError):
+            self.drop(path)
+            return
         self._put(path, {"version": RECORD_VERSION, "kind": "start",
                          "mtime_ns": stat_result.st_mtime_ns, "size": stat_result.st_size,
-                         "started": started.astimezone(timezone.utc).isoformat()})
+                         "started": instant})
 
     def put(self, path: Path, stat_result: os.stat_result, summary: SessionSummary) -> None:
         """Store one summary - unless the parse could not track every path it depends on

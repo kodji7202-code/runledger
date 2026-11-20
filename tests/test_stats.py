@@ -586,6 +586,27 @@ def test_overflowing_probe_timestamp_is_reported_as_skipped(isolated_settings):
     assert len(skipped) == 1 and skipped[0]["path"] == str(path)
 
 
+@pytest.mark.skipif(not hasattr(time, "tzset"), reason="requires time.tzset")
+@pytest.mark.parametrize("zone", ["UTC0", "UTC-1"])
+def test_edge_year_start_cache_never_aborts_collection(isolated_settings, monkeypatch, zone):
+    project = isolated_settings / "edge-year"
+    project.mkdir()
+    path = claude_session(isolated_settings, project, "edge", datetime(2020, 1, 1))
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    rows[0]["timestamp"] = "0001-01-01T00:00:00Z"
+    _write(path, rows)
+    os.utime(path, (1, 1))
+    try:
+        with monkeypatch.context() as env:
+            env.setenv("TZ", zone)
+            time.tzset()
+            summaries, skipped, total = stats.collect(
+                [path], datetime(2026, 1, 1), datetime(2026, 2, 1), stats.StatsCache())
+            assert summaries == [] and total == 0
+    finally:
+        time.tzset()
+
+
 @pytest.mark.parametrize("content", ["", "not json\n"])
 def test_old_mtime_invalid_files_are_reported(tmp_path, content):
     path = tmp_path / "invalid.jsonl"
