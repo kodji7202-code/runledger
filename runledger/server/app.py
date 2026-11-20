@@ -660,19 +660,19 @@ class _Handler(BaseHTTPRequestHandler):
                 if ident.expires_soon:
                     self._extra_headers[KEY_EXPIRES_HEADER] = ident.expires_at or ""
                 return ident
-            expired = self.server.db.expired_key_for_token(token)
-            if expired is not None:
-                # The right secret, past its end: not a guess, so not counted as a failure.
-                raise _HttpError(
-                    401, "key_expired",
-                    f"This API key expired at {expired['expires_at']}. Ask a team admin to rotate it "
-                    "(runledger key rotate ID, or Rotate on the dashboard's API keys page).",
-                )
+        expired = self.server.db.expired_key_for_token(token) if token is not None else None
         cookie = self._cookie(COOKIE_NAME)
         if cookie:
             ident = self.server.identify_session(cookie)
             if ident is not None:
                 return ident
+        if expired is not None:
+            # The right secret, past its end: not a guess, so not counted as a failure.
+            raise _HttpError(
+                401, "key_expired",
+                f"This API key expired at {expired['expires_at']}. Ask a team admin to rotate it "
+                "(runledger key rotate ID, or Rotate on the dashboard's API keys page).",
+            )
         if token is not None:
             self.server.limiter.record_failure(self._client_ip())
         raise _unauthorized()
@@ -842,8 +842,7 @@ class _Handler(BaseHTTPRequestHandler):
             self.server.warn_query_key_once()
             row = self.server.db.key_for_token(key)
             if row is None:
-                self.server.limiter.record_failure(self._client_ip())
-                self._sign_in_page("That key was not recognized. Check the key and try again.")
+                self._refuse_sign_in_key(key)
                 return
             current = self._try_identify()
             if current is not None and current.team_id != row["team_id"]:
@@ -910,11 +909,20 @@ class _Handler(BaseHTTPRequestHandler):
         key = (fields.get("key") or [""])[0].strip()
         row = self.server.db.key_for_token(key) if key else None
         if row is None:
-            if key:
-                self.server.limiter.record_failure(self._client_ip())
-            self._sign_in_page("That key was not recognized. Check the key and try again.")
+            self._refuse_sign_in_key(key)
             return
         self._sign_in(row)
+
+    def _refuse_sign_in_key(self, key: str) -> None:
+        """Sign-in page for a key that did not sign in. An expired key is named as expired and,
+        not being a guess, does not count toward the failure limit."""
+        expired = self.server.db.expired_key_for_token(key) if key else None
+        if expired is not None:
+            self._sign_in_page(f"That key expired at {expired['expires_at']}. Ask a team admin to rotate it.")
+            return
+        if key:
+            self.server.limiter.record_failure(self._client_ip())
+        self._sign_in_page("That key was not recognized. Check the key and try again.")
 
     def _sign_in(self, row: Mapping[str, Any]) -> None:
         if row.get("kind") == "service":

@@ -1593,8 +1593,14 @@ class Database:
             due = [dict(r) for r in rows
                    if r["key_expiry_warn_days"] > 0
                    and r["expires_at"] <= _days_from(moment, int(r["key_expiry_warn_days"]))]
-            for row in due:
-                self._conn.execute("UPDATE api_keys SET expiry_warned_at = ? WHERE id = ?", (stamp, row["id"]))
+            for row in list(due):
+                # Only the lifetime that was read: a rotation in between gave the key a new one.
+                cur = self._conn.execute(
+                    "UPDATE api_keys SET expiry_warned_at = ? WHERE id = ? AND expiry_warned_at IS NULL "
+                    "AND expires_at = ? AND revoked_at IS NULL", (stamp, row["id"], row["expires_at"]))
+                if cur.rowcount != 1:
+                    due.remove(row)
+                    continue
                 self._audit(row["team_id"], "system", "key.expiring", row["id"],
                             {"label": row["label"], "kind": row["kind"], "prefix": row["prefix"],
                              "expires_at": row["expires_at"]})
