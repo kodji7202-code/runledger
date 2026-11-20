@@ -261,3 +261,11 @@ def test_patch_name_object_and_remove(scim):
         assert call("PATCH", path, {"Operations": [{"op": "replace", "path": "name", "value": name}]})[1]["displayName"] == expected
     assert call("PATCH", path, {"Operations": [{"op": "remove", "path": "name"}]})[0] == 200
     assert db.get_user(user["id"])["name"] is None
+
+
+def test_external_id_filter_is_case_exact(scim):
+    db, team, key, token, base, call = scim
+    call("POST", body={"userName": "case@example.com", "externalId": "External-A"})
+    assert call("GET", "/Users?filter=" + quote('externalId eq "External-A"'))[1]["totalResults"] == 1
+    assert call("GET", "/Users?filter=" + quote('externalId eq "external-a"'))[1]["totalResults"] == 0
+    assert call("GET", "/Users?filter=" + quote('userName eq "CASE@example.com"'))[1]["totalResults"] == 1
