@@ -267,6 +267,17 @@ def test_recommendations_that_do_not_validate_are_dropped_one_by_one(env):
     assert stored_recs[1]["steps"] == [1, 4]
 
 
+@pytest.mark.parametrize("estimate, expected", [
+    (None, None), (1e308, None), (10 ** 400, None),
+    (6e11, None), (0.25, 0.5), (-1, None),
+])
+def test_review_fields_bounds_savings(estimate, expected):
+    fields = insights.review_fields({"recommendations": [rec("cost", "Save", estimate)] * 2})
+    assert fields["est_savings_usd"] == expected
+    item_estimate = estimate if estimate is not None and 0 <= estimate <= insights.MAX_COST_USD else None
+    assert all(item["est_savings_usd"] == item_estimate for item in fields["recommendations"])
+
+
 def test_est_savings_is_the_sum_of_the_estimates_that_are_given(env):
     srv, base = env
     team_id, admin, _, _ = team_with_keys(srv)
