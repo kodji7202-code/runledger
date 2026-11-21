@@ -9,6 +9,7 @@ change behavior, so read the entry before you upgrade.
 
 ### Fixed
 
+- Team statistics, Insights, and receipt exports exclude future-dated runs from their reporting windows.
 - `list --limit` counts displayed sessions, so invalid, unreadable, or vanished sessions
   no longer consume limit slots.
 - The HTML receipt fits phone screens (375px and up) instead of scrolling sideways and hiding the
