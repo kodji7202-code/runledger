@@ -13,6 +13,7 @@ change behavior, so read the entry before you upgrade.
   and exits 0, as `--path` already did. It no longer asks for confirmation, prints `Restored`, or
   creates a safety checkpoint of an unchanged tree. When only kept ignored files differ, it names
   them instead of claiming an exact match.
+- Team statistics, Insights, and receipt exports exclude future-dated runs from their reporting windows.
 - `list --limit` counts displayed sessions, so invalid, unreadable, or vanished sessions
   no longer consume limit slots.
 - The HTML receipt fits phone screens (375px and up) instead of scrolling sideways and hiding the
@@ -76,6 +77,9 @@ change behavior, so read the entry before you upgrade.
   `argument --since: invalid value ...` usage error and exits 2, like any other bad value.
 
 ### Changed
+
+- `runledger doctor` wraps human-readable output to the terminal width with hanging
+  indents, keeping URLs, paths and command tokens intact.
 
 - **A warm `runledger stats` prices each model bucket once (`runledger.stats`):** the totals, the
   groups, the partial-cost notes and the top-models line share one per-request priced cost per
