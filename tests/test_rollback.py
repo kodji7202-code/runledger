@@ -1600,6 +1600,44 @@ def test_path_nothing_to_restore_names_the_path_and_creates_no_ref(scoped_repo, 
     assert git(repo.root, "for-each-ref", rollback.PREFIX) == refs
 
 
+def test_whole_tree_nothing_to_restore_says_so_and_creates_no_ref(scoped_repo, capsys):
+    repo = scoped_repo
+    _write(repo.root, "a.txt", "one\n")
+    checkpoint = repo.create()
+    refs = git(repo.root, "for-each-ref", rollback.PREFIX)
+    assert main(["rollback", checkpoint.id, "--yes", "--cwd", str(repo.root)]) == 0
+    output = capsys.readouterr().out
+    assert f"Nothing to restore (already matches {checkpoint.id})." in output
+    assert "Restored" not in output and "Safety checkpoint" not in output
+    assert git(repo.root, "for-each-ref", rollback.PREFIX) == refs
+
+
+def test_whole_tree_nothing_to_restore_but_ignored_files_does_not_claim_a_match(scoped_repo,
+                                                                                  capsys):
+    repo = scoped_repo
+    cp = repo.create()
+    git(repo.root, "add", "-f", ".secret")
+    refs = git(repo.root, "for-each-ref", rollback.PREFIX)
+    assert main(["rollback", cp.id, "--yes", "--cwd", str(repo.root)]) == 0
+    output = capsys.readouterr().out
+    assert "keep ignored '.secret'" in output
+    assert (f"Nothing to restore (matches {cp.id} except 1 ignored file, "
+            "which rollback keeps).") in output
+    assert "already matches" not in output
+    assert git(repo.root, "for-each-ref", rollback.PREFIX) == refs
+
+
+def test_whole_tree_nothing_to_restore_does_not_ask_for_confirmation(scoped_repo, capsys,
+                                                                       monkeypatch):
+    repo = scoped_repo
+    _write(repo.root, "a.txt", "one\n")
+    checkpoint = repo.create()
+    monkeypatch.setattr("sys.stdin", type("Terminal", (io.StringIO,), {"isatty": lambda self: True})())
+    monkeypatch.setattr("builtins.input", lambda _prompt: pytest.fail("prompted for a no-op"))
+    assert main(["rollback", checkpoint.id, "--cwd", str(repo.root)]) == 0
+    assert "Nothing to restore (already matches" in capsys.readouterr().out
+
+
 def test_path_combines_with_run_last_and_the_default_checkpoint(identity_repo):
     folder = identity_repo
     repo = rollback.Repository(str(folder))
