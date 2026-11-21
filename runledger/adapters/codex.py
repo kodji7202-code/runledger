@@ -25,8 +25,9 @@ import shlex
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
+from ..jsonl import read_objects
 from ..parser import Run, Step, Usage, _split_usage
 
 NAME = "codex"
@@ -186,26 +187,12 @@ def _mtime(path: Path) -> float:
 
 def parse(path: Path) -> Run:
     rollout = _Rollout(str(path))
-    for obj in _read_lines(path):
+    for obj in read_objects(path, strip_lines=True):
         try:
             rollout.feed(obj)
         except (AttributeError, IndexError, KeyError, TypeError, ValueError):
             continue  # a line with an unexpected shape must not stop the parse
     return rollout.finish()
-
-
-def _read_lines(path: Path) -> Iterator[Dict[str, Any]]:
-    with open(path, "r", encoding="utf-8-sig", errors="replace") as fh:  # sig: tolerate a BOM
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except (ValueError, RecursionError):
-                continue  # tolerate partial lines from a live session
-            if isinstance(obj, dict):
-                yield obj
 
 
 def _envelope(obj: Dict[str, Any]) -> Optional[Tuple[str, Dict[str, Any], Optional[str]]]:

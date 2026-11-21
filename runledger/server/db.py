@@ -55,6 +55,16 @@ BACKUP_SLEEP_S = 0.01
 PRIVATE_FILE_MODE = 0o600
 
 
+def _run_window(
+    team_id: int, since: str, until: Optional[str] = None, alias: str = ""
+) -> Tuple[str, Tuple[int, str, str]]:
+    end = until or datetime.now(timezone.utc).strftime(TIME_FORMAT)
+    return (
+        f"{alias}team_id = ? AND {alias}sort_at >= ? AND {alias}sort_at <= ?",
+        (team_id, since, end),
+    )
+
+
 def _restrict_file(path: str) -> None:
     """Make a database or backup file readable only by its owner where the OS has modes.
     On Windows, and on filesystems that refuse chmod, this does nothing."""
@@ -1766,9 +1776,10 @@ class Database:
     def stats(self, team_id: int, since_days: int = 30, now: Optional[datetime] = None) -> Dict[str, Any]:
         days = max(1, int(since_days))
         moment = now or datetime.now(timezone.utc)
-        since = (moment - timedelta(days=days)).strftime(TIME_FORMAT)
-        window = "team_id = ? AND sort_at >= ?"
-        args = (team_id, since)
+        since = (moment - timedelta(days=days)).astimezone(timezone.utc).strftime(TIME_FORMAT)
+        until = moment.astimezone(timezone.utc).strftime(TIME_FORMAT)
+        window, args = _run_window(team_id, since, until)
+        risk_window, _ = _run_window(team_id, since, until, alias="u.")
         with self._reading() as conn:
             totals = conn.execute(
                 "SELECT COUNT(*) AS runs, SUM(cost) AS cost_usd, "
@@ -1792,7 +1803,7 @@ class Database:
             top = conn.execute(
                 "SELECT r.code AS code, COUNT(*) AS occurrences, COUNT(DISTINCT r.run_id) AS runs "
                 "FROM risks r JOIN runs u ON u.team_id = r.team_id AND u.id = r.run_id "
-                "WHERE r.team_id = ? AND u.sort_at >= ? "
+                f"WHERE {risk_window} "
                 "GROUP BY r.code ORDER BY occurrences DESC, r.code LIMIT 10",
                 args,
             ).fetchall()
@@ -1856,27 +1867,27 @@ class Database:
 
     # Exports and the compliance report (read only)
 
-    def export_runs(self, team_id: int, since: str) -> List[Dict[str, Any]]:
-        """Every run that started (or was pushed) at or after `since`, oldest first, with its
-        models. Never the receipt JSON or the HTML."""
+    def export_runs(self, team_id: int, since: str, until: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Runs in [since, until], oldest first, with models, never receipt JSON or HTML.
+        An omitted upper bound uses the current UTC time."""
+        window, args = _run_window(team_id, since, until)
         with self._reading() as conn:
             rows = conn.execute(
                 "SELECT id, user, project, agent, models, started_at, created_at, steps, tokens, "
                 "files_changed, cost, cost_partial, risk_score, risk_level, title, quality_score, quality_grade, "
                 "ai_verdict, est_savings_usd FROM runs "
-                "WHERE team_id = ? AND sort_at >= ? "
+                f"WHERE {window} "
                 "ORDER BY sort_at, id",
-                (team_id, since),
+                args,
             ).fetchall()
         return [dict(r) for r in rows]
 
-    def insight_parts(self, team_id: int, since: str) -> Dict[str, Any]:
+    def insight_parts(self, team_id: int, since: str, until: Optional[str] = None) -> Dict[str, Any]:
         """The raw rows behind the Insights summary (see insights.compute), for runs that started
-        (or were pushed) at or after `since`. Aggregates are computed in SQL. The recommendations
+        (or were pushed) in [since, until or now]. Aggregates are computed in SQL. The recommendations
         and the AI assessments come from the copies the server extracted at push time; only the
         receipts stored before those columns existed are read back as JSON."""
-        window = "team_id = ? AND sort_at >= ?"
-        args = (team_id, since)
+        window, args = _run_window(team_id, since, until)
         with self._reading() as conn:
             quality = conn.execute(
                 f"SELECT COUNT(quality_score) AS scored, AVG(quality_score) AS avg FROM runs WHERE {window}",
@@ -1936,26 +1947,26 @@ class Database:
             "legacy_receipts": [r["receipt_json"] for r in legacy_receipts],
         }
 
-    def risk_level_counts(self, team_id: int, since: str) -> Dict[str, int]:
+    def risk_level_counts(self, team_id: int, since: str, until: Optional[str] = None) -> Dict[str, int]:
+        window, args = _run_window(team_id, since, until)
         with self._reading() as conn:
             rows = conn.execute(
-                "SELECT risk_level, COUNT(*) AS n FROM runs WHERE team_id = ? "
-                "AND sort_at >= ? GROUP BY risk_level",
-                (team_id, since),
+                f"SELECT risk_level, COUNT(*) AS n FROM runs WHERE {window} GROUP BY risk_level",
+                args,
             ).fetchall()
         counts = {"low": 0, "medium": 0, "high": 0}
         for r in rows:
             counts[r["risk_level"]] = counts.get(r["risk_level"], 0) + int(r["n"])
         return counts
 
-    def high_risk_runs(self, team_id: int, since: str, limit: int) -> List[Dict[str, Any]]:
-        """Up to `limit` high-risk runs since `since`, riskiest first."""
+    def high_risk_runs(self, team_id: int, since: str, limit: int, until: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Up to `limit` high-risk runs in [since, until or now], riskiest first."""
+        window, args = _run_window(team_id, since, until)
         with self._reading() as conn:
             rows = conn.execute(
-                f"SELECT {_SUMMARY_COLUMNS} FROM runs WHERE team_id = ? AND risk_level = 'high' "
-                "AND sort_at >= ? "
+                f"SELECT {_SUMMARY_COLUMNS} FROM runs WHERE {window} AND risk_level = 'high' "
                 "ORDER BY risk_score DESC, sort_at DESC, id LIMIT ?",
-                (team_id, since, int(limit)),
+                args + (int(limit),),
             ).fetchall()
         return [_summary(r) for r in rows]
 
