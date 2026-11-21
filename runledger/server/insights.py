@@ -416,10 +416,10 @@ def _ai_block(verdict_rows: Iterable[Dict[str, Any]], assessed: int, false_posit
     }
 
 
-def compute(db: Any, team_id: int, since: str, days: int) -> Dict[str, Any]:
-    """The Insights summary for one team, for runs that started (or were pushed) at or after `since`.
+def compute(db: Any, team_id: int, since: str, days: int, until: Optional[str] = None) -> Dict[str, Any]:
+    """The Insights summary for one team, for runs in [since, until or now].
     `db` is a runledger.server.db.Database; its insight_parts() supplies the raw rows."""
-    parts = db.insight_parts(team_id, since)
+    parts = db.insight_parts(team_id, since, until)
     recommendations, assessed, false_positive = _review_inputs(parts)
     return {
         "days": days,

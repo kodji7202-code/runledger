@@ -14,7 +14,7 @@ import re
 import sqlite3
 import threading
 from contextlib import closing, contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -23,6 +23,7 @@ import pytest
 from runledger import client
 from runledger.pricing import friendly_model
 from runledger.server import budgets, exports, insights
+from runledger.server import db as db_module
 from runledger.server.app import make_server, receipt_to_run
 from runledger.server.dashboard import DASHBOARD_HTML
 from runledger.server.db import SCHEMA, Database
@@ -155,6 +156,41 @@ def insights_of(base, key, query="?days=30"):
     status, _, raw = _http(base, "GET", "/api/insights" + query, headers=_auth(key))
     assert status == 200, raw
     return _json(raw)
+
+
+@pytest.mark.parametrize("path", ["stats", "insights", "csv"])
+@pytest.mark.parametrize("offsets", [[-7, 0, 1, -8], [1], []])
+def test_reporting_window_excludes_future(env, monkeypatch, path, offsets):
+    srv, base = env
+    _, key = srv.db.create_team("window")
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return FIXED_NOW
+
+    monkeypatch.setattr(db_module, "datetime", Clock)
+    for offset in offsets:
+        push(base, key, receipt(
+            str(offset), started=(FIXED_NOW + timedelta(days=offset)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            quality=quality(90), risk="high",
+        ))
+    expected = sum(-7 <= offset <= 0 for offset in offsets)
+    endpoint = {"stats": "/api/stats", "insights": "/api/insights", "csv": "/api/export/runs.csv"}[path]
+    status, _, raw = _http(base, "GET", endpoint + "?days=7", headers=_auth(key))
+    assert status == 200, raw
+    if path == "stats":
+        result = _json(raw)
+        assert result["totals"]["runs"] == expected
+        assert sum(row["runs"] for row in result["by_model"]) == expected
+    elif path == "insights":
+        result = _json(raw)
+        assert result["quality"]["scored_runs"] == expected
+        assert sum(row["runs"] for row in result["agents"]) == expected
+    else:
+        rows = list(csv.DictReader(io.StringIO(raw.decode("utf-8-sig"))))
+        assert {row["id"] for row in rows} == {
+            exports.safe_cell(str(offset)) for offset in offsets if -7 <= offset <= 0
+        }
 
 
 def stored(srv, team_id, run_id):
