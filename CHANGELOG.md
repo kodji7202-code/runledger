@@ -73,6 +73,9 @@ change behavior, so read the entry before you upgrade.
 
 ### Changed
 
+- `runledger doctor` wraps human-readable output to the terminal width with hanging
+  indents, keeping URLs, paths and command tokens intact.
+
 - **A warm `runledger stats` prices each model bucket once (`runledger.stats`):** the totals, the
   groups, the partial-cost notes and the top-models line share one per-request priced cost per
   session model instead of repricing it up to nine times, so a warm report over 500 sessions
