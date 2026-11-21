@@ -23,7 +23,7 @@ import json
 import math
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from ..pricing import friendly_model
+from .model_rollup import receipt_models
 
 # Quality never produces an E (the cutoffs are 85, 70, 55 and 40), so the distribution has
 # five buckets. A receipt from another tool may still carry one: GRADE_LETTERS accepts it and
@@ -273,12 +273,11 @@ def _models_block(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
             continue
         quality = row["quality_score"]
         partial = bool(row.get("cost_partial"))
-        for name, info in names.items():
-            label = friendly_model(str(name))
+        for label, info in receipt_models(names, partial).items():
             slot = slots.setdefault(label, {"runs": 0, "priced": 0, "partial": 0, "cost": 0.0,
                                              "q_sum": 0.0, "q_n": 0})
             slot["runs"] += 1
-            slot["partial"] += int(partial)
+            slot["partial"] += int(info["partial"])
             cost = _usd(info.get("cost_usd")) if isinstance(info, dict) else None
             if cost is not None:
                 slot["priced"] += 1

@@ -7,21 +7,6 @@ change behavior, so read the entry before you upgrade.
 
 ## [Unreleased]
 
-### Fixed
-
-- Team statistics, Insights, and receipt exports exclude future-dated runs from their reporting windows.
-- `list --limit` counts displayed sessions, so invalid, unreadable, or vanished sessions
-  no longer consume limit slots.
-- The HTML receipt fits phone screens (375px and up) instead of scrolling sideways and hiding the
-  Tokens and Cost columns: on screens up to 600px wide, step rows put the model, tokens and cost on
-  a line under the step, and the quality score and AI review tables move their notes under each row.
-- `runledger stats --until YYYY-MM-DD` includes sessions and guard events in the final
-  fractional second of the day, while still excluding the next day's midnight.
-- Team server request logging handles oversized URLs rejected before parsing, returning HTTP 414
-  instead of dropping the connection with an internal error.
-- Team receipt ingest rejects numbers outside the finite float range and JSON strings with
-  lone Unicode surrogates with HTTP 400 instead of an internal server error.
-
 ### Added
 
 - Dashboard OIDC sign-in for Okta, Entra ID and Google Workspace using standard-library
@@ -66,6 +51,21 @@ change behavior, so read the entry before you upgrade.
   publishing. PyPI publishing in `release.yml` is unchanged.
 
 ### Fixed
+
+- Team statistics, Insights, and receipt exports exclude future-dated runs from their reporting windows.
+- `list --limit` counts displayed sessions, so invalid, unreadable, or vanished sessions
+  no longer consume limit slots.
+- The HTML receipt fits phone screens (375px and up) instead of scrolling sideways and hiding the
+  Tokens and Cost columns: on screens up to 600px wide, step rows put the model, tokens and cost on
+  a line under the step, and the quality score and AI review tables move their notes under each row.
+- `runledger stats --until YYYY-MM-DD` includes sessions and guard events in the final
+  fractional second of the day, while still excluding the next day's midnight.
+- Team stats and Insights count model aliases sharing a friendly label once per receipt,
+  keeping additive tokens and costs and preserving partly priced lower bounds.
+- Team server request logging handles oversized URLs rejected before parsing, returning HTTP 414
+  instead of dropping the connection with an internal error.
+- Team receipt ingest rejects numbers outside the finite float range and JSON strings with
+  lone Unicode surrogates with HTTP 400 instead of an internal server error.
 
 - **An out-of-range `runledger stats --since` is a usage error (`runledger.stats`):** a relative
   window too large for the calendar (`--since 99999999999d`) made `parse_since()` raise
