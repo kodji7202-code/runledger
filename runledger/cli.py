@@ -56,7 +56,7 @@ from . import adapters
 from . import hook_targets
 from ._text import wrap_text
 from .ai_defaults import DEFAULT_AI_MODEL, DEFAULT_REVIEW_MODEL
-from .gitinfo import current_branch, file_diffs, repo_context, session_base, toplevel, working_changes
+from .gitinfo import current_branch, file_diffs, local_filter_configured, repo_context, session_base, toplevel, working_changes
 from .guard import load_user_config, redact
 from .parser import _ts
 from .paths import inside_git_tree, is_abs, normalized_git_path
@@ -126,7 +126,7 @@ def reconcile_git(run) -> None:
                             if not is_abs(p) and inside_git_tree(p)})
         if git_paths:
             run.git_changes = working_changes(run.cwd, git_paths, run.git_base)
-            if toplevel(run.cwd):
+            if toplevel(run.cwd) and not local_filter_configured(run.cwd):
                 for path in git_paths:
                     if "\0" in path or "\n" in path:
                         continue  # working_changes cannot pass these as Git pathspecs
