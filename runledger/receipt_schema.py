@@ -7,6 +7,7 @@ not a general-purpose JSON Schema validator.
 from __future__ import annotations
 
 import json
+import math
 from importlib import resources
 from typing import Any, Dict, List
 
@@ -18,8 +19,9 @@ _TYPES = {
     "object": lambda v: isinstance(v, dict),
     "array": lambda v: isinstance(v, list),
     "string": lambda v: isinstance(v, str),
-    "integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
-    "number": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
+    "integer": lambda v: (isinstance(v, int) or isinstance(v, float) and math.isfinite(v) and v.is_integer())
+                         and not isinstance(v, bool),
+    "number": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v),
     "boolean": lambda v: isinstance(v, bool),
     "null": lambda v: v is None,
 }

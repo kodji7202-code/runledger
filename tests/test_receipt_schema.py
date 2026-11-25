@@ -105,11 +105,21 @@ def test_validate_command_reports_contract_breaks_and_bad_json(tmp_path, capsys)
     broken.write_text(json.dumps(data), encoding="utf-8")
     malformed = tmp_path / "malformed.json"
     malformed.write_text("{", encoding="utf-8")
+    nonfinite = tmp_path / "nan.json"
+    nonfinite.write_text('{"schema_version": NaN}', encoding="utf-8")
 
-    assert main(["validate", str(broken), str(malformed)]) == 1
+    assert main(["validate", str(broken), str(malformed), str(nonfinite)]) == 1
     err = capsys.readouterr().err
     assert "risk.score" in err
-    assert "invalid JSON" in err
+    assert err.count("invalid JSON") == 2
+
+
+def test_whole_valued_decimals_are_json_schema_integers(capsys):
+    data = _receipt(capsys, SESSIONS["claude"](None))
+    data["schema_version"] = 1.0
+    assert validate(data, SCHEMA) == []
+    data["schema_version"] = 1.5
+    assert any("schema_version" in error for error in validate(data, SCHEMA))
 
 
 def test_markdown_on_stdout_ends_with_the_mode_comment(capsys):

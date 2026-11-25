@@ -459,14 +459,18 @@ def _default_receipt_path(stem: str, ext: str) -> Path:
         n += 1
 
 
+def _reject_json_constant(constant: str):
+    raise ValueError(f"non-JSON number {constant}")
+
+
 def cmd_validate(args) -> int:
     from .receipt_schema import validate_receipt
 
     valid = True
     for name in args.receipts:
         try:
-            data = json.loads(Path(name).read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            data = json.loads(Path(name).read_text(encoding="utf-8"), parse_constant=_reject_json_constant)
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
             print(f"{name}: invalid JSON ({exc})", file=sys.stderr)
             valid = False
             continue
