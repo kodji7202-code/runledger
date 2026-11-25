@@ -454,17 +454,17 @@ class Repository:
         for role in ("AUTHOR", "COMMITTER"):
             if self._git("var", f"GIT_{role}_IDENT", check=False).returncode == 0:
                 continue
-            for field, fallback in (("NAME", "RunLedger"), ("EMAIL", "runledger@localhost")):
-                key = f"GIT_{role}_{field}"
+            for part, fallback in (("NAME", "RunLedger"), ("EMAIL", "runledger@localhost")):
+                key = f"GIT_{role}_{part}"
                 value = self.env.get(key)
                 if value is None:
                     for section in (role.lower(), "user"):
-                        result = self._git("config", "--get", f"{section}.{field.lower()}",
+                        result = self._git("config", "--get", f"{section}.{part.lower()}",
                                            check=False)
                         if result.returncode == 0:
                             value = os.fsdecode(result.stdout).strip()
                             break
-                if value is None and field == "EMAIL":
+                if value is None and part == "EMAIL":
                     value = self.env.get("EMAIL")
                 env[key] = value or fallback
         return env

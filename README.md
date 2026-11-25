@@ -225,8 +225,11 @@ your Anthropic API key and may incur charges from Anthropic.
 ## Development
 
 ```bash
-python -m pip install -e . pytest
+python -m pip install -e '.[dev]'
 python -m pytest -q
+python -m ruff check runledger tests
+python -m mypy runledger/paths.py runledger/_text.py runledger/jsonl.py runledger/ai_defaults.py runledger/userconfig.py
+python -m coverage run -m pytest -q && python -m coverage report
 ```
 
 ## License and security
