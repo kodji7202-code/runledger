@@ -15,7 +15,6 @@ import socket
 import threading
 from typing import Any, Dict, List, Optional, Tuple
 
-import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import Response
 from uvicorn import Config, Server
@@ -215,7 +214,8 @@ class UvicornServer:
         self.socket.listen(100)
         self.server_address = self.socket.getsockname()
         values: Dict[str, Any] = {"log_level": "error", "access_log": False, "http": "h11",
-                                  "proxy_headers": False, "h11_max_incomplete_event_size": 131072}
+                                  "proxy_headers": False, "h11_max_incomplete_event_size": 131072,
+                                  "headers": [("server", "RunLedger")]}
         values.update(config_values or {})
         config = Config(app, **values)
         if tls_context is not None:
