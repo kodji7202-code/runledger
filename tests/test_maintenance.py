@@ -293,6 +293,7 @@ def test_backup_verify_checks_the_copy_without_migrating_it(tmp_path, capsys):
     assert main(["backup", "--db", str(db_path), "--dir", str(folder), "--verify"]) == 0
     out = capsys.readouterr().out
     assert "integrity verified" in out
+    assert list(folder.glob("*.tmp*")) == []
     copy = next(folder.glob("runledger-*.db"))
     with closing(sqlite3.connect(str(copy))) as conn:
         assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
@@ -345,7 +346,7 @@ def test_a_failed_backup_verification_removes_the_copy_and_reservation(tmp_path,
     assert "verification failed: simulated corruption" in capsys.readouterr().err
     assert list(folder.glob("runledger-*.db")) == []
     assert list(folder.glob("*.lock")) == []
-    assert list(folder.glob("*.tmp")) == []
+    assert list(folder.glob("*.tmp*")) == []
 
 
 def test_unverified_backup_cannot_make_retention_delete_the_last_valid_copy(tmp_path, monkeypatch, capsys):
@@ -373,7 +374,7 @@ def test_unverified_backup_cannot_make_retention_delete_the_last_valid_copy(tmp_
     assert "verification failed" in capsys.readouterr().err
     assert older.is_file()
     assert [path.name for path in folder.glob("runledger-*.db")] == [older.name]
-    assert list(folder.glob("*.tmp")) == []
+    assert list(folder.glob("*.tmp*")) == []
 
 
 def test_backup_same_second_no_collision(tmp_path, capsys):
