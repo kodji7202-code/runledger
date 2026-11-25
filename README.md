@@ -218,6 +218,7 @@ your Anthropic API key and may incur charges from Anthropic.
 - [Analysis](docs/analysis.md): the quality score, cost tips and the AI risk review
 - [Enterprise guide](docs/enterprise.md): roles, API keys, audit, budgets, exports, HTTPS
 - [HTTP API](docs/api.md): every endpoint, with examples and error codes
+- [Release checklist](docs/release.md): versioning, RC validation and the clean-install gate
 - [Self-hosting](docs/self-hosting.md): Docker Compose, bare metal, backups, upgrades
 - [GitHub pull requests](docs/github.md): the action and the comment format
 - [Contributing](CONTRIBUTING.md)
