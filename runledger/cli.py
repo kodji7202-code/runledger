@@ -774,6 +774,10 @@ def cmd_backup(args) -> int:
     if not Path(args.db).is_file():
         print(f"error: no database at {args.db}", file=sys.stderr)
         return 1
+    source_problem = backup_integrity_error(args.db)
+    if source_problem is not None:
+        print(f"error: {args.db} is not a usable RunLedger database: {source_problem}", file=sys.stderr)
+        return 1
     stem = _backup_stem(args.db)
     reservation: Optional[Path] = None
     target: Optional[Path] = None
@@ -784,7 +788,10 @@ def cmd_backup(args) -> int:
         target, reservation = _reserve_backup_target(folder, stem, stamp)
         db = Database(args.db)
         try:
-            db.backup_to(str(target), verify=backup_integrity_error if args.verify else None)
+            if args.verify:
+                db.backup_to(str(target), verify=backup_integrity_error)
+            else:
+                db.backup_to(str(target))
         finally:
             db.close()
         _restrict_file(str(target))

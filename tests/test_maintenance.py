@@ -318,13 +318,28 @@ def test_backup_integrity_error_names_empty_foreign_and_non_database_files(tmp_p
     assert "not a RunLedger database" in backup_integrity_error(str(foreign))
 
 
+def test_backup_rejects_an_unrelated_sqlite_database_without_mutating_it(tmp_path, capsys):
+    db_path = tmp_path / "foreign.db"
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        conn.execute("CREATE TABLE unrelated (id INTEGER)")
+        conn.commit()
+    before = db_path.read_bytes()
+
+    assert main(["backup", "--db", str(db_path), "--dir", str(tmp_path / "backups"), "--verify"]) == 1
+    err = capsys.readouterr().err
+    assert "not a usable RunLedger database" in err
+    assert "not a RunLedger database" in err
+    assert db_path.read_bytes() == before
+
+
 def test_a_failed_backup_verification_removes_the_copy_and_reservation(tmp_path, monkeypatch, capsys):
     import runledger.server.db as server_db
 
     db_path = tmp_path / "live.db"
     Database(str(db_path)).close()
     folder = tmp_path / "backups"
-    monkeypatch.setattr(server_db, "backup_integrity_error", lambda _path: "simulated corruption")
+    results = iter((None, "simulated corruption"))
+    monkeypatch.setattr(server_db, "backup_integrity_error", lambda _path: next(results))
 
     assert main(["backup", "--db", str(db_path), "--dir", str(folder), "--verify"]) == 1
     assert "verification failed: simulated corruption" in capsys.readouterr().err
@@ -348,7 +363,8 @@ def test_unverified_backup_cannot_make_retention_delete_the_last_valid_copy(tmp_
     db.close()
 
     def corrupt_after_competing_retention(path):
-        assert path.endswith(".tmp")
+        if not path.endswith(".tmp"):
+            return None  # the source check opens the live database read-only
         _prune_backups(folder, "live", 1)
         return "simulated corruption"
 
@@ -438,6 +454,7 @@ def test_failed_backup_leaves_no_partial_file(tmp_path, monkeypatch, capsys):
     assert list(folder.glob("runledger-*.db")) == []
     assert list(folder.glob("*.tmp")) == []
     assert list(folder.glob("*.lock")) == []
+    folder.mkdir(exist_ok=True)
 
     good_db = tmp_path / "good.db"
     db = Database(str(good_db))
