@@ -19,7 +19,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 from urllib.parse import quote
 from uuid import uuid4
 
@@ -673,10 +673,11 @@ class Database:
             return self._conn
         return sqlite3.connect(self.path, check_same_thread=False, timeout=10)
 
-    def backup_to(self, path: str) -> None:
+    def backup_to(self, path: str, verify: Optional[Callable[[str], Optional[str]]] = None) -> None:
         """A consistent copy of the database at `path`, taken while the server keeps running.
         The copy reads through its own connection in small steps, so pushes and reports go
-        through while it runs."""
+        through while it runs. `verify` checks the closed temporary copy before it becomes
+        visible at `path`; returning text aborts publication with that text in the error."""
         dest = Path(path)
         tmp = dest.with_name(f"{dest.name}.tmp")
         if tmp.exists():
@@ -690,6 +691,11 @@ class Database:
         try:
             source = self._backup_source()
             source.backup(target, pages=BACKUP_PAGES, sleep=BACKUP_SLEEP_S)
+            target.close()
+            if verify is not None:
+                problem = verify(str(tmp))
+                if problem is not None:
+                    raise sqlite3.Error(f"verification failed: {problem}")
             ok = True
         finally:
             target.close()
