@@ -122,6 +122,8 @@ SESSION_IDLE_TIMEOUT_ENV = "RUNLEDGER_SESSION_IDLE_TIMEOUT"
 HSTS_VALUE = "max-age=31536000"
 MAINTENANCE_INTERVAL_S = 3600
 KEY_EXPIRES_HEADER = "X-RunLedger-Key-Expires"
+API_VERSION = 1
+API_VERSION_HEADER = "X-RunLedger-API"
 EXPORT_ROUTES = {
     "/api/export/runs.csv": "runs",
     "/api/export/audit.csv": "audit",
@@ -694,6 +696,7 @@ class _Handler(BaseHTTPRequestHandler):
         if length is not None:
             self.send_header("Content-Length", str(length))
         self.send_header("Cache-Control", "no-store")
+        self.send_header(API_VERSION_HEADER, str(API_VERSION))
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("X-Frame-Options", "DENY")
