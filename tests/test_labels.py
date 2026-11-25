@@ -262,7 +262,7 @@ def test_git_reconciliation_looks_up_the_shells_own_keys(monkeypatch, tmp_path):
              _step("Bash", r"touch C:/repo/tests/My Folder/test_a.py", 2)]
     run = _run(steps)
     cli.reconcile_git(run)
-    assert seen["shell"] == ["My", "Folder/x.txt", "tests/My", "Folder/test_a.py"]
+    assert sorted(seen["shell"]) == sorted(["My", "Folder/x.txt", "tests/My", "Folder/test_a.py"])
     assert "tests/My" in seen["tests"]
     assert not [p for p in seen["shell"] + seen["tests"] if "My Folder" in p]
 

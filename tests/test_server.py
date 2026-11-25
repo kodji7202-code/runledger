@@ -265,6 +265,29 @@ def test_push_then_list_get_and_stats(env):
     assert "default-src 'none'" in headers["content-security-policy"]
 
 
+def test_admin_can_delete_one_run_and_revisions_are_erased(env, tmp_path):
+    srv, base = env
+    team_id, key = srv.db.create_team("alpha")
+    member = srv.db.create_key(team_id, "member", "member", "test")["key"]
+    client.push(base, key, FIX, user="dev@example.com")
+
+    assert _http(base, "DELETE", f"/api/runs/{SESSION_ID}", headers=_auth(member))[0] == 403
+    status, _, raw = _http(base, "DELETE", f"/api/runs/{SESSION_ID}", headers=_auth(key))
+    assert status == 200
+    assert _json(raw) == {"ok": True}
+    assert _http(base, "GET", f"/api/runs/{SESSION_ID}", headers=_auth(key))[0] == 404
+    assert _http(base, "GET", f"/runs/{SESSION_ID}", headers=_auth(key))[0] == 404
+    assert srv.db.list_runs(team_id) == []
+    with closing(sqlite3.connect(str(tmp_path / "rl.db"))) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM risks WHERE run_id = ?", (SESSION_ID,)).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM run_revisions WHERE run_id = ?", (SESSION_ID,)).fetchone()[0] == 0
+    events = srv.db.list_audit(team_id, action="run.")
+    deletion = next(event for event in events if event["action"] == "run.delete")
+    assert deletion["target"] == SESSION_ID
+    assert deletion["details"] == {"revisions_removed": 0}
+    assert _http(base, "DELETE", f"/api/runs/{SESSION_ID}", headers=_auth(key))[0] == 404
+
+
 def test_api_requires_a_valid_key_and_stores_nothing_without_one(env):
     srv, base = env
     team_id, _ = srv.db.create_team("alpha")

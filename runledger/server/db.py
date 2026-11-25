@@ -1771,6 +1771,28 @@ class Database:
             ).fetchone()
         return row["receipt_html"] if row else None
 
+    def delete_run(self, team_id: int, run_id: str, actor: Identity) -> bool:
+        """Delete one run, its risk rows and replaced versions. The audit event is kept.
+
+        Returns False when the team has no run with that id. This is deliberately explicit:
+        retention uses purge_before, while this method is the privacy erase operation for one
+        receipt chosen by an administrator.
+        """
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT 1 FROM runs WHERE team_id = ? AND id = ?",
+                (team_id, run_id),
+            ).fetchone()
+            if row is None:
+                return False
+            self._conn.execute("DELETE FROM risks WHERE team_id = ? AND run_id = ?", (team_id, run_id))
+            revisions = self._conn.execute(
+                "DELETE FROM run_revisions WHERE team_id = ? AND run_id = ?", (team_id, run_id)
+            ).rowcount
+            self._conn.execute("DELETE FROM runs WHERE team_id = ? AND id = ?", (team_id, run_id))
+            self._audit(team_id, actor, "run.delete", run_id, {"revisions_removed": revisions})
+        return True
+
     # Statistics
 
     def stats(self, team_id: int, since_days: int = 30, now: Optional[datetime] = None) -> Dict[str, Any]:

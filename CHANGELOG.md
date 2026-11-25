@@ -30,6 +30,8 @@ change behavior, so read the entry before you upgrade.
 
 - Development quality gates: a `dev` extra, Ruff Pyflakes lint, strict mypy on fully typed leaf
   modules, and coverage measurement with a 70% floor in CI.
+- `DELETE /api/runs/{id}` lets a team administrator erase one stored run and its revisions;
+  the erase operation remains visible as a `run.delete` audit event.
 - `runledger validate` checks JSON receipts against the packaged schema without extra dependencies.
 
 - Dashboard OIDC sign-in for Okta, Entra ID and Google Workspace using standard-library
