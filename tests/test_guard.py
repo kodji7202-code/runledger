@@ -980,6 +980,54 @@ def _decide_with_project(cwd, command="rm -rf /", tool_input=None):
     return guard.decide(event, guard.read_policy(str(cwd)))
 
 
+def unknown_tool_event(cwd, tool="FutureTool"):
+    return {"session_id": "sess-1", "transcript_path": "t.jsonl", "cwd": str(cwd),
+            "hook_event_name": "PreToolUse", "tool_name": tool, "tool_input": {}}
+
+
+def test_unknown_claude_tool_is_allowed_by_default_but_not_canonical(tmp_path):
+    d = guard.decide(unknown_tool_event(tmp_path), {})
+    assert d["decision"] == "allow"
+    assert d["canonical_tool"] is None
+    assert "unknown_tool" not in d["codes"]
+
+
+def test_project_can_ask_for_unknown_tools(tmp_path):
+    write_project(tmp_path, {"guard": {"unknown_tool": "ask"}})
+    d = _decide_with_project(tmp_path, tool_input=unknown_tool_event(tmp_path))
+    assert d["decision"] == "ask"
+    assert d["canonical_tool"] is None
+    assert "unknown_tool" in d["codes"]
+
+
+def test_project_can_deny_unknown_tools(tmp_path):
+    write_project(tmp_path, {"guard": {"unknown_tool": "deny"}})
+    d = _decide_with_project(tmp_path, tool_input=unknown_tool_event(tmp_path))
+    assert d["decision"] == "deny"
+    assert "unknown_tool" in d["codes"]
+
+
+def test_project_cannot_loosen_the_user_unknown_tool_policy(tmp_path, isolated_settings):
+    write_user_config(isolated_settings, {"guard": {"unknown_tool": "deny"}})
+    write_project(tmp_path, {"guard": {"unknown_tool": "allow"}})
+    d = _decide_with_project(tmp_path, tool_input=unknown_tool_event(tmp_path))
+    assert d["decision"] == "deny"
+    assert any("unknown_tool" in w and "tighten" in w for w in d["warnings"])
+
+
+def test_malformed_unknown_tool_policy_cannot_disable_the_guard(tmp_path):
+    write_project(tmp_path, {"guard": {"unknown_tool": []}})
+    d = _decide_with_project(tmp_path)
+    assert d["decision"] == "deny"
+    assert "command" in d["codes"]
+
+
+def test_current_claude_builtin_names_stay_canonical(tmp_path):
+    for tool in ("Write", "AskUserQuestion", "EnterWorktree", "ToolSearch", "Workflow"):
+        d = guard.decide(unknown_tool_event(tmp_path, tool), {})
+        assert d["canonical_tool"] == tool
+
+
 def test_malicious_repo_cannot_switch_enforcement_off(tmp_path):
     write_project(tmp_path, {"guard": {"mode": "monitor"}})
     d = _decide_with_project(tmp_path)
