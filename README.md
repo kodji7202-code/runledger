@@ -211,6 +211,7 @@ your Anthropic API key and may incur charges from Anthropic.
 - [Supported agents](docs/agents.md): where each agent's sessions are, and `--agent`
 - [Session format](docs/format.md): the open format for any agent
 - [JSON receipt](docs/receipt-json.md): the versioned receipt contract and its JSON Schema
+- [Receipt conformance](docs/conformance.md): the fixture matrix and external corpus release gate
 - [Real-time guard](docs/guard.md): policy files, approvals, fail-open and fail-closed, the log
 - [Doctor](docs/doctor.md): the nine setup checks, `--json`, exit codes and `guard status`
 - [Stats](docs/stats.md): sessions, tokens, cost, risk and guard decisions over a window
