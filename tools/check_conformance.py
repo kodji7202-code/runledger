@@ -134,6 +134,8 @@ def _check_case(fixtures: Path, folder: Path, case: dict):
         full = json.loads(raw_full)
     except ValueError as exc:
         return {"name": case["name"], "ok": False, "problems": [f"full receipt is not JSON: {exc}"]}
+    if not isinstance(full, dict):
+        return {"name": case["name"], "ok": False, "problems": ["full receipt is not a JSON object"]}
 
     rc, raw_safe, err = _receipt(path, "json")
     if rc != 0 or "Traceback" in err:
@@ -145,25 +147,32 @@ def _check_case(fixtures: Path, folder: Path, case: dict):
         except ValueError as exc:
             safe = None
             problems.append(f"safe receipt is not JSON: {exc}")
+        if not isinstance(safe, dict):
+            problems.append("safe receipt is not a JSON object")
+            safe = None
 
     rc, markdown, err = _receipt(path, "md")
     if rc != 0 or "Traceback" in err:
         problems.append(f"markdown receipt failed: {err.strip()}")
         markdown = ""
+    if not markdown.strip():
+        problems.append("markdown receipt is empty")
     html_path = folder / "receipt.html"
     rc, err = _html_receipt(path, html_path)
     if rc != 0 or "Traceback" in err:
         problems.append(f"html receipt failed: {err.strip()}")
         html = ""
     else:
-        html = html_path.read_text(encoding="utf-8")
+        html = html_path.read_text(encoding="utf-8") if html_path.is_file() else ""
+    if not html.strip():
+        problems.append("html receipt is empty")
 
     for label, data in (("full", full), ("safe", safe)):
-        if data is None:
+        if not isinstance(data, dict):
             continue
         for error in validate(data, SCHEMA)[:10]:
             problems.append(f"{label} schema: {error}")
-    if safe is not None:
+    if isinstance(safe, dict):
         if not safe.get("safe") or full.get("safe"):
             problems.append("safe mode flags are wrong")
         if safe["totals"]["files_changed"] != len(safe["files"]):
