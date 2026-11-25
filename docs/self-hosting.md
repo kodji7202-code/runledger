@@ -332,11 +332,17 @@ names before another run finished checks the final name again while it holds its
 completed copy is never overwritten by a delayed run:
 
 ```bash
-runledger backup --db /var/lib/runledger/runledger.db --dir /var/backups/runledger --keep 14
+runledger backup --db /var/lib/runledger/runledger.db --dir /var/backups/runledger --keep 14 --verify
 ```
 
-**Docker.** `deploy/backup.sh` runs the same command in the container, keeps 14 copies in the data
-volume, and copies the newest to `deploy/backups/` on the host. Run it from cron:
+`--verify` reopens the finished copy read-only, runs SQLite `PRAGMA integrity_check`, and checks
+that it has the core RunLedger tables before the copy enters retention. Verification never opens
+the copy through the migration path, so a failed check cannot accidentally upgrade or rewrite it.
+It adds one read pass over the database; omit it only when that I/O matters more than knowing the
+copy is structurally usable.
+
+**Docker.** `deploy/backup.sh` runs the same command in the container with verification, keeps
+14 copies in the data volume, and copies the newest to `deploy/backups/` on the host. Run it from cron:
 
 ```bash
 chmod +x deploy/backup.sh

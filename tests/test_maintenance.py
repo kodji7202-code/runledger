@@ -1,6 +1,7 @@
 """Retention and online backups remain independent features of the team server."""
 import sqlite3
 import threading
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -280,6 +281,56 @@ def test_backup_copies_the_database_and_keeps_the_newest(tmp_path, capsys):
 def test_backup_needs_an_existing_database(tmp_path, capsys):
     assert main(["backup", "--db", str(tmp_path / "missing.db"), "--dir", str(tmp_path / "b")]) == 1
     assert "no database" in capsys.readouterr().err
+
+
+def test_backup_verify_checks_the_copy_without_migrating_it(tmp_path, capsys):
+    db_path = tmp_path / "verified.db"
+    db = Database(str(db_path))
+    db.create_team("verified")
+    db.close()
+    folder = tmp_path / "backups"
+
+    assert main(["backup", "--db", str(db_path), "--dir", str(folder), "--verify"]) == 0
+    out = capsys.readouterr().out
+    assert "integrity verified" in out
+    copy = next(folder.glob("runledger-*.db"))
+    with closing(sqlite3.connect(str(copy))) as conn:
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM teams").fetchone()[0] == 1
+
+
+def test_backup_integrity_error_names_empty_foreign_and_non_database_files(tmp_path):
+    from runledger.server.db import backup_integrity_error
+
+    empty = tmp_path / "empty.db"
+    empty.write_bytes(b"")
+    assert backup_integrity_error(str(empty)) == "backup is empty"
+
+    garbage = tmp_path / "garbage.db"
+    garbage.write_bytes(b"not sqlite" * 100)
+    assert backup_integrity_error(str(garbage)) is not None
+
+    foreign = tmp_path / "foreign.db"
+    with closing(sqlite3.connect(str(foreign))) as conn:
+        conn.execute("CREATE TABLE unrelated (id INTEGER)")
+        conn.commit()
+    assert "not a RunLedger database" in backup_integrity_error(str(foreign))
+
+
+def test_a_failed_backup_verification_removes_the_copy_and_reservation(tmp_path, monkeypatch, capsys):
+    import runledger.server.db as server_db
+
+    db_path = tmp_path / "live.db"
+    Database(str(db_path)).close()
+    folder = tmp_path / "backups"
+    monkeypatch.setattr(server_db, "backup_integrity_error", lambda _path: "simulated corruption")
+
+    assert main(["backup", "--db", str(db_path), "--dir", str(folder), "--verify"]) == 1
+    assert "verification failed: simulated corruption" in capsys.readouterr().err
+    assert list(folder.glob("runledger-*.db")) == []
+    assert list(folder.glob("*.lock")) == []
+    assert list(folder.glob("*.tmp")) == []
 
 
 def test_backup_same_second_no_collision(tmp_path, capsys):
