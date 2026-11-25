@@ -5,7 +5,6 @@ import os
 import stat
 import subprocess
 import sys
-import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -2017,7 +2016,6 @@ def test_path_case_sensitive_volume_never_selects_a_differently_cased_file(scope
     _write(repo.root, "readme.md", "modified\n")
     if _volume_folds_case(repo.root):
         pytest.skip("needs a case-sensitive filesystem")
-    refs = git(repo.root, "for-each-ref", rollback.PREFIX)
     assert main(["rollback", checkpoint.id, "--cwd", str(repo.root), "--path", "README.md",
                  "--yes"]) == 1
     err = capsys.readouterr().err

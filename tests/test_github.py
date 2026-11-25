@@ -12,7 +12,7 @@ import pytest
 
 from runledger.cli import build
 from runledger.github import (GITHUB_COMMENT_LIMIT, MARKER, MAX_COMMENT_CHARS, GitHubClient,
-                              GitHubError, Scored, _code, _next_link, _text, build_parser, main,
+                              GitHubError, Scored, _code, _next_link, _text, main,
                               render_comment)
 
 FIX = Path(__file__).parent / "fixtures" / "sample_session.jsonl"

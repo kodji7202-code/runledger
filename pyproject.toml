@@ -32,6 +32,13 @@ dependencies = []
 
 [project.optional-dependencies]
 saml = ["python3-saml>=1.16,<2"]
+dev = [
+    "pytest>=8,<9",
+    "coverage>=7.6,<8",
+    "ruff>=0.8,<1",
+    # 1.18 dropped support for checking python_version=3.9, which remains a supported runtime.
+    "mypy>=1.8,<1.18",
+]
 
 [project.urls]
 Homepage = "https://runledger.site"
@@ -48,3 +55,31 @@ include = ["runledger*"]
 
 [tool.setuptools.package-data]
 runledger = ["prices.json", "receipt.schema.json"]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["F"]
+
+[tool.ruff.lint.per-file-ignores]
+# The shared pytest fixture is imported intentionally, then requested again by name in tests.
+"tests/test_key_expiry.py" = ["F811"]
+
+[tool.mypy]
+python_version = "3.9"
+strict = true
+warn_unused_ignores = true
+
+[tool.coverage.run]
+source = ["runledger"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 70
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+]
