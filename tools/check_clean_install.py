@@ -114,7 +114,8 @@ server = make_server(str(db), host="127.0.0.1", port=0)
 thread = threading.Thread(target=server.serve_forever, daemon=True)
 thread.start()
 try:
-    with urllib.request.urlopen(
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(
         f"http://127.0.0.1:{server.server_address[1]}/health", timeout=10
     ) as response:
         body = json.loads(response.read().decode("utf-8"))
