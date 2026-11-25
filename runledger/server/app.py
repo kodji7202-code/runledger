@@ -3,6 +3,7 @@
   POST /api/runs                              push a receipt -> 201 (admin, member)
   GET  /api/runs[?user&project&agent&min_risk&min_quality&max_quality&ai_verdict&limit&after]  list runs (any role)
   GET  /api/runs/<id>                         one run with its receipt JSON and risk reasons
+  DELETE /api/runs/<id>                       erase one run and its stored revisions (admin)
   GET  /api/stats[?days=30]                   team totals; cost by developer, model, project, agent
   GET  /api/insights[?days=30]                quality, cost by model and agent, recommendations, AI review (any role)
   GET  /runs/<id>                             the stored receipt HTML
@@ -615,8 +616,11 @@ class _Handler(BaseHTTPRequestHandler):
             self._only(method, ("GET",))
             self._insights(query)
         elif path.startswith("/api/runs/"):
-            self._only(method, ("GET",))
-            self._get_run(path[len("/api/runs/"):])
+            self._only(method, ("GET", "DELETE"))
+            if method == "DELETE":
+                self._delete_run(path[len("/api/runs/"):])
+            else:
+                self._get_run(path[len("/api/runs/"):])
         elif path.startswith("/runs/"):
             self._only(method, ("GET",))
             self._receipt(path[len("/runs/"):])
@@ -1138,6 +1142,12 @@ class _Handler(BaseHTTPRequestHandler):
         if run is None:
             raise _not_found()
         self._send_json(200, {"run": run})
+
+    def _delete_run(self, raw_id: str) -> None:
+        ident = self._authed("admin", "delete runs", write=True)
+        if not self.server.db.delete_run(ident.team_id, _run_id(raw_id), ident):
+            raise _not_found()
+        self._send_json(200, {"ok": True})
 
     def _receipt(self, raw_id: str) -> None:
         ident = self._identify()

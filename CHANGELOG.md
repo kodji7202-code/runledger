@@ -24,6 +24,9 @@ change behavior, so read the entry before you upgrade.
 
 ### Added
 
+- `DELETE /api/runs/{id}` lets a team administrator erase one stored run and its revisions;
+  the erase operation remains visible as a `run.delete` audit event.
+
 - Dashboard OIDC sign-in for Okta, Entra ID and Google Workspace using standard-library
   Authorization Code + PKCE and RS256 verification. Person-bound, keyless sessions use live
   membership roles; optional SSO-only dashboard login leaves API keys working.
