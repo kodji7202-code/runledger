@@ -455,6 +455,17 @@ def test_cost_cells_render_unknown_cost_as_not_available_and_partial_as_a_lower_
     assert "var hint = unpricedHint(t);" in js
 
 
+def test_budget_input_matches_the_zero_accepting_api_contract():
+    js = _script(DASHBOARD_HTML)
+    assert "n < 0 || n > MAX_BUDGET_USD" in js
+    assert "n <= 0 || n > MAX_BUDGET_USD" not in js
+    assert 'must be from 0 to " + MAX_BUDGET_USD + "' in js
+
+
+def test_webhook_copy_names_the_loopback_opt_in():
+    assert "RUNLEDGER_ALLOW_LOOPBACK_WEBHOOKS=1" in DASHBOARD_HTML
+
+
 def test_budget_card_and_developer_rows_render_unknown_and_partial_spend_honestly():
     js = _script(DASHBOARD_HTML)
     # A group is a lower bound when one of its runs is partly priced, not only when one has
