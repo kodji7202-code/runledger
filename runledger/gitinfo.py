@@ -245,7 +245,12 @@ def local_filter_configured(cwd: Optional[str]) -> bool:
         if config is None:
             return True
         configured = any(line.split("=", 1)[0].lower().startswith("filter.") for line in config.splitlines())
-        worktree_enabled = any(line.lower() == "extensions.worktreeconfig=true" for line in config.splitlines())
+        worktree_enabled = False
+        for line in config.splitlines():
+            parts = line.lower().split("=", 1)
+            if len(parts) == 2 and parts[0] == "extensions.worktreeconfig" and parts[1] in ("true", "yes", "on", "1"):
+                worktree_enabled = True
+                break
         if worktree_enabled:
             worktree = _git(cwd, "config", "--worktree", "--includes", "--list")
             if worktree is None:

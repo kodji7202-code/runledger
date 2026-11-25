@@ -180,6 +180,19 @@ def test_posix_backslash_in_a_filename_is_not_a_directory_separator(tmp_path):
 
 
 @needs_git
+def test_parent_navigation_after_a_directory_name_is_not_collapsed(tmp_path):
+    repo = _init(tmp_path)
+    steps = [Step(1, "Write", {"file_path": "link/../outside.txt", "content": "x\n"}, "", None, None)]
+    run = Run("s", "/x.jsonl", str(repo), None, None, None, ["go"], steps, "", Usage(), {})
+    reconcile_git(run)
+
+    rows = file_changes(run)
+    assert list(rows) == ["link/../outside.txt"]
+    assert not rows["link/../outside.txt"].verified
+    assert "link/../outside.txt" not in run.git_changes
+
+
+@needs_git
 def test_outside_relative_write_keeps_activity_counts_unverified(tmp_path):
     repo = _init(tmp_path)
     steps = [Step(1, "Write", {"file_path": "../outside.txt", "content": "x\n"}, "", None, None)]
@@ -251,6 +264,22 @@ def test_git_without_show_scope_uses_local_config_fallback(tmp_path, monkeypatch
     monkeypatch.setattr(gitinfo, "_git", old_git)
     assert not gitinfo.local_filter_configured(str(repo))
     assert gitinfo.working_changes(str(repo), ["app.py"])["app.py"]["added"] == 1
+
+
+def test_legacy_git_fallback_accepts_yes_for_worktree_config(tmp_path, monkeypatch):
+    def fake_git(cwd, *args):
+        if args[:2] == ("rev-parse", "--is-inside-work-tree"):
+            return "true\n"
+        if args[:2] == ("config", "--list") and "--show-scope" in args:
+            return None
+        if args[:2] == ("config", "--local"):
+            return "extensions.worktreeconfig=yes\n"
+        if args[:2] == ("config", "--worktree"):
+            return "filter.x.clean=echo x\n"
+        return ""
+
+    monkeypatch.setattr(gitinfo, "_git", fake_git)
+    assert gitinfo.local_filter_configured(str(tmp_path))
 
 
 @needs_git
