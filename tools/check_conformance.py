@@ -131,7 +131,8 @@ def _strings(value):
         for item in value:
             yield from _strings(item)
     elif isinstance(value, dict):
-        for item in value.values():
+        for key, item in value.items():
+            yield from _strings(key)
             yield from _strings(item)
 
 
