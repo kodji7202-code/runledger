@@ -22,6 +22,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+# The matrix freezes the bundled price table. Importing runledger.prices loads RUNLEDGER_PRICES
+# or ~/.runledger/prices.json once, so pin the override before importing the CLI.
+os.environ["RUNLEDGER_PRICES"] = str(ROOT / "runledger" / "prices.json")
+
 from runledger.cli import main as cli_main  # noqa: E402
 from runledger.receipt_schema import SCHEMA, validate  # noqa: E402
 
@@ -204,6 +208,7 @@ def run_matrix(root: Path):
     results = []
     with tempfile.TemporaryDirectory(prefix="runledger-conformance-") as temp:
         base = Path(temp)
+        os.environ["RUNLEDGER_CONFIG"] = str(base / "no-user-config.json")
         for index, case in enumerate(manifest["cases"]):
             folder = base / f"{index:02d}-{case['name']}"
             folder.mkdir(parents=True)
