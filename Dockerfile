@@ -40,7 +40,7 @@ RUN groupadd --system runledger \
 WORKDIR /build
 COPY pyproject.toml README.md LICENSE ./
 COPY runledger ./runledger
-RUN pip install --no-cache-dir . \
+RUN pip install --no-cache-dir '.[server]' \
  && cd / \
  && rm -rf /build
 

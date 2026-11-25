@@ -11,8 +11,10 @@ This guide covers three setups:
 - **Built-in TLS**: the server serves HTTPS itself, with no proxy in front. See
   [Built-in TLS](#built-in-tls-no-reverse-proxy).
 
-The server uses only the Python standard library and SQLite. There is no other database and no other
-service to run. For roles, keys, the audit log and the admin features, see [enterprise.md](enterprise.md).
+The server uses FastAPI, uvicorn and SQLite. Those web dependencies are optional packaging extras,
+so developer machines can still install the dependency-free CLI; the Docker image and the bare-metal
+steps below install the server extra for you. There is no other database and no other service to run.
+For roles, keys, the audit log and the admin features, see [enterprise.md](enterprise.md).
 For every endpoint, see [api.md](api.md).
 
 ## Requirements
@@ -151,9 +153,9 @@ work through Caddy.
 
    ```bash
    sudo python3 -m venv /opt/runledger/venv
-   sudo /opt/runledger/venv/bin/python -m pip install runledger-ai
+   sudo /opt/runledger/venv/bin/python -m pip install 'runledger-ai[server]'
    # until the package is on PyPI, install a wheel built from this repository:
-   # sudo /opt/runledger/venv/bin/python -m pip install /path/to/runledger-<version>-py3-none-any.whl
+   # sudo /opt/runledger/venv/bin/python -m pip install 'runledger-ai[server] @ file:///path/to/runledger-<version>-py3-none-any.whl'
    ```
 
 3. Create `/etc/systemd/system/runledger.service`:
@@ -470,7 +472,7 @@ stopped: fix the archive, the name or the file name above and run the recipe aga
 2. Get the new version and rebuild.
 
    - Docker: `git pull`, then `cd deploy && docker compose build --pull && docker compose up -d`.
-   - Bare metal: `sudo /opt/runledger/venv/bin/python -m pip install --upgrade runledger-ai`, then
+   - Bare metal: `sudo /opt/runledger/venv/bin/python -m pip install --upgrade 'runledger-ai[server]'`, then
      `sudo systemctl restart runledger`.
 
 3. Check `CHANGELOG.md` for changes that affect you. Before 1.0, a minor version can change

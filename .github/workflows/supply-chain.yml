@@ -22,7 +22,7 @@ jobs:
       - name: Generate and validate package SBOM
         run: |
           python -m venv .package-venv
-          .package-venv/bin/python -m pip install .
+          .package-venv/bin/python -m pip install '.[server,saml]'
           python -m venv .sbom-venv
           .sbom-venv/bin/python -m pip install cyclonedx-bom==7.2.1
           .sbom-venv/bin/cyclonedx-py environment .package-venv/bin/python --of JSON -o runledger-python.cdx.json

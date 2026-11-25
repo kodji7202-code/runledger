@@ -1,4 +1,5 @@
 """The CLI reports failures as one `error:` line, never a traceback."""
+import builtins
 import os
 import subprocess
 import sys
@@ -45,6 +46,21 @@ def test_keyboard_interrupt_exits_130(monkeypatch, capsys):
     monkeypatch.setattr(cli, "build", stop)
     assert main(["receipt", str(SAMPLE), "--format", "md", "-o", "-"]) == 130
     assert capsys.readouterr().err == "interrupted\n"
+
+
+def test_serve_without_the_server_extra_is_a_clear_error(tmp_path, monkeypatch, capsys):
+    real_import = builtins.__import__
+
+    def blocked(name, *args, **kwargs):
+        if name in ("fastapi", "uvicorn"):
+            raise ModuleNotFoundError(f"No module named {name!r}")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", blocked)
+    assert main(["serve", "--db", str(tmp_path / "team.db")]) == 1
+    err = capsys.readouterr().err
+    assert "runledger-ai[server]" in err
+    assert "Traceback" not in err and len(err.strip().splitlines()) == 1
 
 
 def test_missing_output_folder_is_a_clear_error(tmp_path):
