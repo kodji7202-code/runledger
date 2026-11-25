@@ -138,9 +138,45 @@ def test_dot_prefixed_direct_edit_is_matched_to_gits_path(tmp_path):
     run = Run("s", "/x.jsonl", str(repo), None, None, None, ["go"], steps, "", Usage(), {})
     reconcile_git(run)
 
-    change = file_changes(run)["./app.py"]
+    change = file_changes(run)["app.py"]
     assert (change.added, change.removed) == (1, 0)
     assert change.verified
+
+
+
+@needs_git
+def test_dot_and_plain_spelling_merge_into_one_receipt_row(tmp_path):
+    repo = _init(tmp_path)
+    (repo / "app.py").write_text("a\nb\nc\n")
+    steps = [
+        Step(1, "Edit", {"file_path": "app.py", "old_string": "b", "new_string": "x"}, "", None, None),
+        Step(2, "Edit", {"file_path": "./app.py", "old_string": "x", "new_string": "b"}, "", None, None),
+    ]
+    run = Run("s", "/x.jsonl", str(repo), None, None, None, ["go"], steps, "", Usage(), {})
+    reconcile_git(run)
+
+    rows = file_changes(run)
+    assert list(rows) == ["app.py"]
+    assert rows["app.py"].verified
+    assert (rows["app.py"].added, rows["app.py"].removed) == (1, 0)
+
+
+@needs_git
+def test_posix_backslash_in_a_filename_is_not_a_directory_separator(tmp_path):
+    if os.name == "nt":
+        pytest.skip("backslash is a path separator on Windows")
+    repo = _init(tmp_path)
+    name = "dir\\file.py"
+    target = repo / name
+    target.write_text("one\n")
+    steps = [Step(1, "Write", {"file_path": name, "content": "one\ntwo\n"}, "", None, None)]
+    target.write_text("one\ntwo\n")
+    run = Run("s", "/x.jsonl", str(repo), None, None, None, ["go"], steps, "", Usage(), {})
+    reconcile_git(run)
+
+    change = file_changes(run)[name]
+    assert change.verified
+    assert change.added == 2
 
 
 @needs_git

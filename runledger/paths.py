@@ -287,7 +287,7 @@ def within(path: str, base: str) -> bool:
 def normalized_git_path(path: str) -> str:
     """The key Git uses for a relative working-tree path: `/` separators and no `./` or
     interior `a/../` navigation."""
-    normalized = posixpath.normpath(path.replace("\\", "/"))
+    normalized = posixpath.normpath(path)
     return "" if normalized == "." else normalized
 
 
