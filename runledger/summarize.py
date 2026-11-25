@@ -28,9 +28,11 @@ def _short(path: str, cwd: Optional[str]) -> str:
     normalized = normalized_git_path(shortened)
     same_platform = bool(cwd) and is_windows_style(cwd) == (os.name == "nt")
     if ".." in normalized.split("/") and same_platform:
-        resolved = relative(os.path.realpath(os.path.join(cwd, normalized)), cwd)
-        if resolved and not is_abs(resolved):
-            normalized = normalized_git_path(resolved)
+        parent_rel = normalized.rsplit("/", 1)[0] if "/" in normalized else "."
+        if os.path.isdir(os.path.join(cwd, parent_rel)):
+            resolved = relative(os.path.realpath(os.path.join(cwd, normalized)), cwd)
+            if resolved and not is_abs(resolved):
+                normalized = normalized_git_path(resolved)
     return normalized
 
 

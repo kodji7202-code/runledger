@@ -232,6 +232,27 @@ def test_parent_navigation_after_a_directory_name_is_not_collapsed(tmp_path):
 
 
 @needs_git
+def test_removed_symlink_parent_navigation_is_not_collapsed(tmp_path):
+    if os.name == "nt":
+        pytest.skip("directory symlink creation needs extra Windows privileges")
+    repo = _init(tmp_path)
+    external = tmp_path / "real-outside"
+    external.mkdir()
+    link = repo / "link"
+    link.symlink_to(external, target_is_directory=True)
+    link.unlink()
+    (repo / "outside.txt").write_text("x\n")
+    steps = [Step(1, "Write", {"file_path": "link/../outside.txt", "content": "x\n"}, "", None, None)]
+    run = Run("s", "/x.jsonl", str(repo), None, None, None, ["go"], steps, "", Usage(), {})
+    reconcile_git(run)
+
+    rows = file_changes(run)
+    assert list(rows) == ["link/../outside.txt"]
+    assert not rows["link/../outside.txt"].verified
+    assert "link/../outside.txt" not in run.git_changes
+
+
+@needs_git
 def test_outside_relative_write_keeps_activity_counts_unverified(tmp_path):
     repo = _init(tmp_path)
     steps = [Step(1, "Write", {"file_path": "../outside.txt", "content": "x\n"}, "", None, None)]
