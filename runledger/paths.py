@@ -284,6 +284,18 @@ def within(path: str, base: str) -> bool:
     return p == b or p.startswith(b + "/")
 
 
+def normalized_git_path(path: str) -> str:
+    """The receipt key for a relative working-tree path: no duplicate separators or `.`
+    components. `..` is preserved because a symlink before it can change what it means."""
+    return "/".join(part for part in path.split("/") if part not in ("", "."))
+
+
+def inside_git_tree(path: str) -> bool:
+    """Whether a relative path can be queried as a working-tree path without leaving it."""
+    normalized = normalized_git_path(path)
+    return bool(normalized) and ".." not in normalized.split("/")
+
+
 def relative(path: str, cwd: Optional[str]) -> str:
     """`path` relative to `cwd` with '/' separators when it lies under `cwd`, as receipts
     list files. Other paths come back unchanged, except that a relative path in a Windows
