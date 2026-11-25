@@ -27,3 +27,9 @@ def test_executable_names_follow_the_platform():
     env = Path("env")
     assert check_clean_install._exe(env, "python").name.startswith("python")
     assert check_clean_install._exe(env, "runledger").name.startswith("runledger")
+
+
+def test_health_smoke_bypasses_environment_proxies():
+    script = (ROOT / "tools" / "check_clean_install.py").read_text(encoding="utf-8")
+    assert "urllib.request.ProxyHandler({})" in script
+    assert "urlopen(" not in script
