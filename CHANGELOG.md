@@ -9,6 +9,10 @@ change behavior, so read the entry before you upgrade.
 
 ### Fixed
 
+- `runledger rollback` with nothing to restore prints `Nothing to restore (already matches <id>).`
+  and exits 0, as `--path` already did. It no longer asks for confirmation, prints `Restored`, or
+  creates a safety checkpoint of an unchanged tree. When only kept ignored files differ, it names
+  them instead of claiming an exact match.
 - Team statistics, Insights, and receipt exports exclude future-dated runs from their reporting windows.
 - `list --limit` counts displayed sessions, so invalid, unreadable, or vanished sessions
   no longer consume limit slots.
@@ -26,6 +30,7 @@ change behavior, so read the entry before you upgrade.
 
 - `DELETE /api/runs/{id}` lets a team administrator erase one stored run and its revisions;
   the erase operation remains visible as a `run.delete` audit event.
+- `runledger validate` checks JSON receipts against the packaged schema without extra dependencies.
 
 - Dashboard OIDC sign-in for Okta, Entra ID and Google Workspace using standard-library
   Authorization Code + PKCE and RS256 verification. Person-bound, keyless sessions use live
