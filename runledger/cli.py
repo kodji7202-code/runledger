@@ -765,7 +765,7 @@ def _backup_size(target: Path) -> Optional[int]:
 
 def cmd_backup(args) -> int:
     """Copy the team database to DIR/runledger-<stem>-YYYYmmdd-HHMMSS[-N].db and keep the newest --keep copies."""
-    from .server.db import Database, _restrict_file
+    from .server.db import Database, backup_integrity_error, _restrict_file
 
     folder = Path(args.dir)
     if args.keep < 1:
@@ -774,8 +774,13 @@ def cmd_backup(args) -> int:
     if not Path(args.db).is_file():
         print(f"error: no database at {args.db}", file=sys.stderr)
         return 1
+    source_problem = backup_integrity_error(args.db)
+    if source_problem is not None:
+        print(f"error: {args.db} is not a usable RunLedger database: {source_problem}", file=sys.stderr)
+        return 1
     stem = _backup_stem(args.db)
     reservation: Optional[Path] = None
+    target: Optional[Path] = None
     size: Optional[int] = None
     try:
         folder.mkdir(parents=True, exist_ok=True)
@@ -783,19 +788,28 @@ def cmd_backup(args) -> int:
         target, reservation = _reserve_backup_target(folder, stem, stamp)
         db = Database(args.db)
         try:
-            db.backup_to(str(target))
+            if args.verify:
+                db.backup_to(str(target), verify=backup_integrity_error)
+            else:
+                db.backup_to(str(target))
         finally:
             db.close()
         _restrict_file(str(target))
         size = _backup_size(target)
     except (OSError, sqlite3.Error) as exc:
+        if target is not None:
+            try:
+                target.unlink()
+            except OSError:
+                pass
         _discard_reserved_backup(reservation)
         print(f"error: backup failed: {exc}", file=sys.stderr)
         return 1
     _discard_reserved_backup(reservation)
     old = _prune_backups(folder, stem, args.keep)
     detail = f"{size} bytes" if size is not None else "size n/a (already pruned by another backup)"
-    print(f"Backup: {target}  ({detail}; removed {len(old)} older)")
+    verified = "; integrity verified" if args.verify else ""
+    print(f"Backup: {target}  ({detail}{verified}; removed {len(old)} older)")
     return 0
 
 
@@ -1233,6 +1247,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     pbk.add_argument("--db", default="runledger.db", help="SQLite database file (default runledger.db)")
     pbk.add_argument("--dir", default="backups", help="folder for the copies (default backups)")
     pbk.add_argument("--keep", type=int, default=14, help="how many copies to keep (default 14)")
+    pbk.add_argument("--verify", action="store_true", help="run SQLite integrity checks on the copy")
     pbk.set_defaults(func=cmd_backup)
 
     pk = sub.add_parser("key", help="manage a team's API keys on a team database")
