@@ -157,6 +157,23 @@ def test_outside_relative_write_keeps_activity_counts_unverified(tmp_path):
 
 
 @needs_git
+def test_large_ignored_file_keeps_activity_counts_unverified(tmp_path, monkeypatch):
+    repo = _init(tmp_path)
+    (repo / ".gitignore").write_text("secret.txt\n")
+    target = repo / "secret.txt"
+    target.write_text("one\ntwo\n")
+    monkeypatch.setattr(gitinfo, "_MAX_COUNT_BYTES", 1)
+    steps = [Step(1, "Write", {"file_path": str(target), "content": "one\ntwo\n"}, "", None, None)]
+    run = Run("s", "/x.jsonl", str(repo), None, None, None, ["go"], steps, "", Usage(), {})
+    reconcile_git(run)
+
+    assert run.git_changes["secret.txt"]["count_limited"] is True
+    change = file_changes(run)["secret.txt"]
+    assert (change.added, change.activity_added) == (2, 2)
+    assert not change.verified
+
+
+@needs_git
 def test_local_filter_config_disables_content_diffs_and_zero_fill(tmp_path, monkeypatch):
     repo = _init(tmp_path)
     _git(repo, "config", "filter.receipt.clean", "echo filtered")
