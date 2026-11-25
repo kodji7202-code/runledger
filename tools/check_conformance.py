@@ -27,6 +27,7 @@ if str(ROOT) not in sys.path:
 os.environ["RUNLEDGER_PRICES"] = str(ROOT / "runledger" / "prices.json")
 
 from runledger.cli import main as cli_main  # noqa: E402
+from runledger.paths import is_abs  # noqa: E402
 from runledger.receipt_schema import SCHEMA, validate  # noqa: E402
 
 EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
@@ -66,7 +67,7 @@ def _receipt(path: Path, fmt: str, *extra: str):
 def _html_receipt(path: Path, target: Path):
     out, err = StringIO(), StringIO()
     with redirect_stdout(out), redirect_stderr(err):
-        rc = cli_main(["receipt", str(path), "--format", "html", "-o", str(target)])
+        rc = cli_main(["receipt", str(path), "--format", "html", "-o", str(target), "--safe"])
     return rc, err.getvalue()
 
 
@@ -123,6 +124,21 @@ def _format_count(fmt: str, text: str):
     return int(match.group(1)) if match else None
 
 
+def _strings(value):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, list):
+        for item in value:
+            yield from _strings(item)
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _strings(item)
+
+
+def _path_spellings(path: str):
+    return {path, path.replace("\\", "/"), path.replace("/", "\\")}
+
+
 def _check_case(fixtures: Path, folder: Path, case: dict):
     problems = []
     path = _copy_case(fixtures, folder, case)
@@ -151,7 +167,7 @@ def _check_case(fixtures: Path, folder: Path, case: dict):
             problems.append("safe receipt is not a JSON object")
             safe = None
 
-    rc, markdown, err = _receipt(path, "md")
+    rc, markdown, err = _receipt(path, "md", "--safe")
     if rc != 0 or "Traceback" in err:
         problems.append(f"markdown receipt failed: {err.strip()}")
         markdown = ""
@@ -196,8 +212,9 @@ def _check_case(fixtures: Path, folder: Path, case: dict):
         if html_count != full["totals"]["files_changed"]:
             problems.append(f"html file count {html_count} != {full['totals']['files_changed']}")
 
-    if safe is not None:
-        safe_texts = [json.dumps(safe, ensure_ascii=False), markdown]
+    if isinstance(safe, dict):
+        object_strings = list(_strings(safe))
+        safe_texts = object_strings + [markdown, html]
         needles = {os.path.expanduser("~"), str(folder)}
         for text in safe_texts:
             for needle in {n for n in needles if n and len(n) > 3}:
@@ -206,6 +223,14 @@ def _check_case(fixtures: Path, folder: Path, case: dict):
             emails = sorted(set(EMAIL.findall(text)))
             if emails:
                 problems.append(f"safe output contains e-mail addresses: {emails[:3]}")
+
+        original_cwd = full.get("cwd")
+        if isinstance(original_cwd, str) and len(original_cwd) > 3 and is_abs(original_cwd):
+            spellings = _path_spellings(original_cwd)
+            exposed = [spelling for spelling in spellings
+                       if any(spelling in text for text in safe_texts)]
+            if exposed:
+                problems.append(f"safe output contains the run's original working directory {exposed[0]!r}")
 
     for step in full["steps"]:
         if not step["tokens_known"] and step["cost_usd"] is not None:
