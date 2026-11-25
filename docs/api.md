@@ -317,6 +317,17 @@ keeps its figure (including a reported `0.0`).
 
 Errors: `401`; `404` `not_found` ("Run not found.").
 
+### `DELETE /api/runs/{id}`
+
+Role: admin. Erases one run: its receipt JSON and HTML, risk rows, and every replaced revision.
+The deletion itself stays in the audit log as `run.delete`; approvals, budget alerts and other runs
+are unchanged. Returns `{"ok": true}`.
+
+This is the per-run privacy erase operation. `RUNLEDGER_RETENTION_DAYS` is the automatic retention
+policy for old history; use this endpoint when one receipt must be removed before that age.
+
+Errors: `401`; `403` for a non-admin; `404` `not_found` ("Run not found.").
+
 ### `GET /runs/{id}`
 
 Role: any. The stored HTML receipt. It is served with a Content Security Policy that blocks scripts and
