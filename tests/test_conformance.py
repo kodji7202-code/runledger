@@ -1,5 +1,6 @@
 """The committed conformance matrix is a release gate, not only documentation."""
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -20,6 +21,21 @@ def test_committed_conformance_matrix():
     names = [case["name"] for case in report["cases"]]
     assert len(names) == len(set(names))
     assert {"claude", "codex", "droid", "droid_shell", "aider", "native", "guard"} <= set(names)
+
+
+def test_custom_prices_and_user_config_do_not_change_the_matrix(tmp_path):
+    prices = tmp_path / "prices.json"
+    prices.write_text(json.dumps({"sonnet:4.5": {"input": 1000, "output": 1000, "cache_read": 1000}}),
+                      encoding="utf-8")
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({"ignore": ["secret_file", "test_deleted", "command"]}), encoding="utf-8")
+    env = dict(os.environ, RUNLEDGER_PRICES=str(prices), RUNLEDGER_CONFIG=str(config))
+
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "tools" / "check_conformance.py")],
+        cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=90,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_conformance_failures_have_a_nonzero_exit_and_name_the_case(tmp_path):

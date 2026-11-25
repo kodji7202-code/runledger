@@ -11,7 +11,9 @@ python tools/check_conformance.py --json   # machine-readable report
 ```
 
 The checker copies every fixture into an isolated temporary folder first. A fixture therefore
-cannot accidentally pick up the branch or path of the RunLedger checkout itself. For each case it:
+cannot accidentally pick up the branch or path of the RunLedger checkout itself. It also pins the
+bundled price table and ignores the runner's user config: the matrix tests the committed contract,
+not one machine's custom pricing or risk-policy overrides. For each case it:
 
 - builds safe and non-safe JSON receipts and validates both against the shipped
   `receipt.schema.json`;
