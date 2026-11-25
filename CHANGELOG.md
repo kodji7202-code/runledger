@@ -7,6 +7,8 @@ change behavior, so read the entry before you upgrade.
 
 ## [Unreleased]
 
+## [1.0.0rc1] - 2026-11-25
+
 ### Fixed
 
 - Small unauthenticated or unauthorized API POSTs reliably return their JSON 401/403 response on
@@ -1685,7 +1687,8 @@ First working prototype (MVP).
   override them.
 - No runtime dependencies; Python 3.9 and later.
 
-[Unreleased]: https://github.com/kodji7202-code/runledger/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/kodji7202-code/runledger/compare/v1.0.0rc1...HEAD
+[1.0.0rc1]: https://github.com/kodji7202-code/runledger/compare/v0.7.0...v1.0.0rc1
 [0.7.0]: https://github.com/kodji7202-code/runledger/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/kodji7202-code/runledger/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/kodji7202-code/runledger/compare/v0.5.2...v0.6.0
