@@ -285,16 +285,15 @@ def within(path: str, base: str) -> bool:
 
 
 def normalized_git_path(path: str) -> str:
-    """The key Git uses for a relative working-tree path: `/` separators and no `./` or
-    interior `a/../` navigation."""
-    normalized = posixpath.normpath(path)
-    return "" if normalized == "." else normalized
+    """The receipt key for a relative working-tree path: no duplicate separators or `.`
+    components. `..` is preserved because a symlink before it can change what it means."""
+    return "/".join(part for part in path.split("/") if part not in ("", "."))
 
 
 def inside_git_tree(path: str) -> bool:
-    """Whether a normalized-looking relative path stays inside the working tree."""
+    """Whether a relative path can be queried as a working-tree path without leaving it."""
     normalized = normalized_git_path(path)
-    return bool(normalized) and normalized != ".." and not normalized.startswith("../")
+    return bool(normalized) and ".." not in normalized.split("/")
 
 
 def relative(path: str, cwd: Optional[str]) -> str:
