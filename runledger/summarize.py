@@ -22,7 +22,8 @@ from .shell_writes import shell_deletes, shell_writes
 
 
 def _short(path: str, cwd: Optional[str]) -> str:
-    return relative(path, cwd)
+    shortened = relative(path, cwd)
+    return normalized_git_path(shortened) if shortened and not is_abs(shortened) else shortened
 
 
 COMMAND_LIMIT = 120
