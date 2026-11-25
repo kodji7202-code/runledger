@@ -180,8 +180,47 @@ def test_posix_backslash_in_a_filename_is_not_a_directory_separator(tmp_path):
 
 
 @needs_git
-def test_parent_navigation_after_a_directory_name_is_not_collapsed(tmp_path):
+def test_real_directory_parent_navigation_merges_spellings(tmp_path):
     repo = _init(tmp_path)
+    (repo / "src").mkdir()
+    (repo / "settings.py").write_text("one\ntwo\n")
+    steps = [
+        Step(1, "Write", {"file_path": "settings.py", "content": "one\n"}, "", None, None),
+        Step(2, "Write", {"file_path": "src/../settings.py", "content": "one\ntwo\n"}, "", None, None),
+    ]
+    run = Run("s", "/x.jsonl", str(repo), None, None, None, ["go"], steps, "", Usage(), {})
+    reconcile_git(run)
+
+    rows = file_changes(run)
+    assert list(rows) == ["settings.py"]
+    assert rows["settings.py"].verified
+
+
+@needs_git
+def test_absolute_outside_path_does_not_share_a_relative_git_key(tmp_path):
+    repo = _init(tmp_path)
+    (repo / "tmp").mkdir()
+    (repo / "tmp" / "report.json").write_text("{}\n")
+    steps = [
+        Step(1, "Write", {"file_path": "/tmp/report.json", "content": "{}\n"}, "", None, None),
+        Step(2, "Write", {"file_path": "tmp/report.json", "content": "{}\n"}, "", None, None),
+    ]
+    run = Run("s", "/x.jsonl", str(repo), None, None, None, ["go"], steps, "", Usage(), {})
+    reconcile_git(run)
+
+    rows = file_changes(run)
+    assert not rows["/tmp/report.json"].verified
+    assert rows["tmp/report.json"].verified
+
+
+@needs_git
+def test_parent_navigation_after_a_directory_name_is_not_collapsed(tmp_path):
+    if os.name == "nt":
+        pytest.skip("directory symlink creation needs extra Windows privileges")
+    repo = _init(tmp_path)
+    external = tmp_path / "real-outside"
+    external.mkdir()
+    (repo / "link").symlink_to(external, target_is_directory=True)
     steps = [Step(1, "Write", {"file_path": "link/../outside.txt", "content": "x\n"}, "", None, None)]
     run = Run("s", "/x.jsonl", str(repo), None, None, None, ["go"], steps, "", Usage(), {})
     reconcile_git(run)
