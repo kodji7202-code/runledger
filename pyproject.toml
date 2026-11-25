@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "runledger-ai"
-version = "0.7.0"
+version = "1.0.0rc1"
 description = "Audit, cost and real-time guard for AI coding agents: receipts, risk score, rollback. Claude Code, Codex CLI, Factory Droid, Aider."
 readme = "README.md"
 license = "Apache-2.0"
@@ -14,7 +14,7 @@ requires-python = ">=3.9"
 authors = [{ name = "RunLedger", email = "hello@runledger.site" }]
 keywords = ["ai", "ai-agents", "coding-agents", "claude-code", "codex", "factory-droid", "droid", "aider", "audit", "receipts", "guardrails", "observability"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Environment :: Console",
     "Intended Audience :: Developers",
     "Operating System :: OS Independent",

@@ -21,8 +21,8 @@ changelog if you want that.
 
 | Version | Security fixes |
 | --- | --- |
-| 0.7.x | Yes |
-| 0.6.x | Security fixes only |
+| 1.0.x | Yes |
+| 0.7.x | Security fixes only |
 | Earlier versions | No; upgrade to a supported version. Since 0.3.0, receipts mask secrets |
 
 ## Scope
