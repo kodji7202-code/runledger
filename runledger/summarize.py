@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional
 from . import llm
 from .ai_defaults import DEFAULT_AI_MODEL
 from .parser import Run, Step, Usage
-from .paths import is_abs, relative
+from .paths import is_abs, normalized_git_path, relative
 from .ps_writes import ps_deletes, ps_writes, shell_kind
 from .shell_writes import shell_deletes, shell_writes
 
@@ -126,7 +126,7 @@ def file_changes(run: Run) -> Dict[str, FileChange]:
                 fc.added += w.added
     for p, fc in changes.items():
         fc.activity_added, fc.activity_removed = fc.added, fc.removed
-        git = run.git_changes.get(p)
+        git = run.git_changes.get(p) or run.git_changes.get(normalized_git_path(p))
         if git:
             fc.added, fc.removed = int(git.get("added") or 0), int(git.get("removed") or 0)
             fc.created = git.get("status") in ("untracked", "added")

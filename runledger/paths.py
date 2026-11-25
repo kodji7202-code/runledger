@@ -284,6 +284,19 @@ def within(path: str, base: str) -> bool:
     return p == b or p.startswith(b + "/")
 
 
+def normalized_git_path(path: str) -> str:
+    """The key Git uses for a relative working-tree path: `/` separators and no `./` or
+    interior `a/../` navigation."""
+    normalized = posixpath.normpath(path.replace("\\", "/"))
+    return "" if normalized == "." else normalized
+
+
+def inside_git_tree(path: str) -> bool:
+    """Whether a normalized-looking relative path stays inside the working tree."""
+    normalized = normalized_git_path(path)
+    return bool(normalized) and normalized != ".." and not normalized.startswith("../")
+
+
 def relative(path: str, cwd: Optional[str]) -> str:
     """`path` relative to `cwd` with '/' separators when it lies under `cwd`, as receipts
     list files. Other paths come back unchanged, except that a relative path in a Windows

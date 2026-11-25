@@ -59,7 +59,7 @@ from .ai_defaults import DEFAULT_AI_MODEL, DEFAULT_REVIEW_MODEL
 from .gitinfo import current_branch, file_diffs, repo_context, session_base, toplevel, working_changes
 from .guard import load_user_config, redact
 from .parser import _ts
-from .paths import is_abs
+from .paths import inside_git_tree, is_abs, normalized_git_path
 from .risk import assess, is_test_source
 
 AGENTS = ("claude-code", "codex", "droid", "aider", "native")
@@ -122,7 +122,8 @@ def reconcile_git(run) -> None:
             run.git_branch = current_branch(run.cwd)
         run.git_base = session_base(run.cwd, _ts(run.started))
         changes = file_changes(run)
-        git_paths = [p for p in changes if not is_abs(p)]
+        git_paths = sorted({normalized_git_path(p) for p in changes
+                            if not is_abs(p) and inside_git_tree(p)})
         if git_paths:
             run.git_changes = working_changes(run.cwd, git_paths, run.git_base)
             if toplevel(run.cwd):
@@ -131,8 +132,8 @@ def reconcile_git(run) -> None:
                         continue  # working_changes cannot pass these as Git pathspecs
                     run.git_changes.setdefault(path, {"added": 0, "removed": 0,
                                                       "status": "unchanged", "binary": False})
-        test_paths = [p for p, fc in changes.items()
-                      if not fc.deleted and not is_abs(p) and is_test_source(p)]
+        test_paths = [normalized_git_path(p) for p, fc in changes.items()
+                      if not fc.deleted and not is_abs(p) and inside_git_tree(p) and is_test_source(p)]
         if test_paths:
             run.test_diffs = file_diffs(run.cwd, test_paths, run.git_base)
 
