@@ -214,10 +214,27 @@ def test_absolute_outside_path_does_not_share_a_relative_git_key(tmp_path):
 
 
 @needs_git
-def test_parent_navigation_after_a_directory_name_is_not_collapsed(tmp_path):
+def test_parent_navigation_through_a_repository_symlink_is_resolved(tmp_path):
     if os.name == "nt":
         pytest.skip("directory symlink creation needs extra Windows privileges")
     repo = _init(tmp_path)
+    inside = tmp_path / "real-inside"
+    inside.mkdir()
+    (repo / "link").symlink_to(inside, target_is_directory=True)
+    steps = [Step(1, "Write", {"file_path": "link/../outside.txt", "content": "x\n"}, "", None, None)]
+    run = Run("s", "/x.jsonl", str(repo), None, None, None, ["go"], steps, "", Usage(), {})
+    reconcile_git(run)
+
+    assert list(file_changes(run)) == ["outside.txt"]
+
+
+@needs_git
+def test_parent_navigation_outside_the_repository_is_not_collapsed(tmp_path):
+    if os.name == "nt":
+        pytest.skip("directory symlink creation needs extra Windows privileges")
+    repo_path = tmp_path / "repo"
+    repo_path.mkdir()
+    repo = _init(repo_path)
     external = tmp_path / "real-outside"
     external.mkdir()
     (repo / "link").symlink_to(external, target_is_directory=True)
