@@ -984,26 +984,27 @@ class _Handler(BaseHTTPRequestHandler):
                 f"Dashboard changes must send the header '{CSRF_HEADER}: {CSRF_VALUE}'.",
             )
 
-    def _discard_small_body_before_close(self, limit: int = 64 * 1024) -> None:
-        """Drain a small declared body before closing the connection.
+    def _discard_small_body_before_close(self, limit: int = 64 * 1024) -> bool:
+        """Drain a small declared body briefly before closing; True when some remains unread.
 
         Closing a TCP connection with unread input can reset it on some platforms and discard the
-        error response before the client reads it. Oversized bodies still are not read; this
-        bounded drain only makes authentication and authorization errors reliable.
+        error response before the client reads it. The drain is deliberately short: an unfinished
+        unauthenticated body must not turn into a way to occupy request workers. Oversized bodies
+        still are not read at all.
         """
         try:
             length = int(self.headers.get("Content-Length") or "")
         except ValueError:
-            return
-        if 0 < length <= limit:
-            try:
-                read_with_timeout = getattr(self.rfile, "read_with_timeout", None)
-                if read_with_timeout is not None:
-                    read_with_timeout(length, 2.0)
-                else:
-                    self.rfile.read(length)
-            except Exception:
-                pass
+            return False
+        if not 0 < length <= limit:
+            return False
+        try:
+            read_with_timeout = getattr(self.rfile, "read_with_timeout", None)
+            if read_with_timeout is None:
+                return True
+            return len(read_with_timeout(length, 0.05)) < length
+        except Exception:
+            return True
 
     def _authed(self, minimum: str, what: str, write: bool = False) -> Identity:
         """Identify and authorize before the request body is read, so a huge unauthenticated
@@ -1012,7 +1013,12 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             ident = self._identify()
         except _HttpError as exc:
-            self._discard_small_body_before_close()
+            incomplete = self._discard_small_body_before_close()
+            if incomplete and self._bearer_token() is None:
+                # A stalled body without even a guessable API key is resource abuse rather than
+                # an ordinary expired dashboard cookie. Counting it gives the existing per-address
+                # limiter a chance to cut off sustained unauthenticated traffic.
+                self.server.limiter.record_failure(self._client_ip())
             exc.headers.setdefault("Connection", "close")
             raise
         try:
