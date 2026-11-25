@@ -21,6 +21,26 @@ from .ps_writes import ps_deletes, ps_writes, shell_kind
 from .shell_writes import shell_deletes, shell_writes
 
 
+def _resolve_dotdot_path(cwd: str, normalized: str) -> Optional[str]:
+    """Resolve a relative path component by component, or None when its parent no longer exists.
+
+    os.path.realpath() can collapse `..` lexically when the final file is absent, which would
+    turn `link/../x` into the wrong file when `link` is a symlink. Resolving each directory
+    before applying `..` preserves the filesystem's actual symlink semantics.
+    """
+    current = os.path.realpath(cwd)
+    parts = normalized.split("/")
+    for part in parts[:-1]:
+        if part == "..":
+            current = os.path.dirname(current)
+            continue
+        candidate = os.path.join(current, part)
+        if not os.path.isdir(candidate):
+            return None
+        current = os.path.realpath(candidate)
+    return os.path.join(current, parts[-1])
+
+
 def _short(path: str, cwd: Optional[str]) -> str:
     shortened = relative(path, cwd)
     if not shortened or is_abs(shortened):
@@ -28,9 +48,9 @@ def _short(path: str, cwd: Optional[str]) -> str:
     normalized = normalized_git_path(shortened)
     same_platform = bool(cwd) and is_windows_style(cwd) == (os.name == "nt")
     if ".." in normalized.split("/") and same_platform:
-        parent_rel = normalized.rsplit("/", 1)[0] if "/" in normalized else "."
-        if os.path.isdir(os.path.join(cwd, parent_rel)):
-            resolved = relative(os.path.realpath(os.path.join(cwd, normalized)), cwd)
+        resolved_path = _resolve_dotdot_path(cwd, normalized)
+        if resolved_path is not None:
+            resolved = relative(resolved_path, cwd)
             if resolved and not is_abs(resolved):
                 normalized = normalized_git_path(resolved)
     return normalized
