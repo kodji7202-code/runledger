@@ -15,13 +15,28 @@ SCHEMA: Dict[str, Any] = json.loads(
     resources.files("runledger").joinpath("receipt.schema.json").read_text(encoding="utf-8")
 )
 
+def _integer(value: Any) -> bool:
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return True
+    return isinstance(value, float) and math.isfinite(value) and value.is_integer()
+
+
+def _number(value: Any) -> bool:
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return True
+    return isinstance(value, float) and math.isfinite(value)
+
+
 _TYPES = {
     "object": lambda v: isinstance(v, dict),
     "array": lambda v: isinstance(v, list),
     "string": lambda v: isinstance(v, str),
-    "integer": lambda v: (isinstance(v, int) or isinstance(v, float) and math.isfinite(v) and v.is_integer())
-                         and not isinstance(v, bool),
-    "number": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v),
+    "integer": _integer,
+    "number": _number,
     "boolean": lambda v: isinstance(v, bool),
     "null": lambda v: v is None,
 }

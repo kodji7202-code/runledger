@@ -122,6 +122,13 @@ def test_whole_valued_decimals_are_json_schema_integers(capsys):
     assert any("schema_version" in error for error in validate(data, SCHEMA))
 
 
+def test_huge_integers_do_not_abort_validation(capsys):
+    data = _receipt(capsys, SESSIONS["claude"](None))
+    data["risk"]["score"] = 10 ** 1000
+    errors = validate(data, SCHEMA)
+    assert any("risk.score" in error and "100" in error for error in errors)
+
+
 def test_markdown_on_stdout_ends_with_the_mode_comment(capsys):
     assert main(["receipt", str(SESSIONS["claude"](None)), "--format", "md", "-o", "-"]) == 0
     out = capsys.readouterr().out
