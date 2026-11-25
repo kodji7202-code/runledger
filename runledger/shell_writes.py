@@ -55,6 +55,7 @@ class ShellWrite:
     added: int = 0
     deleted: bool = False
     source: Optional[str] = None  # what cp, mv or install copied to `path`
+    follows_link: bool = False    # true when the write opens a symlink's target rather than replacing the link
 
 
 @dataclass
@@ -263,9 +264,9 @@ def _command_writes(words: List[str], targets: List[str], body: Optional[str]) -
     name = posixpath.basename(words[0]) if words else ""
     args = words[1:]
     body_lines = len(body.splitlines()) if body is not None and name in ("cat", "tee") else 0
-    out = [ShellWrite(t, body_lines) for t in targets]
+    out = [ShellWrite(t, body_lines, follows_link=True) for t in targets]
     if name == "tee":
-        out += [ShellWrite(f, body_lines) for f in _positional(args)]
+        out += [ShellWrite(f, body_lines, follows_link=True) for f in _positional(args)]
     elif name == "touch":
         out += [ShellWrite(f) for f in _positional(args, ("-d", "-r", "-t"))]
     elif name in ("cp", "install", "mv"):
@@ -276,7 +277,7 @@ def _command_writes(words: List[str], targets: List[str], body: Optional[str]) -
                 into = dest.endswith(("/", "\\") if is_windows_style(dest) else "/") or len(sources) > 1
                 name_of = ntpath.basename if is_windows_style(src) else posixpath.basename
                 target = join(dest, name_of(src)) if into else dest
-                out.append(ShellWrite(target, source=src))
+                out.append(ShellWrite(target, source=src, follows_link=(name == "cp")))
                 if name == "mv":
                     out.append(ShellWrite(src, deleted=True))
     elif name == "sed":
@@ -288,7 +289,7 @@ def _command_writes(words: List[str], targets: List[str], body: Optional[str]) -
         if "-c" in args and args.index("-c") + 1 < len(args):
             sources.append(args[args.index("-c") + 1])
         for src in sources:
-            out += [ShellWrite(p) for p in _python_writes(src)]
+            out += [ShellWrite(p, follows_link=True) for p in _python_writes(src)]
     return out
 
 
@@ -349,7 +350,8 @@ def _shell_writes(command: str) -> Tuple[ShellWrite, ...]:
             path = resolve(w.path)
             if path is None or path == "/dev" or path.startswith("/dev/"):
                 continue
-            out.append(ShellWrite(path, w.added, w.deleted, resolve(w.source) if w.source else None))
+            out.append(ShellWrite(path, w.added, w.deleted, resolve(w.source) if w.source else None,
+                                  w.follows_link))
     return tuple(out)
 
 

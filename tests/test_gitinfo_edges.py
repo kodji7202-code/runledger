@@ -255,6 +255,36 @@ def test_write_through_a_final_symlink_reconciles_its_target(tmp_path, written):
 
 
 @needs_git
+def test_direct_and_shell_writes_through_one_symlink_merge(tmp_path):
+    if os.name == "nt":
+        pytest.skip("symlink creation needs extra Windows privileges")
+    repo = _init(tmp_path)
+    target = repo / "target.cfg"
+    target.write_text("old\n")
+    _git(repo, "add", "target.cfg")
+    _git(repo, "commit", "-q", "-m", "target")
+    (repo / "alias.cfg").symlink_to("target.cfg")
+    target.write_text("old\nnew\n")
+    steps = [
+        Step(1, "Write", {"file_path": "alias.cfg", "content": "new\n"}, "", None, None),
+        Step(2, "Bash", {"command": "printf 'new\\n' >> alias.cfg"}, "", None, None),
+    ]
+    run = Run("s", "/x.jsonl", str(repo), None, None, None, ["go"], steps, "", Usage(), {})
+    reconcile_git(run)
+
+    rows = file_changes(run)
+    assert list(rows) == ["target.cfg"]
+    assert rows["target.cfg"].verified
+    assert "alias.cfg" not in rows
+
+
+def test_invalid_write_path_does_not_abort_file_changes(tmp_path):
+    steps = [Step(1, "Write", {"file_path": "bad\0name", "content": "x\n"}, "", None, None)]
+    run = Run("s", "/x.jsonl", str(tmp_path), None, None, None, ["go"], steps, "", Usage(), {})
+    assert list(file_changes(run)) == ["bad\0name"]
+
+
+@needs_git
 def test_removed_symlink_parent_navigation_is_not_collapsed(tmp_path):
     if os.name == "nt":
         pytest.skip("directory symlink creation needs extra Windows privileges")

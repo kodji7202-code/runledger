@@ -509,13 +509,13 @@ def _ps_writes_cached(command: str) -> Tuple[ShellWrite, ...]:
                 # `System.IO.File` takes a filesystem path, so no provider filter applies here.
                 cleaned = _clean_ps_path(quoted_path, cwd, dotnet=True)
                 if cleaned:
-                    out.append(ShellWrite(cleaned, added=1))
+                    out.append(ShellWrite(cleaned, added=1, follows_link=True))
 
         words, redirs = _tokenize_stmt(stmt)
         for r_target in redirs:
             cleaned = _clean_ps_path(r_target, cwd)
             if cleaned:
-                out.append(ShellWrite(cleaned, added=1))
+                out.append(ShellWrite(cleaned, added=1, follows_link=True))
 
         if not words:
             continue
@@ -551,7 +551,7 @@ def _ps_writes_cached(command: str) -> Tuple[ShellWrite, ...]:
             for t in targets:
                 cleaned = _clean_ps_path(t, cwd)
                 if cleaned:
-                    out.append(ShellWrite(cleaned, added=added))
+                    out.append(ShellWrite(cleaned, added=added, follows_link=True))
             continue
 
         if cmd in _NEW_CMDS:
@@ -566,13 +566,13 @@ def _ps_writes_cached(command: str) -> Tuple[ShellWrite, ...]:
                 raw_target = _join_dir_and_leaf(paths_arg[0], names_arg[0])
                 cleaned = _clean_ps_path(raw_target, cwd)
                 if cleaned:
-                    out.append(ShellWrite(cleaned, added=added))
+                    out.append(ShellWrite(cleaned, added=added, follows_link=True))
             else:
                 targets = paths_arg or names_arg or pos[:1]
                 for t in targets:
                     cleaned = _clean_ps_path(t, cwd)
                     if cleaned:
-                        out.append(ShellWrite(cleaned, added=added))
+                        out.append(ShellWrite(cleaned, added=added, follows_link=True))
             continue
 
         if cmd in _COPY_CMDS or cmd in _MOVE_CMDS:
@@ -649,7 +649,7 @@ def _ps_writes_cached(command: str) -> Tuple[ShellWrite, ...]:
             for t in _first_param(named, _OUTFILE_PARAMS):
                 cleaned = _clean_ps_path(t, cwd)
                 if cleaned:
-                    out.append(ShellWrite(cleaned))
+                    out.append(ShellWrite(cleaned, follows_link=True))
 
     merged: Dict[str, ShellWrite] = {}
     for w in out:
@@ -660,7 +660,8 @@ def _ps_writes_cached(command: str) -> Tuple[ShellWrite, ...]:
             merged[w.path] = ShellWrite(w.path, deleted=True)
         else:
             merged[w.path] = ShellWrite(
-                w.path, prev.added + w.added, deleted=False, source=w.source or prev.source
+                w.path, prev.added + w.added, deleted=False, source=w.source or prev.source,
+                follows_link=prev.follows_link or w.follows_link
             )
     return tuple(merged.values())
 
