@@ -194,6 +194,39 @@ def test_the_migration_is_idempotent_and_a_fresh_database_matches(tmp_path):
     assert set(_column_names(fresh, "run_revisions")) == set(_column_names(path, "run_revisions"))
 
 
+def test_schema_version_is_stamped_on_fresh_and_migrated_databases(tmp_path):
+    fresh = tmp_path / "fresh.db"
+    with closing(Database(str(fresh))):
+        pass
+    assert _rows(fresh, "PRAGMA user_version")[0][0] == 1
+
+    old = tmp_path / "old.db"
+    old_database(old)
+    assert _rows(old, "PRAGMA user_version")[0][0] == 0
+    with closing(Database(str(old))):
+        pass
+    assert _rows(old, "PRAGMA user_version")[0][0] == 1
+
+
+def test_a_newer_schema_version_is_rejected_before_any_migration(tmp_path):
+    path = tmp_path / "future.db"
+    with closing(Database(str(path))):
+        pass
+    with closing(sqlite3.connect(str(path))) as conn:
+        conn.execute("PRAGMA user_version = 99")
+        conn.commit()
+    before = _rows(path, "SELECT type, name, sql FROM sqlite_master ORDER BY type, name")
+
+    try:
+        Database(str(path))
+    except sqlite3.DatabaseError as exc:
+        assert "schema version 99" in str(exc)
+    else:
+        raise AssertionError("a newer database schema was accepted")
+    assert _rows(path, "PRAGMA user_version")[0][0] == 99
+    assert _rows(path, "SELECT type, name, sql FROM sqlite_master ORDER BY type, name") == before
+
+
 def test_window_queries_use_the_sort_at_index(tmp_path):
     path = tmp_path / "fresh.db"
     with closing(Database(str(path))):

@@ -140,6 +140,11 @@ REVIEW_COLUMNS = (
     ("est_savings_usd", "REAL"),
 )
 
+# Version 1 is the first explicitly versioned schema. It includes every additive upgrade that
+# older unversioned databases receive below; future schema changes must get a new numbered,
+# transactional migration instead of another unconditional ALTER in Database.__init__.
+SCHEMA_VERSION = 1
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS scim_tokens (
     id TEXT PRIMARY KEY, team_id INTEGER NOT NULL REFERENCES teams(id),
@@ -535,6 +540,32 @@ def _read_only_uri(path: str) -> str:
     return "file:" + quote(text, safe="/:") + "?mode=ro"
 
 
+def backup_integrity_error(path: str) -> Optional[str]:
+    """None when `path` is a structurally valid RunLedger backup, else a short error.
+
+    This deliberately opens the copy read-only instead of Database: verification must never run
+    migrations or otherwise write to the file it is checking. `integrity_check` proves the SQLite
+    pages and indexes; the table check catches a valid SQLite file that is not a RunLedger backup.
+    """
+    try:
+        if os.path.getsize(path) == 0:
+            return "backup is empty"
+        conn = sqlite3.connect(_read_only_uri(path), uri=True, timeout=10)
+        try:
+            rows = conn.execute("PRAGMA integrity_check").fetchall()
+            if rows != [("ok",)]:
+                return "integrity_check: " + "; ".join(str(row[0]) for row in rows[:3])
+            tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+            missing = {"teams", "api_keys", "runs"} - tables
+            if missing:
+                return "not a RunLedger database (missing " + ", ".join(sorted(missing)) + ")"
+            return None
+        finally:
+            conn.close()
+    except (OSError, sqlite3.Error) as exc:
+        return str(exc)
+
+
 class Database:
     """One SQLite connection shared by all request threads, guarded by a lock, and a second,
     read-only connection for reports and exports: a long report never holds the lock the writers
@@ -556,6 +587,7 @@ class Database:
                     self._conn.execute("PRAGMA journal_mode = WAL")
                 except sqlite3.DatabaseError:
                     pass  # some filesystems refuse WAL; the default journal still works
+                self._reject_newer_schema()
                 self._conn.executescript(SCHEMA)
                 self._add_missing_columns("api_keys", (("user_id", "TEXT REFERENCES users (id)"),))
                 self._add_missing_columns("memberships", (("deactivated_at", "TEXT"), ("external_id", "TEXT"), ("updated_at", "TEXT")))
@@ -593,6 +625,7 @@ class Database:
                 self._upgrade_run_store()
                 self._upgrade_review_columns()
                 self._migrate_api_keys()
+                self._finish_schema_migrations()
         except BaseException:
             self._conn.close()
             raise
@@ -676,6 +709,30 @@ class Database:
                 pass
             raise
         _restrict_file(str(dest))
+
+    def _schema_version(self) -> int:
+        return int(self._conn.execute("PRAGMA user_version").fetchone()[0])
+
+    def _reject_newer_schema(self) -> None:
+        """Do not mutate a database written by a newer RunLedger."""
+        version = self._schema_version()
+        if version > SCHEMA_VERSION:
+            raise sqlite3.DatabaseError(
+                f"database schema version {version} is newer than this RunLedger reads "
+                f"({SCHEMA_VERSION}); upgrade RunLedger or restore the pre-upgrade backup"
+            )
+
+    def _finish_schema_migrations(self) -> None:
+        """Stamp the version after the pre-versioning additive upgrades have converged.
+
+        Version 1 is the baseline, so there is no data migration to run here yet. Future
+        migrations belong in numbered steps before the stamp; leaving the stamp last lets an
+        interrupted upgrade run the idempotent steps again.
+        """
+        if self._schema_version() >= SCHEMA_VERSION:
+            return
+        with self._conn:
+            self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def _add_missing_columns(self, table: str, columns: Tuple[Tuple[str, str], ...]) -> None:
         """Upgrade a database created before these columns existed."""
