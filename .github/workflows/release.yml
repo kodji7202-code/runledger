@@ -88,4 +88,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          python tools/check_release.py --tag "$GITHUB_REF_NAME" --notes | gh release create "$GITHUB_REF_NAME" --notes-file - --title "RunLedger ${GITHUB_REF_NAME#v}"
+          version="${GITHUB_REF_NAME#v}"
+          prerelease=()
+          if [[ "$version" =~ (a|b|rc|dev)[0-9]+$ ]]; then
+            prerelease=(--prerelease)
+          fi
+          python tools/check_release.py --tag "$GITHUB_REF_NAME" --notes | gh release create "$GITHUB_REF_NAME" --notes-file - --title "RunLedger $version" "${prerelease[@]}"
