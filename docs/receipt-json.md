@@ -103,4 +103,5 @@ runledger validate run.json
 `validate` exits 0 when every file conforms and 1 when JSON parsing or schema validation fails.
 The checker is part of the base install and needs no extra dependencies. It implements the JSON
 Schema subset used by `receipt.schema.json`; the test suite also validates every fixture with
-safe mode on and off (`tests/test_receipt_schema.py`).
+safe mode on and off (`tests/test_receipt_schema.py`). The end-to-end fixture matrix and the
+external real-session corpus are documented in [conformance.md](conformance.md).
