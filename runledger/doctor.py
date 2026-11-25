@@ -779,7 +779,6 @@ def _risk_severity_points(level: str) -> int:
 
 def _invalid_rule_count(data: Dict[str, Any]) -> int:
     """How many rule entries in one config file are typed wrongly or dropped as unsafe."""
-    from . import risk as _risk
 
     count = 0
     guard_section = _guard._section(data, "guard")
@@ -1222,7 +1221,7 @@ def check_extra(report: Report, check: Check) -> List[str]:
     if check.id in ("approval", "log", "rollback", "pricing"):
         return _file_extras(check, report)
     if check.id == "sessions":
-        return [f"counts only; no transcript is read into the report"]
+        return ["counts only; no transcript is read into the report"]
     return []
 
 

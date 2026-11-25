@@ -12,7 +12,7 @@ git clone https://github.com/kodji7202-code/runledger.git runledger
 cd runledger
 python -m venv .venv
 . .venv/bin/activate              # Windows: .venv\Scripts\activate
-python -m pip install -e '.[server]' pytest
+python -m pip install -e '.[dev,server]'
 ```
 
 ## Run the tests
@@ -26,7 +26,8 @@ backend from the package index. Offline, those tests are skipped with the reason
 
 CI runs the same suite on Ubuntu, Windows and macOS with Python 3.9 to 3.13, builds the sdist
 and the wheel and runs `twine check` on them, lints `deploy/docker-compose.yml`, and builds the
-Docker image, starts it and checks its `/health` endpoint.
+Docker image, starts it and checks its `/health` endpoint. A quality job also runs Ruff,
+strict mypy on the typed leaf modules, and coverage with the floor in `pyproject.toml`.
 
 ## Rules for the code
 
@@ -43,7 +44,10 @@ Docker image, starts it and checks its `/health` endpoint.
   particular shell in tests.
 - **No real data in fixtures.** Session files, API keys and customer data never go into
   `tests/`. Use small synthetic files, such as those in `tests/fixtures/`.
-- **Match the style of the code around your change.** There is no formatter or linter in CI.
+- **Match the style of the code around your change.** Ruff checks Pyflakes correctness rules
+  (`F`): undefined names, unused imports and redefinitions. The strict mypy ratchet currently
+  covers `paths.py`, `_text.py`, `jsonl.py`, `ai_defaults.py` and `userconfig.py`; keep those
+  files clean and add another module to the CI command only when it passes strict checking.
 
 ## Agent adapters
 

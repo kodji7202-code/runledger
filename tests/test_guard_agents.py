@@ -10,7 +10,6 @@ Real-shaped events for other tools reuse those key sets. Every secret below is s
 import copy
 import json
 import os
-import socket
 import subprocess
 import sys
 import threading
@@ -170,7 +169,6 @@ def test_droid_output_is_json_exit_zero_and_silent_allow(tmp_path):
 
 
 def test_droid_hook_process_never_exits_two(tmp_path):
-    env = dict(os.environ)
     for command in ("rm -rf x", "echo rl-ready"):
         proc = hook_process("droid", json.dumps(bash("droid", command, tmp_path)), tmp_path)
         assert proc.returncode == 0, proc.stderr

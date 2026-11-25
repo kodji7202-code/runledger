@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from runledger import doctor, guard, hook_targets, pricing, rollback
+from runledger import doctor, pricing, rollback
 from runledger._text import display_width, wrap_text
 from runledger.cli import main as cli_main
 

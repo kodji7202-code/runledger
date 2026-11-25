@@ -50,6 +50,28 @@ jobs:
       - name: Run tests
         run: pytest -q -ra  # -ra lists skipped tests by name, so platform-only skips stay visible
 
+  quality:
+    name: Lint, typecheck and coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install the development tools
+        run: python -m pip install -e '.[dev,server]'
+      - name: Lint for correctness defects
+        run: python -m ruff check runledger tests
+      - name: Typecheck the fully typed leaf modules
+        # This is a strict ratchet: keep these files clean, and add another module only when it passes.
+        run: python -m mypy runledger/paths.py runledger/_text.py runledger/jsonl.py runledger/ai_defaults.py runledger/userconfig.py
+      - name: Measure test coverage
+        run: python -m coverage run -m pytest -q
+      - name: Report coverage
+        run: python -m coverage report
+
   build:
     name: Build the distributions and check them
     runs-on: ubuntu-latest
