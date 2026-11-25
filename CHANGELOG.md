@@ -13,6 +13,8 @@ change behavior, so read the entry before you upgrade.
   read-only verification can recreate, so verified backups no longer leave files outside retention cleanup.
 - Status lines written to pipes and redirects use UTF-8 unless `PYTHONIOENCODING` explicitly
   requests another encoding, so Windows Git Bash no longer shows middle-dot separators as `�`.
+- The dashboard accepts zero budgets, matching the API contract, and its webhook help now names the
+  `RUNLEDGER_ALLOW_LOOPBACK_WEBHOOKS=1` opt-in required for local HTTP endpoints.
 
 ## [1.0.0rc1] - 2026-11-25
 
