@@ -334,6 +334,9 @@ def test_release_workflow_uses_trusted_publishing_on_version_tags():
         assert re.search(rf"uses: {re.escape(action)}@v\d+\b", release), \
             f"the release workflow does not use {action} from a major-version tag"
     assert "v0.3.0" not in release
+    assert 'if [[ "$version" =~ (a|b|rc|dev)[0-9]+$ ]]' in release
+    assert 'prerelease=(--prerelease)' in release
+    assert '"${prerelease[@]}"' in release
 
 
 def test_release_workflow_verifies_tag_against_version():
