@@ -16,14 +16,22 @@ from typing import Any, Dict, List, Optional
 from . import llm
 from .ai_defaults import DEFAULT_AI_MODEL
 from .parser import Run, Step, Usage
-from .paths import is_abs, normalized_git_path, relative
+from .paths import is_abs, is_windows_style, normalized_git_path, relative
 from .ps_writes import ps_deletes, ps_writes, shell_kind
 from .shell_writes import shell_deletes, shell_writes
 
 
 def _short(path: str, cwd: Optional[str]) -> str:
     shortened = relative(path, cwd)
-    return normalized_git_path(shortened) if shortened and not is_abs(shortened) else shortened
+    if not shortened or is_abs(shortened):
+        return shortened
+    normalized = normalized_git_path(shortened)
+    same_platform = bool(cwd) and is_windows_style(cwd) == (os.name == "nt")
+    if ".." in normalized.split("/") and same_platform:
+        resolved = relative(os.path.realpath(os.path.join(cwd, normalized)), cwd)
+        if resolved and not is_abs(resolved):
+            normalized = normalized_git_path(resolved)
+    return normalized
 
 
 COMMAND_LIMIT = 120
@@ -127,7 +135,7 @@ def file_changes(run: Run) -> Dict[str, FileChange]:
                 fc.added += w.added
     for p, fc in changes.items():
         fc.activity_added, fc.activity_removed = fc.added, fc.removed
-        git = run.git_changes.get(p) or run.git_changes.get(normalized_git_path(p))
+        git = run.git_changes.get(p) or (None if is_abs(p) else run.git_changes.get(normalized_git_path(p)))
         if git and not git.get("count_limited"):
             fc.added, fc.removed = int(git.get("added") or 0), int(git.get("removed") or 0)
             fc.created = git.get("status") in ("untracked", "added")
