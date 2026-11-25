@@ -28,8 +28,9 @@ _METHODS = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"]
 class _ASGIBody:
     """Synchronous file-like access to an ASGI request body, started only when read."""
 
-    def __init__(self, request: Request) -> None:
+    def __init__(self, request: Request, closing: Any) -> None:
         self.request = request
+        self.closing = closing
         self.loop = asyncio.get_running_loop()
         self.chunks: "queue.Queue[Optional[bytes]]" = queue.Queue()
         self.buffer = bytearray()
@@ -53,7 +54,11 @@ class _ASGIBody:
     def read(self, size: int = -1) -> bytes:
         self._start()
         while not self.eof and (size < 0 or len(self.buffer) < size):
-            chunk = self.chunks.get()
+            try:
+                chunk = self.chunks.get(timeout=0.1)
+            except queue.Empty:
+                self.eof = bool(self.closing())
+                continue
             if chunk is None:
                 self.eof = True
             else:
@@ -166,7 +171,7 @@ class _MethodCompatibility:
             await self.app(scope, receive, send)
             return
         request = Request(scope, receive)
-        handler = _CapturedHandler(self.server, request, _ASGIBody(request))
+        handler = _CapturedHandler(self.server, request, _ASGIBody(request, self.server.closing.is_set))
         await asyncio.to_thread(handler.handle)
         await handler.response()(scope, receive, send)
 
@@ -176,7 +181,7 @@ def create_app(server: RunLedgerServer) -> Any:
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
     async def endpoint(request: Request) -> Response:
-        handler = _CapturedHandler(server, request, _ASGIBody(request))
+        handler = _CapturedHandler(server, request, _ASGIBody(request, server.closing.is_set))
         # The existing database object is already shared safely across request threads. Run the
         # synchronous endpoint off the event loop. Its body stream starts only when the
         # authenticated endpoint actually reads it.
@@ -243,8 +248,6 @@ class UvicornServer:
     ) -> None:
         family = socket.AF_INET6 if ":" in address[0] else socket.AF_INET
         self.socket = socket.socket(family, socket.SOCK_STREAM)
-        if socket.AF_INET6 == family:
-            self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
         # On Windows, SO_REUSEADDR lets a second process take over a bound port.
         if os.name != "nt":
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

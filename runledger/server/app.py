@@ -259,6 +259,7 @@ class RunLedgerServer:
         self._query_key_warned = False
         self._query_key_lock = threading.Lock()
         self._maintenance_stop = threading.Event()
+        self.closing = threading.Event()
         from .asgi import UvicornServer, create_app
 
         self._uvicorn = UvicornServer(address, create_app(self), tls_context=tls_context)
@@ -289,6 +290,7 @@ class RunLedgerServer:
         self._uvicorn.serve_forever()
 
     def shutdown(self) -> None:
+        self.closing.set()
         self._uvicorn.shutdown()
 
     def start_maintenance(self, interval_s: float = MAINTENANCE_INTERVAL_S) -> bool:
@@ -333,6 +335,7 @@ class RunLedgerServer:
         threading.Thread(target=loop, name="runledger-key-expiry", daemon=True).start()
 
     def server_close(self) -> None:
+        self.closing.set()
         self._maintenance_stop.set()
         self._uvicorn.server_close()
 

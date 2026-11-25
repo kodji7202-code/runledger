@@ -8,8 +8,10 @@ import http.client
 import json
 import math
 import re
+import socket
 import sqlite3
 import threading
+import time
 from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1534,6 +1536,23 @@ def test_receipt_csp_has_sandbox(env):
     assert "sandbox" in csp
     assert "default-src 'none'" in csp and "script-src" not in csp
     assert headers["x-content-type-options"] == "nosniff"
+
+
+def test_stalled_upload_does_not_block_shutdown(env):
+    srv, base = env
+    _, key = srv.db.create_team("alpha")
+    port = urlsplit(base).port
+    sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+    try:
+        request = (f"POST /api/runs HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {key}\r\n"
+                   "Content-Type: application/json\r\nContent-Length: 1000\r\n\r\n{").encode("utf-8")
+        sock.sendall(request)
+        time.sleep(0.2)
+        started = time.monotonic()
+        srv.shutdown()
+        assert time.monotonic() - started < 5
+    finally:
+        sock.close()
 
 
 def test_unauthenticated_post_rejected_without_reading_body(env):
