@@ -127,7 +127,7 @@ def file_changes(run: Run) -> Dict[str, FileChange]:
     for p, fc in changes.items():
         fc.activity_added, fc.activity_removed = fc.added, fc.removed
         git = run.git_changes.get(p) or run.git_changes.get(normalized_git_path(p))
-        if git:
+        if git and not git.get("count_limited"):
             fc.added, fc.removed = int(git.get("added") or 0), int(git.get("removed") or 0)
             fc.created = git.get("status") in ("untracked", "added")
             fc.deleted = git.get("status") == "deleted"

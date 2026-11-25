@@ -256,18 +256,18 @@ _ORIG_IN_REPO = _in_repo
 _ORIG_GIT = _git
 
 
-def _count_lines(path: str) -> Tuple[int, bool]:
-    """(line count, is binary) of a file; a file too large to read counts 0 lines."""
+def _count_lines(path: str) -> Tuple[int, bool, bool]:
+    """(line count, is binary, count unknown) of a worktree file."""
     try:
         if os.path.getsize(path) > _MAX_COUNT_BYTES:
-            return 0, False
+            return 0, False, True
         with open(path, "rb") as fh:
             data = fh.read()
     except OSError:
-        return 0, False
+        return 0, False, True
     if b"\0" in data:
-        return 0, True
-    return len(data.splitlines()), False
+        return 0, True, False
+    return len(data.splitlines()), False, False
 
 
 _ESCAPES = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13, '"': 34, "\\": 92}
@@ -365,8 +365,11 @@ def working_changes(cwd: Optional[str], paths: Optional[Iterable[str]] = None,
         untracked = _git(cwd, "ls-files", "--cached", "--others", *others_standard, "-z", *path_args) or ""
     for path in untracked.split("\0"):
         if path and path not in out and (wanted is None or path in wanted):
-            lines, binary = _count_lines(os.path.join(cwd, path))
-            out[path] = {"added": lines, "removed": 0, "status": "untracked", "binary": binary}
+            lines, binary, count_limited = _count_lines(os.path.join(cwd, path))
+            entry = {"added": lines, "removed": 0, "status": "untracked", "binary": binary}
+            if count_limited:
+                entry["count_limited"] = True
+            out[path] = entry
     return out
 
 
