@@ -9,6 +9,10 @@ change behavior, so read the entry before you upgrade.
 
 ### Fixed
 
+- `runledger rollback` with nothing to restore prints `Nothing to restore (already matches <id>).`
+  and exits 0, as `--path` already did. It no longer asks for confirmation, prints `Restored`, or
+  creates a safety checkpoint of an unchanged tree. When only kept ignored files differ, it names
+  them instead of claiming an exact match.
 - Team statistics, Insights, and receipt exports exclude future-dated runs from their reporting windows.
 - `list --limit` counts displayed sessions, so invalid, unreadable, or vanished sessions
   no longer consume limit slots.

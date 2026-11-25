@@ -278,15 +278,6 @@ def cmd_rollback(args) -> int:
                 print(f"  restore  {path!r}")
             for path in plan.remove:
                 print(f"  delete   {path!r}  (not in checkpoint)")
-            if not (plan.restore or plan.remove):
-                print(f"Nothing to restore for {', '.join(plan.paths)} "
-                      f"(already matches {checkpoint.id}).")
-                return 0
-            count = len(plan.restore) + len(plan.remove)
-            size = _changed_bytes(repo, plan, CheckpointError)
-            detail = f" ({size} bytes)" if size >= 0 else ""
-            print(f"{count} file(s) would change{detail}. "
-                  "Everything outside the scope is untouched. Run with --yes to apply.")
         else:
             for path in plan.restore:
                 print(f"  restore {path!r}")
@@ -294,8 +285,22 @@ def cmd_rollback(args) -> int:
                 print(f"  remove  {path!r}")
             for path in plan.keep_ignored:
                 print(f"  keep ignored {path!r}")
-            size = _changed_bytes(repo, plan, CheckpointError)
-            detail = f" ({size} bytes)" if size >= 0 else ""
+        if not (plan.restore or plan.remove):
+            scope = f" for {', '.join(plan.paths)}" if plan.paths else ""
+            if plan.keep_ignored:
+                kept = len(plan.keep_ignored)
+                print(f"Nothing to restore{scope} (matches {checkpoint.id} except {kept} "
+                      f"ignored file{'' if kept == 1 else 's'}, which rollback keeps).")
+            else:
+                print(f"Nothing to restore{scope} (already matches {checkpoint.id}).")
+            return 0
+        size = _changed_bytes(repo, plan, CheckpointError)
+        detail = f" ({size} bytes)" if size >= 0 else ""
+        if plan.paths:
+            count = len(plan.restore) + len(plan.remove)
+            print(f"{count} file(s) would change{detail}. "
+                  "Everything outside the scope is untouched. Run with --yes to apply.")
+        else:
             print(f"{len(plan.restore)} restore, {len(plan.remove)} remove{detail}. "
                   "HEAD, branch, and index stay unchanged.")
         if args.dry_run:
