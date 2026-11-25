@@ -280,11 +280,19 @@ def _command_writes(words: List[str], targets: List[str], body: Optional[str]) -
                 or (a.startswith("-") and not a.startswith("--") and any(c in a[1:] for c in "bls"))
                 for a in args
             )
-            preserves_links = name == "cp" and any(
-                a in ("--no-dereference", "--archive")
-                or (a.startswith("-") and not a.startswith("--") and any(c in a[1:] for c in "Pda"))
-                for a in args
-            )
+            preserves_links = False
+            for a in args:
+                if a in ("--no-dereference", "--archive"):
+                    preserves_links = True
+                elif a == "--dereference":
+                    preserves_links = False
+                elif a.startswith("-") and not a.startswith("--"):
+                    for option in a[1:]:
+                        if option in "adP":
+                            preserves_links = True
+                        elif option in "HL":
+                            preserves_links = False
+            preserves_links = preserves_links and name == "cp"
             for src in sources:
                 into = dest.endswith(("/", "\\") if is_windows_style(dest) else "/") or len(sources) > 1
                 name_of = ntpath.basename if is_windows_style(src) else posixpath.basename
