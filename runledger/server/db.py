@@ -537,7 +537,11 @@ def _read_only_uri(path: str) -> str:
     """A `file:` URI for a second, read-only connection to the same database file. SQLite
     percent-decodes the path, so a Windows drive letter, a space or a non-ASCII name works."""
     text = path.replace("\\", "/") if os.sep == "\\" else path
-    return "file:" + quote(text, safe="/:") + "?mode=ro"
+    text = quote(text, safe="/:")
+    if text.startswith("//"):
+        # Two literal leading slashes would otherwise be parsed as a URI authority/host.
+        text = "%2F" + text[1:]
+    return "file:" + text + "?mode=ro"
 
 
 def backup_integrity_error(path: str) -> Optional[str]:

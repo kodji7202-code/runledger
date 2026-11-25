@@ -337,3 +337,9 @@ def test_session_cap_per_key(tmp_path):
         for token in tokens[5:]:
             assert db.session_key(token) is not None
         assert db.session_key(other_token) is not None
+
+
+def test_read_only_uri_keeps_double_slash_paths_out_of_the_uri_host():
+    from runledger.server.db import _read_only_uri
+
+    assert _read_only_uri("//server/share/team.db").startswith("file:%2F/server/share/team.db")
