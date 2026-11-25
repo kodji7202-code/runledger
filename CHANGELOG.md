@@ -9,6 +9,10 @@ change behavior, so read the entry before you upgrade.
 
 ### Fixed
 
+- Small unauthenticated or unauthorized API POSTs reliably return their JSON 401/403 response on
+  Windows: the server briefly drains only the small declared body before closing, instead of letting
+  unread input reset the connection before the client reads the error. Stalled unauthenticated bodies
+  count toward the existing per-address failure limit, so they cannot hold request workers indefinitely.
 - `runledger rollback` with nothing to restore prints `Nothing to restore (already matches <id>).`
   and exits 0, as `--path` already did. It no longer asks for confirmation, prints `Restored`, or
   creates a safety checkpoint of an unchanged tree. When only kept ignored files differ, it names
@@ -31,6 +35,9 @@ change behavior, so read the entry before you upgrade.
 - Receipt conformance release gate: `tools/check_conformance.py` runs a deterministic fixture
   matrix for Claude Code, Codex CLI, Factory Droid, Aider, the native format and guard receipts;
   [docs/conformance.md](docs/conformance.md) documents the matrix and the external real-session corpus.
+- Deterministic adversarial parser and guard fuzz corpora: malformed shell, PowerShell, heredoc,
+  Unicode/NUL and nested-operator input must keep the synchronous guard path crash-free and preserve
+  its decision contract.
 - Development quality gates: a `dev` extra, Ruff Pyflakes lint, strict mypy on fully typed leaf
   modules, and coverage measurement with a 70% floor in CI.
 - `DELETE /api/runs/{id}` lets a team administrator erase one stored run and its revisions;
