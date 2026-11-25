@@ -308,6 +308,32 @@ def test_link_creating_commands_stay_on_the_link_path(tmp_path, tool, command):
 
 
 @needs_git
+@pytest.mark.parametrize("tool,command", [
+    ("Bash", "cp --backup=none source.cfg alias.cfg"),
+    ("Bash", "cp --backup=off source.cfg alias.cfg"),
+    ("PowerShell", "New-Item -ItemType File -Force -Path alias.cfg -Value new"),
+])
+def test_write_through_commands_still_reconcile_the_target(tmp_path, tool, command):
+    if os.name == "nt":
+        pytest.skip("symlink creation needs extra Windows privileges")
+    repo = _init(tmp_path)
+    target = repo / "target.cfg"
+    target.write_text("old\n")
+    (repo / "source.cfg").write_text("new\n")
+    _git(repo, "add", "target.cfg")
+    _git(repo, "commit", "-q", "-m", "target")
+    (repo / "alias.cfg").symlink_to("target.cfg")
+    target.write_text("new\n")
+    steps = [Step(1, tool, {"command": command}, "", None, None)]
+    run = Run("s", "/x.jsonl", str(repo), None, None, None, ["go"], steps, "", Usage(), {})
+    reconcile_git(run)
+
+    rows = file_changes(run)
+    assert list(rows) == ["target.cfg"]
+    assert rows["target.cfg"].verified
+
+
+@needs_git
 def test_removed_symlink_parent_navigation_is_not_collapsed(tmp_path):
     if os.name == "nt":
         pytest.skip("directory symlink creation needs extra Windows privileges")

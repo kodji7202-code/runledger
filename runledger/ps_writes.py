@@ -476,7 +476,10 @@ def _parse_args(
             i += 1
             continue
         if a.startswith("-"):
-            # Unknown switch or parameter: if it's a known switch, consume just the flag
+            if low == "-force":
+                named.setdefault(low, []).append("true")
+            # Unknown switches consume no value here; the path parameters above are the ones
+            # this static reader knows how to interpret safely.
             i += 1
             continue
         positional.append(a)
@@ -558,6 +561,8 @@ def _ps_writes_cached(command: str) -> Tuple[ShellWrite, ...]:
             item_types = [v.lower() for v in _first_param(named, _ITEMTYPE_PARAMS)]
             if any(t in ("directory", "folder", "container") for t in item_types):
                 continue
+            creates_link = any(t in ("symboliclink", "hardlink", "junction") for t in item_types)
+            follows_link = not creates_link and "-force" in named
             vals = _first_param(named, {"-value"})
             added = max(1, len("\n".join(vals).replace("\\n", "\n").replace("`n", "\n").splitlines())) if vals else 0
             paths_arg = _first_param(named, _PATH_PARAMS)
@@ -566,13 +571,13 @@ def _ps_writes_cached(command: str) -> Tuple[ShellWrite, ...]:
                 raw_target = _join_dir_and_leaf(paths_arg[0], names_arg[0])
                 cleaned = _clean_ps_path(raw_target, cwd)
                 if cleaned:
-                    out.append(ShellWrite(cleaned, added=added))
+                    out.append(ShellWrite(cleaned, added=added, follows_link=follows_link))
             else:
                 targets = paths_arg or names_arg or pos[:1]
                 for t in targets:
                     cleaned = _clean_ps_path(t, cwd)
                     if cleaned:
-                        out.append(ShellWrite(cleaned, added=added))
+                        out.append(ShellWrite(cleaned, added=added, follows_link=follows_link))
             continue
 
         if cmd in _COPY_CMDS or cmd in _MOVE_CMDS:

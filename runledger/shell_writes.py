@@ -275,7 +275,7 @@ def _command_writes(words: List[str], targets: List[str], body: Optional[str]) -
             dest, sources = paths[-1], paths[:-1]
             replaces_link = any(
                 a in ("-b", "-l", "-s", "--backup", "--link", "--remove-destination", "--symbolic-link")
-                or a.startswith("--backup=")
+                or (a.startswith("--backup=") and a not in ("--backup=none", "--backup=off"))
                 or (a.startswith("-") and not a.startswith("--") and any(c in a[1:] for c in "bls"))
                 for a in args
             )
