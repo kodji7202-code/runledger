@@ -11,7 +11,7 @@ import json
 import os
 import re
 from dataclasses import dataclass, replace
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from . import llm
 from .ai_defaults import DEFAULT_AI_MODEL
@@ -38,42 +38,72 @@ def _is_symlink_path(path: str, cwd: Optional[str]) -> bool:
         return False
 
 
-def _resolve_parent_path(cwd: str, normalized: str) -> Optional[str]:
-    """Resolve the parent directories, or None when one no longer exists.
+class _PathResolver:
+    """Filesystem lookups shared by the paths of one receipt.
 
-    os.path.realpath() can collapse `..` lexically when the final file is absent, which would
-    turn `link/../x` into the wrong file when `link` is a symlink. Resolving each directory
-    before applying `..` preserves the filesystem's actual symlink semantics. The final path
-    component is deliberately left alone: deleting a symlink acts on the link, while writing
-    through one acts on its target.
+    A large run often writes thousands of files in the same directories. Resolving every
+    parent anew made receipt generation several times slower on Windows, while sharing the
+    lookups within one pass does not change the result: the receipt is a snapshot of the
+    filesystem as it is being read.
     """
-    current = _realpath(cwd)
-    if current is None:
-        return None
-    parts = normalized.split("/")
-    for part in parts[:-1]:
-        if part == "..":
-            current = os.path.dirname(current)
-            continue
-        candidate = os.path.join(current, part)
-        if not os.path.isdir(candidate):
-            return None
-        current = _realpath(candidate)
+
+    def __init__(self, cwd: str):
+        self.cwd = cwd
+        self.realpaths: Dict[str, Optional[str]] = {}
+        self.parents: Dict[Tuple[str, ...], Optional[str]] = {}
+
+    def realpath(self, path: str) -> Optional[str]:
+        if path not in self.realpaths:
+            self.realpaths[path] = _realpath(path)
+        return self.realpaths[path]
+
+    def resolve_parent(self, normalized: str) -> Optional[str]:
+        """Resolve the parent directories, or None when one no longer exists.
+
+        os.path.realpath() can collapse `..` lexically when the final file is absent, which
+        would turn `link/../x` into the wrong file when `link` is a symlink. Resolving each
+        directory before applying `..` preserves the filesystem's actual symlink semantics.
+        The final path component is deliberately left alone: deleting a symlink acts on the
+        link, while writing through one acts on its target.
+        """
+        current = self.realpath(self.cwd)
         if current is None:
             return None
-    return os.path.join(current, parts[-1])
+        parts = normalized.split("/")
+        for index, part in enumerate(parts[:-1], 1):
+            key = tuple(parts[:index])
+            if key in self.parents:
+                current = self.parents[key]
+                if current is None:
+                    return None
+                continue
+            if part == "..":
+                current = os.path.dirname(current)
+            else:
+                candidate = os.path.join(current, part)
+                if not os.path.isdir(candidate):
+                    current = None
+                else:
+                    current = self.realpath(candidate)
+            self.parents[key] = current
+            if current is None:
+                return None
+        return os.path.join(current, parts[-1])
 
 
-def _short(path: str, cwd: Optional[str], follow_write: bool = False) -> str:
+def _short(path: str, cwd: Optional[str], follow_write: bool = False,
+           resolver: Optional[_PathResolver] = None) -> str:
     shortened = relative(path, cwd)
     if not shortened or is_abs(shortened):
         return shortened
     normalized = normalized_git_path(shortened)
     same_platform = bool(cwd) and is_windows_style(cwd) == (os.name == "nt")
     if same_platform:
-        resolved_path = _resolve_parent_path(cwd, normalized)
+        if resolver is None:
+            resolver = _PathResolver(cwd or "")
+        resolved_path = resolver.resolve_parent(normalized)
         if resolved_path is not None and follow_write:
-            resolved_path = _realpath(resolved_path)
+            resolved_path = resolver.realpath(resolved_path)
         if resolved_path is not None:
             resolved = relative(resolved_path, cwd)
             if resolved and not is_abs(resolved):
@@ -132,10 +162,12 @@ def file_changes(run: Run) -> Dict[str, FileChange]:
         return {p: replace(fc) for p, fc in run.frozen_changes.items()}
     changes: Dict[str, FileChange] = {}
     uncounted = set()
+    resolver = (_PathResolver(run.cwd) if run.cwd and is_windows_style(run.cwd) == (os.name == "nt")
+                else None)
     for s in run.steps:
         p = _str(s.input.get("file_path")) or _str(s.input.get("notebook_path"))
         follow_write = s.tool in ("Write", "Edit", "MultiEdit", "NotebookEdit")
-        p = _short(p, run.cwd, follow_write=follow_write) if p else p
+        p = _short(p, run.cwd, follow_write=follow_write, resolver=resolver) if p else p
         if s.tool == "Write" and p:
             fc = changes.setdefault(p, FileChange(p))
             if not fc.added and not fc.removed:
@@ -168,7 +200,7 @@ def file_changes(run: Run) -> Dict[str, FileChange]:
             deletes = ps_deletes(cmd) if is_ps else shell_deletes(cmd)
             writes = ps_writes(cmd) if is_ps else shell_writes(cmd)
             for target in deletes:
-                p = _short(target, run.cwd)
+                p = _short(target, run.cwd, resolver=resolver)
                 if run.cwd and is_abs(p):
                     continue  # outside the project, such as a scratch file in /tmp
                 fc = changes.setdefault(p, FileChange(p))
@@ -177,7 +209,7 @@ def file_changes(run: Run) -> Dict[str, FileChange]:
                 follow_write = w.follows_link
                 if follow_write and w.preserves_links and _is_symlink_path(w.source or "", run.cwd):
                     follow_write = False
-                p = _short(w.path, run.cwd, follow_write=follow_write)
+                p = _short(w.path, run.cwd, follow_write=follow_write, resolver=resolver)
                 if run.cwd and is_abs(p):
                     continue  # outside the project, such as a backup in /tmp
                 fc = changes.setdefault(p, FileChange(p))
