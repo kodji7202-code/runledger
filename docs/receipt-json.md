@@ -67,8 +67,14 @@ A risk reason (in `risk.reasons` and `steps[].risks`) has `severity` (`high`, `m
 ## `files[]`
 
 `path` (relative to the run folder when it is inside it), `added`, `removed` (line counts),
-`created`, `deleted`, `shell` (written through the shell, so counts may be incomplete),
-`verified` (counts come from Git) and `binary` (Git sees a binary file, so there are no counts).
+`activity_added`, `activity_removed`, `created`, `deleted`, `shell` (written through the shell,
+so counts may be incomplete), `verified` (counts come from Git) and `binary` (Git sees a binary
+file, so there are no counts).
+
+When `verified` is true, `added`/`removed` are the net working-tree diff against HEAD or
+`git_base`. When it is false, they are the best-effort activity reconstructed from tool events.
+`activity_added`/`activity_removed` always keep that cumulative activity: repeated writes or
+edits of the same lines count each operation, so they can be larger than the final net diff.
 
 ## `steps[]`
 

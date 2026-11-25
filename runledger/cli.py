@@ -112,7 +112,7 @@ def build(session_path: str, use_ai: bool = False, ai_model: str = DEFAULT_AI_MO
 
 def reconcile_git(run) -> None:
     """Fill what the session log leaves out from the run's Git working tree: the
-    branch when none was recorded, line counts for files written through the shell, and
+    branch when none was recorded, net line counts for every changed project file, and
     the diffs of changed test files. When the run's changes were committed after it began,
     both compare the working tree with the last commit before the session start (run.git_base)."""
     from .summarize import file_changes
@@ -122,10 +122,15 @@ def reconcile_git(run) -> None:
             run.git_branch = current_branch(run.cwd)
         run.git_base = session_base(run.cwd, _ts(run.started))
         changes = file_changes(run)
-        shell_paths = [p for p, fc in changes.items()
-                       if fc.shell or (not fc.added and not fc.removed and not fc.deleted)]
-        if shell_paths:
-            run.git_changes = working_changes(run.cwd, shell_paths, run.git_base)
+        git_paths = [p for p in changes if not is_abs(p)]
+        if git_paths:
+            run.git_changes = working_changes(run.cwd, git_paths, run.git_base)
+            if toplevel(run.cwd):
+                for path in git_paths:
+                    if "\0" in path or "\n" in path:
+                        continue  # working_changes cannot pass these as Git pathspecs
+                    run.git_changes.setdefault(path, {"added": 0, "removed": 0,
+                                                      "status": "unchanged", "binary": False})
         test_paths = [p for p, fc in changes.items()
                       if not fc.deleted and not is_abs(p) and is_test_source(p)]
         if test_paths:

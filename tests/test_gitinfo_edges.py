@@ -49,6 +49,7 @@ def test_not_a_repo_gives_static_counts_and_no_branch(tmp_path, capsys):
     assert run.git_branch is None and run.git_changes == {}
     md = render(run, 0, "Low", [], "md")
     assert "**Branch:** `-`" in md
+    assert "cumulative tool-input counts" in md and "(activity)" in md
 
 
 @needs_git
@@ -75,6 +76,58 @@ def test_repo_without_commits_counts_new_files(tmp_path):
     assert changes == {"new.py": {"added": 3, "removed": 0, "status": "untracked", "binary": False}}
     assert gitinfo.file_diffs(str(repo), ["new.py"]) == {}
     assert gitinfo.current_branch(str(repo)) == "main"
+
+
+@needs_git
+def test_direct_writes_report_net_diff_and_keep_activity_counts(tmp_path):
+    repo = _init(tmp_path)
+    target = repo / "app.py"
+    target.write_text("a\nb\nc\nd\n")
+    steps = [
+        Step(1, "Write", {"file_path": str(target), "content": "a\nb\nc\n"}, "", None, None),
+        Step(2, "Write", {"file_path": str(target), "content": "a\nb\nc\nd\n"}, "", None, None),
+    ]
+    run = Run("s", "/x.jsonl", str(repo), None, None, None, ["go"], steps, "", Usage(), {})
+    reconcile_git(run)
+
+    change = file_changes(run)["app.py"]
+    assert (change.added, change.removed) == (2, 0)
+    assert (change.activity_added, change.activity_removed) == (7, 0)
+    assert change.verified
+
+    data = json.loads(render(run, 0, "Low", [], "json"))
+    row = data["files"][0]
+    assert (row["activity_added"], row["activity_removed"]) == (7, 0)
+    assert row["verified"] is True
+
+
+@needs_git
+def test_reverted_direct_write_is_verified_as_zero_net_diff(tmp_path):
+    repo = _init(tmp_path)
+    target = repo / "app.py"
+    steps = [
+        Step(1, "Write", {"file_path": str(target), "content": "temporary\n"}, "", None, None),
+        Step(2, "Write", {"file_path": str(target), "content": "a\nb\n"}, "", None, None),
+    ]
+    run = Run("s", "/x.jsonl", str(repo), None, None, None, ["go"], steps, "", Usage(), {})
+    reconcile_git(run)
+
+    change = file_changes(run)["app.py"]
+    assert (change.added, change.removed) == (0, 0)
+    assert (change.activity_added, change.activity_removed) == (3, 0)
+    assert change.verified
+
+
+@needs_git
+def test_explicit_paths_include_ignored_files_written_by_the_agent(tmp_path):
+    repo = _init(tmp_path)
+    (repo / ".gitignore").write_text("secret.txt\n")
+    (repo / "secret.txt").write_text("one\ntwo\n")
+
+    assert "secret.txt" not in gitinfo.working_changes(str(repo))
+    assert gitinfo.working_changes(str(repo), ["secret.txt"])["secret.txt"] == {
+        "added": 2, "removed": 0, "status": "untracked", "binary": False,
+    }
 
 
 @needs_git
