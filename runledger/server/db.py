@@ -74,6 +74,15 @@ def _restrict_file(path: str) -> None:
         pass
 
 
+def _unlink_sqlite_sidecars(path: Path) -> None:
+    """Best-effort removal of SQLite's WAL/shared-memory files next to a temporary copy."""
+    for suffix in ("-shm", "-wal"):
+        try:
+            path.with_name(path.name + suffix).unlink()
+        except OSError:
+            pass
+
+
 # Team settings added after the first release. Databases created earlier get them
 # through _add_missing_columns().
 TEAM_SETTING_COLUMNS = (
@@ -689,6 +698,7 @@ class Database:
                 tmp.unlink()
             except OSError:
                 pass
+        _unlink_sqlite_sidecars(tmp)
         target = sqlite3.connect(str(tmp))
         source: Optional[sqlite3.Connection] = None
         ok = False
@@ -700,6 +710,10 @@ class Database:
                 problem = verify(str(tmp))
                 if problem is not None:
                     raise sqlite3.Error(f"verification failed: {problem}")
+            # A read-only verification of a WAL-mode copy can recreate empty sidecars after the
+            # writer has already checkpointed and closed. They belong to the temporary name and
+            # must not escape into the backup directory when the database itself is renamed.
+            _unlink_sqlite_sidecars(tmp)
             ok = True
         finally:
             target.close()
@@ -710,6 +724,7 @@ class Database:
                     tmp.unlink()
                 except OSError:
                     pass
+                _unlink_sqlite_sidecars(tmp)
         try:
             os.replace(str(tmp), str(dest))
         except BaseException:
@@ -717,6 +732,7 @@ class Database:
                 tmp.unlink()
             except OSError:
                 pass
+            _unlink_sqlite_sidecars(tmp)
             raise
         _restrict_file(str(dest))
 
