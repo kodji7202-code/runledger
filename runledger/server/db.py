@@ -1780,7 +1780,7 @@ class Database:
         """
         with self._lock, self._conn:
             row = self._conn.execute(
-                "SELECT user, project, revision FROM runs WHERE team_id = ? AND id = ?",
+                "SELECT 1 FROM runs WHERE team_id = ? AND id = ?",
                 (team_id, run_id),
             ).fetchone()
             if row is None:
@@ -1790,8 +1790,7 @@ class Database:
                 "DELETE FROM run_revisions WHERE team_id = ? AND run_id = ?", (team_id, run_id)
             ).rowcount
             self._conn.execute("DELETE FROM runs WHERE team_id = ? AND id = ?", (team_id, run_id))
-            self._audit(team_id, actor, "run.delete", run_id,
-                        {"project": row["project"], "user": row["user"], "revisions_removed": revisions})
+            self._audit(team_id, actor, "run.delete", run_id, {"revisions_removed": revisions})
         return True
 
     # Statistics

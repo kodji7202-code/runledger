@@ -282,7 +282,9 @@ def test_admin_can_delete_one_run_and_revisions_are_erased(env, tmp_path):
         assert conn.execute("SELECT COUNT(*) FROM risks WHERE run_id = ?", (SESSION_ID,)).fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM run_revisions WHERE run_id = ?", (SESSION_ID,)).fetchone()[0] == 0
     events = srv.db.list_audit(team_id, action="run.")
-    assert any(event["action"] == "run.delete" and event["target"] == SESSION_ID for event in events)
+    deletion = next(event for event in events if event["action"] == "run.delete")
+    assert deletion["target"] == SESSION_ID
+    assert deletion["details"] == {"revisions_removed": 0}
     assert _http(base, "DELETE", f"/api/runs/{SESSION_ID}", headers=_auth(key))[0] == 404
 
 
