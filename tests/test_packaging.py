@@ -350,7 +350,7 @@ def test_release_workflow_installs_the_package_like_ci_before_testing():
     v0.6.1 run, so every test importing runledger failed and the release could not publish."""
     release = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
     ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-    install = "python -m pip install -e . pytest"
+    install = "python -m pip install -e '.[server]' pytest"
     assert install in ci, "the CI test job installs the package and pytest"
     jobs = _workflow_jobs(release)
     assert jobs, "no jobs found in release.yml"
@@ -392,7 +392,7 @@ def test_container_runs_as_non_root_on_port_8787():
     for mirror in ("public.ecr.aws/docker/library/python:3.12-slim",
                    "mirror.gcr.io/library/python:3.12-slim"):
         assert mirror in ci
-    assert "pip install --no-cache-dir ." in dockerfile
+    assert "pip install --no-cache-dir '.[server]'" in dockerfile
     assert "USER runledger" in dockerfile
     assert "EXPOSE 8787" in dockerfile
     assert 'ENTRYPOINT ["runledger"]' in dockerfile
