@@ -3,6 +3,7 @@
   runledger list [--project PATH] [--all] [--agent AGENT] [--limit N]
   runledger receipt [SESSION | --latest] [--project PATH] [--agent AGENT] [--format html|md|json]
                     [-o FILE] [--ai] [--ai-model MODEL] [--review] [--review-model MODEL] [--open]
+  runledger validate RECEIPT...
   runledger serve [--host 127.0.0.1] [--port 8787] [--db runledger.db]
                   [--tls-cert FILE --tls-key FILE] [--secure-cookies] [--trust-proxy]
                   [--trusted-proxy CIDR ...]
@@ -278,15 +279,6 @@ def cmd_rollback(args) -> int:
                 print(f"  restore  {path!r}")
             for path in plan.remove:
                 print(f"  delete   {path!r}  (not in checkpoint)")
-            if not (plan.restore or plan.remove):
-                print(f"Nothing to restore for {', '.join(plan.paths)} "
-                      f"(already matches {checkpoint.id}).")
-                return 0
-            count = len(plan.restore) + len(plan.remove)
-            size = _changed_bytes(repo, plan, CheckpointError)
-            detail = f" ({size} bytes)" if size >= 0 else ""
-            print(f"{count} file(s) would change{detail}. "
-                  "Everything outside the scope is untouched. Run with --yes to apply.")
         else:
             for path in plan.restore:
                 print(f"  restore {path!r}")
@@ -294,10 +286,25 @@ def cmd_rollback(args) -> int:
                 print(f"  remove  {path!r}")
             for path in plan.keep_ignored:
                 print(f"  keep ignored {path!r}")
-            size = _changed_bytes(repo, plan, CheckpointError)
-            detail = f" ({size} bytes)" if size >= 0 else ""
+        if not (plan.restore or plan.remove):
+            scope = f" for {', '.join(plan.paths)}" if plan.paths else ""
+            if plan.keep_ignored:
+                kept = len(plan.keep_ignored)
+                print(f"Nothing to restore{scope} (matches {checkpoint.id} except {kept} "
+                      f"ignored file{'' if kept == 1 else 's'}, which rollback keeps).")
+            else:
+                print(f"Nothing to restore{scope} (already matches {checkpoint.id}).")
+            return 0
+        size = _changed_bytes(repo, plan, CheckpointError)
+        detail = f" ({size} bytes)" if size >= 0 else ""
+        if plan.paths:
+            count = len(plan.restore) + len(plan.remove)
+            print(f"{count} file(s) would change{detail}. "
+                  "Everything outside the scope is untouched. Run with --yes to apply.")
+        else:
             print(f"{len(plan.restore)} restore, {len(plan.remove)} remove{detail}. "
                   "HEAD, branch, and index stay unchanged.")
+        print("Note: Git line-ending and clean/smudge filters apply; rollback is not byte-for-byte backup.")
         if args.dry_run:
             print("Dry run. No files restored and no safety checkpoint created.")
             return 0
@@ -456,6 +463,32 @@ def _default_receipt_path(stem: str, ext: str) -> Path:
         if not candidate.exists():
             return candidate
         n += 1
+
+
+def _reject_json_constant(constant: str):
+    raise ValueError(f"non-JSON number {constant}")
+
+
+def cmd_validate(args) -> int:
+    from .receipt_schema import validate_receipt
+
+    valid = True
+    for name in args.receipts:
+        try:
+            data = json.loads(Path(name).read_text(encoding="utf-8"), parse_constant=_reject_json_constant)
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            print(f"{name}: invalid JSON ({exc})", file=sys.stderr)
+            valid = False
+            continue
+        errors = validate_receipt(data)
+        if errors:
+            valid = False
+            print(f"{name}: invalid", file=sys.stderr)
+            for error in errors:
+                print(f"  {error}", file=sys.stderr)
+        else:
+            print(f"{name}: valid")
+    return 0 if valid else 1
 
 
 def cmd_receipt(args) -> int:
@@ -1127,6 +1160,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     safe.add_argument("--no-safe", dest="safe", action="store_false",
                       help="keep full local paths and e-mail addresses")
     pr.set_defaults(func=cmd_receipt)
+
+    pv = sub.add_parser("validate", help="validate JSON receipts against receipt.schema.json")
+    pv.add_argument("receipts", nargs="+", metavar="RECEIPT", help="JSON receipt file to validate")
+    pv.set_defaults(func=cmd_validate)
 
     ps = sub.add_parser("serve", help="run the team server (collects pushed runs, serves the dashboard)")
     ps.add_argument("--host", default="127.0.0.1", help="bind address (default 127.0.0.1)")

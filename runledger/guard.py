@@ -112,7 +112,22 @@ _DROID_TOOLS = {
     "ApplyPatch": "ApplyPatch",
 }
 _CODEX_TOOLS = {"Bash": "Bash", "apply_patch": "ApplyPatch"}
+_CLAUDE_TOOLS = {
+    # Current Claude Code built-ins, plus names used by older supported versions.
+    "Agent", "ApplyPatch", "Artifact", "AskUserQuestion", "Bash", "BashOutput", "CronCreate",
+    "CronDelete", "CronList", "Delete", "Edit", "EndConversation", "EnterPlanMode", "EnterWorktree",
+    "ExitPlanMode", "ExitWorktree", "Glob", "Grep", "KillShell", "ListAgents",
+    "ListMcpResourcesTool", "ListPlugins", "ListSkills", "LS", "LSP", "Monitor", "MultiEdit",
+    "NotebookEdit", "PowerShell", "propose_skills", "PushNotification", "Read",
+    "ReadMcpResourceTool", "RemoteTrigger", "REPL", "ReportFindings", "ScheduleWakeup", "Search",
+    "SearchPlugins", "SearchSkills", "SendFeedback", "SendMessage", "SendUserFile",
+    "ShareOnboardingGuide", "Skill", "SlashCommand", "SubagentHandback", "SuggestPluginInstall",
+    "SuggestSkills", "Task", "TaskCreate", "TaskGet", "TaskList", "TaskOutput", "TaskStop",
+    "TaskUpdate", "TodoWrite", "ToolSearch", "WaitForMcpServers", "WebFetch", "WebSearch",
+    "Workflow", "Write",
+}
 _PATCH_TOOLS = ("ApplyPatch", "apply_patch")
+_UNKNOWN_TOOL_RANK = {"allow": 0, "ask": 1, "deny": 2}
 
 LOG_DIR = ".runledger"
 LOG_FILE = "guard.log"
@@ -433,6 +448,11 @@ def _on_timeout_of(approval: Dict[str, Any]) -> Optional[str]:
     return value if value in ("deny", "ask") else None
 
 
+def _unknown_tool_of(section: Dict[str, Any]) -> Optional[str]:
+    value = section.get("unknown_tool")
+    return value if isinstance(value, str) and value in _UNKNOWN_TOOL_RANK else None
+
+
 def _effective_guard(project: Dict[str, Any], user: Dict[str, Any], trusted: Dict[str, str]) -> Tuple[Dict[str, Any], List[str]]:
     """The guard settings in force, and the warnings for project settings that were ignored."""
     p = _section(project, "guard")
@@ -484,6 +504,18 @@ def _effective_guard(project: Dict[str, Any], user: Dict[str, Any], trusted: Dic
         warnings.append(f"Ignored codex_ask in {POLICY_FILE}: Codex cannot prompt from a hook, so only "
                         f"{USER_CONFIG_DIR}/{USER_CONFIG_FILE} can decide what an ask means there.")
 
+    # Unknown tools are allow by default for forward compatibility. A project may tighten
+    # the user's choice (allow -> ask -> deny), never loosen it.
+    user_unknown = _unknown_tool_of(u) or "allow"
+    project_unknown = _unknown_tool_of(p)
+    unknown_tool = user_unknown
+    if project_unknown is not None:
+        if _UNKNOWN_TOOL_RANK[project_unknown] > _UNKNOWN_TOOL_RANK[user_unknown]:
+            unknown_tool = project_unknown
+        elif _UNKNOWN_TOOL_RANK[project_unknown] < _UNKNOWN_TOOL_RANK[user_unknown]:
+            warnings.append(f"Ignored unknown_tool {project_unknown} in {POLICY_FILE}: a project can tighten "
+                            f"the unknown-tool policy, not loosen it.")
+
     cfg = {
         "mode": mode,
         "fail_closed": u.get("fail_closed") is True or p.get("fail_closed") is True,
@@ -494,6 +526,7 @@ def _effective_guard(project: Dict[str, Any], user: Dict[str, Any], trusted: Dic
         "user_ask": user_ask,
         "project_ask": project_ask,
         "codex_ask": codex_ask,
+        "unknown_tool": unknown_tool,
         "approval": {"server": trusted["server"], "api_key_env": trusted["api_key_env"],
                      "timeout_s": timeout, "on_timeout": on_timeout},
     }
@@ -659,10 +692,12 @@ def infer_agent(event: Any) -> str:
 
 def canonical_tool(agent: str, tool: str) -> Optional[str]:
     """The canonical name a tool is assessed and logged under, or None for a name this
-    agent's vocabulary does not know. Claude Code names are canonical already; a Droid
-    connector name gets the `mcp__` prefix the receipts use (the classifier reads both)."""
+    agent's vocabulary does not know. A connector name gets the `mcp__` prefix the receipts
+    use (the classifier reads both spellings)."""
     if agent == AGENT_CLAUDE:
-        return tool
+        if tool in _CLAUDE_TOOLS:
+            return tool
+        return tool if mcp_parts(tool) is not None else None
     mapped = (_DROID_TOOLS if agent == AGENT_DROID else _CODEX_TOOLS).get(tool)
     if mapped is not None:
         return mapped
@@ -845,6 +880,7 @@ def decide(event: dict, policy: Optional[dict] = None, approver: Optional[Approv
     warnings = _project_key_warnings(project) + warnings
 
     tool, tool_input, steps = normalize_event(event, agent)
+    canonical = canonical_tool(agent, tool)
     session_id = str(event.get("session_id") or "")
     tool_use_id = str(event.get("tool_use_id") or "")
 
@@ -855,12 +891,24 @@ def decide(event: dict, policy: Optional[dict] = None, approver: Optional[Approv
         step = Step(index=index, tool=step_tool, input=step_input,
                     tool_use_id=tool_use_id, model=None, timestamp=None)
         risks.extend(assess_step(step, cwd, rs["assess"], workdir=event_cwd))
+    unknown_risks: List[Risk] = []
+    if canonical is None and cfg["unknown_tool"] != "allow":
+        unknown_risks.append(Risk("high", "unknown_tool",
+                                  f"Unknown {agent} tool ({clean(tool, 80)})", 1))
+        risks.extend(unknown_risks)
     warnings += _apply_project_severity(risks, rs["project_severity"])
     warnings += _ignore_warnings(risks, rs["project_ignore"])
     warnings += _exclusion_warnings(cfg["user_deny"], cfg["project_deny"], risks, "deny")
     warnings += _exclusion_warnings(cfg["user_ask"], cfg["project_ask"], risks, "ask")
 
     policy_decision, drivers = _evaluate(risks, cfg)
+    if unknown_risks:
+        if cfg["unknown_tool"] == "deny":
+            policy_decision = "deny"
+        elif cfg["unknown_tool"] == "ask" and policy_decision == "allow":
+            policy_decision = "ask"
+        if policy_decision in ("ask", "deny") and not any(r is unknown_risks[0] for r in drivers):
+            drivers = unknown_risks + drivers
     summary = _steps_summary(steps)
     # Everything decided above used the shell's own words; the label is the whole spaced drive
     # path in the reason text this decision shows. The label names what the command said, so it
@@ -896,7 +944,7 @@ def decide(event: dict, policy: Optional[dict] = None, approver: Optional[Approv
         "mode": cfg["mode"],
         "agent": agent,
         "tool": tool,
-        "canonical_tool": canonical_tool(agent, tool),
+        "canonical_tool": canonical,
         "tool_use_id": tool_use_id,
         "session_id": session_id,
         "cwd": cwd,
