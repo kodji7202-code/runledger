@@ -191,7 +191,9 @@ payload.
 | `mcp__server__tool`, Droid's bare `server__tool` | unchanged: one classifier, both name shapes |
 
 A tool name the agent's vocabulary does not know keeps its own name and is logged with
-`canonical_tool` `null`; the decision is then allow unless a `tool_rules` entry matches it.
+`canonical_tool` `null`. It is allowed by default for forward compatibility, but
+`guard.unknown_tool` can change that policy to `ask` or `deny`; a `tool_rules` entry can still
+match the name either way.
 
 **Codex and `ask`.** Codex marks a hook that answers `ask` as failed and runs the call anyway, so
 the guard turns an ask into a deny whose reason names the rule and how to proceed. The user's own
@@ -348,6 +350,7 @@ What each file can set:
 | `guard.approval.server` | Sets it. | Ignored. |
 | `guard.approval.api_key_env` | Sets it. | Ignored. |
 | `guard.codex_ask`: `deny` (default) or `allow` | Decides what an ask means for Codex, which cannot prompt from a hook. | Ignored and logged: only your file may allow an ask there. |
+| `guard.unknown_tool`: `allow` (default), `ask` or `deny` | Sets the policy for a tool outside the agent vocabulary. | Can tighten it (`allow` to `ask` or `deny`, `ask` to `deny`), never loosen it. |
 | `ignore` | Hides matching findings from the guard and the receipt. | Ignored by both the guard and the receipt (the receipt adds a note). |
 | `severity_overrides` | Sets any severity. | Can raise a severity, never lower it (in both the guard and the receipt). |
 | `extra_secret_paths` | Adds safe regular expressions or `glob:...` patterns (up to 20, max 200 characters each). | Adds safe regular expressions or `glob:...` patterns. Unsafe backtracking patterns are ignored and logged. |
