@@ -232,6 +232,29 @@ def test_parent_navigation_after_a_directory_name_is_not_collapsed(tmp_path):
 
 
 @needs_git
+@pytest.mark.parametrize("written", ["alias.cfg", "sub/../alias.cfg"])
+def test_write_through_a_final_symlink_reconciles_its_target(tmp_path, written):
+    if os.name == "nt":
+        pytest.skip("symlink creation needs extra Windows privileges")
+    repo = _init(tmp_path)
+    (repo / "sub").mkdir()
+    target = repo / "target.cfg"
+    target.write_text("old\n")
+    _git(repo, "add", "target.cfg")
+    _git(repo, "commit", "-q", "-m", "target")
+    (repo / "alias.cfg").symlink_to("target.cfg")
+    target.write_text("new\n")
+    steps = [Step(1, "Write", {"file_path": written, "content": "new\n"}, "", None, None)]
+    run = Run("s", "/x.jsonl", str(repo), None, None, None, ["go"], steps, "", Usage(), {})
+    reconcile_git(run)
+
+    rows = file_changes(run)
+    assert list(rows) == ["target.cfg"]
+    assert rows["target.cfg"].verified
+    assert "alias.cfg" not in run.git_changes
+
+
+@needs_git
 def test_removed_symlink_parent_navigation_is_not_collapsed(tmp_path):
     if os.name == "nt":
         pytest.skip("directory symlink creation needs extra Windows privileges")
