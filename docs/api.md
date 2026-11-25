@@ -86,6 +86,15 @@ below names the minimum role. A higher role always works. See [enterprise.md](en
 **Formats.** Request and response bodies are JSON in UTF-8, except the HTML pages and the exports.
 Times are UTC in the form `2026-10-08T16:37:34Z`.
 
+**API version.** This document is HTTP API version **1**. Every response, including errors, carries
+`X-RunLedger-API: 1`; `/health` also reports the server software version. Within version 1 changes
+are additive only: new endpoints, optional request fields, response fields and enum values may be
+added, and clients must ignore response fields they do not know. Removing or renaming a field,
+changing its type, tightening a previously valid request into an error, or changing the meaning of an
+existing value is incompatible. An incompatible version is exposed beside the old one rather than
+silently changing version 1. After 1.0, deprecations are documented in the changelog and supported
+for at least one minor release before removal.
+
 **Errors.** Every JSON error has this shape. Tracebacks are never sent to the client; they go to the
 server's log.
 

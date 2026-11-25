@@ -33,6 +33,10 @@ change behavior, so read the entry before you upgrade.
   is rejected before any migration touches it, with instructions to upgrade or restore the backup.
 - `runledger backup --verify` reopens the finished copy read-only, runs SQLite `integrity_check`,
   and checks the core RunLedger tables before retention. `deploy/backup.sh` verifies scheduled copies.
+- Every team-server response carries `X-RunLedger-API: 1`; the HTTP API now has an explicit
+  additive-change and deprecation contract. The test suite includes a concurrent mixed read/write
+  load check and an opt-in `RUNLEDGER_SOAK` soak harness, with an operations runbook for monitoring,
+  restore drills, load testing and upgrade rehearsal.
 - Development quality gates: a `dev` extra, Ruff Pyflakes lint, strict mypy on fully typed leaf
   modules, and coverage measurement with a 70% floor in CI.
 - `DELETE /api/runs/{id}` lets a team administrator erase one stored run and its revisions;
