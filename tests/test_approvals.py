@@ -348,6 +348,16 @@ def test_missing_or_wrong_credentials_are_401_and_store_nothing(env):
     assert _get_view(base, key, approval_id)["decided_by"] is None
 
 
+def test_repeated_small_unauthenticated_posts_keep_their_json_401(env):
+    """Windows can turn close-with-unread-input into a reset before the client reads the error."""
+    _, base = env
+    bad = _auth("rl_wrong")
+    for headers in ({}, bad) * 8:
+        status, _, raw = _http(base, "POST", "/api/approvals", body=_valid(), headers=headers)
+        assert status == 401
+        assert _json(raw)["error"]["code"] == "unauthorized"
+
+
 def test_dashboard_cookie_follows_the_role_of_its_key(env):
     srv, base = env
     team_id, key = srv.db.create_team("alpha")
