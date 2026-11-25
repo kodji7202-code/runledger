@@ -1015,6 +1015,13 @@ def test_project_cannot_loosen_the_user_unknown_tool_policy(tmp_path, isolated_s
     assert any("unknown_tool" in w and "tighten" in w for w in d["warnings"])
 
 
+def test_malformed_unknown_tool_policy_cannot_disable_the_guard(tmp_path):
+    write_project(tmp_path, {"guard": {"unknown_tool": []}})
+    d = _decide_with_project(tmp_path)
+    assert d["decision"] == "deny"
+    assert "command" in d["codes"]
+
+
 def test_current_claude_builtin_names_stay_canonical(tmp_path):
     for tool in ("Write", "AskUserQuestion", "EnterWorktree", "ToolSearch", "Workflow"):
         d = guard.decide(unknown_tool_event(tmp_path, tool), {})

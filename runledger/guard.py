@@ -449,7 +449,7 @@ def _on_timeout_of(approval: Dict[str, Any]) -> Optional[str]:
 
 def _unknown_tool_of(section: Dict[str, Any]) -> Optional[str]:
     value = section.get("unknown_tool")
-    return value if value in _UNKNOWN_TOOL_RANK else None
+    return value if isinstance(value, str) and value in _UNKNOWN_TOOL_RANK else None
 
 
 def _effective_guard(project: Dict[str, Any], user: Dict[str, Any], trusted: Dict[str, str]) -> Tuple[Dict[str, Any], List[str]]:
