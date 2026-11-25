@@ -52,8 +52,8 @@ to one, and the detail. The first line is a header with the RunLedger version, t
 the platform and the project folder. Warnings and failures add a `->` line with what to do:
 
 ```text
-RunLedger doctor 1.0.0rc1  |  python 3.12.10  |  win32  |  D:\my-app
-[ok] install: runledger 1.0.0rc1 | python 3.12.10 | win32 | D:\my-app | runledger on PATH (C:\Python312\Scripts\runledger.exe)
+RunLedger doctor 1.0.0rc2  |  python 3.12.10  |  win32  |  D:\my-app
+[ok] install: runledger 1.0.0rc2 | python 3.12.10 | win32 | D:\my-app | runledger on PATH (C:\Python312\Scripts\runledger.exe)
 [ok] guard hooks claude-code project: Claude Code project: guard hook (PreToolUse) and 1 + 1 checkpoint hooks (SessionStart, UserPromptSubmit) in D:\my-app\.claude\settings.json
 [info] guard hooks claude-code global: Claude Code global: not installed (C:\Users\me\.claude\settings.json)
 [info] guard hooks droid project: Droid project: not installed (D:\my-app\.factory\hooks.json)
@@ -88,7 +88,7 @@ installed`, which is not a warning: only `[warn]` and `[fail]` raise the exit co
 ```json
 {
   "version": 1,
-  "runledger": "1.0.0rc1",
+  "runledger": "1.0.0rc2",
   "project": "D:\\my-app",
   "summary": {"ok": 5, "warn": 1, "fail": 0, "info": 13},
   "checks": [
