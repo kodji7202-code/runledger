@@ -502,29 +502,31 @@ def test_unverified_variants_stay_unpriced():
 
 
 def test_verified_openai_models_in_prices_json():
-    assert price_for("gpt-6-astra") == (10.0, 50.0, 1.0)
-    assert price_for("gpt-6.1-sol") == (2.0, 10.0, 0.1)
-    assert price_for("gpt-6-luna") == (0.1, 0.5, 0.01)
-    assert price_for("gpt-5.6-sol") == (4.0, 20.0, 0.4)
-    assert price_for("gpt-5.6-cyber") == (12.5, 75.0, 1.25)
-    assert price_for("gpt-5.3-codex") == (1.75, 14.0, 0.175)
-    assert price_for("gpt-4o") is None
-    assert price_for("gpt-5-codex") is None
+    checked = "2026-11-01"
+    assert price_for("gpt-6-astra", date=checked) == (10.0, 50.0, 1.0)
+    assert price_for("gpt-6.1-sol", date=checked) == (2.0, 10.0, 0.1)
+    assert price_for("gpt-6-luna", date=checked) == (0.1, 0.5, 0.01)
+    assert price_for("gpt-5.6-sol", date=checked) == (4.0, 20.0, 0.4)
+    assert price_for("gpt-5.6-cyber", date=checked) == (12.5, 75.0, 1.25)
+    assert price_for("gpt-5.3-codex", date=checked) == (1.75, 14.0, 0.175)
+    assert price_for("gpt-4o", date=checked) is None
+    assert price_for("gpt-5-codex", date=checked) is None
 
 
 def test_verified_google_gemini_models_in_prices_json():
-    assert price_for("gemini-4-argon") == (2.0, 10.0, 0.1)
+    checked = "2026-11-01"
+    assert price_for("gemini-4-argon", date=checked) == (2.0, 10.0, 0.1)
     assert price_for("gemini-4-argon", date="2026-12-01") == (4.0, 20.0, 0.2)
-    assert price_for("gemini-3.8-flash") == (0.75, 3.75, 0.075)
+    assert price_for("gemini-3.8-flash", date=checked) == (0.75, 3.75, 0.075)
     assert price_for("gemini-3.8-flash", date="2027-01-01") == (1.5, 7.5, 0.15)
-    assert price_for("gemini-3.6-flash") == (0.75, 3.75, 0.075)
+    assert price_for("gemini-3.6-flash", date=checked) == (0.75, 3.75, 0.075)
     assert price_for("gemini-3.6-flash", date="2027-01-01") == (1.5, 7.5, 0.15)
-    assert price_for("gemini-3.5-flash-lite") == (0.3, 2.5, 0.03)
-    assert price_for("gemini-3.1-flash-lite") == (0.25, 1.5, 0.025)
-    assert price_for("gemini-3-flash-preview") == (0.5, 3.0, 0.05)
-    assert price_for("gemini-2.5-pro") == (1.25, 10.0, 0.125)
-    assert price_for("gemini-2.5-flash") == (0.3, 2.5, 0.03)
-    assert price_for("gemini-2.5-flash-lite") == (0.1, 0.4, 0.01)
+    assert price_for("gemini-3.5-flash-lite", date=checked) == (0.3, 2.5, 0.03)
+    assert price_for("gemini-3.1-flash-lite", date=checked) == (0.25, 1.5, 0.025)
+    assert price_for("gemini-3-flash-preview", date=checked) == (0.5, 3.0, 0.05)
+    assert price_for("gemini-2.5-pro", date=checked) == (1.25, 10.0, 0.125)
+    assert price_for("gemini-2.5-flash", date=checked) == (0.3, 2.5, 0.03)
+    assert price_for("gemini-2.5-flash-lite", date=checked) == (0.1, 0.4, 0.01)
 
 
 def test_all_twenty_v060_anthropic_keys_preserved():
