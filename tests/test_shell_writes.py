@@ -253,3 +253,15 @@ def test_build_receipt_uses_git(repo, tmp_path_factory):
 
 def test_shell_write_dataclass_defaults():
     assert ShellWrite("a") == ShellWrite("a", 0, False)
+
+
+@pytest.mark.parametrize("command,expected", [
+    ("cp -aL source-link alias.cfg", False),
+    ("cp -La source-link alias.cfg", True),
+    ("cp -P -L source-link alias.cfg", False),
+    ("cp -L -P source-link alias.cfg", True),
+])
+def test_cp_dereference_modes_use_the_last_option(command, expected):
+    write = shell_writes(command)[0]
+    assert write.preserves_links is expected
+    assert write.follows_link is True
