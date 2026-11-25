@@ -5,6 +5,7 @@ never change the results."""
 import json
 import os
 import shutil
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -206,22 +207,26 @@ def _droid_session(factory: Path, project: Path, session_id: str) -> Path:
     return path
 
 
-def test_droid_discovery_follows_factory_home_override(tmp_path, monkeypatch, capsys):
+def test_droid_discovery_follows_factory_home_override(monkeypatch, capsys):
     """VAL-AGENT-028: FACTORY_HOME_OVERRIDE is a HOME, so droid sessions live in
     `<override>/.factory/sessions`, and both list and receipt find them there."""
-    project = tmp_path / "proj"
-    project.mkdir()
-    monkeypatch.delenv("FACTORY_HOME", raising=False)
-    monkeypatch.setenv("FACTORY_HOME_OVERRIDE", str(tmp_path / "override"))
-    _droid_session(tmp_path / "override" / ".factory", project, "droidhome1")
+    # Droid repeats the whole project path in its session folder; pytest's deep
+    # tmp_path can push that encoding past the 260-character Windows path limit.
+    with tempfile.TemporaryDirectory(prefix="rl-") as short_tmp:
+        base = Path(short_tmp)
+        project = base / "p"
+        project.mkdir()
+        monkeypatch.delenv("FACTORY_HOME", raising=False)
+        monkeypatch.setenv("FACTORY_HOME_OVERRIDE", str(base / "o"))
+        _droid_session(base / "o" / ".factory", project, "droidhome1")
 
-    assert main(["list", "--agent", "droid", "--all"]) == 0
-    assert "droidhom" in capsys.readouterr().out
+        assert main(["list", "--agent", "droid", "--all"]) == 0
+        assert "droidhom" in capsys.readouterr().out
 
-    assert main(["receipt", "--agent", "droid", "--project", str(project),
-                 "--format", "json", "-o", "-"]) == 0
-    data = _json_out(capsys)
-    assert (data["agent_id"], data["session_id"]) == ("droid", "droidhome1")
+        assert main(["receipt", "--agent", "droid", "--project", str(project),
+                     "--format", "json", "-o", "-"]) == 0
+        data = _json_out(capsys)
+        assert (data["agent_id"], data["session_id"]) == ("droid", "droidhome1")
 
 
 def test_receipt_defaults_to_the_current_folder(tmp_path, monkeypatch, capsys):
