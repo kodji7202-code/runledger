@@ -49,6 +49,7 @@ def test_not_a_repo_gives_static_counts_and_no_branch(tmp_path, capsys):
     assert run.git_branch is None and run.git_changes == {}
     md = render(run, 0, "Low", [], "md")
     assert "**Branch:** `-`" in md
+    assert "cumulative tool-input counts" in md and "(activity)" in md
 
 
 @needs_git
@@ -75,6 +76,409 @@ def test_repo_without_commits_counts_new_files(tmp_path):
     assert changes == {"new.py": {"added": 3, "removed": 0, "status": "untracked", "binary": False}}
     assert gitinfo.file_diffs(str(repo), ["new.py"]) == {}
     assert gitinfo.current_branch(str(repo)) == "main"
+
+
+@needs_git
+def test_direct_writes_report_net_diff_and_keep_activity_counts(tmp_path):
+    repo = _init(tmp_path)
+    target = repo / "app.py"
+    target.write_text("a\nb\nc\nd\n")
+    steps = [
+        Step(1, "Write", {"file_path": str(target), "content": "a\nb\nc\n"}, "", None, None),
+        Step(2, "Write", {"file_path": str(target), "content": "a\nb\nc\nd\n"}, "", None, None),
+    ]
+    run = Run("s", "/x.jsonl", str(repo), None, None, None, ["go"], steps, "", Usage(), {})
+    reconcile_git(run)
+
+    change = file_changes(run)["app.py"]
+    assert (change.added, change.removed) == (2, 0)
+    assert (change.activity_added, change.activity_removed) == (7, 0)
+    assert change.verified
+
+    data = json.loads(render(run, 0, "Low", [], "json"))
+    row = data["files"][0]
+    assert (row["activity_added"], row["activity_removed"]) == (7, 0)
+    assert row["verified"] is True
+
+
+@needs_git
+def test_reverted_direct_write_is_verified_as_zero_net_diff(tmp_path):
+    repo = _init(tmp_path)
+    target = repo / "app.py"
+    steps = [
+        Step(1, "Write", {"file_path": str(target), "content": "temporary\n"}, "", None, None),
+        Step(2, "Write", {"file_path": str(target), "content": "a\nb\n"}, "", None, None),
+    ]
+    run = Run("s", "/x.jsonl", str(repo), None, None, None, ["go"], steps, "", Usage(), {})
+    reconcile_git(run)
+
+    change = file_changes(run)["app.py"]
+    assert (change.added, change.removed) == (0, 0)
+    assert (change.activity_added, change.activity_removed) == (3, 0)
+    assert change.verified
+
+
+@needs_git
+def test_explicit_paths_include_ignored_files_written_by_the_agent(tmp_path):
+    repo = _init(tmp_path)
+    (repo / ".gitignore").write_text("secret.txt\n")
+    (repo / "secret.txt").write_text("one\ntwo\n")
+
+    assert "secret.txt" not in gitinfo.working_changes(str(repo))
+    assert gitinfo.working_changes(str(repo), ["secret.txt"])["secret.txt"] == {
+        "added": 2, "removed": 0, "status": "untracked", "binary": False,
+    }
+
+
+@needs_git
+def test_dot_prefixed_direct_edit_is_matched_to_gits_path(tmp_path):
+    repo = _init(tmp_path)
+    (repo / "app.py").write_text("a\nb\nc\n")
+    steps = [Step(1, "Edit", {"file_path": "./app.py", "old_string": "b", "new_string": "c"}, "", None, None)]
+    run = Run("s", "/x.jsonl", str(repo), None, None, None, ["go"], steps, "", Usage(), {})
+    reconcile_git(run)
+
+    change = file_changes(run)["app.py"]
+    assert (change.added, change.removed) == (1, 0)
+    assert change.verified
+
+
+
+@needs_git
+def test_dot_and_plain_spelling_merge_into_one_receipt_row(tmp_path):
+    repo = _init(tmp_path)
+    (repo / "app.py").write_text("a\nb\nc\n")
+    steps = [
+        Step(1, "Edit", {"file_path": "app.py", "old_string": "b", "new_string": "x"}, "", None, None),
+        Step(2, "Edit", {"file_path": "./app.py", "old_string": "x", "new_string": "b"}, "", None, None),
+    ]
+    run = Run("s", "/x.jsonl", str(repo), None, None, None, ["go"], steps, "", Usage(), {})
+    reconcile_git(run)
+
+    rows = file_changes(run)
+    assert list(rows) == ["app.py"]
+    assert rows["app.py"].verified
+    assert (rows["app.py"].added, rows["app.py"].removed) == (1, 0)
+
+
+@needs_git
+def test_posix_backslash_in_a_filename_is_not_a_directory_separator(tmp_path):
+    if os.name == "nt":
+        pytest.skip("backslash is a path separator on Windows")
+    repo = _init(tmp_path)
+    name = "dir\\file.py"
+    target = repo / name
+    target.write_text("one\n")
+    steps = [Step(1, "Write", {"file_path": name, "content": "one\ntwo\n"}, "", None, None)]
+    target.write_text("one\ntwo\n")
+    run = Run("s", "/x.jsonl", str(repo), None, None, None, ["go"], steps, "", Usage(), {})
+    reconcile_git(run)
+
+    change = file_changes(run)[name]
+    assert change.verified
+    assert change.added == 2
+
+
+@needs_git
+def test_real_directory_parent_navigation_merges_spellings(tmp_path):
+    repo = _init(tmp_path)
+    (repo / "src").mkdir()
+    (repo / "settings.py").write_text("one\ntwo\n")
+    steps = [
+        Step(1, "Write", {"file_path": "settings.py", "content": "one\n"}, "", None, None),
+        Step(2, "Write", {"file_path": "src/../settings.py", "content": "one\ntwo\n"}, "", None, None),
+    ]
+    run = Run("s", "/x.jsonl", str(repo), None, None, None, ["go"], steps, "", Usage(), {})
+    reconcile_git(run)
+
+    rows = file_changes(run)
+    assert list(rows) == ["settings.py"]
+    assert rows["settings.py"].verified
+
+
+@needs_git
+def test_absolute_outside_path_does_not_share_a_relative_git_key(tmp_path):
+    repo = _init(tmp_path)
+    (repo / "tmp").mkdir()
+    (repo / "tmp" / "report.json").write_text("{}\n")
+    steps = [
+        Step(1, "Write", {"file_path": "/tmp/report.json", "content": "{}\n"}, "", None, None),
+        Step(2, "Write", {"file_path": "tmp/report.json", "content": "{}\n"}, "", None, None),
+    ]
+    run = Run("s", "/x.jsonl", str(repo), None, None, None, ["go"], steps, "", Usage(), {})
+    reconcile_git(run)
+
+    rows = file_changes(run)
+    assert not rows["/tmp/report.json"].verified
+    assert rows["tmp/report.json"].verified
+
+
+@needs_git
+def test_parent_navigation_through_a_repository_symlink_is_resolved(tmp_path):
+    if os.name == "nt":
+        pytest.skip("directory symlink creation needs extra Windows privileges")
+    repo = _init(tmp_path)
+    inside = tmp_path / "real-inside"
+    inside.mkdir()
+    (repo / "link").symlink_to(inside, target_is_directory=True)
+    steps = [Step(1, "Write", {"file_path": "link/../outside.txt", "content": "x\n"}, "", None, None)]
+    run = Run("s", "/x.jsonl", str(repo), None, None, None, ["go"], steps, "", Usage(), {})
+    reconcile_git(run)
+
+    assert list(file_changes(run)) == ["outside.txt"]
+
+
+@needs_git
+def test_parent_navigation_outside_the_repository_is_not_collapsed(tmp_path):
+    if os.name == "nt":
+        pytest.skip("directory symlink creation needs extra Windows privileges")
+    repo_path = tmp_path / "repo"
+    repo_path.mkdir()
+    repo = _init(repo_path)
+    external = tmp_path / "real-outside"
+    external.mkdir()
+    (repo / "link").symlink_to(external, target_is_directory=True)
+    steps = [Step(1, "Write", {"file_path": "link/../outside.txt", "content": "x\n"}, "", None, None)]
+    run = Run("s", "/x.jsonl", str(repo), None, None, None, ["go"], steps, "", Usage(), {})
+    reconcile_git(run)
+
+    rows = file_changes(run)
+    assert list(rows) == ["link/../outside.txt"]
+    assert not rows["link/../outside.txt"].verified
+    assert "link/../outside.txt" not in run.git_changes
+
+
+@needs_git
+@pytest.mark.parametrize("written", ["alias.cfg", "sub/../alias.cfg"])
+def test_write_through_a_final_symlink_reconciles_its_target(tmp_path, written):
+    if os.name == "nt":
+        pytest.skip("symlink creation needs extra Windows privileges")
+    repo = _init(tmp_path)
+    (repo / "sub").mkdir()
+    target = repo / "target.cfg"
+    target.write_text("old\n")
+    _git(repo, "add", "target.cfg")
+    _git(repo, "commit", "-q", "-m", "target")
+    (repo / "alias.cfg").symlink_to("target.cfg")
+    target.write_text("new\n")
+    steps = [Step(1, "Write", {"file_path": written, "content": "new\n"}, "", None, None)]
+    run = Run("s", "/x.jsonl", str(repo), None, None, None, ["go"], steps, "", Usage(), {})
+    reconcile_git(run)
+
+    rows = file_changes(run)
+    assert list(rows) == ["target.cfg"]
+    assert rows["target.cfg"].verified
+    assert "alias.cfg" not in run.git_changes
+
+
+@needs_git
+def test_direct_and_shell_writes_through_one_symlink_merge(tmp_path):
+    if os.name == "nt":
+        pytest.skip("symlink creation needs extra Windows privileges")
+    repo = _init(tmp_path)
+    target = repo / "target.cfg"
+    target.write_text("old\n")
+    _git(repo, "add", "target.cfg")
+    _git(repo, "commit", "-q", "-m", "target")
+    (repo / "alias.cfg").symlink_to("target.cfg")
+    target.write_text("old\nnew\n")
+    steps = [
+        Step(1, "Write", {"file_path": "alias.cfg", "content": "new\n"}, "", None, None),
+        Step(2, "Bash", {"command": "printf 'new\\n' >> alias.cfg"}, "", None, None),
+    ]
+    run = Run("s", "/x.jsonl", str(repo), None, None, None, ["go"], steps, "", Usage(), {})
+    reconcile_git(run)
+
+    rows = file_changes(run)
+    assert list(rows) == ["target.cfg"]
+    assert rows["target.cfg"].verified
+    assert "alias.cfg" not in rows
+
+
+def test_invalid_write_path_does_not_abort_file_changes(tmp_path):
+    steps = [Step(1, "Write", {"file_path": "bad\0name", "content": "x\n"}, "", None, None)]
+    run = Run("s", "/x.jsonl", str(tmp_path), None, None, None, ["go"], steps, "", Usage(), {})
+    assert list(file_changes(run)) == ["bad\0name"]
+
+
+@needs_git
+@pytest.mark.parametrize("tool,command", [
+    ("Bash", "cp -s target.cfg alias.cfg"),
+    ("PowerShell", "New-Item -ItemType SymbolicLink -Path alias.cfg -Target target.cfg"),
+])
+def test_link_creating_commands_stay_on_the_link_path(tmp_path, tool, command):
+    if os.name == "nt":
+        pytest.skip("symlink creation needs extra Windows privileges")
+    repo = _init(tmp_path)
+    target = repo / "target.cfg"
+    target.write_text("old\n")
+    _git(repo, "add", "target.cfg")
+    _git(repo, "commit", "-q", "-m", "target")
+    (repo / "alias.cfg").symlink_to("target.cfg")
+    steps = [Step(1, tool, {"command": command}, "", None, None)]
+    run = Run("s", "/x.jsonl", str(repo), None, None, None, ["go"], steps, "", Usage(), {})
+    reconcile_git(run)
+
+    rows = file_changes(run)
+    assert list(rows) == ["alias.cfg"]
+    assert "target.cfg" not in rows
+
+
+@needs_git
+@pytest.mark.parametrize("tool,command", [
+    ("Bash", "cp --backup=none source.cfg alias.cfg"),
+    ("Bash", "cp --backup=off source.cfg alias.cfg"),
+    ("PowerShell", "New-Item -ItemType File -Force -Path alias.cfg -Value new"),
+])
+def test_write_through_commands_still_reconcile_the_target(tmp_path, tool, command):
+    if os.name == "nt":
+        pytest.skip("symlink creation needs extra Windows privileges")
+    repo = _init(tmp_path)
+    target = repo / "target.cfg"
+    target.write_text("old\n")
+    (repo / "source.cfg").write_text("new\n")
+    _git(repo, "add", "target.cfg")
+    _git(repo, "commit", "-q", "-m", "target")
+    (repo / "alias.cfg").symlink_to("target.cfg")
+    target.write_text("new\n")
+    steps = [Step(1, tool, {"command": command}, "", None, None)]
+    run = Run("s", "/x.jsonl", str(repo), None, None, None, ["go"], steps, "", Usage(), {})
+    reconcile_git(run)
+
+    rows = file_changes(run)
+    assert list(rows) == ["target.cfg"]
+    assert rows["target.cfg"].verified
+
+
+@needs_git
+def test_copying_a_symlink_with_no_dereference_stays_on_the_copy(tmp_path):
+    if os.name == "nt":
+        pytest.skip("symlink creation needs extra Windows privileges")
+    repo = _init(tmp_path)
+    target = repo / "target.cfg"
+    target.write_text("old\n")
+    _git(repo, "add", "target.cfg")
+    _git(repo, "commit", "-q", "-m", "target")
+    (repo / "source-link").symlink_to("target.cfg")
+    (repo / "alias.cfg").symlink_to("target.cfg")
+    steps = [Step(1, "Bash", {"command": "cp -P --backup=none source-link alias.cfg"}, "", None, None)]
+    run = Run("s", "/x.jsonl", str(repo), None, None, None, ["go"], steps, "", Usage(), {})
+    reconcile_git(run)
+
+    rows = file_changes(run)
+    assert list(rows) == ["alias.cfg"]
+    assert "target.cfg" not in rows
+
+
+@needs_git
+def test_removed_symlink_parent_navigation_is_not_collapsed(tmp_path):
+    if os.name == "nt":
+        pytest.skip("directory symlink creation needs extra Windows privileges")
+    repo = _init(tmp_path)
+    external = tmp_path / "real-outside"
+    external.mkdir()
+    link = repo / "link"
+    link.symlink_to(external, target_is_directory=True)
+    link.unlink()
+    (repo / "outside.txt").write_text("x\n")
+    steps = [Step(1, "Write", {"file_path": "link/../outside.txt", "content": "x\n"}, "", None, None)]
+    run = Run("s", "/x.jsonl", str(repo), None, None, None, ["go"], steps, "", Usage(), {})
+    reconcile_git(run)
+
+    rows = file_changes(run)
+    assert list(rows) == ["link/../outside.txt"]
+    assert not rows["link/../outside.txt"].verified
+    assert "link/../outside.txt" not in run.git_changes
+
+
+@needs_git
+def test_outside_relative_write_keeps_activity_counts_unverified(tmp_path):
+    repo = _init(tmp_path)
+    steps = [Step(1, "Write", {"file_path": "../outside.txt", "content": "x\n"}, "", None, None)]
+    run = Run("s", "/x.jsonl", str(repo), None, None, None, ["go"], steps, "", Usage(), {})
+    reconcile_git(run)
+
+    change = file_changes(run)["../outside.txt"]
+    assert (change.added, change.removed) == (1, 0)
+    assert not change.verified
+    assert "../outside.txt" not in run.git_changes
+
+
+@needs_git
+def test_large_ignored_file_keeps_activity_counts_unverified(tmp_path, monkeypatch):
+    repo = _init(tmp_path)
+    (repo / ".gitignore").write_text("secret.txt\n")
+    target = repo / "secret.txt"
+    target.write_text("one\ntwo\n")
+    monkeypatch.setattr(gitinfo, "_MAX_COUNT_BYTES", 1)
+    steps = [Step(1, "Write", {"file_path": str(target), "content": "one\ntwo\n"}, "", None, None)]
+    run = Run("s", "/x.jsonl", str(repo), None, None, None, ["go"], steps, "", Usage(), {})
+    reconcile_git(run)
+
+    assert run.git_changes["secret.txt"]["count_limited"] is True
+    change = file_changes(run)["secret.txt"]
+    assert (change.added, change.activity_added) == (2, 2)
+    assert not change.verified
+
+
+@needs_git
+def test_local_filter_config_disables_content_diffs_and_zero_fill(tmp_path, monkeypatch):
+    repo = _init(tmp_path)
+    _git(repo, "config", "filter.receipt.clean", "echo filtered")
+    (repo / "app.py").write_text("a\nb\nc\n")
+    real_git = gitinfo._git
+    calls = []
+
+    def spy(cwd, *args):
+        calls.append(args)
+        return real_git(cwd, *args)
+
+    monkeypatch.setattr(gitinfo, "_git", spy)
+    assert gitinfo.local_filter_configured(str(repo))
+    assert gitinfo.working_changes(str(repo), ["app.py"]) == {}
+    assert not any(args and args[0] == "diff" for args in calls)
+
+    calls.clear()
+    assert gitinfo.file_diffs(str(repo), ["app.py"]) == {}
+    assert not any(args and args[0] == "diff" for args in calls)
+
+    steps = [Step(1, "Write", {"file_path": str(repo / "app.py"), "content": "a\nb\nc\n"}, "", None, None)]
+    run = Run("s", "/x.jsonl", str(repo), None, None, None, ["go"], steps, "", Usage(), {})
+    reconcile_git(run)
+    assert run.git_changes == {}
+    assert not file_changes(run)["app.py"].verified
+
+
+@needs_git
+def test_git_without_show_scope_uses_local_config_fallback(tmp_path, monkeypatch):
+    repo = _init(tmp_path)
+    (repo / "app.py").write_text("a\nb\nc\n")
+    real_git = gitinfo._git
+
+    def old_git(cwd, *args):
+        if args[:2] == ("config", "--list") and "--show-scope" in args:
+            return None
+        return real_git(cwd, *args)
+
+    monkeypatch.setattr(gitinfo, "_git", old_git)
+    assert not gitinfo.local_filter_configured(str(repo))
+    assert gitinfo.working_changes(str(repo), ["app.py"])["app.py"]["added"] == 1
+
+
+def test_legacy_git_fallback_accepts_yes_for_worktree_config(tmp_path, monkeypatch):
+    def fake_git(cwd, *args):
+        if args[:2] == ("rev-parse", "--is-inside-work-tree"):
+            return "true\n"
+        if args[:2] == ("config", "--list") and "--show-scope" in args:
+            return None
+        if args[:2] == ("config", "--local"):
+            return "extensions.worktreeconfig=yes\n"
+        if args[:2] == ("config", "--worktree"):
+            return "filter.x.clean=echo x\n"
+        return ""
+
+    monkeypatch.setattr(gitinfo, "_git", fake_git)
+    assert gitinfo.local_filter_configured(str(tmp_path))
 
 
 @needs_git

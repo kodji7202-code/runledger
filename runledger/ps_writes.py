@@ -476,7 +476,10 @@ def _parse_args(
             i += 1
             continue
         if a.startswith("-"):
-            # Unknown switch or parameter: if it's a known switch, consume just the flag
+            if low == "-force":
+                named.setdefault(low, []).append("true")
+            # Unknown switches consume no value here; the path parameters above are the ones
+            # this static reader knows how to interpret safely.
             i += 1
             continue
         positional.append(a)
@@ -509,13 +512,13 @@ def _ps_writes_cached(command: str) -> Tuple[ShellWrite, ...]:
                 # `System.IO.File` takes a filesystem path, so no provider filter applies here.
                 cleaned = _clean_ps_path(quoted_path, cwd, dotnet=True)
                 if cleaned:
-                    out.append(ShellWrite(cleaned, added=1))
+                    out.append(ShellWrite(cleaned, added=1, follows_link=True))
 
         words, redirs = _tokenize_stmt(stmt)
         for r_target in redirs:
             cleaned = _clean_ps_path(r_target, cwd)
             if cleaned:
-                out.append(ShellWrite(cleaned, added=1))
+                out.append(ShellWrite(cleaned, added=1, follows_link=True))
 
         if not words:
             continue
@@ -551,13 +554,15 @@ def _ps_writes_cached(command: str) -> Tuple[ShellWrite, ...]:
             for t in targets:
                 cleaned = _clean_ps_path(t, cwd)
                 if cleaned:
-                    out.append(ShellWrite(cleaned, added=added))
+                    out.append(ShellWrite(cleaned, added=added, follows_link=True))
             continue
 
         if cmd in _NEW_CMDS:
             item_types = [v.lower() for v in _first_param(named, _ITEMTYPE_PARAMS)]
             if any(t in ("directory", "folder", "container") for t in item_types):
                 continue
+            creates_link = any(t in ("symboliclink", "hardlink", "junction") for t in item_types)
+            follows_link = not creates_link and "-force" in named
             vals = _first_param(named, {"-value"})
             added = max(1, len("\n".join(vals).replace("\\n", "\n").replace("`n", "\n").splitlines())) if vals else 0
             paths_arg = _first_param(named, _PATH_PARAMS)
@@ -566,13 +571,13 @@ def _ps_writes_cached(command: str) -> Tuple[ShellWrite, ...]:
                 raw_target = _join_dir_and_leaf(paths_arg[0], names_arg[0])
                 cleaned = _clean_ps_path(raw_target, cwd)
                 if cleaned:
-                    out.append(ShellWrite(cleaned, added=added))
+                    out.append(ShellWrite(cleaned, added=added, follows_link=follows_link))
             else:
                 targets = paths_arg or names_arg or pos[:1]
                 for t in targets:
                     cleaned = _clean_ps_path(t, cwd)
                     if cleaned:
-                        out.append(ShellWrite(cleaned, added=added))
+                        out.append(ShellWrite(cleaned, added=added, follows_link=follows_link))
             continue
 
         if cmd in _COPY_CMDS or cmd in _MOVE_CMDS:
@@ -649,7 +654,7 @@ def _ps_writes_cached(command: str) -> Tuple[ShellWrite, ...]:
             for t in _first_param(named, _OUTFILE_PARAMS):
                 cleaned = _clean_ps_path(t, cwd)
                 if cleaned:
-                    out.append(ShellWrite(cleaned))
+                    out.append(ShellWrite(cleaned, follows_link=True))
 
     merged: Dict[str, ShellWrite] = {}
     for w in out:
@@ -660,7 +665,8 @@ def _ps_writes_cached(command: str) -> Tuple[ShellWrite, ...]:
             merged[w.path] = ShellWrite(w.path, deleted=True)
         else:
             merged[w.path] = ShellWrite(
-                w.path, prev.added + w.added, deleted=False, source=w.source or prev.source
+                w.path, prev.added + w.added, deleted=False, source=w.source or prev.source,
+                follows_link=prev.follows_link or w.follows_link
             )
     return tuple(merged.values())
 
