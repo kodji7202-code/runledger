@@ -285,6 +285,29 @@ def test_invalid_write_path_does_not_abort_file_changes(tmp_path):
 
 
 @needs_git
+@pytest.mark.parametrize("tool,command", [
+    ("Bash", "cp -s target.cfg alias.cfg"),
+    ("PowerShell", "New-Item -ItemType SymbolicLink -Path alias.cfg -Target target.cfg"),
+])
+def test_link_creating_commands_stay_on_the_link_path(tmp_path, tool, command):
+    if os.name == "nt":
+        pytest.skip("symlink creation needs extra Windows privileges")
+    repo = _init(tmp_path)
+    target = repo / "target.cfg"
+    target.write_text("old\n")
+    _git(repo, "add", "target.cfg")
+    _git(repo, "commit", "-q", "-m", "target")
+    (repo / "alias.cfg").symlink_to("target.cfg")
+    steps = [Step(1, tool, {"command": command}, "", None, None)]
+    run = Run("s", "/x.jsonl", str(repo), None, None, None, ["go"], steps, "", Usage(), {})
+    reconcile_git(run)
+
+    rows = file_changes(run)
+    assert list(rows) == ["alias.cfg"]
+    assert "target.cfg" not in rows
+
+
+@needs_git
 def test_removed_symlink_parent_navigation_is_not_collapsed(tmp_path):
     if os.name == "nt":
         pytest.skip("directory symlink creation needs extra Windows privileges")

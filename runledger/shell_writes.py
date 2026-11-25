@@ -273,11 +273,17 @@ def _command_writes(words: List[str], targets: List[str], body: Optional[str]) -
         paths = _positional(args, ("-t", "-S", "-m", "-o", "-g", "--suffix"))
         if len(paths) >= 2:
             dest, sources = paths[-1], paths[:-1]
+            replaces_link = any(
+                a in ("-b", "-l", "-s", "--backup", "--link", "--remove-destination", "--symbolic-link")
+                or a.startswith("--backup=")
+                or (a.startswith("-") and not a.startswith("--") and any(c in a[1:] for c in "bls"))
+                for a in args
+            )
             for src in sources:
                 into = dest.endswith(("/", "\\") if is_windows_style(dest) else "/") or len(sources) > 1
                 name_of = ntpath.basename if is_windows_style(src) else posixpath.basename
                 target = join(dest, name_of(src)) if into else dest
-                out.append(ShellWrite(target, source=src, follows_link=(name == "cp")))
+                out.append(ShellWrite(target, source=src, follows_link=(name == "cp" and not replaces_link)))
                 if name == "mv":
                     out.append(ShellWrite(src, deleted=True))
     elif name == "sed":

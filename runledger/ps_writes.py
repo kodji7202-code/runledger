@@ -566,13 +566,13 @@ def _ps_writes_cached(command: str) -> Tuple[ShellWrite, ...]:
                 raw_target = _join_dir_and_leaf(paths_arg[0], names_arg[0])
                 cleaned = _clean_ps_path(raw_target, cwd)
                 if cleaned:
-                    out.append(ShellWrite(cleaned, added=added, follows_link=True))
+                    out.append(ShellWrite(cleaned, added=added))
             else:
                 targets = paths_arg or names_arg or pos[:1]
                 for t in targets:
                     cleaned = _clean_ps_path(t, cwd)
                     if cleaned:
-                        out.append(ShellWrite(cleaned, added=added, follows_link=True))
+                        out.append(ShellWrite(cleaned, added=added))
             continue
 
         if cmd in _COPY_CMDS or cmd in _MOVE_CMDS:
