@@ -7,6 +7,8 @@ change behavior, so read the entry before you upgrade.
 
 ## [Unreleased]
 
+## [1.0.0rc2] - 2026-11-25
+
 ### Fixed
 
 - `runledger backup --verify` removes the temporary SQLite `.tmp-shm`/`.tmp-wal` sidecars that
@@ -1696,7 +1698,8 @@ First working prototype (MVP).
   override them.
 - No runtime dependencies; Python 3.9 and later.
 
-[Unreleased]: https://github.com/kodji7202-code/runledger/compare/v1.0.0rc1...HEAD
+[Unreleased]: https://github.com/kodji7202-code/runledger/compare/v1.0.0rc2...HEAD
+[1.0.0rc2]: https://github.com/kodji7202-code/runledger/compare/v1.0.0rc1...v1.0.0rc2
 [1.0.0rc1]: https://github.com/kodji7202-code/runledger/compare/v0.7.0...v1.0.0rc1
 [0.7.0]: https://github.com/kodji7202-code/runledger/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/kodji7202-code/runledger/compare/v0.6.0...v0.6.1
