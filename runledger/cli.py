@@ -161,7 +161,8 @@ def _tolerant_console() -> None:
     PYTHONIOENCODING still wins. Interactive consoles keep their native encoding, with
     replacement instead of a crash when they cannot encode `·`, `−` or `⚠️`.
     """
-    explicit_encoding = os.environ.get("PYTHONIOENCODING")
+    io_encoding = os.environ.get("PYTHONIOENCODING")
+    encoding_overridden = io_encoding is not None and io_encoding.split(":", 1)[0] != ""
     for stream in (sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
         if reconfigure is not None:
@@ -170,7 +171,7 @@ def _tolerant_console() -> None:
             except (ValueError, OSError):
                 piped = False
             try:
-                if piped and explicit_encoding is None:
+                if piped and not encoding_overridden:
                     reconfigure(encoding="utf-8", errors="replace")
                 else:
                     reconfigure(errors="replace")

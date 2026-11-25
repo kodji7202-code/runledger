@@ -89,12 +89,16 @@ def test_cp1252_console_status_line_does_not_crash(tmp_path):
     assert result.stdout.startswith(b"Receipt: ")
 
 
-def test_piped_status_line_is_utf8_when_no_encoding_was_requested(monkeypatch):
+@pytest.mark.parametrize("ioencoding", [None, "", ":replace"])
+def test_piped_status_line_is_utf8_when_no_encoding_was_requested(monkeypatch, ioencoding):
     stdout = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
     stderr = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
     monkeypatch.setattr(sys, "stdout", stdout)
     monkeypatch.setattr(sys, "stderr", stderr)
-    monkeypatch.delenv("PYTHONIOENCODING", raising=False)
+    if ioencoding is None:
+        monkeypatch.delenv("PYTHONIOENCODING", raising=False)
+    else:
+        monkeypatch.setenv("PYTHONIOENCODING", ioencoding)
 
     cli._tolerant_console()
     print("dot ·", file=stdout)
