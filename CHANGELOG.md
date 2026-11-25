@@ -10,8 +10,9 @@ change behavior, so read the entry before you upgrade.
 ### Fixed
 
 - Small unauthenticated or unauthorized API POSTs reliably return their JSON 401/403 response on
-  Windows: the server drains only the small declared body before closing, instead of letting unread
-  input reset the connection before the client reads the error.
+  Windows: the server briefly drains only the small declared body before closing, instead of letting
+  unread input reset the connection before the client reads the error. Stalled unauthenticated bodies
+  count toward the existing per-address failure limit, so they cannot hold request workers indefinitely.
 - `runledger rollback` with nothing to restore prints `Nothing to restore (already matches <id>).`
   and exits 0, as `--path` already did. It no longer asks for confirmation, prints `Restored`, or
   creates a safety checkpoint of an unchanged tree. When only kept ignored files differ, it names

@@ -20,6 +20,7 @@ import pytest
 from runledger.server import approvals
 from runledger.server.approvals import CREATE_BODY_LIMIT
 from runledger.server.app import make_server
+from runledger.server.auth import FailureLimiter
 from runledger.server.dashboard import APPROVAL_HTML, DASHBOARD_HTML
 from runledger.server.db import Database
 
@@ -356,6 +357,27 @@ def test_repeated_small_unauthenticated_posts_keep_their_json_401(env):
         status, _, raw = _http(base, "POST", "/api/approvals", body=_valid(), headers=headers)
         assert status == 401
         assert _json(raw)["error"]["code"] == "unauthorized"
+
+
+def test_stalled_unauthenticated_posts_feed_the_failure_limit(env):
+    """An unfinished body may get one short drain, never a way to occupy workers indefinitely."""
+    srv, base = env
+    srv.limiter = FailureLimiter(max_failures=2)
+    host, port = urlsplit(base).hostname, urlsplit(base).port
+    for _ in range(3):
+        sock = socket.create_connection((host, port), timeout=2)
+        try:
+            sock.sendall(
+                b"POST /api/approvals HTTP/1.1\r\n"
+                + f"Host: {host}:{port}\r\n".encode()
+                + b"Content-Type: application/json\r\nContent-Length: 64\r\n\r\nx"
+            )
+            time.sleep(0.15)
+        finally:
+            sock.close()
+    status, _, raw = _http(base, "GET", "/api/me")
+    assert status == 429
+    assert _json(raw)["error"]["code"] == "rate_limited"
 
 
 def test_dashboard_cookie_follows_the_role_of_its_key(env):
