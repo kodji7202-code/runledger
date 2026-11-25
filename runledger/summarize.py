@@ -21,14 +21,25 @@ from .ps_writes import ps_deletes, ps_writes, shell_kind
 from .shell_writes import shell_deletes, shell_writes
 
 
-def _resolve_dotdot_path(cwd: str, normalized: str) -> Optional[str]:
-    """Resolve a relative path component by component, or None when its parent no longer exists.
+def _realpath(path: str) -> Optional[str]:
+    try:
+        return os.path.realpath(path)
+    except (OSError, ValueError):
+        return None  # a logged path can contain bytes the filesystem rejects, such as NUL
+
+
+def _resolve_parent_path(cwd: str, normalized: str) -> Optional[str]:
+    """Resolve the parent directories, or None when one no longer exists.
 
     os.path.realpath() can collapse `..` lexically when the final file is absent, which would
     turn `link/../x` into the wrong file when `link` is a symlink. Resolving each directory
-    before applying `..` preserves the filesystem's actual symlink semantics.
+    before applying `..` preserves the filesystem's actual symlink semantics. The final path
+    component is deliberately left alone: deleting a symlink acts on the link, while writing
+    through one acts on its target.
     """
-    current = os.path.realpath(cwd)
+    current = _realpath(cwd)
+    if current is None:
+        return None
     parts = normalized.split("/")
     for part in parts[:-1]:
         if part == "..":
@@ -37,7 +48,9 @@ def _resolve_dotdot_path(cwd: str, normalized: str) -> Optional[str]:
         candidate = os.path.join(current, part)
         if not os.path.isdir(candidate):
             return None
-        current = os.path.realpath(candidate)
+        current = _realpath(candidate)
+        if current is None:
+            return None
     return os.path.join(current, parts[-1])
 
 
@@ -48,14 +61,10 @@ def _short(path: str, cwd: Optional[str], follow_write: bool = False) -> str:
     normalized = normalized_git_path(shortened)
     same_platform = bool(cwd) and is_windows_style(cwd) == (os.name == "nt")
     if same_platform:
-        resolved_path = None
-        if ".." in normalized.split("/"):
-            resolved_path = _resolve_dotdot_path(cwd, normalized)
-        elif follow_write:
-            resolved_path = os.path.join(cwd, normalized)
+        resolved_path = _resolve_parent_path(cwd, normalized)
+        if resolved_path is not None and follow_write:
+            resolved_path = _realpath(resolved_path)
         if resolved_path is not None:
-            if follow_write:
-                resolved_path = os.path.realpath(resolved_path)
             resolved = relative(resolved_path, cwd)
             if resolved and not is_abs(resolved):
                 normalized = normalized_git_path(resolved)
@@ -155,7 +164,7 @@ def file_changes(run: Run) -> Dict[str, FileChange]:
                 fc = changes.setdefault(p, FileChange(p))
                 fc.deleted = fc.shell = True
             for w in writes:
-                p = _short(w.path, run.cwd)
+                p = _short(w.path, run.cwd, follow_write=w.follows_link)
                 if run.cwd and is_abs(p):
                     continue  # outside the project, such as a backup in /tmp
                 fc = changes.setdefault(p, FileChange(p))
