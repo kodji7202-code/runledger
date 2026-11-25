@@ -7,6 +7,11 @@ change behavior, so read the entry before you upgrade.
 
 ## [Unreleased]
 
+### Fixed
+
+- `runledger backup --verify` removes the temporary SQLite `.tmp-shm`/`.tmp-wal` sidecars that
+  read-only verification can recreate, so verified backups no longer leave files outside retention cleanup.
+
 ## [1.0.0rc1] - 2026-11-25
 
 ### Fixed
