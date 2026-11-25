@@ -87,12 +87,14 @@ A risk reason (in `risk.reasons` and `steps[].risks`) has `severity` (`high`, `m
 
 ## Checking a receipt
 
-The test suite validates every fixture against the schema with safe mode on and off
-(`tests/test_receipt_schema.py`). Any JSON Schema validator works too, for example:
+Validate one or more receipts with the schema shipped in the package:
 
 ```bash
 runledger receipt --format json -o run.json
-python -m jsonschema -i run.json "$(python -c 'import runledger,os;print(os.path.join(os.path.dirname(runledger.__file__),"receipt.schema.json"))')"
+runledger validate run.json
 ```
 
-`jsonschema` is not a RunLedger dependency; install it separately if you want this check.
+`validate` exits 0 when every file conforms and 1 when JSON parsing or schema validation fails.
+The checker is part of the base install and needs no extra dependencies. It implements the JSON
+Schema subset used by `receipt.schema.json`; the test suite also validates every fixture with
+safe mode on and off (`tests/test_receipt_schema.py`).

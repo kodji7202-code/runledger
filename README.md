@@ -80,8 +80,9 @@ runledger checkpoints prune --keep 50                 # or --older-than 30d
 ```
 
 Requires Git, but no Git identity setup. Ignored untracked files stay untouched.
-Rollback never changes HEAD, branches, staging, or stashes. Scripts must pass `--yes` to restore;
-use `--dry-run` to preview without restoring.
+Rollback never changes HEAD, branches, staging, or stashes. It is a Git-tree restore, not a
+byte-for-byte backup: line-ending and clean/smudge filters apply. Scripts must pass `--yes` to
+restore; use `--dry-run` to preview without restoring.
 Use `--run SESSION_ID` when creating a checkpoint to include its rollback command in the session
 receipt. `guard install` also installs automatic session-start and pre-prompt
 checkpoints for Claude Code, Droid and Codex. [docs/rollback.md](docs/rollback.md) covers hooks,
