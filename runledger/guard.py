@@ -80,6 +80,7 @@ from .parser import Step
 from .risk import POLICY_FILE, RULE_ASK_CODE, RULE_DENY_CODE, SEVERITY_POINTS, Risk, assess_step
 # The user's own file has one reader for every consumer (guard, risk, rollback, doctor).
 from .userconfig import USER_CONFIG_DIR, USER_CONFIG_FILE, load_user_config
+from .userconfig import user_config_path as user_config_path
 
 try:
     from . import secrets as _secrets

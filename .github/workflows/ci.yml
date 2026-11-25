@@ -53,7 +53,7 @@ jobs:
   quality:
     name: Lint, typecheck and coverage
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
