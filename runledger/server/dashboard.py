@@ -456,7 +456,7 @@ tr.pickable:hover{background:var(--chip)}
           </label>
           <button type="submit" class="btn primary" id="notify-save">Save notifications</button>
         </div>
-        <p class="msg">Use https:// URLs. Plain http:// is allowed only for 127.0.0.1 and localhost.</p>
+        <p class="msg">Use https:// URLs. Plain http:// for 127.0.0.1 or localhost requires RUNLEDGER_ALLOW_LOOPBACK_WEBHOOKS=1 on the server.</p>
       </form>
       <p class="msg" id="notify-msg" role="status" aria-live="polite"></p>
     </div>
@@ -1146,8 +1146,8 @@ tr.pickable:hover{background:var(--chip)}
     var text = raw.trim();
     if (text === "") { return { value: null }; }
     var n = Number(text);
-    if (!isFinite(n) || n <= 0 || n > MAX_BUDGET_USD) {
-      return { error: label + " must be a positive amount up to " + MAX_BUDGET_USD + ", or left blank for no limit." };
+    if (!isFinite(n) || n < 0 || n > MAX_BUDGET_USD) {
+      return { error: label + " must be from 0 to " + MAX_BUDGET_USD + ", or left blank for no limit." };
     }
     return { value: Math.round(n * 100) / 100 };
   }
