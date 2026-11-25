@@ -24,6 +24,8 @@ change behavior, so read the entry before you upgrade.
 
 ### Added
 
+- `runledger validate` checks JSON receipts against the packaged schema without extra dependencies.
+
 - Dashboard OIDC sign-in for Okta, Entra ID and Google Workspace using standard-library
   Authorization Code + PKCE and RS256 verification. Person-bound, keyless sessions use live
   membership roles; optional SSO-only dashboard login leaves API keys working.
