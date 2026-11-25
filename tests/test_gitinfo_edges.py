@@ -131,6 +131,32 @@ def test_explicit_paths_include_ignored_files_written_by_the_agent(tmp_path):
 
 
 @needs_git
+def test_dot_prefixed_direct_edit_is_matched_to_gits_path(tmp_path):
+    repo = _init(tmp_path)
+    (repo / "app.py").write_text("a\nb\nc\n")
+    steps = [Step(1, "Edit", {"file_path": "./app.py", "old_string": "b", "new_string": "c"}, "", None, None)]
+    run = Run("s", "/x.jsonl", str(repo), None, None, None, ["go"], steps, "", Usage(), {})
+    reconcile_git(run)
+
+    change = file_changes(run)["./app.py"]
+    assert (change.added, change.removed) == (1, 0)
+    assert change.verified
+
+
+@needs_git
+def test_outside_relative_write_keeps_activity_counts_unverified(tmp_path):
+    repo = _init(tmp_path)
+    steps = [Step(1, "Write", {"file_path": "../outside.txt", "content": "x\n"}, "", None, None)]
+    run = Run("s", "/x.jsonl", str(repo), None, None, None, ["go"], steps, "", Usage(), {})
+    reconcile_git(run)
+
+    change = file_changes(run)["../outside.txt"]
+    assert (change.added, change.removed) == (1, 0)
+    assert not change.verified
+    assert "../outside.txt" not in run.git_changes
+
+
+@needs_git
 def test_binary_files_are_marked_not_counted(tmp_path):
     repo = _init(tmp_path)
     (repo / "logo.png").write_bytes(b"\x89PNG\x00\x01" * 8)
