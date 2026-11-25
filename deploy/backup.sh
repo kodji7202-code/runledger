@@ -15,9 +15,9 @@ set -eu
 keep=14
 
 # The command prints the copy it wrote ("Backup: /data/backups/runledger-....db  (123 bytes;
-# removed 0 older)"). Copy exactly that file, so two runs in the same second cannot copy the
+# integrity verified; removed 0 older)"). Copy exactly that file, so two runs in the same second cannot copy the
 # same file twice.
-out=$(docker compose exec -T runledger runledger backup --db /data/runledger.db --dir /data/backups --keep "$keep")
+out=$(docker compose exec -T runledger runledger backup --db /data/runledger.db --dir /data/backups --keep "$keep" --verify)
 latest=$(printf '%s\n' "$out" | tr -d '\r' | sed -n 's/^Backup: \([^ ][^ ]*\) .*/\1/p' | tail -n 1)
 if [ -z "$latest" ]; then
     echo "backup.sh: could not read the copy's name from: $out" >&2

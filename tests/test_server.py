@@ -1658,8 +1658,14 @@ def test_bad_bodies_are_rejected_with_json_errors(env):
 
 def test_health_needs_no_key(env):
     _, base = env
-    status, _, raw = _http(base, "GET", "/health")
+    status, headers, raw = _http(base, "GET", "/health")
     assert status == 200 and _json(raw)["ok"] is True
+    assert headers["x-runledger-api"] == "1"
+
+    status, headers, raw = _http(base, "GET", "/api/runs")
+    assert status == 401
+    assert headers["x-runledger-api"] == "1"
+    assert sorted(_json(raw)["error"]) == ["code", "message"]
 
 
 def test_api_keys_are_stored_only_as_hashes(tmp_path):
