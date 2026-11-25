@@ -295,8 +295,9 @@ def test_percent_encoded_run_ids_roundtrip_through_the_asgi_router(env):
 def test_unimplemented_methods_keep_the_legacy_json_501(env):
     srv, base = env
     _, key = srv.db.create_team("alpha")
-    status, _, raw = _http(base, "OPTIONS", "/api/runs", headers=_auth(key))
-    assert status == 501 and _json(raw)["error"]["code"] == "server_error"
+    for method in ("OPTIONS", "TRACE", "CONNECT", "COPY"):
+        status, _, raw = _http(base, method, "/api/runs", headers=_auth(key))
+        assert status == 501 and _json(raw)["error"]["code"] == "server_error"
 
 
 def test_unknown_runs_routes_and_params_return_json_errors(env):

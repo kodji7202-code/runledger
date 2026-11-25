@@ -22,7 +22,7 @@ from uvicorn import Config, Server
 
 from .app import RunLedgerServer, _Handler
 
-_METHODS = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+_METHODS = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"]
 
 
 class _ASGIBody:
@@ -154,7 +154,24 @@ class _CapturedHandler(_Handler):
         return response
 
 
-def create_app(server: RunLedgerServer) -> FastAPI:
+class _MethodCompatibility:
+    """Answer every unimplemented HTTP method through the legacy handler, not Starlette's 405."""
+
+    def __init__(self, app: Any, server: RunLedgerServer) -> None:
+        self.app = app
+        self.server = server
+
+    async def __call__(self, scope: Dict[str, Any], receive: Any, send: Any) -> None:
+        if scope.get("type") != "http" or scope.get("method") in _METHODS:
+            await self.app(scope, receive, send)
+            return
+        request = Request(scope, receive)
+        handler = _CapturedHandler(self.server, request, _ASGIBody(request))
+        await asyncio.to_thread(handler.handle)
+        await handler.response()(scope, receive, send)
+
+
+def create_app(server: RunLedgerServer) -> Any:
     """The ASGI application for one configured team server."""
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
@@ -211,7 +228,7 @@ def create_app(server: RunLedgerServer) -> FastAPI:
     for path in routes:
         app.add_api_route(path, endpoint, methods=_METHODS, include_in_schema=False)
 
-    return app
+    return _MethodCompatibility(app, server)
 
 
 class UvicornServer:
@@ -220,7 +237,7 @@ class UvicornServer:
     def __init__(
         self,
         address: Tuple[str, int],
-        app: FastAPI,
+        app: Any,
         config_values: Optional[Dict[str, Any]] = None,
         tls_context: Optional[Any] = None,
     ) -> None:
