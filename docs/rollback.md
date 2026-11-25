@@ -316,7 +316,8 @@ but never change your worktree, real index, or refs.
   junctions that obstruct restoration.
 - Sparse checkouts, submodules, and embedded Git repositories are refused rather than give an
   incomplete snapshot or restore. Empty directories, filesystem metadata beyond Git file modes,
-  and ignored untracked contents are not saved. Git's line-ending and clean/smudge filters apply.
+  and ignored untracked contents are not saved. Git's line-ending and clean/smudge filters apply,
+  so rollback is a Git-tree restore rather than a byte-for-byte backup of the original filesystem bytes.
 - The real index remains unchanged after rollback, so `git status` may still show staged changes.
   Rollback changes files, not staging, commits, branch history, external services, or databases.
 - Checkpoints use local disk and are not a substitute for backups. Linked worktrees share the
