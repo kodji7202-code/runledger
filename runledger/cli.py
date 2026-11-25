@@ -3,6 +3,7 @@
   runledger list [--project PATH] [--all] [--agent AGENT] [--limit N]
   runledger receipt [SESSION | --latest] [--project PATH] [--agent AGENT] [--format html|md|json]
                     [-o FILE] [--ai] [--ai-model MODEL] [--review] [--review-model MODEL] [--open]
+  runledger validate RECEIPT...
   runledger serve [--host 127.0.0.1] [--port 8787] [--db runledger.db]
                   [--tls-cert FILE --tls-key FILE] [--secure-cookies] [--trust-proxy]
                   [--trusted-proxy CIDR ...]
@@ -462,6 +463,32 @@ def _default_receipt_path(stem: str, ext: str) -> Path:
         if not candidate.exists():
             return candidate
         n += 1
+
+
+def _reject_json_constant(constant: str):
+    raise ValueError(f"non-JSON number {constant}")
+
+
+def cmd_validate(args) -> int:
+    from .receipt_schema import validate_receipt
+
+    valid = True
+    for name in args.receipts:
+        try:
+            data = json.loads(Path(name).read_text(encoding="utf-8"), parse_constant=_reject_json_constant)
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            print(f"{name}: invalid JSON ({exc})", file=sys.stderr)
+            valid = False
+            continue
+        errors = validate_receipt(data)
+        if errors:
+            valid = False
+            print(f"{name}: invalid", file=sys.stderr)
+            for error in errors:
+                print(f"  {error}", file=sys.stderr)
+        else:
+            print(f"{name}: valid")
+    return 0 if valid else 1
 
 
 def cmd_receipt(args) -> int:
@@ -1133,6 +1160,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     safe.add_argument("--no-safe", dest="safe", action="store_false",
                       help="keep full local paths and e-mail addresses")
     pr.set_defaults(func=cmd_receipt)
+
+    pv = sub.add_parser("validate", help="validate JSON receipts against receipt.schema.json")
+    pv.add_argument("receipts", nargs="+", metavar="RECEIPT", help="JSON receipt file to validate")
+    pv.set_defaults(func=cmd_validate)
 
     ps = sub.add_parser("serve", help="run the team server (collects pushed runs, serves the dashboard)")
     ps.add_argument("--host", default="127.0.0.1", help="bind address (default 127.0.0.1)")
