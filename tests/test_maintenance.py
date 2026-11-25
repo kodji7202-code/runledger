@@ -333,6 +333,33 @@ def test_a_failed_backup_verification_removes_the_copy_and_reservation(tmp_path,
     assert list(folder.glob("*.tmp")) == []
 
 
+def test_unverified_backup_cannot_make_retention_delete_the_last_valid_copy(tmp_path, monkeypatch, capsys):
+    """A concurrently pruning backup must not see the new copy before verification finishes."""
+    import runledger.server.db as server_db
+    from runledger.cli import _prune_backups
+
+    db_path = tmp_path / "live.db"
+    db = Database(str(db_path))
+    db.create_team("kept")
+    folder = tmp_path / "backups"
+    folder.mkdir()
+    older = folder / "runledger-live-20200101-000000.db"
+    db.backup_to(str(older))
+    db.close()
+
+    def corrupt_after_competing_retention(path):
+        assert path.endswith(".tmp")
+        _prune_backups(folder, "live", 1)
+        return "simulated corruption"
+
+    monkeypatch.setattr(server_db, "backup_integrity_error", corrupt_after_competing_retention)
+    assert main(["backup", "--db", str(db_path), "--dir", str(folder), "--keep", "1", "--verify"]) == 1
+    assert "verification failed" in capsys.readouterr().err
+    assert older.is_file()
+    assert [path.name for path in folder.glob("runledger-*.db")] == [older.name]
+    assert list(folder.glob("*.tmp")) == []
+
+
 def test_backup_same_second_no_collision(tmp_path, capsys):
     from contextlib import closing
     import re

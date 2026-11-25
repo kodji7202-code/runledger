@@ -784,13 +784,9 @@ def cmd_backup(args) -> int:
         target, reservation = _reserve_backup_target(folder, stem, stamp)
         db = Database(args.db)
         try:
-            db.backup_to(str(target))
+            db.backup_to(str(target), verify=backup_integrity_error if args.verify else None)
         finally:
             db.close()
-        if args.verify:
-            problem = backup_integrity_error(str(target))
-            if problem is not None:
-                raise sqlite3.Error(f"verification failed: {problem}")
         _restrict_file(str(target))
         size = _backup_size(target)
     except (OSError, sqlite3.Error) as exc:
