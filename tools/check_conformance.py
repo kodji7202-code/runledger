@@ -177,6 +177,10 @@ def _check_case(fixtures: Path, folder: Path, case: dict):
             problems.append("safe mode flags are wrong")
         if safe["totals"]["files_changed"] != len(safe["files"]):
             problems.append("totals.files_changed differs from len(files)")
+        if len(safe["files"]) != len(full["files"]):
+            problems.append(f"safe receipt has {len(safe['files'])} files, full receipt has {len(full['files'])}")
+        if safe["totals"]["files_changed"] != full["totals"]["files_changed"]:
+            problems.append("safe and full file totals differ")
 
     actual = _actual(full)
     problems.extend(_compare_expectations(actual, case["expect"]))
