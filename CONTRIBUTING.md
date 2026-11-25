@@ -12,7 +12,7 @@ git clone https://github.com/kodji7202-code/runledger.git runledger
 cd runledger
 python -m venv .venv
 . .venv/bin/activate              # Windows: .venv\Scripts\activate
-python -m pip install -e . pytest
+python -m pip install -e '.[server]' pytest
 ```
 
 ## Run the tests
@@ -31,8 +31,9 @@ Docker image, starts it and checks its `/health` endpoint.
 ## Rules for the code
 
 - **Standard library only in the base install.** `dependencies` in `pyproject.toml` stays empty.
-  `pytest` is a development dependency only. To test the optional SAML integration, install
-  `python -m pip install -e '.[saml]'` and ensure OpenSSL is on your PATH.
+  `pytest` is a development dependency only. FastAPI and uvicorn belong only to the optional
+  `server` extra. To test the optional SAML integration, install
+  `python -m pip install -e '.[server,saml]'` and ensure OpenSSL is on your PATH.
 - **Python 3.9 must keep working.** Avoid `match` statements, `X | Y` union types outside
   annotations (inside annotations they are fine when the module starts with
   `from __future__ import annotations`), parenthesized context managers, `zip(strict=...)`,

@@ -549,6 +549,14 @@ _LOOPBACK = {"127.0.0.1", "localhost", "::1"}
 
 
 def cmd_serve(args) -> int:
+    try:
+        import fastapi  # noqa: F401
+        import uvicorn  # noqa: F401
+    except ModuleNotFoundError:
+        print("error: the team server requires the optional server dependencies; "
+              "install them with: python -m pip install 'runledger-ai[server]'", file=sys.stderr)
+        return 1
+
     from .server.app import TLSConfigError, make_server
 
     try:

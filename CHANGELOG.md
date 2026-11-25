@@ -80,6 +80,11 @@ change behavior, so read the entry before you upgrade.
 
 ### Changed
 
+- **The team server runs on FastAPI and uvicorn (`runledger.server`):** the HTTP edge, explicit
+  route dispatch and TLS transport now use a maintained ASGI framework instead of
+  `http.server`, while keeping the existing API, dashboard, security headers, authentication,
+  SCIM and request-limit behavior. The CLI remains dependency-free; server deployments install
+  the new optional `server` extra, as the Docker image already does.
 - `runledger doctor` wraps human-readable output to the terminal width with hanging
   indents, keeping URLs, paths and command tokens intact.
 

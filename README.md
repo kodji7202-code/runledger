@@ -90,7 +90,11 @@ selective `--path` restores, pruning and limits.
 
 ## Team server in five steps
 
+The CLI stays dependency-free. On the machine that runs the server, install its optional web
+framework dependencies once (`pip install '.[server]'` from a clone):
+
 ```bash
+pip install 'runledger-ai[server]'
 runledger team create myteam --db runledger.db       # 1. create the team; prints its API key once
 runledger serve --db runledger.db                    # 2. start the server on http://127.0.0.1:8787
 # 3. open http://127.0.0.1:8787/?key=YOUR_KEY once, then use the plain address

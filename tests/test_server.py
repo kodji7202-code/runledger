@@ -13,7 +13,7 @@ import threading
 from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import quote, urlencode, urlsplit
 
 import pytest
 
@@ -277,6 +277,26 @@ def test_api_requires_a_valid_key_and_stores_nothing_without_one(env):
     assert _http(base, "GET", "/api/runs", headers=_auth("rl_wrong"))[0] == 401
     assert _http(base, "GET", "/api/stats")[0] == 401
     assert srv.db.list_runs(team_id) == []
+
+
+def test_percent_encoded_run_ids_roundtrip_through_the_asgi_router(env):
+    srv, base = env
+    _, key = srv.db.create_team("alpha")
+    run_id = "folder/a%20b"
+    payload = client.build_payload(FIX, user="dev@example.com")
+    assert _push(base, key, _stored(payload, run_id))[0] == 201
+
+    escaped = quote(run_id, safe="")
+    status, _, raw = _http(base, "GET", "/api/runs/" + escaped, headers=_auth(key))
+    assert status == 200 and _json(raw)["run"]["id"] == run_id
+    assert _http(base, "GET", "/runs/" + escaped, headers=_auth(key))[0] == 200
+
+
+def test_unimplemented_methods_keep_the_legacy_json_501(env):
+    srv, base = env
+    _, key = srv.db.create_team("alpha")
+    status, _, raw = _http(base, "OPTIONS", "/api/runs", headers=_auth(key))
+    assert status == 501 and _json(raw)["error"]["code"] == "server_error"
 
 
 def test_unknown_runs_routes_and_params_return_json_errors(env):

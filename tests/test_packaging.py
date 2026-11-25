@@ -141,11 +141,14 @@ def test_wheel_metadata_matches_pyproject(wheel):
     assert meta["Summary"] == _toml_string(project, "description")
     for keyword in ("claude-code", "factory-droid", "droid", "codex", "aider", "ai-agents", "guardrails"):
         assert keyword in (meta["Keywords"] or ""), f"{keyword} is missing from the wheel metadata"
-    assert meta.get_all("Provides-Extra") == ["saml"]
+    assert meta.get_all("Provides-Extra") == ["server", "saml"]
     requirements = meta.get_all("Requires-Dist", [])
-    assert len(requirements) == 1 and re.fullmatch(
-        r'python3-saml[^;]*; extra == "saml"', requirements[0]
-    ), "the base package must remain dependency-free"
+    assert len(requirements) == 3
+    assert sum(re.fullmatch(r'(fastapi|uvicorn)[^;]*; extra == "server"', req) is not None
+               for req in requirements) == 2
+    assert sum(re.fullmatch(r'python3-saml[^;]*; extra == "saml"', req) is not None
+               for req in requirements) == 1
+    assert all('; extra == "' in req for req in requirements), "the base package must remain dependency-free"
 
 
 def test_pyproject_project_table():

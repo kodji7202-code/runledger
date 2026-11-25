@@ -73,13 +73,12 @@ import math
 import os
 import re
 import secrets
-import socket
 import ssl
 import sys
 import threading
 import traceback
 from datetime import timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from html import escape as _escape
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 from urllib.parse import parse_qs, quote, unquote, urlsplit
@@ -228,11 +227,7 @@ def make_tls_context(cert_file: str, key_file: str) -> ssl.SSLContext:
     return context
 
 
-class RunLedgerServer(ThreadingHTTPServer):
-    daemon_threads = True
-    # On Windows, SO_REUSEADDR lets a second process take over a bound port.
-    allow_reuse_address = os.name != "nt"
-
+class RunLedgerServer:
     def __init__(
         self,
         address: Tuple[str, int],
@@ -264,7 +259,10 @@ class RunLedgerServer(ThreadingHTTPServer):
         self._query_key_warned = False
         self._query_key_lock = threading.Lock()
         self._maintenance_stop = threading.Event()
-        super().__init__(address, _Handler)
+        from .asgi import UvicornServer, create_app
+
+        self._uvicorn = UvicornServer(address, create_app(self), tls_context=tls_context)
+        self.server_address = self._uvicorn.server_address
         # The base URL people see in approval links. The default is the bound address,
         # so set RUNLEDGER_PUBLIC_URL when the server sits behind a reverse proxy.
         host, port = self.server_address[:2]
@@ -287,13 +285,11 @@ class RunLedgerServer(ThreadingHTTPServer):
     def dashboard_key_sign_in_disabled(self) -> bool:
         return any(client.disable_key_sign_in for client in (self.oidc, self.saml) if client is not None)
 
-    def get_request(self) -> Tuple[socket.socket, Any]:
-        # The handshake runs in the request's own thread (see _Handler.setup), so a slow
-        # client cannot stall the accept loop.
-        sock, addr = super().get_request()
-        if self.tls_context is not None:
-            sock = self.tls_context.wrap_socket(sock, server_side=True, do_handshake_on_connect=False)
-        return sock, addr
+    def serve_forever(self) -> None:
+        self._uvicorn.serve_forever()
+
+    def shutdown(self) -> None:
+        self._uvicorn.shutdown()
 
     def start_maintenance(self, interval_s: float = MAINTENANCE_INTERVAL_S) -> bool:
         """Apply retention now and then every interval_s, on a daemon thread, until
@@ -338,14 +334,7 @@ class RunLedgerServer(ThreadingHTTPServer):
 
     def server_close(self) -> None:
         self._maintenance_stop.set()
-        super().server_close()
-
-    def handle_error(self, request: Any, client_address: Any) -> None:
-        exc = sys.exc_info()[1]
-        if isinstance(exc, OSError):  # includes ssl.SSLError: a client that drops or speaks the wrong protocol
-            sys.stderr.write(f"RunLedger: connection from {client_address[0]} ended ({type(exc).__name__})\n")
-            return
-        super().handle_error(request, client_address)
+        self._uvicorn.server_close()
 
     def secure_for(self, forwarded_proto: Optional[str], peer: str) -> bool:
         """Whether this exchange is secure: TLS on this server, --secure-cookies, or a reverse
@@ -404,10 +393,6 @@ class RunLedgerServer(ThreadingHTTPServer):
             "warning: signing in with '?key=' in the URL is deprecated; "
             "use the sign-in form (POST /session) instead.\n"
         )
-
-
-class _IPv6Server(RunLedgerServer):
-    address_family = socket.AF_INET6
 
 
 def parse_trusted_proxies(values: Iterable[str]) -> Tuple[_IPNetwork, ...]:
@@ -482,9 +467,8 @@ def make_server(
     saml_path = saml_config or os.environ.get("RUNLEDGER_SAML_CONFIG")
     saml_client = saml.Client(saml_path) if saml_path else None
     db = Database(db_path)
-    cls = _IPv6Server if ":" in host else RunLedgerServer
     try:
-        return cls(
+        return RunLedgerServer(
             (host, port), db, log_requests=log_requests, public_url=public_url,
             tls_context=tls_context, secure_cookies=secure, trust_proxy=bool(trust_proxy),
             trusted_proxies=networks, retention_days=retention_days,

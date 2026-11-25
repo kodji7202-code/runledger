@@ -31,6 +31,10 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
+server = [
+    "fastapi>=0.115,<1",
+    "uvicorn>=0.30,<1",
+]
 saml = ["python3-saml>=1.16,<2"]
 
 [project.urls]
