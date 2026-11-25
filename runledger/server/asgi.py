@@ -13,6 +13,7 @@ import os
 import queue
 import socket
 import threading
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, Request
@@ -61,6 +62,26 @@ class _ASGIBody:
             out = bytes(self.buffer)
             self.buffer.clear()
             return out
+        out = bytes(self.buffer[:size])
+        del self.buffer[:size]
+        return out
+
+    def read_with_timeout(self, size: int, timeout: float) -> bytes:
+        """Read at most `size` bytes, returning what is available when `timeout` expires."""
+        self._start()
+        deadline = time.monotonic() + timeout
+        while not self.eof and len(self.buffer) < size:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                chunk = self.chunks.get(timeout=remaining)
+            except queue.Empty:
+                break
+            if chunk is None:
+                self.eof = True
+            else:
+                self.buffer.extend(chunk)
         out = bytes(self.buffer[:size])
         del self.buffer[:size]
         return out
