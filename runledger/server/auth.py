@@ -39,7 +39,7 @@ import time
 from collections import OrderedDict, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Deque, Dict, Mapping, Optional
+from typing import Any, Callable, Deque, Mapping, Optional
 
 ROLES = ("admin", "member", "viewer")
 KEY_KINDS = ("personal", "service")

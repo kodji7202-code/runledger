@@ -24,6 +24,9 @@ change behavior, so read the entry before you upgrade.
 
 ### Added
 
+- Development quality gates: a `dev` extra, Ruff Pyflakes lint, strict mypy on fully typed leaf
+  modules, and coverage measurement with a 70% floor in CI.
+
 - Dashboard OIDC sign-in for Okta, Entra ID and Google Workspace using standard-library
   Authorization Code + PKCE and RS256 verification. Person-bound, keyless sessions use live
   membership roles; optional SSO-only dashboard login leaves API keys working.

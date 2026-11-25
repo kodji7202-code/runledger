@@ -213,7 +213,7 @@ def test_tabs_are_a_tablist_wired_to_their_panels():
 
     for name in VIEWS:
         assert f"view-{name}" in by_id and f"tab-{name}" in by_id
-    assert f'var VIEWS = ["runs", "insights", "approvals", "sessions", "keys", "audit", "settings"];' in _script(DASHBOARD_HTML)
+    assert 'var VIEWS = ["runs", "insights", "approvals", "sessions", "keys", "audit", "settings"];' in _script(DASHBOARD_HTML)
 
 
 def test_session_controls_are_available_to_all_roles_and_use_the_authenticated_helper():

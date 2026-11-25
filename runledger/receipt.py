@@ -16,7 +16,7 @@ from .parser import Run, Step, Usage
 from .pricing import (PRICING_HELP, UNATTRIBUTED, UNATTRIBUTED_NOTE, friendly_model, is_stale,
                       partial_note, stale_note, unknown_models, unpriced)
 from .risk import Risk
-from .summarize import FileChange, file_changes
+from .summarize import file_changes
 
 
 def _money(v: Optional[float]) -> str:

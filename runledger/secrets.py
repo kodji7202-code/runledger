@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import fnmatch
 import re
-from typing import Any, Iterable, List, Optional, Pattern, Sequence, Tuple, Union
+from typing import Any, Iterable, List, Optional, Pattern, Tuple, Union
 
 try:
     import re._parser as _re_parser  # type: ignore[attr-defined]
