@@ -47,6 +47,9 @@ change behavior, so read the entry before you upgrade.
   additive-change and deprecation contract. The test suite includes a concurrent mixed read/write
   load check and an opt-in `RUNLEDGER_SOAK` soak harness, with an operations runbook for monitoring,
   restore drills, load testing and upgrade rehearsal.
+- Release validation now smoke-tests the built wheel in clean base and `[server]` virtual
+  environments: CLI version/receipt/validation, accidental FastAPI absence from the zero-dependency
+  install, and a real `/health` response. `docs/release.md` defines the 1.0/RC checklist.
 - Development quality gates: a `dev` extra, Ruff Pyflakes lint, strict mypy on fully typed leaf
   modules, and coverage measurement with a 70% floor in CI.
 - `DELETE /api/runs/{id}` lets a team administrator erase one stored run and its revisions;

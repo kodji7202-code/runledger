@@ -323,8 +323,8 @@ def test_release_workflow_uses_trusted_publishing_on_version_tags():
     release = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
     assert '- "v*"' in release
     assert "python -m pytest -q" in release
-    assert "python -m venv .release-smoke" in release
-    assert ".release-smoke/bin/runledger --version" in release
+    assert "python tools/check_clean_install.py --dist-dir dist" in release
+    assert (ROOT / "tools" / "check_clean_install.py").is_file()
     assert "id-token: write" in release
     # Only the third-party publish action is pinned by commit; first-party actions stay on tags.
     assert re.search(r"pypa/gh-action-pypi-publish@[0-9a-f]{40} # release/v1", release)
