@@ -43,7 +43,8 @@ def test_five_thousand_steps_render_in_every_format(tmp_path, capsys):
         out = capsys.readouterr().out
         if fmt == "json":
             assert json.loads(out)["totals"]["steps"] == 5000
-    assert time.perf_counter() - start < 20
+    limit = 30 if "coverage" in sys.modules else 20
+    assert time.perf_counter() - start < limit
 
 
 def _megabyte_command():
