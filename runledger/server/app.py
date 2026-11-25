@@ -985,12 +985,11 @@ class _Handler(BaseHTTPRequestHandler):
             )
 
     def _discard_small_body_before_close(self, limit: int = 64 * 1024) -> None:
-        """Drain a small body from an authenticated caller before closing the connection.
+        """Drain a small declared body before closing the connection.
 
         Closing a TCP connection with unread input can reset it on some platforms and discard the
-        error response before the client reads it. Unauthenticated and oversized bodies still are
-        not read; this bounded drain only makes authorization errors to authenticated callers
-        reliable.
+        error response before the client reads it. Oversized bodies still are not read; this
+        bounded drain only makes authentication and authorization errors reliable.
         """
         try:
             length = int(self.headers.get("Content-Length") or "")
@@ -1008,10 +1007,12 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _authed(self, minimum: str, what: str, write: bool = False) -> Identity:
         """Identify and authorize before the request body is read, so a huge unauthenticated
-        body is answered 401 at once, and the connection closes without draining it."""
+        body is answered 401 at once. Small bodies are drained before an early close because
+        unread input can otherwise reset the response on Windows."""
         try:
             ident = self._identify()
         except _HttpError as exc:
+            self._discard_small_body_before_close()
             exc.headers.setdefault("Connection", "close")
             raise
         try:
