@@ -67,6 +67,8 @@ class _ASGIBody:
             out = bytes(self.buffer)
             self.buffer.clear()
             return out
+        if len(self.buffer) < size:
+            raise EOFError("truncated request body")
         out = bytes(self.buffer[:size])
         del self.buffer[:size]
         return out
