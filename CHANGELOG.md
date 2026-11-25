@@ -7,6 +7,11 @@ change behavior, so read the entry before you upgrade.
 
 ## [Unreleased]
 
+### Fixed
+
+- The dashboard accepts zero budgets, matching the API contract, and its webhook help now names the
+  `RUNLEDGER_ALLOW_LOOPBACK_WEBHOOKS=1` opt-in required for local HTTP endpoints.
+
 ## [1.0.0rc1] - 2026-11-25
 
 ### Fixed
