@@ -238,6 +238,22 @@ def test_local_filter_config_disables_content_diffs_and_zero_fill(tmp_path, monk
 
 
 @needs_git
+def test_git_without_show_scope_uses_local_config_fallback(tmp_path, monkeypatch):
+    repo = _init(tmp_path)
+    (repo / "app.py").write_text("a\nb\nc\n")
+    real_git = gitinfo._git
+
+    def old_git(cwd, *args):
+        if args[:2] == ("config", "--list") and "--show-scope" in args:
+            return None
+        return real_git(cwd, *args)
+
+    monkeypatch.setattr(gitinfo, "_git", old_git)
+    assert not gitinfo.local_filter_configured(str(repo))
+    assert gitinfo.working_changes(str(repo), ["app.py"])["app.py"]["added"] == 1
+
+
+@needs_git
 def test_binary_files_are_marked_not_counted(tmp_path):
     repo = _init(tmp_path)
     (repo / "logo.png").write_bytes(b"\x89PNG\x00\x01" * 8)

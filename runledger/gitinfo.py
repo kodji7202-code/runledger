@@ -240,13 +240,25 @@ def local_filter_configured(cwd: Optional[str]) -> bool:
         return bool(info["filter_configured"])
     config = _git(cwd, "config", "--list", "--show-scope")
     if config is None:
-        return True
-    configured = False
-    for line in config.splitlines():
-        parts = line.split("\t", 1)
-        if len(parts) == 2 and parts[0] in ("local", "worktree") and parts[1].lower().startswith("filter."):
-            configured = True
-            break
+        # Git before 2.26 has no --show-scope; inspect the two file scopes explicitly.
+        config = _git(cwd, "config", "--local", "--includes", "--list")
+        if config is None:
+            return True
+        configured = any(line.split("=", 1)[0].lower().startswith("filter.") for line in config.splitlines())
+        worktree_enabled = any(line.lower() == "extensions.worktreeconfig=true" for line in config.splitlines())
+        if worktree_enabled:
+            worktree = _git(cwd, "config", "--worktree", "--includes", "--list")
+            if worktree is None:
+                return True
+            configured = configured or any(line.split("=", 1)[0].lower().startswith("filter.")
+                                           for line in worktree.splitlines())
+    else:
+        configured = False
+        for line in config.splitlines():
+            parts = line.split("\t", 1)
+            if len(parts) == 2 and parts[0] in ("local", "worktree") and parts[1].lower().startswith("filter."):
+                configured = True
+                break
     if info is not None:
         info["filter_configured"] = configured
     return configured
