@@ -977,13 +977,40 @@ class _Handler(BaseHTTPRequestHandler):
                 f"Dashboard changes must send the header '{CSRF_HEADER}: {CSRF_VALUE}'.",
             )
 
+    def _discard_small_body_before_close(self, limit: int = 64 * 1024) -> None:
+        """Drain a small body from an authenticated caller before closing the connection.
+
+        Closing a TCP connection with unread input can reset it on some platforms and discard the
+        error response before the client reads it. Unauthenticated and oversized bodies still are
+        not read; this bounded drain only makes authorization errors to authenticated callers
+        reliable.
+        """
+        try:
+            length = int(self.headers.get("Content-Length") or "")
+        except ValueError:
+            return
+        if 0 < length <= limit:
+            try:
+                read_with_timeout = getattr(self.rfile, "read_with_timeout", None)
+                if read_with_timeout is not None:
+                    read_with_timeout(length, 2.0)
+                else:
+                    self.rfile.read(length)
+            except Exception:
+                pass
+
     def _authed(self, minimum: str, what: str, write: bool = False) -> Identity:
         """Identify and authorize before the request body is read, so a huge unauthenticated
-        body is answered 401/403 at once, and the connection closes without draining it."""
+        body is answered 401 at once, and the connection closes without draining it."""
         try:
             ident = self._identify()
+        except _HttpError as exc:
+            exc.headers.setdefault("Connection", "close")
+            raise
+        try:
             self._require(ident, minimum, what, write=write)
         except _HttpError as exc:
+            self._discard_small_body_before_close()
             exc.headers.setdefault("Connection", "close")
             raise
         return ident
