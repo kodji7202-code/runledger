@@ -11,6 +11,8 @@ change behavior, so read the entry before you upgrade.
 
 - `runledger backup --verify` removes the temporary SQLite `.tmp-shm`/`.tmp-wal` sidecars that
   read-only verification can recreate, so verified backups no longer leave files outside retention cleanup.
+- Status lines written to pipes and redirects use UTF-8 unless `PYTHONIOENCODING` explicitly
+  requests another encoding, so Windows Git Bash no longer shows middle-dot separators as `�`.
 
 ## [1.0.0rc1] - 2026-11-25
 
