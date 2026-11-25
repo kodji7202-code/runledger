@@ -155,12 +155,25 @@ def _write_stdout(text: str) -> None:
 
 
 def _tolerant_console() -> None:
-    """Status lines print `·`, `−` and `⚠️`; a console that cannot encode them gets `?` instead of a crash."""
+    """Keep status lines readable across consoles and byte pipes.
+
+    Pipes and redirects get UTF-8, matching receipts and modern shells; an explicit
+    PYTHONIOENCODING still wins. Interactive consoles keep their native encoding, with
+    replacement instead of a crash when they cannot encode `·`, `−` or `⚠️`.
+    """
+    explicit_encoding = os.environ.get("PYTHONIOENCODING")
     for stream in (sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
         if reconfigure is not None:
             try:
-                reconfigure(errors="replace")
+                piped = not stream.isatty()
+            except (ValueError, OSError):
+                piped = False
+            try:
+                if piped and explicit_encoding is None:
+                    reconfigure(encoding="utf-8", errors="replace")
+                else:
+                    reconfigure(errors="replace")
             except (ValueError, OSError):
                 pass
 

@@ -7,6 +7,11 @@ change behavior, so read the entry before you upgrade.
 
 ## [Unreleased]
 
+### Fixed
+
+- Status lines written to pipes and redirects use UTF-8 unless `PYTHONIOENCODING` explicitly
+  requests another encoding, so Windows Git Bash no longer shows middle-dot separators as `�`.
+
 ## [1.0.0rc1] - 2026-11-25
 
 ### Fixed
