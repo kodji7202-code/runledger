@@ -7,7 +7,7 @@ import pytest
 
 from runledger.cli import main
 from runledger.receipt import SCHEMA_VERSION
-from schema_check import SCHEMA, validate
+from runledger.receipt_schema import SCHEMA, validate
 
 FIXTURES = Path(__file__).parent / "fixtures"
 def _guard_session(tmp_path):
@@ -87,6 +87,29 @@ def test_schema_requires_what_the_receipt_always_has(capsys):
     data = _receipt(capsys, SESSIONS["claude"](None))
     assert set(SCHEMA["required"]) <= set(data)
     assert set(data) <= set(SCHEMA["properties"])
+
+
+def test_validate_command_accepts_a_generated_receipt(tmp_path, capsys):
+    data = _receipt(capsys, SESSIONS["claude"](None))
+    target = tmp_path / "run.json"
+    target.write_text(json.dumps(data), encoding="utf-8")
+
+    assert main(["validate", str(target)]) == 0
+    assert capsys.readouterr().out.endswith("valid\n")
+
+
+def test_validate_command_reports_contract_breaks_and_bad_json(tmp_path, capsys):
+    data = _receipt(capsys, SESSIONS["claude"](None))
+    data["risk"]["score"] = 101
+    broken = tmp_path / "broken.json"
+    broken.write_text(json.dumps(data), encoding="utf-8")
+    malformed = tmp_path / "malformed.json"
+    malformed.write_text("{", encoding="utf-8")
+
+    assert main(["validate", str(broken), str(malformed)]) == 1
+    err = capsys.readouterr().err
+    assert "risk.score" in err
+    assert "invalid JSON" in err
 
 
 def test_markdown_on_stdout_ends_with_the_mode_comment(capsys):

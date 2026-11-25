@@ -24,7 +24,7 @@ from runledger.cli import main
 from runledger.parser import Usage
 from runledger.paths import is_abs
 from runledger.pricing import cost_of, price_for
-from schema_check import SCHEMA, validate
+from runledger.receipt_schema import SCHEMA, validate
 
 SESSIONS = [p for p in os.environ.get("RUNLEDGER_CORPUS", "").split(os.pathsep) if p.strip()]
 pytestmark = pytest.mark.skipif(not SESSIONS, reason="set RUNLEDGER_CORPUS to run the corpus checks")
