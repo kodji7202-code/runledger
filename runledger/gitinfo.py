@@ -13,6 +13,8 @@ from .paths import is_unc, native
 
 # The session log names the folder, so its repository config is not trusted:
 # these options keep git from running fsmonitor hooks, external diff tools or textconv filters.
+# Configured content filters cannot be neutralised by name ahead of time, so content diffs
+# are skipped entirely when the repository's local config declares any filter driver.
 _SAFE = ["-c", "core.fsmonitor=false", "-c", "core.quotepath=false"]
 _STRIP_GIT_ENV = (
     "GIT_DIR",
@@ -227,22 +229,62 @@ def session_base(cwd: Optional[str], started: Optional[datetime]) -> Optional[st
     return (_git(cwd, "rev-parse", "--short", base) or "").strip() or None
 
 
+def local_filter_configured(cwd: Optional[str]) -> bool:
+    """Whether repository or worktree config declares a content filter driver. An inspection
+    failure is treated as configured because the next diff could execute that driver."""
+    if not _in_repo(cwd):
+        return False
+    assert cwd is not None
+    info = _probe_context(cwd) if _is_unpatched() and _CONTEXT_CACHE is not None else None
+    if info is not None and "filter_configured" in info:
+        return bool(info["filter_configured"])
+    config = _git(cwd, "config", "--list", "--show-scope")
+    if config is None:
+        # Git before 2.26 has no --show-scope; inspect the two file scopes explicitly.
+        config = _git(cwd, "config", "--local", "--includes", "--list")
+        if config is None:
+            return True
+        configured = any(line.split("=", 1)[0].lower().startswith("filter.") for line in config.splitlines())
+        worktree_enabled = False
+        for line in config.splitlines():
+            parts = line.lower().split("=", 1)
+            if len(parts) == 2 and parts[0] == "extensions.worktreeconfig" and parts[1] in ("true", "yes", "on", "1"):
+                worktree_enabled = True
+                break
+        if worktree_enabled:
+            worktree = _git(cwd, "config", "--worktree", "--includes", "--list")
+            if worktree is None:
+                return True
+            configured = configured or any(line.split("=", 1)[0].lower().startswith("filter.")
+                                           for line in worktree.splitlines())
+    else:
+        configured = False
+        for line in config.splitlines():
+            parts = line.split("\t", 1)
+            if len(parts) == 2 and parts[0] in ("local", "worktree") and parts[1].lower().startswith("filter."):
+                configured = True
+                break
+    if info is not None:
+        info["filter_configured"] = configured
+    return configured
+
+
 _ORIG_IN_REPO = _in_repo
 _ORIG_GIT = _git
 
 
-def _count_lines(path: str) -> Tuple[int, bool]:
-    """(line count, is binary) of a file; a file too large to read counts 0 lines."""
+def _count_lines(path: str) -> Tuple[int, bool, bool]:
+    """(line count, is binary, count unknown) of a worktree file."""
     try:
         if os.path.getsize(path) > _MAX_COUNT_BYTES:
-            return 0, False
+            return 0, False, True
         with open(path, "rb") as fh:
             data = fh.read()
     except OSError:
-        return 0, False
+        return 0, False, True
     if b"\0" in data:
-        return 0, True
-    return len(data.splitlines()), False
+        return 0, True, False
+    return len(data.splitlines()), False, False
 
 
 _ESCAPES = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13, '"': 34, "\\": 92}
@@ -289,7 +331,7 @@ def working_changes(cwd: Optional[str], paths: Optional[Iterable[str]] = None,
     """Changes of the working tree against `base` (default HEAD), keyed by path relative to cwd:
     {"added": int, "removed": int, "status": "modified" | "deleted" | "added" | "untracked",
     "binary": bool}. "added" is a tracked file that `base` does not have. Binary files count 0 lines.
-    With `paths`, only those paths are reported."""
+    With `paths`, only those paths are reported, including ignored files the agent wrote."""
     if not _in_repo(cwd):
         return {}
     assert cwd is not None
@@ -299,8 +341,11 @@ def working_changes(cwd: Optional[str], paths: Optional[Iterable[str]] = None,
     path_args = (["--", *sorted(p for p in wanted if p and "\0" not in p and "\n" not in p)]
                  if wanted is not None and len(wanted) <= _MAX_DIFF_PATHS else [])
     out: Dict[str, Dict[str, object]] = {}
+    others_standard = ["--exclude-standard"] if wanted is None else []
     rev = base or "HEAD"
-    if rev == "HEAD" and _is_unpatched() and _CONTEXT_CACHE is not None and not _probe_context(cwd).get("head_valid"):
+    unsafe_filters = local_filter_configured(cwd)
+    if unsafe_filters or (rev == "HEAD" and _is_unpatched() and _CONTEXT_CACHE is not None
+                          and not _probe_context(cwd).get("head_valid")):
         raw = None
     else:
         raw = _git(cwd, "diff", rev, "--raw", "--numstat", "-z", "--no-renames", "--relative",
@@ -329,14 +374,19 @@ def working_changes(cwd: Optional[str], paths: Optional[Iterable[str]] = None,
                          "removed": int(removed) if removed.isdigit() else 0,
                          "status": "deleted" if not exists else "added" if path in new else "modified",
                          "binary": added == "-" and removed == "-"}
-        untracked = _git(cwd, "ls-files", "--others", "--exclude-standard", "-z", *path_args) or ""
+        untracked = _git(cwd, "ls-files", "--others", *others_standard, "-z", *path_args) or ""
+    elif unsafe_filters:
+        untracked = _git(cwd, "ls-files", "--others", *others_standard, "-z", *path_args) or ""
     else:
         # No commit yet: every file in the index or the tree is new.
-        untracked = _git(cwd, "ls-files", "--cached", "--others", "--exclude-standard", "-z", *path_args) or ""
+        untracked = _git(cwd, "ls-files", "--cached", "--others", *others_standard, "-z", *path_args) or ""
     for path in untracked.split("\0"):
         if path and path not in out and (wanted is None or path in wanted):
-            lines, binary = _count_lines(os.path.join(cwd, path))
-            out[path] = {"added": lines, "removed": 0, "status": "untracked", "binary": binary}
+            lines, binary, count_limited = _count_lines(os.path.join(cwd, path))
+            entry = {"added": lines, "removed": 0, "status": "untracked", "binary": binary}
+            if count_limited:
+                entry["count_limited"] = True
+            out[path] = entry
     return out
 
 
@@ -346,7 +396,7 @@ def file_diffs(cwd: Optional[str], paths: Iterable[str], base: Optional[str] = N
     without commits give no entry. Each diff is cut at a size limit."""
     wanted = sorted(p for p in set(paths) if p and "\0" not in p and "\n" not in p)[:_MAX_DIFF_PATHS]
     rev = base or "HEAD"
-    if not wanted or not _in_repo(cwd):
+    if not wanted or not _in_repo(cwd) or local_filter_configured(cwd):
         return {}
     assert cwd is not None
     if rev == "HEAD" and _is_unpatched() and _CONTEXT_CACHE is not None and not _probe_context(cwd).get("head_valid"):
