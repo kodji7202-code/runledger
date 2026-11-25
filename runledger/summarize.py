@@ -28,6 +28,16 @@ def _realpath(path: str) -> Optional[str]:
         return None  # a logged path can contain bytes the filesystem rejects, such as NUL
 
 
+def _is_symlink_path(path: str, cwd: Optional[str]) -> bool:
+    if not path or not cwd or is_windows_style(cwd) != (os.name == "nt"):
+        return False
+    full = path if is_abs(path) else os.path.join(cwd, path)
+    try:
+        return os.path.islink(full)
+    except (OSError, ValueError):
+        return False
+
+
 def _resolve_parent_path(cwd: str, normalized: str) -> Optional[str]:
     """Resolve the parent directories, or None when one no longer exists.
 
@@ -164,7 +174,10 @@ def file_changes(run: Run) -> Dict[str, FileChange]:
                 fc = changes.setdefault(p, FileChange(p))
                 fc.deleted = fc.shell = True
             for w in writes:
-                p = _short(w.path, run.cwd, follow_write=w.follows_link)
+                follow_write = w.follows_link
+                if follow_write and w.preserves_links and _is_symlink_path(w.source or "", run.cwd):
+                    follow_write = False
+                p = _short(w.path, run.cwd, follow_write=follow_write)
                 if run.cwd and is_abs(p):
                     continue  # outside the project, such as a backup in /tmp
                 fc = changes.setdefault(p, FileChange(p))

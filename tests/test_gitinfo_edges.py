@@ -334,6 +334,26 @@ def test_write_through_commands_still_reconcile_the_target(tmp_path, tool, comma
 
 
 @needs_git
+def test_copying_a_symlink_with_no_dereference_stays_on_the_copy(tmp_path):
+    if os.name == "nt":
+        pytest.skip("symlink creation needs extra Windows privileges")
+    repo = _init(tmp_path)
+    target = repo / "target.cfg"
+    target.write_text("old\n")
+    _git(repo, "add", "target.cfg")
+    _git(repo, "commit", "-q", "-m", "target")
+    (repo / "source-link").symlink_to("target.cfg")
+    (repo / "alias.cfg").symlink_to("target.cfg")
+    steps = [Step(1, "Bash", {"command": "cp -P --backup=none source-link alias.cfg"}, "", None, None)]
+    run = Run("s", "/x.jsonl", str(repo), None, None, None, ["go"], steps, "", Usage(), {})
+    reconcile_git(run)
+
+    rows = file_changes(run)
+    assert list(rows) == ["alias.cfg"]
+    assert "target.cfg" not in rows
+
+
+@needs_git
 def test_removed_symlink_parent_navigation_is_not_collapsed(tmp_path):
     if os.name == "nt":
         pytest.skip("directory symlink creation needs extra Windows privileges")

@@ -56,6 +56,7 @@ class ShellWrite:
     deleted: bool = False
     source: Optional[str] = None  # what cp, mv or install copied to `path`
     follows_link: bool = False    # true when the write opens a symlink's target rather than replacing the link
+    preserves_links: bool = False  # true when cp copies a source symlink as a link (-P/-d/-a)
 
 
 @dataclass
@@ -279,11 +280,17 @@ def _command_writes(words: List[str], targets: List[str], body: Optional[str]) -
                 or (a.startswith("-") and not a.startswith("--") and any(c in a[1:] for c in "bls"))
                 for a in args
             )
+            preserves_links = name == "cp" and any(
+                a in ("--no-dereference", "--archive")
+                or (a.startswith("-") and not a.startswith("--") and any(c in a[1:] for c in "Pda"))
+                for a in args
+            )
             for src in sources:
                 into = dest.endswith(("/", "\\") if is_windows_style(dest) else "/") or len(sources) > 1
                 name_of = ntpath.basename if is_windows_style(src) else posixpath.basename
                 target = join(dest, name_of(src)) if into else dest
-                out.append(ShellWrite(target, source=src, follows_link=(name == "cp" and not replaces_link)))
+                out.append(ShellWrite(target, source=src, follows_link=(name == "cp" and not replaces_link),
+                                      preserves_links=preserves_links))
                 if name == "mv":
                     out.append(ShellWrite(src, deleted=True))
     elif name == "sed":
@@ -357,7 +364,7 @@ def _shell_writes(command: str) -> Tuple[ShellWrite, ...]:
             if path is None or path == "/dev" or path.startswith("/dev/"):
                 continue
             out.append(ShellWrite(path, w.added, w.deleted, resolve(w.source) if w.source else None,
-                                  w.follows_link))
+                                  w.follows_link, w.preserves_links))
     return tuple(out)
 
 
