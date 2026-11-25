@@ -67,6 +67,8 @@ jobs:
       - name: Typecheck the fully typed leaf modules
         # This is a strict ratchet: keep these files clean, and add another module only when it passes.
         run: python -m mypy runledger/paths.py runledger/_text.py runledger/jsonl.py runledger/ai_defaults.py runledger/userconfig.py
+      - name: Run the receipt conformance matrix
+        run: python tools/check_conformance.py
       - name: Measure test coverage
         run: python -m coverage run -m pytest -q
       - name: Report coverage
