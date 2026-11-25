@@ -13,6 +13,8 @@ from .paths import is_unc, native
 
 # The session log names the folder, so its repository config is not trusted:
 # these options keep git from running fsmonitor hooks, external diff tools or textconv filters.
+# Configured content filters cannot be neutralised by name ahead of time, so content diffs
+# are skipped entirely when the repository's local config declares any filter driver.
 _SAFE = ["-c", "core.fsmonitor=false", "-c", "core.quotepath=false"]
 _STRIP_GIT_ENV = (
     "GIT_DIR",
@@ -227,6 +229,29 @@ def session_base(cwd: Optional[str], started: Optional[datetime]) -> Optional[st
     return (_git(cwd, "rev-parse", "--short", base) or "").strip() or None
 
 
+def local_filter_configured(cwd: Optional[str]) -> bool:
+    """Whether repository or worktree config declares a content filter driver. An inspection
+    failure is treated as configured because the next diff could execute that driver."""
+    if not _in_repo(cwd):
+        return False
+    assert cwd is not None
+    info = _probe_context(cwd) if _is_unpatched() and _CONTEXT_CACHE is not None else None
+    if info is not None and "filter_configured" in info:
+        return bool(info["filter_configured"])
+    config = _git(cwd, "config", "--list", "--show-scope")
+    if config is None:
+        return True
+    configured = False
+    for line in config.splitlines():
+        parts = line.split("\t", 1)
+        if len(parts) == 2 and parts[0] in ("local", "worktree") and parts[1].lower().startswith("filter."):
+            configured = True
+            break
+    if info is not None:
+        info["filter_configured"] = configured
+    return configured
+
+
 _ORIG_IN_REPO = _in_repo
 _ORIG_GIT = _git
 
@@ -301,7 +326,9 @@ def working_changes(cwd: Optional[str], paths: Optional[Iterable[str]] = None,
     out: Dict[str, Dict[str, object]] = {}
     others_standard = ["--exclude-standard"] if wanted is None else []
     rev = base or "HEAD"
-    if rev == "HEAD" and _is_unpatched() and _CONTEXT_CACHE is not None and not _probe_context(cwd).get("head_valid"):
+    unsafe_filters = local_filter_configured(cwd)
+    if unsafe_filters or (rev == "HEAD" and _is_unpatched() and _CONTEXT_CACHE is not None
+                          and not _probe_context(cwd).get("head_valid")):
         raw = None
     else:
         raw = _git(cwd, "diff", rev, "--raw", "--numstat", "-z", "--no-renames", "--relative",
@@ -331,6 +358,8 @@ def working_changes(cwd: Optional[str], paths: Optional[Iterable[str]] = None,
                          "status": "deleted" if not exists else "added" if path in new else "modified",
                          "binary": added == "-" and removed == "-"}
         untracked = _git(cwd, "ls-files", "--others", *others_standard, "-z", *path_args) or ""
+    elif unsafe_filters:
+        untracked = _git(cwd, "ls-files", "--others", *others_standard, "-z", *path_args) or ""
     else:
         # No commit yet: every file in the index or the tree is new.
         untracked = _git(cwd, "ls-files", "--cached", "--others", *others_standard, "-z", *path_args) or ""
@@ -347,7 +376,7 @@ def file_diffs(cwd: Optional[str], paths: Iterable[str], base: Optional[str] = N
     without commits give no entry. Each diff is cut at a size limit."""
     wanted = sorted(p for p in set(paths) if p and "\0" not in p and "\n" not in p)[:_MAX_DIFF_PATHS]
     rev = base or "HEAD"
-    if not wanted or not _in_repo(cwd):
+    if not wanted or not _in_repo(cwd) or local_filter_configured(cwd):
         return {}
     assert cwd is not None
     if rev == "HEAD" and _is_unpatched() and _CONTEXT_CACHE is not None and not _probe_context(cwd).get("head_valid"):

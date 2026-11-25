@@ -157,6 +157,34 @@ def test_outside_relative_write_keeps_activity_counts_unverified(tmp_path):
 
 
 @needs_git
+def test_local_filter_config_disables_content_diffs_and_zero_fill(tmp_path, monkeypatch):
+    repo = _init(tmp_path)
+    _git(repo, "config", "filter.receipt.clean", "echo filtered")
+    (repo / "app.py").write_text("a\nb\nc\n")
+    real_git = gitinfo._git
+    calls = []
+
+    def spy(cwd, *args):
+        calls.append(args)
+        return real_git(cwd, *args)
+
+    monkeypatch.setattr(gitinfo, "_git", spy)
+    assert gitinfo.local_filter_configured(str(repo))
+    assert gitinfo.working_changes(str(repo), ["app.py"]) == {}
+    assert not any(args and args[0] == "diff" for args in calls)
+
+    calls.clear()
+    assert gitinfo.file_diffs(str(repo), ["app.py"]) == {}
+    assert not any(args and args[0] == "diff" for args in calls)
+
+    steps = [Step(1, "Write", {"file_path": str(repo / "app.py"), "content": "a\nb\nc\n"}, "", None, None)]
+    run = Run("s", "/x.jsonl", str(repo), None, None, None, ["go"], steps, "", Usage(), {})
+    reconcile_git(run)
+    assert run.git_changes == {}
+    assert not file_changes(run)["app.py"].verified
+
+
+@needs_git
 def test_binary_files_are_marked_not_counted(tmp_path):
     repo = _init(tmp_path)
     (repo / "logo.png").write_bytes(b"\x89PNG\x00\x01" * 8)
