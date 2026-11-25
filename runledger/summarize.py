@@ -41,15 +41,21 @@ def _resolve_dotdot_path(cwd: str, normalized: str) -> Optional[str]:
     return os.path.join(current, parts[-1])
 
 
-def _short(path: str, cwd: Optional[str]) -> str:
+def _short(path: str, cwd: Optional[str], follow_write: bool = False) -> str:
     shortened = relative(path, cwd)
     if not shortened or is_abs(shortened):
         return shortened
     normalized = normalized_git_path(shortened)
     same_platform = bool(cwd) and is_windows_style(cwd) == (os.name == "nt")
-    if ".." in normalized.split("/") and same_platform:
-        resolved_path = _resolve_dotdot_path(cwd, normalized)
+    if same_platform:
+        resolved_path = None
+        if ".." in normalized.split("/"):
+            resolved_path = _resolve_dotdot_path(cwd, normalized)
+        elif follow_write:
+            resolved_path = os.path.join(cwd, normalized)
         if resolved_path is not None:
+            if follow_write:
+                resolved_path = os.path.realpath(resolved_path)
             resolved = relative(resolved_path, cwd)
             if resolved and not is_abs(resolved):
                 normalized = normalized_git_path(resolved)
@@ -109,7 +115,8 @@ def file_changes(run: Run) -> Dict[str, FileChange]:
     uncounted = set()
     for s in run.steps:
         p = _str(s.input.get("file_path")) or _str(s.input.get("notebook_path"))
-        p = _short(p, run.cwd) if p else p
+        follow_write = s.tool in ("Write", "Edit", "MultiEdit", "NotebookEdit")
+        p = _short(p, run.cwd, follow_write=follow_write) if p else p
         if s.tool == "Write" and p:
             fc = changes.setdefault(p, FileChange(p))
             if not fc.added and not fc.removed:
