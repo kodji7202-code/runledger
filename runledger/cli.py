@@ -298,6 +298,7 @@ def cmd_rollback(args) -> int:
             detail = f" ({size} bytes)" if size >= 0 else ""
             print(f"{len(plan.restore)} restore, {len(plan.remove)} remove{detail}. "
                   "HEAD, branch, and index stay unchanged.")
+        print("Note: Git line-ending and clean/smudge filters apply; rollback is not byte-for-byte backup.")
         if args.dry_run:
             print("Dry run. No files restored and no safety checkpoint created.")
             return 0
