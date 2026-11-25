@@ -62,6 +62,8 @@ class FileChange:
     path: str
     added: int = 0
     removed: int = 0
+    activity_added: int = 0   # cumulative lines written by tool events, before Git reconciliation
+    activity_removed: int = 0 # cumulative lines removed by tool events, before Git reconciliation
     created: bool = False
     deleted: bool = False
     shell: bool = False      # written by a shell command, so the line counts may be incomplete
@@ -123,7 +125,8 @@ def file_changes(run: Run) -> Dict[str, FileChange]:
                 fc.deleted = w.deleted
                 fc.added += w.added
     for p, fc in changes.items():
-        git = run.git_changes.get(p) if (fc.shell or p in uncounted) else None
+        fc.activity_added, fc.activity_removed = fc.added, fc.removed
+        git = run.git_changes.get(p)
         if git:
             fc.added, fc.removed = int(git.get("added") or 0), int(git.get("removed") or 0)
             fc.created = git.get("status") in ("untracked", "added")

@@ -289,7 +289,7 @@ def working_changes(cwd: Optional[str], paths: Optional[Iterable[str]] = None,
     """Changes of the working tree against `base` (default HEAD), keyed by path relative to cwd:
     {"added": int, "removed": int, "status": "modified" | "deleted" | "added" | "untracked",
     "binary": bool}. "added" is a tracked file that `base` does not have. Binary files count 0 lines.
-    With `paths`, only those paths are reported."""
+    With `paths`, only those paths are reported, including ignored files the agent wrote."""
     if not _in_repo(cwd):
         return {}
     assert cwd is not None
@@ -299,6 +299,7 @@ def working_changes(cwd: Optional[str], paths: Optional[Iterable[str]] = None,
     path_args = (["--", *sorted(p for p in wanted if p and "\0" not in p and "\n" not in p)]
                  if wanted is not None and len(wanted) <= _MAX_DIFF_PATHS else [])
     out: Dict[str, Dict[str, object]] = {}
+    others_standard = ["--exclude-standard"] if wanted is None else []
     rev = base or "HEAD"
     if rev == "HEAD" and _is_unpatched() and _CONTEXT_CACHE is not None and not _probe_context(cwd).get("head_valid"):
         raw = None
@@ -329,10 +330,10 @@ def working_changes(cwd: Optional[str], paths: Optional[Iterable[str]] = None,
                          "removed": int(removed) if removed.isdigit() else 0,
                          "status": "deleted" if not exists else "added" if path in new else "modified",
                          "binary": added == "-" and removed == "-"}
-        untracked = _git(cwd, "ls-files", "--others", "--exclude-standard", "-z", *path_args) or ""
+        untracked = _git(cwd, "ls-files", "--others", *others_standard, "-z", *path_args) or ""
     else:
         # No commit yet: every file in the index or the tree is new.
-        untracked = _git(cwd, "ls-files", "--cached", "--others", "--exclude-standard", "-z", *path_args) or ""
+        untracked = _git(cwd, "ls-files", "--cached", "--others", *others_standard, "-z", *path_args) or ""
     for path in untracked.split("\0"):
         if path and path not in out and (wanted is None or path in wanted):
             lines, binary = _count_lines(os.path.join(cwd, path))

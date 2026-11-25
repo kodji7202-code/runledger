@@ -150,6 +150,8 @@
         "path": {"type": "string"},
         "added": {"type": "integer", "minimum": 0},
         "removed": {"type": "integer", "minimum": 0},
+        "activity_added": {"type": "integer", "minimum": 0},
+        "activity_removed": {"type": "integer", "minimum": 0},
         "created": {"type": "boolean"},
         "deleted": {"type": "boolean"},
         "shell": {"type": "boolean"},

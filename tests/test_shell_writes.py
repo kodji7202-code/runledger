@@ -177,21 +177,23 @@ def test_git_fills_line_counts_for_shell_writes(repo):
     assert (app.added, app.removed, app.created, app.verified) == (2, 1, False, True)
     assert (new.added, new.removed, new.created, new.verified) == (3, 0, True, True)
     assert gone.deleted and gone.verified and gone.removed == 1
-    assert not changes["elsewhere.txt"].verified  # the move target does not exist
+    elsewhere = changes["elsewhere.txt"]
+    assert elsewhere.verified and (elsewhere.added, elsewhere.removed) == (0, 0)
     files = {f["path"]: f for f in to_dict(run, 0, "low", [])["files"]}
     assert files["app.py"]["verified"] and files["app.py"]["shell"]
 
 
 @needs_git
-def test_tool_edits_keep_their_own_counts(repo):
+def test_tool_edits_are_reconciled_and_keep_activity_counts(repo):
     (repo / "app.py").write_text("changed\n")
     run = _run(repo, [])
     run.steps.append(Step(1, "Edit", {"file_path": str(repo / "app.py"), "old_string": "a", "new_string": "x\ny"},
                           "e", "m", None))
     reconcile_git(run)
-    assert run.git_changes == {}
+    assert set(run.git_changes) == {"app.py"}
     fc = file_changes(run)["app.py"]
-    assert (fc.added, fc.removed, fc.verified) == (2, 1, False)
+    assert (fc.added, fc.removed, fc.verified) == (1, 3, True)
+    assert (fc.activity_added, fc.activity_removed) == (2, 1)
 
 
 @needs_git
