@@ -1,5 +1,6 @@
 """The CLI reports failures as one `error:` line, never a traceback."""
 import builtins
+import io
 import os
 import subprocess
 import sys
@@ -86,6 +87,38 @@ def test_cp1252_console_status_line_does_not_crash(tmp_path):
                   cwd=tmp_path, PYTHONIOENCODING="cp1252")
     assert result.returncode == 0, result.stderr.decode()
     assert result.stdout.startswith(b"Receipt: ")
+
+
+@pytest.mark.parametrize("ioencoding", [None, "", ":replace"])
+def test_piped_status_line_is_utf8_when_no_encoding_was_requested(monkeypatch, ioencoding):
+    stdout = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
+    stderr = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
+    monkeypatch.setattr(sys, "stdout", stdout)
+    monkeypatch.setattr(sys, "stderr", stderr)
+    if ioencoding is None:
+        monkeypatch.delenv("PYTHONIOENCODING", raising=False)
+    else:
+        monkeypatch.setenv("PYTHONIOENCODING", ioencoding)
+
+    cli._tolerant_console()
+    print("dot ·", file=stdout)
+    stdout.flush()
+
+    assert "dot ·".encode("utf-8") in stdout.buffer.getvalue()
+
+
+def test_explicit_pythonioencoding_controls_piped_status_lines(monkeypatch):
+    stdout = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
+    stderr = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
+    monkeypatch.setattr(sys, "stdout", stdout)
+    monkeypatch.setattr(sys, "stderr", stderr)
+    monkeypatch.setenv("PYTHONIOENCODING", "cp1252")
+
+    cli._tolerant_console()
+    print("dot ·", file=stdout)
+    stdout.flush()
+
+    assert b"dot \xb7" in stdout.buffer.getvalue()
 
 
 def test_broken_pipe_exits_quietly(monkeypatch, capsys):
