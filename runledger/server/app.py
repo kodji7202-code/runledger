@@ -1223,6 +1223,7 @@ class _Handler(BaseHTTPRequestHandler):
         """403 without a cookie and without a session row. The line names the header that
         refused the request, never the key."""
         sys.stderr.write(f"warning: refused a cross-site sign-in request ({reason})\n")
+        self._discard_small_body_before_close(SIGN_IN_BODY_LIMIT)
         raise _HttpError(
             403, "cross_site",
             "Sign-in must come from this site. Open the dashboard in a new tab and use the form there.",
