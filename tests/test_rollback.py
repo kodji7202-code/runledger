@@ -1586,6 +1586,7 @@ def test_whole_tree_preview_counts_the_bytes(scoped_repo, capsys):
     size = repo.tree_sizes(checkpoint.tree)["a.txt"]  # the checkpoint blob, not the edited file
     assert f"1 restore, 0 remove ({size} bytes)" in output
     assert "HEAD, branch, and index stay unchanged" in output
+    assert "not byte-for-byte backup" in output
 
 
 def test_path_nothing_to_restore_names_the_path_and_creates_no_ref(scoped_repo, capsys):
