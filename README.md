@@ -1,6 +1,24 @@
-# RunLedger
+<div align="center">
+  <a href="https://runledger.site">
+    <img src=".github/brand/runledger-social.png" alt="RunLedger: every agent run, on the record" width="900">
+  </a>
 
-**Receipts and safe rollback for AI coding agents.**
+  <p>
+    <a href="https://pypi.org/project/runledger-ai/"><img alt="PyPI version" src="https://img.shields.io/pypi/v/runledger-ai?label=PyPI&color=48ffb2"></a>
+    <a href="https://github.com/kodji7202-code/runledger/releases"><img alt="GitHub release" src="https://img.shields.io/github/v/release/kodji7202-code/runledger?display_name=tag&label=release&color=34c7ff"></a>
+    <a href="LICENSE"><img alt="Apache-2.0 license" src="https://img.shields.io/badge/license-Apache--2.0-9c5cff"></a>
+    <img alt="Python 3.9 or later" src="https://img.shields.io/badge/python-3.9%2B-34c7ff">
+    <img alt="CLI with zero runtime dependencies" src="https://img.shields.io/badge/CLI-zero%20dependencies-48ffb2">
+  </p>
+
+  <p><strong>Receipts, guardrails and safe rollback for AI coding agents.</strong></p>
+  <p>
+    <a href="https://runledger.site">Website</a> ·
+    <a href="docs/quickstart.md">Quickstart</a> ·
+    <a href="docs/format.md">Open format</a> ·
+    <a href="docs/enterprise.md">Team server</a>
+  </p>
+</div>
 
 RunLedger reads the session logs of your coding agents (Claude Code, Codex CLI, Factory Droid and
 Aider) and turns each run into a receipt: what changed, what ran, which model did each step, what it
