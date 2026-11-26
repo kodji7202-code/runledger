@@ -1,5 +1,4 @@
 """PowerShell write/delete extraction, risk assessment, file_changes, and guard hook."""
-import io
 import json
 
 import pytest

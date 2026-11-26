@@ -67,8 +67,14 @@ A risk reason (in `risk.reasons` and `steps[].risks`) has `severity` (`high`, `m
 ## `files[]`
 
 `path` (relative to the run folder when it is inside it), `added`, `removed` (line counts),
-`created`, `deleted`, `shell` (written through the shell, so counts may be incomplete),
-`verified` (counts come from Git) and `binary` (Git sees a binary file, so there are no counts).
+`activity_added`, `activity_removed`, `created`, `deleted`, `shell` (written through the shell,
+so counts may be incomplete), `verified` (counts come from Git) and `binary` (Git sees a binary
+file, so there are no counts).
+
+When `verified` is true, `added`/`removed` are the net working-tree diff against HEAD or
+`git_base`. When it is false, they are the best-effort activity reconstructed from tool events.
+`activity_added`/`activity_removed` always keep that cumulative activity: repeated writes or
+edits of the same lines count each operation, so they can be larger than the final net diff.
 
 ## `steps[]`
 
@@ -87,12 +93,15 @@ A risk reason (in `risk.reasons` and `steps[].risks`) has `severity` (`high`, `m
 
 ## Checking a receipt
 
-The test suite validates every fixture against the schema with safe mode on and off
-(`tests/test_receipt_schema.py`). Any JSON Schema validator works too, for example:
+Validate one or more receipts with the schema shipped in the package:
 
 ```bash
 runledger receipt --format json -o run.json
-python -m jsonschema -i run.json "$(python -c 'import runledger,os;print(os.path.join(os.path.dirname(runledger.__file__),"receipt.schema.json"))')"
+runledger validate run.json
 ```
 
-`jsonschema` is not a RunLedger dependency; install it separately if you want this check.
+`validate` exits 0 when every file conforms and 1 when JSON parsing or schema validation fails.
+The checker is part of the base install and needs no extra dependencies. It implements the JSON
+Schema subset used by `receipt.schema.json`; the test suite also validates every fixture with
+safe mode on and off (`tests/test_receipt_schema.py`). The end-to-end fixture matrix and the
+external real-session corpus are documented in [conformance.md](conformance.md).

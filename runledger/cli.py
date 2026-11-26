@@ -3,6 +3,7 @@
   runledger list [--project PATH] [--all] [--agent AGENT] [--limit N]
   runledger receipt [SESSION | --latest] [--project PATH] [--agent AGENT] [--format html|md|json]
                     [-o FILE] [--ai] [--ai-model MODEL] [--review] [--review-model MODEL] [--open]
+  runledger validate RECEIPT...
   runledger serve [--host 127.0.0.1] [--port 8787] [--db runledger.db]
                   [--tls-cert FILE --tls-key FILE] [--secure-cookies] [--trust-proxy]
                   [--trusted-proxy CIDR ...]
@@ -45,7 +46,6 @@ import os
 import re
 import sqlite3
 import sys
-import unicodedata
 import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
@@ -55,11 +55,12 @@ from urllib.parse import quote
 from . import __version__
 from . import adapters
 from . import hook_targets
+from ._text import wrap_text
 from .ai_defaults import DEFAULT_AI_MODEL, DEFAULT_REVIEW_MODEL
-from .gitinfo import current_branch, file_diffs, repo_context, session_base, toplevel, working_changes
+from .gitinfo import current_branch, file_diffs, local_filter_configured, repo_context, session_base, toplevel, working_changes
 from .guard import load_user_config, redact
 from .parser import _ts
-from .paths import is_abs
+from .paths import inside_git_tree, is_abs, normalized_git_path
 from .risk import assess, is_test_source
 
 AGENTS = ("claude-code", "codex", "droid", "aider", "native")
@@ -112,7 +113,7 @@ def build(session_path: str, use_ai: bool = False, ai_model: str = DEFAULT_AI_MO
 
 def reconcile_git(run) -> None:
     """Fill what the session log leaves out from the run's Git working tree: the
-    branch when none was recorded, line counts for files written through the shell, and
+    branch when none was recorded, net line counts for every changed project file, and
     the diffs of changed test files. When the run's changes were committed after it began,
     both compare the working tree with the last commit before the session start (run.git_base)."""
     from .summarize import file_changes
@@ -122,12 +123,18 @@ def reconcile_git(run) -> None:
             run.git_branch = current_branch(run.cwd)
         run.git_base = session_base(run.cwd, _ts(run.started))
         changes = file_changes(run)
-        shell_paths = [p for p, fc in changes.items()
-                       if fc.shell or (not fc.added and not fc.removed and not fc.deleted)]
-        if shell_paths:
-            run.git_changes = working_changes(run.cwd, shell_paths, run.git_base)
-        test_paths = [p for p, fc in changes.items()
-                      if not fc.deleted and not is_abs(p) and is_test_source(p)]
+        git_paths = sorted({normalized_git_path(p) for p in changes
+                            if not is_abs(p) and inside_git_tree(p)})
+        if git_paths:
+            run.git_changes = working_changes(run.cwd, git_paths, run.git_base)
+            if toplevel(run.cwd) and not local_filter_configured(run.cwd):
+                for path in git_paths:
+                    if "\0" in path or "\n" in path:
+                        continue  # working_changes cannot pass these as Git pathspecs
+                    run.git_changes.setdefault(path, {"added": 0, "removed": 0,
+                                                      "status": "unchanged", "binary": False})
+        test_paths = [normalized_git_path(p) for p, fc in changes.items()
+                      if not fc.deleted and not is_abs(p) and inside_git_tree(p) and is_test_source(p)]
         if test_paths:
             run.test_diffs = file_diffs(run.cwd, test_paths, run.git_base)
 
@@ -148,12 +155,26 @@ def _write_stdout(text: str) -> None:
 
 
 def _tolerant_console() -> None:
-    """Status lines print `·`, `−` and `⚠️`; a console that cannot encode them gets `?` instead of a crash."""
+    """Keep status lines readable across consoles and byte pipes.
+
+    Pipes and redirects get UTF-8, matching receipts and modern shells; an explicit
+    PYTHONIOENCODING still wins. Interactive consoles keep their native encoding, with
+    replacement instead of a crash when they cannot encode `·`, `−` or `⚠️`.
+    """
+    io_encoding = os.environ.get("PYTHONIOENCODING")
+    encoding_overridden = io_encoding is not None and io_encoding.split(":", 1)[0] != ""
     for stream in (sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
         if reconfigure is not None:
             try:
-                reconfigure(errors="replace")
+                piped = not stream.isatty()
+            except (ValueError, OSError):
+                piped = False
+            try:
+                if piped and not encoding_overridden:
+                    reconfigure(encoding="utf-8", errors="replace")
+                else:
+                    reconfigure(errors="replace")
             except (ValueError, OSError):
                 pass
 
@@ -209,19 +230,7 @@ def _prune_scope(keep, older_than) -> str:
 
 
 def _wrap_checkpoint_label(label: str) -> str:
-    lines = []
-    line, columns = "  ", 2
-    for match in re.finditer(r"( *)([^ ]+)", repr(redact(label))):
-        gap, word = match.groups()
-        width = sum(2 if unicodedata.east_asian_width(char) in ("F", "W") else 1
-                    for char in word if unicodedata.category(char) not in ("Mn", "Me"))
-        if line.strip() and columns + len(gap) + width > 80:
-            lines.append(line)
-            line, columns = "   " + word, 3 + width
-        else:
-            line += gap + word
-            columns += len(gap) + width
-    return "\n".join([*lines, line])
+    return wrap_text(repr(redact(label)), initial_indent="  ", subsequent_indent="   ")
 
 
 def cmd_checkpoints(args) -> int:
@@ -290,15 +299,6 @@ def cmd_rollback(args) -> int:
                 print(f"  restore  {path!r}")
             for path in plan.remove:
                 print(f"  delete   {path!r}  (not in checkpoint)")
-            if not (plan.restore or plan.remove):
-                print(f"Nothing to restore for {', '.join(plan.paths)} "
-                      f"(already matches {checkpoint.id}).")
-                return 0
-            count = len(plan.restore) + len(plan.remove)
-            size = _changed_bytes(repo, plan, CheckpointError)
-            detail = f" ({size} bytes)" if size >= 0 else ""
-            print(f"{count} file(s) would change{detail}. "
-                  "Everything outside the scope is untouched. Run with --yes to apply.")
         else:
             for path in plan.restore:
                 print(f"  restore {path!r}")
@@ -306,10 +306,25 @@ def cmd_rollback(args) -> int:
                 print(f"  remove  {path!r}")
             for path in plan.keep_ignored:
                 print(f"  keep ignored {path!r}")
-            size = _changed_bytes(repo, plan, CheckpointError)
-            detail = f" ({size} bytes)" if size >= 0 else ""
+        if not (plan.restore or plan.remove):
+            scope = f" for {', '.join(plan.paths)}" if plan.paths else ""
+            if plan.keep_ignored:
+                kept = len(plan.keep_ignored)
+                print(f"Nothing to restore{scope} (matches {checkpoint.id} except {kept} "
+                      f"ignored file{'' if kept == 1 else 's'}, which rollback keeps).")
+            else:
+                print(f"Nothing to restore{scope} (already matches {checkpoint.id}).")
+            return 0
+        size = _changed_bytes(repo, plan, CheckpointError)
+        detail = f" ({size} bytes)" if size >= 0 else ""
+        if plan.paths:
+            count = len(plan.restore) + len(plan.remove)
+            print(f"{count} file(s) would change{detail}. "
+                  "Everything outside the scope is untouched. Run with --yes to apply.")
+        else:
             print(f"{len(plan.restore)} restore, {len(plan.remove)} remove{detail}. "
                   "HEAD, branch, and index stay unchanged.")
+        print("Note: Git line-ending and clean/smudge filters apply; rollback is not byte-for-byte backup.")
         if args.dry_run:
             print("Dry run. No files restored and no safety checkpoint created.")
             return 0
@@ -470,6 +485,32 @@ def _default_receipt_path(stem: str, ext: str) -> Path:
         n += 1
 
 
+def _reject_json_constant(constant: str):
+    raise ValueError(f"non-JSON number {constant}")
+
+
+def cmd_validate(args) -> int:
+    from .receipt_schema import validate_receipt
+
+    valid = True
+    for name in args.receipts:
+        try:
+            data = json.loads(Path(name).read_text(encoding="utf-8"), parse_constant=_reject_json_constant)
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            print(f"{name}: invalid JSON ({exc})", file=sys.stderr)
+            valid = False
+            continue
+        errors = validate_receipt(data)
+        if errors:
+            valid = False
+            print(f"{name}: invalid", file=sys.stderr)
+            for error in errors:
+                print(f"  {error}", file=sys.stderr)
+        else:
+            print(f"{name}: valid")
+    return 0 if valid else 1
+
+
 def cmd_receipt(args) -> int:
     from .receipt import md_trailer, render
     from .safe import make_safe
@@ -528,6 +569,14 @@ _LOOPBACK = {"127.0.0.1", "localhost", "::1"}
 
 
 def cmd_serve(args) -> int:
+    try:
+        import fastapi  # noqa: F401
+        import uvicorn  # noqa: F401
+    except ModuleNotFoundError:
+        print("error: the team server requires the optional server dependencies; "
+              "install them with: python -m pip install 'runledger-ai[server]'", file=sys.stderr)
+        return 1
+
     from .server.app import TLSConfigError, make_server
 
     try:
@@ -730,7 +779,7 @@ def _backup_size(target: Path) -> Optional[int]:
 
 def cmd_backup(args) -> int:
     """Copy the team database to DIR/runledger-<stem>-YYYYmmdd-HHMMSS[-N].db and keep the newest --keep copies."""
-    from .server.db import Database, _restrict_file
+    from .server.db import Database, backup_integrity_error, _restrict_file
 
     folder = Path(args.dir)
     if args.keep < 1:
@@ -739,8 +788,13 @@ def cmd_backup(args) -> int:
     if not Path(args.db).is_file():
         print(f"error: no database at {args.db}", file=sys.stderr)
         return 1
+    source_problem = backup_integrity_error(args.db)
+    if source_problem is not None:
+        print(f"error: {args.db} is not a usable RunLedger database: {source_problem}", file=sys.stderr)
+        return 1
     stem = _backup_stem(args.db)
     reservation: Optional[Path] = None
+    target: Optional[Path] = None
     size: Optional[int] = None
     try:
         folder.mkdir(parents=True, exist_ok=True)
@@ -748,19 +802,28 @@ def cmd_backup(args) -> int:
         target, reservation = _reserve_backup_target(folder, stem, stamp)
         db = Database(args.db)
         try:
-            db.backup_to(str(target))
+            if args.verify:
+                db.backup_to(str(target), verify=backup_integrity_error)
+            else:
+                db.backup_to(str(target))
         finally:
             db.close()
         _restrict_file(str(target))
         size = _backup_size(target)
     except (OSError, sqlite3.Error) as exc:
+        if target is not None:
+            try:
+                target.unlink()
+            except OSError:
+                pass
         _discard_reserved_backup(reservation)
         print(f"error: backup failed: {exc}", file=sys.stderr)
         return 1
     _discard_reserved_backup(reservation)
     old = _prune_backups(folder, stem, args.keep)
     detail = f"{size} bytes" if size is not None else "size n/a (already pruned by another backup)"
-    print(f"Backup: {target}  ({detail}; removed {len(old)} older)")
+    verified = "; integrity verified" if args.verify else ""
+    print(f"Backup: {target}  ({detail}{verified}; removed {len(old)} older)")
     return 0
 
 
@@ -1140,6 +1203,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                       help="keep full local paths and e-mail addresses")
     pr.set_defaults(func=cmd_receipt)
 
+    pv = sub.add_parser("validate", help="validate JSON receipts against receipt.schema.json")
+    pv.add_argument("receipts", nargs="+", metavar="RECEIPT", help="JSON receipt file to validate")
+    pv.set_defaults(func=cmd_validate)
+
     ps = sub.add_parser("serve", help="run the team server (collects pushed runs, serves the dashboard)")
     ps.add_argument("--host", default="127.0.0.1", help="bind address (default 127.0.0.1)")
     ps.add_argument("--port", type=int, default=8787)
@@ -1194,6 +1261,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     pbk.add_argument("--db", default="runledger.db", help="SQLite database file (default runledger.db)")
     pbk.add_argument("--dir", default="backups", help="folder for the copies (default backups)")
     pbk.add_argument("--keep", type=int, default=14, help="how many copies to keep (default 14)")
+    pbk.add_argument("--verify", action="store_true", help="run SQLite integrity checks on the copy")
     pbk.set_defaults(func=cmd_backup)
 
     pk = sub.add_parser("key", help="manage a team's API keys on a team database")

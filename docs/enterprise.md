@@ -172,8 +172,8 @@ a 200 continuation page rather than a redirect chain so the Strict cookie reache
 
 ### SAML 2.0 single sign-on
 
-Install the optional server dependency with `pip install 'runledger-ai[saml]'` (from a clone,
-`pip install '.[saml]'`). Configure your IdP for SP-initiated SAML 2.0: use HTTP-Redirect for
+Install the optional server and SAML dependencies with `pip install 'runledger-ai[server,saml]'`
+(from a clone, `pip install '.[server,saml]'`). Configure your IdP for SP-initiated SAML 2.0: use HTTP-Redirect for
 the AuthnRequest and HTTP-POST for the response. In this example, import the SP metadata from
 `https://ledger.example.com/auth/saml/work/metadata` or register that URL as the SP entity ID
 and `https://ledger.example.com/auth/saml/work/acs` as the assertion consumer service URL.

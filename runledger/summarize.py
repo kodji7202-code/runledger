@@ -11,18 +11,104 @@ import json
 import os
 import re
 from dataclasses import dataclass, replace
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from . import llm
 from .ai_defaults import DEFAULT_AI_MODEL
 from .parser import Run, Step, Usage
-from .paths import is_abs, relative
+from .paths import is_abs, is_windows_style, normalized_git_path, relative
 from .ps_writes import ps_deletes, ps_writes, shell_kind
 from .shell_writes import shell_deletes, shell_writes
 
 
-def _short(path: str, cwd: Optional[str]) -> str:
-    return relative(path, cwd)
+def _realpath(path: str) -> Optional[str]:
+    try:
+        return os.path.realpath(path)
+    except (OSError, ValueError):
+        return None  # a logged path can contain bytes the filesystem rejects, such as NUL
+
+
+def _is_symlink_path(path: str, cwd: Optional[str]) -> bool:
+    if not path or not cwd or is_windows_style(cwd) != (os.name == "nt"):
+        return False
+    full = path if is_abs(path) else os.path.join(cwd, path)
+    try:
+        return os.path.islink(full)
+    except (OSError, ValueError):
+        return False
+
+
+class _PathResolver:
+    """Filesystem lookups shared by the paths of one receipt.
+
+    A large run often writes thousands of files in the same directories. Resolving every
+    parent anew made receipt generation several times slower on Windows, while sharing the
+    lookups within one pass does not change the result: the receipt is a snapshot of the
+    filesystem as it is being read.
+    """
+
+    def __init__(self, cwd: str):
+        self.cwd = cwd
+        self.realpaths: Dict[str, Optional[str]] = {}
+        self.parents: Dict[Tuple[str, ...], Optional[str]] = {}
+
+    def realpath(self, path: str) -> Optional[str]:
+        if path not in self.realpaths:
+            self.realpaths[path] = _realpath(path)
+        return self.realpaths[path]
+
+    def resolve_parent(self, normalized: str) -> Optional[str]:
+        """Resolve the parent directories, or None when one no longer exists.
+
+        os.path.realpath() can collapse `..` lexically when the final file is absent, which
+        would turn `link/../x` into the wrong file when `link` is a symlink. Resolving each
+        directory before applying `..` preserves the filesystem's actual symlink semantics.
+        The final path component is deliberately left alone: deleting a symlink acts on the
+        link, while writing through one acts on its target.
+        """
+        current = self.realpath(self.cwd)
+        if current is None:
+            return None
+        parts = normalized.split("/")
+        for index, part in enumerate(parts[:-1], 1):
+            key = tuple(parts[:index])
+            if key in self.parents:
+                current = self.parents[key]
+                if current is None:
+                    return None
+                continue
+            if part == "..":
+                current = os.path.dirname(current)
+            else:
+                candidate = os.path.join(current, part)
+                if not os.path.isdir(candidate):
+                    current = None
+                else:
+                    current = self.realpath(candidate)
+            self.parents[key] = current
+            if current is None:
+                return None
+        return os.path.join(current, parts[-1])
+
+
+def _short(path: str, cwd: Optional[str], follow_write: bool = False,
+           resolver: Optional[_PathResolver] = None) -> str:
+    shortened = relative(path, cwd)
+    if not shortened or is_abs(shortened):
+        return shortened
+    normalized = normalized_git_path(shortened)
+    same_platform = bool(cwd) and is_windows_style(cwd) == (os.name == "nt")
+    if same_platform:
+        if resolver is None:
+            resolver = _PathResolver(cwd or "")
+        resolved_path = resolver.resolve_parent(normalized)
+        if resolved_path is not None and follow_write:
+            resolved_path = resolver.realpath(resolved_path)
+        if resolved_path is not None:
+            resolved = relative(resolved_path, cwd)
+            if resolved and not is_abs(resolved):
+                normalized = normalized_git_path(resolved)
+    return normalized
 
 
 COMMAND_LIMIT = 120
@@ -62,6 +148,8 @@ class FileChange:
     path: str
     added: int = 0
     removed: int = 0
+    activity_added: int = 0   # cumulative lines written by tool events, before Git reconciliation
+    activity_removed: int = 0 # cumulative lines removed by tool events, before Git reconciliation
     created: bool = False
     deleted: bool = False
     shell: bool = False      # written by a shell command, so the line counts may be incomplete
@@ -74,9 +162,12 @@ def file_changes(run: Run) -> Dict[str, FileChange]:
         return {p: replace(fc) for p, fc in run.frozen_changes.items()}
     changes: Dict[str, FileChange] = {}
     uncounted = set()
+    resolver = (_PathResolver(run.cwd) if run.cwd and is_windows_style(run.cwd) == (os.name == "nt")
+                else None)
     for s in run.steps:
         p = _str(s.input.get("file_path")) or _str(s.input.get("notebook_path"))
-        p = _short(p, run.cwd) if p else p
+        follow_write = s.tool in ("Write", "Edit", "MultiEdit", "NotebookEdit")
+        p = _short(p, run.cwd, follow_write=follow_write, resolver=resolver) if p else p
         if s.tool == "Write" and p:
             fc = changes.setdefault(p, FileChange(p))
             if not fc.added and not fc.removed:
@@ -109,13 +200,16 @@ def file_changes(run: Run) -> Dict[str, FileChange]:
             deletes = ps_deletes(cmd) if is_ps else shell_deletes(cmd)
             writes = ps_writes(cmd) if is_ps else shell_writes(cmd)
             for target in deletes:
-                p = _short(target, run.cwd)
+                p = _short(target, run.cwd, resolver=resolver)
                 if run.cwd and is_abs(p):
                     continue  # outside the project, such as a scratch file in /tmp
                 fc = changes.setdefault(p, FileChange(p))
                 fc.deleted = fc.shell = True
             for w in writes:
-                p = _short(w.path, run.cwd)
+                follow_write = w.follows_link
+                if follow_write and w.preserves_links and _is_symlink_path(w.source or "", run.cwd):
+                    follow_write = False
+                p = _short(w.path, run.cwd, follow_write=follow_write, resolver=resolver)
                 if run.cwd and is_abs(p):
                     continue  # outside the project, such as a backup in /tmp
                 fc = changes.setdefault(p, FileChange(p))
@@ -123,8 +217,9 @@ def file_changes(run: Run) -> Dict[str, FileChange]:
                 fc.deleted = w.deleted
                 fc.added += w.added
     for p, fc in changes.items():
-        git = run.git_changes.get(p) if (fc.shell or p in uncounted) else None
-        if git:
+        fc.activity_added, fc.activity_removed = fc.added, fc.removed
+        git = run.git_changes.get(p) or (None if is_abs(p) else run.git_changes.get(normalized_git_path(p)))
+        if git and not git.get("count_limited"):
             fc.added, fc.removed = int(git.get("added") or 0), int(git.get("removed") or 0)
             fc.created = git.get("status") in ("untracked", "added")
             fc.deleted = git.get("status") == "deleted"

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "runledger-ai"
-version = "0.7.0"
+version = "1.0.0"
 description = "Audit, cost and real-time guard for AI coding agents: receipts, risk score, rollback. Claude Code, Codex CLI, Factory Droid, Aider."
 readme = "README.md"
 license = "Apache-2.0"
@@ -14,7 +14,7 @@ requires-python = ">=3.9"
 authors = [{ name = "RunLedger", email = "hello@runledger.site" }]
 keywords = ["ai", "ai-agents", "coding-agents", "claude-code", "codex", "factory-droid", "droid", "aider", "audit", "receipts", "guardrails", "observability"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Environment :: Console",
     "Intended Audience :: Developers",
     "Operating System :: OS Independent",
@@ -31,7 +31,18 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
+server = [
+    "fastapi>=0.115,<1",
+    "uvicorn>=0.30,<1",
+]
 saml = ["python3-saml>=1.16,<2"]
+dev = [
+    "pytest>=8,<9",
+    "coverage>=7.6,<8",
+    "ruff>=0.8,<1",
+    # 1.18 dropped support for checking python_version=3.9, which remains a supported runtime.
+    "mypy>=1.8,<1.18",
+]
 
 [project.urls]
 Homepage = "https://runledger.site"
@@ -48,3 +59,31 @@ include = ["runledger*"]
 
 [tool.setuptools.package-data]
 runledger = ["prices.json", "receipt.schema.json"]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["F"]
+
+[tool.ruff.lint.per-file-ignores]
+# The shared pytest fixture is imported intentionally, then requested again by name in tests.
+"tests/test_key_expiry.py" = ["F811"]
+
+[tool.mypy]
+python_version = "3.9"
+strict = true
+warn_unused_ignores = true
+
+[tool.coverage.run]
+source = ["runledger"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 70
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+]

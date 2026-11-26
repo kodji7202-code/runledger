@@ -141,11 +141,14 @@ def test_wheel_metadata_matches_pyproject(wheel):
     assert meta["Summary"] == _toml_string(project, "description")
     for keyword in ("claude-code", "factory-droid", "droid", "codex", "aider", "ai-agents", "guardrails"):
         assert keyword in (meta["Keywords"] or ""), f"{keyword} is missing from the wheel metadata"
-    assert meta.get_all("Provides-Extra") == ["saml"]
+    assert meta.get_all("Provides-Extra") == ["server", "saml", "dev"]
     requirements = meta.get_all("Requires-Dist", [])
-    assert len(requirements) == 1 and re.fullmatch(
-        r'python3-saml[^;]*; extra == "saml"', requirements[0]
-    ), "the base package must remain dependency-free"
+    assert len(requirements) == 7
+    assert sum(re.fullmatch(r'(fastapi|uvicorn)[^;]*; extra == "server"', req) is not None
+               for req in requirements) == 2
+    assert any(re.fullmatch(r'python3-saml[^;]*; extra == "saml"', req) for req in requirements)
+    assert sum('; extra == "dev"' in req for req in requirements) == 4
+    assert all('; extra == "' in req for req in requirements), "the base package must remain dependency-free"
 
 
 def test_pyproject_project_table():
@@ -320,8 +323,8 @@ def test_release_workflow_uses_trusted_publishing_on_version_tags():
     release = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
     assert '- "v*"' in release
     assert "python -m pytest -q" in release
-    assert "python -m venv .release-smoke" in release
-    assert ".release-smoke/bin/runledger --version" in release
+    assert "python tools/check_clean_install.py --dist-dir dist" in release
+    assert (ROOT / "tools" / "check_clean_install.py").is_file()
     assert "id-token: write" in release
     # Only the third-party publish action is pinned by commit; first-party actions stay on tags.
     assert re.search(r"pypa/gh-action-pypi-publish@[0-9a-f]{40} # release/v1", release)
@@ -331,6 +334,9 @@ def test_release_workflow_uses_trusted_publishing_on_version_tags():
         assert re.search(rf"uses: {re.escape(action)}@v\d+\b", release), \
             f"the release workflow does not use {action} from a major-version tag"
     assert "v0.3.0" not in release
+    assert 'if [[ "$version" =~ (a|b|rc|dev)[0-9]+$ ]]' in release
+    assert 'prerelease=(--prerelease)' in release
+    assert '"${prerelease[@]}"' in release
 
 
 def test_release_workflow_verifies_tag_against_version():
@@ -347,7 +353,7 @@ def test_release_workflow_installs_the_package_like_ci_before_testing():
     v0.6.1 run, so every test importing runledger failed and the release could not publish."""
     release = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
     ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-    install = "python -m pip install -e . pytest"
+    install = "python -m pip install -e '.[server]' pytest"
     assert install in ci, "the CI test job installs the package and pytest"
     jobs = _workflow_jobs(release)
     assert jobs, "no jobs found in release.yml"
@@ -389,7 +395,7 @@ def test_container_runs_as_non_root_on_port_8787():
     for mirror in ("public.ecr.aws/docker/library/python:3.12-slim",
                    "mirror.gcr.io/library/python:3.12-slim"):
         assert mirror in ci
-    assert "pip install --no-cache-dir ." in dockerfile
+    assert "pip install --no-cache-dir '.[server]'" in dockerfile
     assert "USER runledger" in dockerfile
     assert "EXPOSE 8787" in dockerfile
     assert 'ENTRYPOINT ["runledger"]' in dockerfile

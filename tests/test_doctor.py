@@ -13,12 +13,14 @@ import re
 import subprocess
 import sys
 import time
+import unicodedata
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
-from runledger import doctor, guard, hook_targets, pricing, rollback
+from runledger import doctor, pricing, rollback
+from runledger._text import display_width, wrap_text
 from runledger.cli import main as cli_main
 
 AGENTS = ("claude-code", "droid", "codex")
@@ -276,6 +278,97 @@ def test_fix_hints_appear_on_warnings_and_failures(tmp_path):
     path.write_text("{not json", encoding="utf-8")
     text = doctor.render_text(checks(proj))
     assert "->" in text
+
+
+@pytest.mark.parametrize("columns", [0, -1])
+def test_text_output_falls_back_for_nonpositive_terminal_width(monkeypatch, columns):
+    monkeypatch.setattr(doctor.shutil, "get_terminal_size",
+                        lambda **kwargs: os.terminal_size((columns, 0)))
+    report = doctor.Report("/project", [doctor.Check(
+        "config", "info", "config", "Diagnostic context. " * 12)])
+
+    lines = doctor.render_text(report).splitlines()
+
+    assert all(len(line) <= 80 for line in lines)
+    assert lines[2].startswith("       Diagnostic")
+    assert lines[-1] == "Summary: 0 ok, 0 warnings, 0 failures"
+
+
+def _display_width(text):
+    return sum(2 if unicodedata.east_asian_width(char) in ("F", "W") else 1
+               for char in text if unicodedata.category(char) not in ("Mn", "Me"))
+
+
+def test_text_output_wraps_wide_characters(monkeypatch):
+    monkeypatch.setenv("COLUMNS", "80")
+    path = "/home/プロジェクト/runledger-デモ"
+    detail = f"Configuration for {path}: " + "日本語の診断 😀 cafe\u0301 " * 8
+    report = doctor.Report(path, [doctor.Check("config", "info", "config", detail)])
+
+    lines = doctor.render_text(report).splitlines()
+
+    assert all(_display_width(line) <= 80 for line in lines), [
+        (_display_width(line), line) for line in lines]
+    start = next(i for i, line in enumerate(lines) if line.startswith("[info]"))
+    assert " ".join(line.strip() for line in lines[start:-1]) == f"[info] config: {detail.strip()}"
+
+
+@pytest.mark.parametrize("text, width", [("日本語", 6), ("😀", 2), ("cafe\u0301", 4), ("Ａ", 2)])
+def test_display_width(text, width):
+    assert display_width(text) == width
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("a" + " " * 200_000 + "b", "a\n  b"),
+    (" " * 200_000, ""),
+], ids=["spaced-words", "only-spaces"])
+def test_text_wrapping_handles_long_space_runs_quickly(text, expected):
+    start = time.perf_counter()
+    assert wrap_text(text, 80, subsequent_indent="  ") == expected
+    assert time.perf_counter() - start < 1
+
+
+def test_text_output_wraps_with_hanging_indents(monkeypatch):
+    monkeypatch.setenv("COLUMNS", "80")
+    detail = "A long diagnostic message with useful context. " * 4
+    fix = "runledger guard install --agent codex --project /a/long/project/path --global"
+    extra = "Additional diagnostic context to help locate the configuration. " * 3
+    monkeypatch.setattr(doctor, "check_extra", lambda report, check: [extra])
+    report = doctor.Report("/project", [doctor.Check(
+        "config", "warn", "config", detail, fix, agent="codex", scope="project")])
+
+    lines = doctor.render_text(report, verbose=True).splitlines()
+
+    assert f"        -> {fix}" in lines
+    assert all(len(line) <= 80 for line in lines if not line.startswith("        -> "))
+    for content, prefix, indent in ((detail, "[warn] config codex project: ", 7),
+                                    (extra, "        ", 8)):
+        start = next(i for i, line in enumerate(lines)
+                     if line.startswith(prefix + content.split()[0]))
+        wrapped = [lines[start][len(prefix):]]
+        for line in lines[start + 1:]:
+            if len(line) - len(line.lstrip()) != indent:
+                break
+            wrapped.append(line[indent:])
+        assert len(wrapped) > 1
+        assert " ".join(wrapped) == content.strip()
+
+
+@pytest.mark.parametrize("detail", ["", "All good", "https://example.com/" + "a-b/" * 30,
+                                   "/" + "long-path/" * 20, "command-" * 20])
+def test_text_output_preserves_short_lines_and_long_tokens(monkeypatch, detail):
+    monkeypatch.setenv("COLUMNS", "80")
+    report = doctor.Report("/project", [doctor.Check("config", "ok", "config", detail)])
+
+    lines = doctor.render_text(report).splitlines()
+
+    if len(detail) <= 80 - len("[ok] config: "):
+        assert lines[1] == f"[ok] config: {detail}"
+        assert len(lines) == 3
+    else:
+        assert lines[1:3] == ["[ok] config:", "     " + detail]
+        assert len(lines) == 4
+    assert lines[-1] == "Summary: 1 ok, 0 warnings, 0 failures"
 
 
 def test_exit_codes_follow_the_highest_severity(tmp_path):
@@ -1632,7 +1725,7 @@ def doc_text_samples():
 
 def report_head(line):
     """`[ok] guard hooks claude-code project: ...` -> `guard hooks claude-code project`."""
-    match = re.match(r"^\[(?:ok|warn|fail|info|skip)\] ([^:]+): ", line)
+    match = re.match(r"^\[(?:ok|warn|fail|info|skip)\] ([^:]+):(?: |$)", line)
     return match.group(1) if match else None
 
 
@@ -1676,6 +1769,3 @@ def test_the_doc_says_the_log_check_cannot_check_git_outside_a_repo():
     section = text.split("### `log`", 1)[1].split("### `rollback`", 1)[0]
     assert re.search(r"outside a Git (work tree|repository)", section, re.I), section
     assert "`info`" in section, section
-
-
-

@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from . import hook_targets
+from ._text import wrap_text
 from . import paths as _paths
 from . import pricing
 from . import rollback as _rollback
@@ -778,7 +779,6 @@ def _risk_severity_points(level: str) -> int:
 
 def _invalid_rule_count(data: Dict[str, Any]) -> int:
     """How many rule entries in one config file are typed wrongly or dropped as unsafe."""
-    from . import risk as _risk
 
     count = 0
     guard_section = _guard._section(data, "guard")
@@ -1172,21 +1172,31 @@ def _mode_check(user: Dict[str, Any], project_policy: Dict[str, Any]) -> Check:
 # ---------------------------------------------------------------- rendering
 
 def render_text(report: Report, verbose: bool = False) -> str:
-    """The text report: one line per check, `->` fix hints, a final summary line."""
+    """The text report: wrapped checks, `->` fix hints, a final summary line."""
     from . import __version__
 
-    lines = [f"RunLedger doctor {__version__}  |  python {platform.python_version()}  |  "
-             f"{sys.platform}  |  {report.project}"]
+    width = shutil.get_terminal_size(fallback=(80, 24)).columns
+    if width <= 0:
+        width = 80
+    lines = []
+
+    def append(text: str, prefix: str = "", indent: int = 2) -> None:
+        lines.append(wrap_text(text, width, prefix, " " * indent))
+
+    append(f"RunLedger doctor {__version__}  |  python {platform.python_version()}  |  "
+           f"{sys.platform}  |  {report.project}")
     for check in report.checks:
         who = f" {check.agent}" if check.agent else ""
         who += f" {check.scope}" if check.scope else ""
-        lines.append(f"[{check.status}] {check.title}{who}: {check.detail}")
+        append(f"[{check.status}] {check.title}{who}: {check.detail}",
+               indent=len(f"[{check.status}] "))
         if check.fix and check.status in (WARN, FAIL):
             lines.append(f"        -> {check.fix}")
         if verbose:
-            lines.extend(f"        {extra}" for extra in check_extra(report, check))
+            for extra in check_extra(report, check):
+                append(extra, "        ", indent=8)
     counts = summary(report.checks)
-    lines.append(f"Summary: {counts['ok']} ok, {counts['warn']} warnings, {counts['fail']} failures")
+    append(f"{counts['ok']} ok, {counts['warn']} warnings, {counts['fail']} failures", "Summary: ")
     return "\n".join(lines) + "\n"
 
 
@@ -1211,7 +1221,7 @@ def check_extra(report: Report, check: Check) -> List[str]:
     if check.id in ("approval", "log", "rollback", "pricing"):
         return _file_extras(check, report)
     if check.id == "sessions":
-        return [f"counts only; no transcript is read into the report"]
+        return ["counts only; no transcript is read into the report"]
     return []
 
 

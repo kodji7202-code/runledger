@@ -1,6 +1,7 @@
 """Retention and online backups remain independent features of the team server."""
 import sqlite3
 import threading
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -282,6 +283,100 @@ def test_backup_needs_an_existing_database(tmp_path, capsys):
     assert "no database" in capsys.readouterr().err
 
 
+def test_backup_verify_checks_the_copy_without_migrating_it(tmp_path, capsys):
+    db_path = tmp_path / "verified.db"
+    db = Database(str(db_path))
+    db.create_team("verified")
+    db.close()
+    folder = tmp_path / "backups"
+
+    assert main(["backup", "--db", str(db_path), "--dir", str(folder), "--verify"]) == 0
+    out = capsys.readouterr().out
+    assert "integrity verified" in out
+    assert list(folder.glob("*.tmp*")) == []
+    copy = next(folder.glob("runledger-*.db"))
+    with closing(sqlite3.connect(str(copy))) as conn:
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM teams").fetchone()[0] == 1
+
+
+def test_backup_integrity_error_names_empty_foreign_and_non_database_files(tmp_path):
+    from runledger.server.db import backup_integrity_error
+
+    empty = tmp_path / "empty.db"
+    empty.write_bytes(b"")
+    assert backup_integrity_error(str(empty)) == "backup is empty"
+
+    garbage = tmp_path / "garbage.db"
+    garbage.write_bytes(b"not sqlite" * 100)
+    assert backup_integrity_error(str(garbage)) is not None
+
+    foreign = tmp_path / "foreign.db"
+    with closing(sqlite3.connect(str(foreign))) as conn:
+        conn.execute("CREATE TABLE unrelated (id INTEGER)")
+        conn.commit()
+    assert "not a RunLedger database" in backup_integrity_error(str(foreign))
+
+
+def test_backup_rejects_an_unrelated_sqlite_database_without_mutating_it(tmp_path, capsys):
+    db_path = tmp_path / "foreign.db"
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        conn.execute("CREATE TABLE unrelated (id INTEGER)")
+        conn.commit()
+    before = db_path.read_bytes()
+
+    assert main(["backup", "--db", str(db_path), "--dir", str(tmp_path / "backups"), "--verify"]) == 1
+    err = capsys.readouterr().err
+    assert "not a usable RunLedger database" in err
+    assert "not a RunLedger database" in err
+    assert db_path.read_bytes() == before
+
+
+def test_a_failed_backup_verification_removes_the_copy_and_reservation(tmp_path, monkeypatch, capsys):
+    import runledger.server.db as server_db
+
+    db_path = tmp_path / "live.db"
+    Database(str(db_path)).close()
+    folder = tmp_path / "backups"
+    results = iter((None, "simulated corruption"))
+    monkeypatch.setattr(server_db, "backup_integrity_error", lambda _path: next(results))
+
+    assert main(["backup", "--db", str(db_path), "--dir", str(folder), "--verify"]) == 1
+    assert "verification failed: simulated corruption" in capsys.readouterr().err
+    assert list(folder.glob("runledger-*.db")) == []
+    assert list(folder.glob("*.lock")) == []
+    assert list(folder.glob("*.tmp*")) == []
+
+
+def test_unverified_backup_cannot_make_retention_delete_the_last_valid_copy(tmp_path, monkeypatch, capsys):
+    """A concurrently pruning backup must not see the new copy before verification finishes."""
+    import runledger.server.db as server_db
+    from runledger.cli import _prune_backups
+
+    db_path = tmp_path / "live.db"
+    db = Database(str(db_path))
+    db.create_team("kept")
+    folder = tmp_path / "backups"
+    folder.mkdir()
+    older = folder / "runledger-live-20200101-000000.db"
+    db.backup_to(str(older))
+    db.close()
+
+    def corrupt_after_competing_retention(path):
+        if not path.endswith(".tmp"):
+            return None  # the source check opens the live database read-only
+        _prune_backups(folder, "live", 1)
+        return "simulated corruption"
+
+    monkeypatch.setattr(server_db, "backup_integrity_error", corrupt_after_competing_retention)
+    assert main(["backup", "--db", str(db_path), "--dir", str(folder), "--keep", "1", "--verify"]) == 1
+    assert "verification failed" in capsys.readouterr().err
+    assert older.is_file()
+    assert [path.name for path in folder.glob("runledger-*.db")] == [older.name]
+    assert list(folder.glob("*.tmp*")) == []
+
+
 def test_backup_same_second_no_collision(tmp_path, capsys):
     from contextlib import closing
     import re
@@ -360,6 +455,7 @@ def test_failed_backup_leaves_no_partial_file(tmp_path, monkeypatch, capsys):
     assert list(folder.glob("runledger-*.db")) == []
     assert list(folder.glob("*.tmp")) == []
     assert list(folder.glob("*.lock")) == []
+    folder.mkdir(exist_ok=True)
 
     good_db = tmp_path / "good.db"
     db = Database(str(good_db))

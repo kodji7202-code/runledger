@@ -5,7 +5,7 @@ import os
 import stat
 import subprocess
 import sys
-import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,7 +14,7 @@ from unicodedata import east_asian_width
 import pytest
 
 from runledger import guard, redirects, rollback
-from runledger.cli import build, main
+from runledger.cli import _wrap_checkpoint_label, build, main
 from runledger.receipt import render
 
 
@@ -729,6 +729,12 @@ def test_listing_counts_differing_files_that_must_remain_ignored(repo, monkeypat
 
 def _display_width(text):
     return sum(2 if east_asian_width(char) in ("F", "W") else 1 for char in text)
+
+
+def test_checkpoint_label_wrapping_handles_long_space_runs_quickly():
+    start = time.perf_counter()
+    assert _wrap_checkpoint_label("a" + " " * 200_000 + "b") == "  'a\n   b'"
+    assert time.perf_counter() - start < 1
 
 
 @pytest.mark.parametrize("label", [
@@ -1579,6 +1585,7 @@ def test_whole_tree_preview_counts_the_bytes(scoped_repo, capsys):
     size = repo.tree_sizes(checkpoint.tree)["a.txt"]  # the checkpoint blob, not the edited file
     assert f"1 restore, 0 remove ({size} bytes)" in output
     assert "HEAD, branch, and index stay unchanged" in output
+    assert "not byte-for-byte backup" in output
 
 
 def test_path_nothing_to_restore_names_the_path_and_creates_no_ref(scoped_repo, capsys):
@@ -1591,6 +1598,44 @@ def test_path_nothing_to_restore_names_the_path_and_creates_no_ref(scoped_repo, 
     output = capsys.readouterr().out
     assert f"Nothing to restore for a.txt (already matches {checkpoint.id})." in output
     assert git(repo.root, "for-each-ref", rollback.PREFIX) == refs
+
+
+def test_whole_tree_nothing_to_restore_says_so_and_creates_no_ref(scoped_repo, capsys):
+    repo = scoped_repo
+    _write(repo.root, "a.txt", "one\n")
+    checkpoint = repo.create()
+    refs = git(repo.root, "for-each-ref", rollback.PREFIX)
+    assert main(["rollback", checkpoint.id, "--yes", "--cwd", str(repo.root)]) == 0
+    output = capsys.readouterr().out
+    assert f"Nothing to restore (already matches {checkpoint.id})." in output
+    assert "Restored" not in output and "Safety checkpoint" not in output
+    assert git(repo.root, "for-each-ref", rollback.PREFIX) == refs
+
+
+def test_whole_tree_nothing_to_restore_but_ignored_files_does_not_claim_a_match(scoped_repo,
+                                                                                  capsys):
+    repo = scoped_repo
+    cp = repo.create()
+    git(repo.root, "add", "-f", ".secret")
+    refs = git(repo.root, "for-each-ref", rollback.PREFIX)
+    assert main(["rollback", cp.id, "--yes", "--cwd", str(repo.root)]) == 0
+    output = capsys.readouterr().out
+    assert "keep ignored '.secret'" in output
+    assert (f"Nothing to restore (matches {cp.id} except 1 ignored file, "
+            "which rollback keeps).") in output
+    assert "already matches" not in output
+    assert git(repo.root, "for-each-ref", rollback.PREFIX) == refs
+
+
+def test_whole_tree_nothing_to_restore_does_not_ask_for_confirmation(scoped_repo, capsys,
+                                                                       monkeypatch):
+    repo = scoped_repo
+    _write(repo.root, "a.txt", "one\n")
+    checkpoint = repo.create()
+    monkeypatch.setattr("sys.stdin", type("Terminal", (io.StringIO,), {"isatty": lambda self: True})())
+    monkeypatch.setattr("builtins.input", lambda _prompt: pytest.fail("prompted for a no-op"))
+    assert main(["rollback", checkpoint.id, "--cwd", str(repo.root)]) == 0
+    assert "Nothing to restore (already matches" in capsys.readouterr().out
 
 
 def test_path_combines_with_run_last_and_the_default_checkpoint(identity_repo):
@@ -2010,7 +2055,6 @@ def test_path_case_sensitive_volume_never_selects_a_differently_cased_file(scope
     _write(repo.root, "readme.md", "modified\n")
     if _volume_folds_case(repo.root):
         pytest.skip("needs a case-sensitive filesystem")
-    refs = git(repo.root, "for-each-ref", rollback.PREFIX)
     assert main(["rollback", checkpoint.id, "--cwd", str(repo.root), "--path", "README.md",
                  "--yes"]) == 1
     err = capsys.readouterr().err

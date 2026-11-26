@@ -5,7 +5,6 @@ v0.6 low wording with the tool's own leaf name, and the SQL body of an execute-c
 never reaches a reason, a log row or an approval request.
 """
 import json
-from pathlib import Path
 
 import pytest
 

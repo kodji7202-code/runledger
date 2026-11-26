@@ -21,8 +21,8 @@ changelog if you want that.
 
 | Version | Security fixes |
 | --- | --- |
-| 0.7.x | Yes |
-| 0.6.x | Security fixes only |
+| 1.0.x | Yes |
+| 0.7.x | Security fixes only |
 | Earlier versions | No; upgrade to a supported version. Since 0.3.0, receipts mask secrets |
 
 ## Scope
@@ -40,8 +40,9 @@ Read the security checklist and the "Known limits" section of
 
 - The guard is a policy check, not a sandbox. It fails open on internal errors unless
   `fail_closed` is set in either settings file.
-- API keys can be rotated and revoked, but they do not expire. A leaked key stays valid until it is
-  rotated or revoked.
+- API keys can be rotated and revoked. They may also carry an expiry, and teams can cap personal
+  and service key lifetimes; rotation gives a key a new secret and lifetime. A leaked key without
+  an expiry stays valid until it is rotated or revoked.
 - A receipt holds the prompts (the first three in full), file paths, the first line of each command
   (up to 120 characters), search patterns, URLs, test counts, models, cost and risk reasons. It does not
   hold file contents or command output, but the agent's own session file, which RunLedger reads and does

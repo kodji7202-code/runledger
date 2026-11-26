@@ -1,6 +1,24 @@
-# RunLedger
+<div align="center">
+  <a href="https://runledger.site">
+    <img src=".github/brand/runledger-social.png" alt="RunLedger: every agent run, on the record" width="900">
+  </a>
 
-**Receipts and safe rollback for AI coding agents.**
+  <p>
+    <a href="https://pypi.org/project/runledger-ai/"><img alt="PyPI version" src="https://img.shields.io/pypi/v/runledger-ai?label=PyPI&color=48ffb2"></a>
+    <a href="https://github.com/kodji7202-code/runledger/releases"><img alt="GitHub release" src="https://img.shields.io/github/v/release/kodji7202-code/runledger?display_name=tag&label=release&color=34c7ff"></a>
+    <a href="LICENSE"><img alt="Apache-2.0 license" src="https://img.shields.io/badge/license-Apache--2.0-9c5cff"></a>
+    <img alt="Python 3.9 or later" src="https://img.shields.io/badge/python-3.9%2B-34c7ff">
+    <img alt="CLI with zero runtime dependencies" src="https://img.shields.io/badge/CLI-zero%20dependencies-48ffb2">
+  </p>
+
+  <p><strong>Receipts, guardrails and safe rollback for AI coding agents.</strong></p>
+  <p>
+    <a href="https://runledger.site">Website</a> ·
+    <a href="docs/quickstart.md">Quickstart</a> ·
+    <a href="docs/format.md">Open format</a> ·
+    <a href="docs/enterprise.md">Team server</a>
+  </p>
+</div>
 
 RunLedger reads the session logs of your coding agents (Claude Code, Codex CLI, Factory Droid and
 Aider) and turns each run into a receipt: what changed, what ran, which model did each step, what it
@@ -9,7 +27,7 @@ server collects receipts from the whole team.
 Local Git checkpoints let you restore files from before a run, with a safety checkpoint for undo.
 
 RunLedger is fully free and open source, including the self-hosted team server.
-Version 0.7.0. Python 3.9 or later, no runtime dependencies by default.
+Version 1.0.0. Python 3.9 or later, no runtime dependencies by default.
 
 ## Quickstart
 
@@ -80,8 +98,9 @@ runledger checkpoints prune --keep 50                 # or --older-than 30d
 ```
 
 Requires Git, but no Git identity setup. Ignored untracked files stay untouched.
-Rollback never changes HEAD, branches, staging, or stashes. Scripts must pass `--yes` to restore;
-use `--dry-run` to preview without restoring.
+Rollback never changes HEAD, branches, staging, or stashes. It is a Git-tree restore, not a
+byte-for-byte backup: line-ending and clean/smudge filters apply. Scripts must pass `--yes` to
+restore; use `--dry-run` to preview without restoring.
 Use `--run SESSION_ID` when creating a checkpoint to include its rollback command in the session
 receipt. `guard install` also installs automatic session-start and pre-prompt
 checkpoints for Claude Code, Droid and Codex. [docs/rollback.md](docs/rollback.md) covers hooks,
@@ -89,7 +108,11 @@ selective `--path` restores, pruning and limits.
 
 ## Team server in five steps
 
+The CLI stays dependency-free. On the machine that runs the server, install its optional web
+framework dependencies once (`pip install '.[server]'` from a clone):
+
 ```bash
+pip install 'runledger-ai[server]'
 runledger team create myteam --db runledger.db       # 1. create the team; prints its API key once
 runledger serve --db runledger.db                    # 2. start the server on http://127.0.0.1:8787
 # 3. open http://127.0.0.1:8787/?key=YOUR_KEY once, then use the plain address
@@ -138,7 +161,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: kodji7202-code/runledger@v0.7.0
+      - uses: kodji7202-code/runledger@v1.0.0
         with:
           fail-on: "60"                   # the job fails at 60 or above; "" never fails
 ```
@@ -206,6 +229,7 @@ your Anthropic API key and may incur charges from Anthropic.
 - [Supported agents](docs/agents.md): where each agent's sessions are, and `--agent`
 - [Session format](docs/format.md): the open format for any agent
 - [JSON receipt](docs/receipt-json.md): the versioned receipt contract and its JSON Schema
+- [Receipt conformance](docs/conformance.md): the fixture matrix and external corpus release gate
 - [Real-time guard](docs/guard.md): policy files, approvals, fail-open and fail-closed, the log
 - [Doctor](docs/doctor.md): the nine setup checks, `--json`, exit codes and `guard status`
 - [Stats](docs/stats.md): sessions, tokens, cost, risk and guard decisions over a window
@@ -213,6 +237,7 @@ your Anthropic API key and may incur charges from Anthropic.
 - [Analysis](docs/analysis.md): the quality score, cost tips and the AI risk review
 - [Enterprise guide](docs/enterprise.md): roles, API keys, audit, budgets, exports, HTTPS
 - [HTTP API](docs/api.md): every endpoint, with examples and error codes
+- [Release checklist](docs/release.md): versioning, RC validation and the clean-install gate
 - [Self-hosting](docs/self-hosting.md): Docker Compose, bare metal, backups, upgrades
 - [GitHub pull requests](docs/github.md): the action and the comment format
 - [Contributing](CONTRIBUTING.md)
@@ -220,8 +245,11 @@ your Anthropic API key and may incur charges from Anthropic.
 ## Development
 
 ```bash
-python -m pip install -e . pytest
+python -m pip install -e '.[dev,server]'
 python -m pytest -q
+python -m ruff check runledger tests
+python -m mypy runledger/paths.py runledger/_text.py runledger/jsonl.py runledger/ai_defaults.py runledger/userconfig.py
+python -m coverage run -m pytest -q && python -m coverage report
 ```
 
 ## License and security
