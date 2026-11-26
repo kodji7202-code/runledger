@@ -7,6 +7,11 @@ change behavior, so read the entry before you upgrade.
 
 ## [Unreleased]
 
+### Fixed
+
+- Team stats and Insights count model aliases sharing a friendly label once per receipt,
+  keeping additive tokens and costs and preserving partly priced lower bounds.
+
 ## [1.0.0] - 2026-11-26
 
 RunLedger 1.0.0 is the first stable release. It promotes the validated `1.0.0rc2` feature set to a stable release: local-first receipts, deterministic risk and quality scoring, guard hooks, checkpoint rollback, the GitHub Action, and the optional self-hosted team server.
