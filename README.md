@@ -27,7 +27,7 @@ server collects receipts from the whole team.
 Local Git checkpoints let you restore files from before a run, with a safety checkpoint for undo.
 
 RunLedger is fully free and open source, including the self-hosted team server.
-Version 1.0.0. Python 3.9 or later, no runtime dependencies by default.
+Version 1.0.1. Python 3.9 or later, no runtime dependencies by default.
 
 ## Quickstart
 
@@ -161,7 +161,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: kodji7202-code/runledger@v1.0.0
+      - uses: kodji7202-code/runledger@v1.0.1
         with:
           fail-on: "60"                   # the job fails at 60 or above; "" never fails
 ```

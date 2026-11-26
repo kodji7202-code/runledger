@@ -7,6 +7,8 @@ change behavior, so read the entry before you upgrade.
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-11-26
+
 ### Fixed
 
 - Team stats and Insights count model aliases sharing a friendly label once per receipt,
@@ -1722,7 +1724,8 @@ First working prototype (MVP).
   override them.
 - No runtime dependencies; Python 3.9 and later.
 
-[Unreleased]: https://github.com/kodji7202-code/runledger/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/kodji7202-code/runledger/compare/v1.0.1...HEAD
+[1.0.1]: https://github.com/kodji7202-code/runledger/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/kodji7202-code/runledger/compare/v1.0.0rc2...v1.0.0
 [1.0.0rc2]: https://github.com/kodji7202-code/runledger/compare/v1.0.0rc1...v1.0.0rc2
 [1.0.0rc1]: https://github.com/kodji7202-code/runledger/compare/v0.7.0...v1.0.0rc1
