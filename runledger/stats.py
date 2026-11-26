@@ -25,7 +25,7 @@ import re
 import sys
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from functools import cached_property
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -271,7 +271,8 @@ class StatsCache:
     A record is valid while the session file's `(mtime_ns, size)`, every path the parse read or
     looked for beside it is still in the state the record was built from (a path that was
     missing then must still be missing, so one that appears drops the record), the record
-    version and the policy files it was scored with are unchanged."""
+    version and the policy files it was scored with are unchanged. Start-only records
+    depend solely on the transcript's mtime and size and cannot stand in for a summary."""
 
     def __init__(self, entries: Optional[Dict[str, Dict[str, Any]]] = None,
                  path: Optional[Path] = None, dirty: bool = False):
@@ -290,12 +291,8 @@ class StatsCache:
         return cache
 
     def get(self, path: Path, stat_result: os.stat_result) -> Optional[SessionSummary]:
-        record = self.entries.get(str(path))
-        if not isinstance(record, dict) or record.get("version") != RECORD_VERSION:
-            return None
-        if record.get("mtime_ns") != stat_result.st_mtime_ns:
-            return None
-        if record.get("size") != stat_result.st_size:
+        record = self._matching_record(path, stat_result)
+        if record is None or record.get("kind") == "start":
             return None
         if record.get("policy") != policy_signature(record.get("cwd")):
             return None
@@ -305,6 +302,37 @@ class StatsCache:
             return _summary_from_record(str(path), record)
         except (KeyError, TypeError, ValueError):
             return None
+
+    def _matching_record(self, path: Path, stat_result: os.stat_result
+                         ) -> Optional[Dict[str, Any]]:
+        record = self.entries.get(str(path))
+        if not isinstance(record, dict) or record.get("version") != RECORD_VERSION:
+            return None
+        if record.get("mtime_ns") != stat_result.st_mtime_ns:
+            return None
+        if record.get("size") != stat_result.st_size:
+            return None
+        return record
+
+    def get_start(self, path: Path, stat_result: os.stat_result) -> Optional[datetime]:
+        record = self._matching_record(path, stat_result)
+        if record is None or record.get("kind") != "start":
+            return None
+        try:
+            started = datetime.fromisoformat(record["started"])
+            return _local(started) if started.tzinfo is not None else None
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return None
+
+    def put_start(self, path: Path, stat_result: os.stat_result, started: datetime) -> None:
+        try:
+            instant = started.astimezone(timezone.utc).isoformat()
+        except (ValueError, OverflowError, OSError):
+            self.drop(path)
+            return
+        self._put(path, {"version": RECORD_VERSION, "kind": "start",
+                         "mtime_ns": stat_result.st_mtime_ns, "size": stat_result.st_size,
+                         "started": instant})
 
     def put(self, path: Path, stat_result: os.stat_result, summary: SessionSummary) -> None:
         """Store one summary - unless the parse could not track every path it depends on
@@ -316,7 +344,10 @@ class StatsCache:
         if not summary.complete:
             self.drop(path)
             return
-        self.entries[str(path)] = _record(stat_result, summary)
+        self._put(path, _record(stat_result, summary))
+
+    def _put(self, path: Path, record: Dict[str, Any]) -> None:
+        self.entries[str(path)] = record
         self.dirty = True
         if len(self.entries) > MAX_CACHE_ENTRIES:
             self._trim()
@@ -656,6 +687,49 @@ def _aider_history(project: Optional[str], history_file: str) -> List[Path]:
 
 # ---------------------------------------------------------------- collecting
 
+def _session_start(path: Path) -> Optional[datetime]:
+    """Read a bounded JSONL prefix; uncertainty falls back to the full parser."""
+    if path.suffix != ".jsonl" or path.name.lower().endswith(".runledger.jsonl"):
+        return None
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            line = handle.readline(EMPTY_FILE_BYTES)
+            record = json.loads(line)
+            if (isinstance(record, dict) and record.get("type") == "session_start"
+                    and isinstance(record.get("id"), str)
+                    and isinstance(record.get("cwd"), str)):
+                remaining = EMPTY_FILE_BYTES - len(line)
+                while not record.get("timestamp") and remaining:
+                    line = handle.readline(remaining)
+                    if not line:
+                        return None
+                    remaining -= len(line)
+                    try:
+                        candidate = json.loads(line)
+                    except (ValueError, RecursionError):
+                        continue
+                    if isinstance(candidate, dict):
+                        record = candidate
+    except (OSError, ValueError, RecursionError):
+        return None
+    if not isinstance(record, dict) or "runledger_format" in record:
+        return None
+    kind = record.get("type")
+    codex = (kind == "session_meta" or "instructions" in record or
+             (path.name.startswith("rollout-") and
+              any(part.lower() == "sessions" for part in path.parent.parts)))
+    if codex:
+        modern = kind == "session_meta" and isinstance(record.get("payload"), dict)
+        legacy = not isinstance(kind, str) and ("instructions" in record or "id" in record)
+        if not modern and not legacy:
+            return None
+    stamp = record.get("timestamp")
+    try:
+        return _local(_ts(stamp)) if isinstance(stamp, str) else None
+    except (ValueError, OverflowError):
+        return None
+
+
 def collect(files: Sequence[Path], since: datetime, until: datetime,
             cache: Optional[StatsCache] = None, limit: Optional[int] = None
             ) -> Tuple[List[SessionSummary], List[Dict[str, str]], int]:
@@ -673,9 +747,15 @@ def collect(files: Sequence[Path], since: datetime, until: datetime,
         except OSError:
             skipped.append({"path": str(path), "reason": "the file is gone"})
             continue
-        if stat_result.st_mtime < since.timestamp():
-            continue  # written before the window opened, so it cannot hold a newer session
         summary = cache.get(path, stat_result) if cache is not None else None
+        if summary is None and stat_result.st_mtime < since.timestamp():
+            started = cache.get_start(path, stat_result) if cache is not None else None
+            if started is None:
+                started = _session_start(path)
+                if started is not None and cache is not None:
+                    cache.put_start(path, stat_result, started)
+            if started is not None and not since <= started <= until:
+                continue
         if summary is None:
             misses += 1
             if misses == PROGRESS_AFTER + 1:
@@ -683,7 +763,7 @@ def collect(files: Sequence[Path], since: datetime, until: datetime,
                       f"({len(files)} file(s) listed)...", file=sys.stderr)
             try:
                 summary = summarize(path)
-            except (OSError, ValueError) as exc:
+            except (OSError, ValueError, OverflowError) as exc:
                 skipped.append({"path": str(path), "reason": _reason(path, exc)})
                 if cache is not None:
                     cache.drop(path)

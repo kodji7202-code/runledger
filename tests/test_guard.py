@@ -394,10 +394,11 @@ def approval_server():
             return self.headers.get("Authorization") == "Bearer test-key"
 
         def do_POST(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(length)
             if self.path != "/api/approvals" or not self._authorised():
                 return self._send(401, {"error": "unauthorized"})
-            length = int(self.headers.get("Content-Length") or 0)
-            state["posts"].append(json.loads(self.rfile.read(length) or b"{}"))
+            state["posts"].append(json.loads(body or b"{}"))
             self._send(201, {"id": "req-1", "status": "pending"})
 
         def do_GET(self):
