@@ -11,8 +11,10 @@ This guide covers three setups:
 - **Built-in TLS**: the server serves HTTPS itself, with no proxy in front. See
   [Built-in TLS](#built-in-tls-no-reverse-proxy).
 
-The server uses only the Python standard library and SQLite. There is no other database and no other
-service to run. For roles, keys, the audit log and the admin features, see [enterprise.md](enterprise.md).
+The server uses FastAPI, uvicorn and SQLite. Those web dependencies are optional packaging extras,
+so developer machines can still install the dependency-free CLI; the Docker image and the bare-metal
+steps below install the server extra for you. There is no other database and no other service to run.
+For roles, keys, the audit log and the admin features, see [enterprise.md](enterprise.md).
 For every endpoint, see [api.md](api.md).
 
 ## Requirements
@@ -151,9 +153,9 @@ work through Caddy.
 
    ```bash
    sudo python3 -m venv /opt/runledger/venv
-   sudo /opt/runledger/venv/bin/python -m pip install runledger-ai
+   sudo /opt/runledger/venv/bin/python -m pip install 'runledger-ai[server]'
    # until the package is on PyPI, install a wheel built from this repository:
-   # sudo /opt/runledger/venv/bin/python -m pip install /path/to/runledger-<version>-py3-none-any.whl
+   # sudo /opt/runledger/venv/bin/python -m pip install 'runledger-ai[server] @ file:///path/to/runledger-<version>-py3-none-any.whl'
    ```
 
 3. Create `/etc/systemd/system/runledger.service`:
@@ -330,11 +332,17 @@ names before another run finished checks the final name again while it holds its
 completed copy is never overwritten by a delayed run:
 
 ```bash
-runledger backup --db /var/lib/runledger/runledger.db --dir /var/backups/runledger --keep 14
+runledger backup --db /var/lib/runledger/runledger.db --dir /var/backups/runledger --keep 14 --verify
 ```
 
-**Docker.** `deploy/backup.sh` runs the same command in the container, keeps 14 copies in the data
-volume, and copies the newest to `deploy/backups/` on the host. Run it from cron:
+`--verify` reopens the finished copy read-only, runs SQLite `PRAGMA integrity_check`, and checks
+that it has the core RunLedger tables before the copy enters retention. Verification never opens
+the copy through the migration path, so a failed check cannot accidentally upgrade or rewrite it.
+It adds one read pass over the database; omit it only when that I/O matters more than knowing the
+copy is structurally usable.
+
+**Docker.** `deploy/backup.sh` runs the same command in the container with verification, keeps
+14 copies in the data volume, and copies the newest to `deploy/backups/` on the host. Run it from cron:
 
 ```bash
 chmod +x deploy/backup.sh
@@ -470,7 +478,7 @@ stopped: fix the archive, the name or the file name above and run the recipe aga
 2. Get the new version and rebuild.
 
    - Docker: `git pull`, then `cd deploy && docker compose build --pull && docker compose up -d`.
-   - Bare metal: `sudo /opt/runledger/venv/bin/python -m pip install --upgrade runledger-ai`, then
+   - Bare metal: `sudo /opt/runledger/venv/bin/python -m pip install --upgrade 'runledger-ai[server]'`, then
      `sudo systemctl restart runledger`.
 
 3. Check `CHANGELOG.md` for changes that affect you. Before 1.0, a minor version can change
@@ -478,6 +486,39 @@ stopped: fix the archive, the name or the file name above and run the recipe aga
 
 There is no supported way to go back to an older version on the same database. If you need to
 roll back, install the older version and restore the backup from before the upgrade.
+
+## Operations runbook
+
+**Monitor continuously.** Poll `GET /health` through the same public URL and reverse proxy clients
+use, not only inside the container. Alert when it is not `200`, when the response stops reporting
+the expected software version, when the host is low on disk for the SQLite volume, or when the
+backup job stops printing `integrity verified`. Caddy/ nginx and systemd/Docker logs are the first
+stop for a failed check; the server never sends tracebacks to API clients.
+
+**Test restores, not only backups.** Before relying on the backup and after changing the storage
+layout, restore one verified copy into a throwaway container or host and open it with the new server
+version. The restore recipes above are written so a corrupt archive fails before live data is
+deleted. Keep one pre-upgrade backup off the host; it is the supported rollback path.
+
+**Load-test before capacity changes.** There is no portable request-per-second number: payload
+size, disk latency, TLS termination and the reverse proxy dominate it. Measure the deployment you
+are changing. From a source checkout with the development extras installed, the load suite runs a
+mixed read/write check in CI, and this opt-in soak runs the same mix for the number of seconds in
+the environment variable:
+
+```bash
+python -m pip install -e '.[dev,server]'
+RUNLEDGER_SOAK=60 python -m pytest tests/test_server_load.py -k soak
+```
+
+Run a short local smoke first, then a longer soak against a staging copy with production-like data
+and proxying. The check fails on any 5xx/transport error, stale concurrency state or deadlock;
+inspect throughput and system metrics around it before raising capacity limits.
+
+**Upgrade rehearsal.** For a production upgrade: make a verified backup, apply the upgrade first in
+staging with a copy of the database, check the schema upgrade and key API flows (`/health`, push,
+list, dashboard sign-in), then upgrade production and keep the pre-upgrade backup until the release
+has run long enough to trust it.
 
 ## Security checklist
 

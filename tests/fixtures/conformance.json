@@ -1,0 +1,171 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "name": "claude",
+      "session": "sample_session.jsonl",
+      "expect": {
+        "agent_id": "claude-code",
+        "session_id": "7f3c2a10-9b1e-4c55-a1d2-0e6f8b3c9d42",
+        "cwd_source": null,
+        "git_branch": "fix/retry-logic",
+        "steps": 10,
+        "tokens": 116416,
+        "input_tokens": 71,
+        "output_tokens": 3345,
+        "cache_write_tokens": 9800,
+        "cache_read_tokens": 103200,
+        "cost_usd": 0.108408,
+        "usage_source": null,
+        "files_changed": 3,
+        "file_paths": ["src/payments/retry.ts", "tests/payments/retry.legacy.spec.ts", "tests/payments/retry.spec.ts"],
+        "risk_score": 80,
+        "risk_level": "High",
+        "risk_codes": ["secret_file", "test_deleted", "command", "secret_file", "shell_outside"]
+      }
+    },
+    {
+      "name": "codex",
+      "session": "codex_session.jsonl",
+      "expect": {
+        "agent_id": "codex",
+        "session_id": "0198c3f2-5b7e-7a41-9d3e-6c2f1a8b4e10",
+        "cwd_source": null,
+        "git_branch": "fix/retry-backoff",
+        "steps": 7,
+        "tokens": 16753,
+        "input_tokens": 5490,
+        "output_tokens": 1023,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 10240,
+        "cost_usd": null,
+        "usage_source": null,
+        "files_changed": 3,
+        "file_paths": ["src/payments/retry.ts", "tests/old.spec.ts", "tests/retry.spec.ts"],
+        "risk_score": 65,
+        "risk_level": "High",
+        "risk_codes": ["test_deleted", "secret_file", "mcp"]
+      }
+    },
+    {
+      "name": "droid",
+      "session": "droid_session.jsonl",
+      "sidecars": ["droid_session.settings.json"],
+      "expect": {
+        "agent_id": "droid",
+        "session_id": "synthetic-droid-session",
+        "cwd_source": "header",
+        "git_branch": null,
+        "steps": 5,
+        "tokens": 1812,
+        "input_tokens": 1003,
+        "output_tokens": 203,
+        "cache_write_tokens": 103,
+        "cache_read_tokens": 503,
+        "cost_usd": 0.00659115,
+        "usage_source": "settings",
+        "files_changed": 2,
+        "file_paths": ["src/greet.py", "tests/test_greet.py"],
+        "risk_score": 0,
+        "risk_level": "Low",
+        "risk_codes": []
+      }
+    },
+    {
+      "name": "droid_shell",
+      "session": "droid_shell_edits.jsonl",
+      "sidecars": ["droid_shell_edits.settings.json"],
+      "expect": {
+        "agent_id": "droid",
+        "session_id": "4f081969-21df-49b2-9272-75a305796c06",
+        "cwd_source": "header",
+        "git_branch": null,
+        "steps": 5,
+        "tokens": 110007,
+        "input_tokens": 12,
+        "output_tokens": 3451,
+        "cache_write_tokens": 13726,
+        "cache_read_tokens": 92818,
+        "cost_usd": 0.0781308,
+        "usage_source": "settings",
+        "files_changed": 4,
+        "file_paths": ["README.md", "app/routes.py", "migrations/002_users_soft_delete.sql", "tests/test_api.py"],
+        "risk_score": 35,
+        "risk_level": "Medium",
+        "risk_codes": ["db_migration", "temp_copy", "db_write"]
+      }
+    },
+    {
+      "name": "aider",
+      "session": "aider/.aider.chat.history.md",
+      "expect": {
+        "agent_id": "aider",
+        "cwd_source": null,
+        "git_branch": null,
+        "steps": 6,
+        "tokens": 25200,
+        "input_tokens": 23500,
+        "output_tokens": 1700,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 0,
+        "cost_usd": 0.096,
+        "usage_source": null,
+        "files_changed": 3,
+        "file_paths": ["build", "src/payments/retry.py", "tests/test_retry.py"],
+        "risk_score": 30,
+        "risk_level": "Medium",
+        "risk_codes": ["command"]
+      }
+    },
+    {
+      "name": "native",
+      "session": "native_session.json",
+      "expect": {
+        "agent_id": "demo-agent",
+        "session_id": "demo-0001-native",
+        "cwd_source": null,
+        "git_branch": "feature/price-cache",
+        "steps": 4,
+        "tokens": 39400,
+        "input_tokens": 18400,
+        "output_tokens": 3900,
+        "cache_write_tokens": 2100,
+        "cache_read_tokens": 15000,
+        "cost_usd": 0.08255,
+        "usage_source": null,
+        "files_changed": 2,
+        "file_paths": ["build", "src/prices.py"],
+        "risk_score": 30,
+        "risk_level": "Medium",
+        "risk_codes": ["command"]
+      }
+    },
+    {
+      "name": "guard",
+      "session": "guard/session.jsonl",
+      "guard_log": "guard/guard.log",
+      "rewrite_cwd": true,
+      "expect": {
+        "agent_id": "claude-code",
+        "session_id": "guard-session",
+        "cwd_source": null,
+        "git_branch": null,
+        "steps": 10,
+        "tokens": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 0,
+        "cost_usd": 0.0,
+        "usage_source": null,
+        "files_changed": 2,
+        "file_paths": ["build", "cache"],
+        "risk_score": 100,
+        "risk_level": "High",
+        "risk_codes": ["command", "secret_file", "command", "command", "command", "command", "secret_file", "command", "command", "secret_file"],
+        "guard_counts": {"approved": 3, "asked": 8, "blocked": 2, "monitor_asked": 1, "monitor_blocked": 1, "rejected": 5},
+        "guard_events": 12
+      }
+    }
+  ]
+}

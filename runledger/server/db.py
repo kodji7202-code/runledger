@@ -19,7 +19,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 from urllib.parse import quote
 from uuid import uuid4
 
@@ -72,6 +72,15 @@ def _restrict_file(path: str) -> None:
         os.chmod(path, PRIVATE_FILE_MODE)
     except OSError:
         pass
+
+
+def _unlink_sqlite_sidecars(path: Path) -> None:
+    """Best-effort removal of SQLite's WAL/shared-memory files next to a temporary copy."""
+    for suffix in ("-shm", "-wal"):
+        try:
+            path.with_name(path.name + suffix).unlink()
+        except OSError:
+            pass
 
 
 # Team settings added after the first release. Databases created earlier get them
@@ -139,6 +148,11 @@ REVIEW_COLUMNS = (
     ("ai_verdict", "TEXT"),
     ("est_savings_usd", "REAL"),
 )
+
+# Version 1 is the first explicitly versioned schema. It includes every additive upgrade that
+# older unversioned databases receive below; future schema changes must get a new numbered,
+# transactional migration instead of another unconditional ALTER in Database.__init__.
+SCHEMA_VERSION = 1
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS scim_tokens (
@@ -532,7 +546,37 @@ def _read_only_uri(path: str) -> str:
     """A `file:` URI for a second, read-only connection to the same database file. SQLite
     percent-decodes the path, so a Windows drive letter, a space or a non-ASCII name works."""
     text = path.replace("\\", "/") if os.sep == "\\" else path
-    return "file:" + quote(text, safe="/:") + "?mode=ro"
+    text = quote(text, safe="/:")
+    if text.startswith("//"):
+        # Two literal leading slashes would otherwise be parsed as a URI authority/host.
+        text = "%2F" + text[1:]
+    return "file:" + text + "?mode=ro"
+
+
+def backup_integrity_error(path: str) -> Optional[str]:
+    """None when `path` is a structurally valid RunLedger backup, else a short error.
+
+    This deliberately opens the copy read-only instead of Database: verification must never run
+    migrations or otherwise write to the file it is checking. `integrity_check` proves the SQLite
+    pages and indexes; the table check catches a valid SQLite file that is not a RunLedger backup.
+    """
+    try:
+        if os.path.getsize(path) == 0:
+            return "backup is empty"
+        conn = sqlite3.connect(_read_only_uri(path), uri=True, timeout=10)
+        try:
+            rows = conn.execute("PRAGMA integrity_check").fetchall()
+            if rows != [("ok",)]:
+                return "integrity_check: " + "; ".join(str(row[0]) for row in rows[:3])
+            tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+            missing = {"teams", "api_keys", "runs"} - tables
+            if missing:
+                return "not a RunLedger database (missing " + ", ".join(sorted(missing)) + ")"
+            return None
+        finally:
+            conn.close()
+    except (OSError, sqlite3.Error) as exc:
+        return str(exc)
 
 
 class Database:
@@ -556,6 +600,7 @@ class Database:
                     self._conn.execute("PRAGMA journal_mode = WAL")
                 except sqlite3.DatabaseError:
                     pass  # some filesystems refuse WAL; the default journal still works
+                self._reject_newer_schema()
                 self._conn.executescript(SCHEMA)
                 self._add_missing_columns("api_keys", (("user_id", "TEXT REFERENCES users (id)"),))
                 self._add_missing_columns("memberships", (("deactivated_at", "TEXT"), ("external_id", "TEXT"), ("updated_at", "TEXT")))
@@ -593,6 +638,7 @@ class Database:
                 self._upgrade_run_store()
                 self._upgrade_review_columns()
                 self._migrate_api_keys()
+                self._finish_schema_migrations()
         except BaseException:
             self._conn.close()
             raise
@@ -640,10 +686,11 @@ class Database:
             return self._conn
         return sqlite3.connect(self.path, check_same_thread=False, timeout=10)
 
-    def backup_to(self, path: str) -> None:
+    def backup_to(self, path: str, verify: Optional[Callable[[str], Optional[str]]] = None) -> None:
         """A consistent copy of the database at `path`, taken while the server keeps running.
         The copy reads through its own connection in small steps, so pushes and reports go
-        through while it runs."""
+        through while it runs. `verify` checks the closed temporary copy before it becomes
+        visible at `path`; returning text aborts publication with that text in the error."""
         dest = Path(path)
         tmp = dest.with_name(f"{dest.name}.tmp")
         if tmp.exists():
@@ -651,12 +698,22 @@ class Database:
                 tmp.unlink()
             except OSError:
                 pass
+        _unlink_sqlite_sidecars(tmp)
         target = sqlite3.connect(str(tmp))
         source: Optional[sqlite3.Connection] = None
         ok = False
         try:
             source = self._backup_source()
             source.backup(target, pages=BACKUP_PAGES, sleep=BACKUP_SLEEP_S)
+            target.close()
+            if verify is not None:
+                problem = verify(str(tmp))
+                if problem is not None:
+                    raise sqlite3.Error(f"verification failed: {problem}")
+            # A read-only verification of a WAL-mode copy can recreate empty sidecars after the
+            # writer has already checkpointed and closed. They belong to the temporary name and
+            # must not escape into the backup directory when the database itself is renamed.
+            _unlink_sqlite_sidecars(tmp)
             ok = True
         finally:
             target.close()
@@ -667,6 +724,7 @@ class Database:
                     tmp.unlink()
                 except OSError:
                     pass
+                _unlink_sqlite_sidecars(tmp)
         try:
             os.replace(str(tmp), str(dest))
         except BaseException:
@@ -674,8 +732,33 @@ class Database:
                 tmp.unlink()
             except OSError:
                 pass
+            _unlink_sqlite_sidecars(tmp)
             raise
         _restrict_file(str(dest))
+
+    def _schema_version(self) -> int:
+        return int(self._conn.execute("PRAGMA user_version").fetchone()[0])
+
+    def _reject_newer_schema(self) -> None:
+        """Do not mutate a database written by a newer RunLedger."""
+        version = self._schema_version()
+        if version > SCHEMA_VERSION:
+            raise sqlite3.DatabaseError(
+                f"database schema version {version} is newer than this RunLedger reads "
+                f"({SCHEMA_VERSION}); upgrade RunLedger or restore the pre-upgrade backup"
+            )
+
+    def _finish_schema_migrations(self) -> None:
+        """Stamp the version after the pre-versioning additive upgrades have converged.
+
+        Version 1 is the baseline, so there is no data migration to run here yet. Future
+        migrations belong in numbered steps before the stamp; leaving the stamp last lets an
+        interrupted upgrade run the idempotent steps again.
+        """
+        if self._schema_version() >= SCHEMA_VERSION:
+            return
+        with self._conn:
+            self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def _add_missing_columns(self, table: str, columns: Tuple[Tuple[str, str], ...]) -> None:
         """Upgrade a database created before these columns existed."""
@@ -1770,6 +1853,28 @@ class Database:
                 "SELECT receipt_html FROM runs WHERE team_id = ? AND id = ?", (team_id, run_id)
             ).fetchone()
         return row["receipt_html"] if row else None
+
+    def delete_run(self, team_id: int, run_id: str, actor: Identity) -> bool:
+        """Delete one run, its risk rows and replaced versions. The audit event is kept.
+
+        Returns False when the team has no run with that id. This is deliberately explicit:
+        retention uses purge_before, while this method is the privacy erase operation for one
+        receipt chosen by an administrator.
+        """
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT 1 FROM runs WHERE team_id = ? AND id = ?",
+                (team_id, run_id),
+            ).fetchone()
+            if row is None:
+                return False
+            self._conn.execute("DELETE FROM risks WHERE team_id = ? AND run_id = ?", (team_id, run_id))
+            revisions = self._conn.execute(
+                "DELETE FROM run_revisions WHERE team_id = ? AND run_id = ?", (team_id, run_id)
+            ).rowcount
+            self._conn.execute("DELETE FROM runs WHERE team_id = ? AND id = ?", (team_id, run_id))
+            self._audit(team_id, actor, "run.delete", run_id, {"revisions_removed": revisions})
+        return True
 
     # Statistics
 

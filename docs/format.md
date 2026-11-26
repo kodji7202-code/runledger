@@ -267,5 +267,14 @@ log.finish("The retry test still fails.",
 
 ## Versions
 
-`runledger_format` is `1`. A future incompatible change would use `2`. RunLedger
-rejects a version it does not know, with a message saying which version it reads.
+`runledger_format` is `1`. Within a format version, changes are additive only: new optional
+fields may appear and producers/consumers must ignore fields they do not know. Removing a field,
+changing a field's type or changing the meaning of an existing value is incompatible and uses
+`2`. RunLedger rejects a version it does not know, with a message saying which version it reads.
+
+A producer that needs behavior outside version 1 should keep writing version 1 with an optional
+extension field when possible, and must not silently reuse version 1 for incompatible semantics.
+There is no long deprecation window inside the session file itself: the version integer is the
+compatibility contract. The generated receipt has its own additive schema contract in
+[receipt-json.md](receipt-json.md), and the release conformance matrix in
+[conformance.md](conformance.md) checks both sides end to end.

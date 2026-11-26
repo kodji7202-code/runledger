@@ -86,6 +86,15 @@ below names the minimum role. A higher role always works. See [enterprise.md](en
 **Formats.** Request and response bodies are JSON in UTF-8, except the HTML pages and the exports.
 Times are UTC in the form `2026-10-08T16:37:34Z`.
 
+**API version.** This document is HTTP API version **1**. Every response, including errors, carries
+`X-RunLedger-API: 1`; `/health` also reports the server software version. Within version 1 changes
+are additive only: new endpoints, optional request fields, response fields and enum values may be
+added, and clients must ignore response fields they do not know. Removing or renaming a field,
+changing its type, tightening a previously valid request into an error, or changing the meaning of an
+existing value is incompatible. An incompatible version is exposed beside the old one rather than
+silently changing version 1. After 1.0, deprecations are documented in the changelog and supported
+for at least one minor release before removal.
+
 **Errors.** Every JSON error has this shape. Tracebacks are never sent to the client; they go to the
 server's log.
 
@@ -126,7 +135,7 @@ body. Methods the server does not implement, such as `OPTIONS`, return `501`.
 No authentication. Use it for load balancers and container health checks.
 
 ```json
-{"ok": true, "version": "0.7.0"}
+{"ok": true, "version": "1.0.0"}
 ```
 
 ### `GET /api/me`
@@ -301,7 +310,7 @@ Role: any. One run with its full receipt JSON and its risk reasons.
   "usage_source": "messages", "cost_partial": false,
   "risk_score": 80, "risk_level": "high", "revision": 1, "has_html": true,
   "created_at": "2026-10-08T16:37:34Z", "updated_at": "2026-10-08T16:37:34Z",
-  "receipt": {"runledger_version": "0.7.0", "session_id": "7f3c2a10-...", "...": "..."},
+  "receipt": {"runledger_version": "1.0.0", "session_id": "7f3c2a10-...", "...": "..."},
   "risks": [{"severity": "high", "code": "secret_file", "reason": "Read a secrets file (.env)", "step": 3}]
 }}
 ```
@@ -316,6 +325,17 @@ The embedded `receipt` follows the same cost rule as the flattened fields: a run
 keeps its figure (including a reported `0.0`).
 
 Errors: `401`; `404` `not_found` ("Run not found.").
+
+### `DELETE /api/runs/{id}`
+
+Role: admin. Erases one run: its receipt JSON and HTML, risk rows, and every replaced revision.
+The deletion itself stays in the audit log as `run.delete`; approvals, budget alerts and other runs
+are unchanged. Returns `{"ok": true}`.
+
+This is the per-run privacy erase operation. `RUNLEDGER_RETENTION_DAYS` is the automatic retention
+policy for old history; use this endpoint when one receipt must be removed before that age.
+
+Errors: `401`; `403` for a non-admin; `404` `not_found` ("Run not found.").
 
 ### `GET /runs/{id}`
 

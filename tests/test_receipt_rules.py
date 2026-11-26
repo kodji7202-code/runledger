@@ -5,7 +5,6 @@ must show up in `risk.reasons` in every format, and the Guard decisions section 
 match the logged rows without leaking MCP arguments.
 """
 import json
-from pathlib import Path
 
 import pytest
 

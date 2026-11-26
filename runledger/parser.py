@@ -18,7 +18,10 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+
+if TYPE_CHECKING:
+    from .risk import Risk
 
 # How a path a parse read or looked for beside a transcript turned out: it was read, it was not
 # there, or it was there and could not be used. `runledger stats` records the state beside the

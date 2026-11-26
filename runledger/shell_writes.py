@@ -55,6 +55,8 @@ class ShellWrite:
     added: int = 0
     deleted: bool = False
     source: Optional[str] = None  # what cp, mv or install copied to `path`
+    follows_link: bool = False    # true when the write opens a symlink's target rather than replacing the link
+    preserves_links: bool = False  # true when cp copies a source symlink as a link (-P/-d/-a)
 
 
 @dataclass
@@ -263,20 +265,40 @@ def _command_writes(words: List[str], targets: List[str], body: Optional[str]) -
     name = posixpath.basename(words[0]) if words else ""
     args = words[1:]
     body_lines = len(body.splitlines()) if body is not None and name in ("cat", "tee") else 0
-    out = [ShellWrite(t, body_lines) for t in targets]
+    out = [ShellWrite(t, body_lines, follows_link=True) for t in targets]
     if name == "tee":
-        out += [ShellWrite(f, body_lines) for f in _positional(args)]
+        out += [ShellWrite(f, body_lines, follows_link=True) for f in _positional(args)]
     elif name == "touch":
         out += [ShellWrite(f) for f in _positional(args, ("-d", "-r", "-t"))]
     elif name in ("cp", "install", "mv"):
         paths = _positional(args, ("-t", "-S", "-m", "-o", "-g", "--suffix"))
         if len(paths) >= 2:
             dest, sources = paths[-1], paths[:-1]
+            replaces_link = any(
+                a in ("-b", "-l", "-s", "--backup", "--link", "--remove-destination", "--symbolic-link")
+                or (a.startswith("--backup=") and a not in ("--backup=none", "--backup=off"))
+                or (a.startswith("-") and not a.startswith("--") and any(c in a[1:] for c in "bls"))
+                for a in args
+            )
+            preserves_links = False
+            for a in args:
+                if a in ("--no-dereference", "--archive"):
+                    preserves_links = True
+                elif a == "--dereference":
+                    preserves_links = False
+                elif a.startswith("-") and not a.startswith("--"):
+                    for option in a[1:]:
+                        if option in "adP":
+                            preserves_links = True
+                        elif option in "HL":
+                            preserves_links = False
+            preserves_links = preserves_links and name == "cp"
             for src in sources:
                 into = dest.endswith(("/", "\\") if is_windows_style(dest) else "/") or len(sources) > 1
                 name_of = ntpath.basename if is_windows_style(src) else posixpath.basename
                 target = join(dest, name_of(src)) if into else dest
-                out.append(ShellWrite(target, source=src))
+                out.append(ShellWrite(target, source=src, follows_link=(name == "cp" and not replaces_link),
+                                      preserves_links=preserves_links))
                 if name == "mv":
                     out.append(ShellWrite(src, deleted=True))
     elif name == "sed":
@@ -288,7 +310,7 @@ def _command_writes(words: List[str], targets: List[str], body: Optional[str]) -
         if "-c" in args and args.index("-c") + 1 < len(args):
             sources.append(args[args.index("-c") + 1])
         for src in sources:
-            out += [ShellWrite(p) for p in _python_writes(src)]
+            out += [ShellWrite(p, follows_link=True) for p in _python_writes(src)]
     return out
 
 
@@ -349,7 +371,8 @@ def _shell_writes(command: str) -> Tuple[ShellWrite, ...]:
             path = resolve(w.path)
             if path is None or path == "/dev" or path.startswith("/dev/"):
                 continue
-            out.append(ShellWrite(path, w.added, w.deleted, resolve(w.source) if w.source else None))
+            out.append(ShellWrite(path, w.added, w.deleted, resolve(w.source) if w.source else None,
+                                  w.follows_link, w.preserves_links))
     return tuple(out)
 
 

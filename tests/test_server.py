@@ -8,12 +8,14 @@ import http.client
 import json
 import math
 import re
+import socket
 import sqlite3
 import threading
+import time
 from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import quote, urlencode, urlsplit
 
 import pytest
 
@@ -314,6 +316,29 @@ def test_push_then_list_get_and_stats(env):
     assert "default-src 'none'" in headers["content-security-policy"]
 
 
+def test_admin_can_delete_one_run_and_revisions_are_erased(env, tmp_path):
+    srv, base = env
+    team_id, key = srv.db.create_team("alpha")
+    member = srv.db.create_key(team_id, "member", "member", "test")["key"]
+    client.push(base, key, FIX, user="dev@example.com")
+
+    assert _http(base, "DELETE", f"/api/runs/{SESSION_ID}", headers=_auth(member))[0] == 403
+    status, _, raw = _http(base, "DELETE", f"/api/runs/{SESSION_ID}", headers=_auth(key))
+    assert status == 200
+    assert _json(raw) == {"ok": True}
+    assert _http(base, "GET", f"/api/runs/{SESSION_ID}", headers=_auth(key))[0] == 404
+    assert _http(base, "GET", f"/runs/{SESSION_ID}", headers=_auth(key))[0] == 404
+    assert srv.db.list_runs(team_id) == []
+    with closing(sqlite3.connect(str(tmp_path / "rl.db"))) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM risks WHERE run_id = ?", (SESSION_ID,)).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM run_revisions WHERE run_id = ?", (SESSION_ID,)).fetchone()[0] == 0
+    events = srv.db.list_audit(team_id, action="run.")
+    deletion = next(event for event in events if event["action"] == "run.delete")
+    assert deletion["target"] == SESSION_ID
+    assert deletion["details"] == {"revisions_removed": 0}
+    assert _http(base, "DELETE", f"/api/runs/{SESSION_ID}", headers=_auth(key))[0] == 404
+
+
 def test_api_requires_a_valid_key_and_stores_nothing_without_one(env):
     srv, base = env
     team_id, _ = srv.db.create_team("alpha")
@@ -326,6 +351,27 @@ def test_api_requires_a_valid_key_and_stores_nothing_without_one(env):
     assert _http(base, "GET", "/api/runs", headers=_auth("rl_wrong"))[0] == 401
     assert _http(base, "GET", "/api/stats")[0] == 401
     assert srv.db.list_runs(team_id) == []
+
+
+def test_percent_encoded_run_ids_roundtrip_through_the_asgi_router(env):
+    srv, base = env
+    _, key = srv.db.create_team("alpha")
+    run_id = "folder/a%20b"
+    payload = client.build_payload(FIX, user="dev@example.com")
+    assert _push(base, key, _stored(payload, run_id))[0] == 201
+
+    escaped = quote(run_id, safe="")
+    status, _, raw = _http(base, "GET", "/api/runs/" + escaped, headers=_auth(key))
+    assert status == 200 and _json(raw)["run"]["id"] == run_id
+    assert _http(base, "GET", "/runs/" + escaped, headers=_auth(key))[0] == 200
+
+
+def test_unimplemented_methods_keep_the_legacy_json_501(env):
+    srv, base = env
+    _, key = srv.db.create_team("alpha")
+    for method in ("OPTIONS", "TRACE", "CONNECT", "COPY"):
+        status, _, raw = _http(base, method, "/api/runs", headers=_auth(key))
+        assert status == 501 and _json(raw)["error"]["code"] == "server_error"
 
 
 def test_unknown_runs_routes_and_params_return_json_errors(env):
@@ -1564,6 +1610,23 @@ def test_receipt_csp_has_sandbox(env):
     assert headers["x-content-type-options"] == "nosniff"
 
 
+def test_stalled_upload_does_not_block_shutdown(env):
+    srv, base = env
+    _, key = srv.db.create_team("alpha")
+    port = urlsplit(base).port
+    sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+    try:
+        request = (f"POST /api/runs HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {key}\r\n"
+                   "Content-Type: application/json\r\nContent-Length: 1000\r\n\r\n{").encode("utf-8")
+        sock.sendall(request)
+        time.sleep(0.2)
+        started = time.monotonic()
+        srv.shutdown()
+        assert time.monotonic() - started < 5
+    finally:
+        sock.close()
+
+
 def test_unauthenticated_post_rejected_without_reading_body(env):
     srv, base = env
     team_id, admin = srv.db.create_team("alpha")
@@ -1644,8 +1707,14 @@ def test_bad_bodies_are_rejected_with_json_errors(env):
 
 def test_health_needs_no_key(env):
     _, base = env
-    status, _, raw = _http(base, "GET", "/health")
+    status, headers, raw = _http(base, "GET", "/health")
     assert status == 200 and _json(raw)["ok"] is True
+    assert headers["x-runledger-api"] == "1"
+
+    status, headers, raw = _http(base, "GET", "/api/runs")
+    assert status == 401
+    assert headers["x-runledger-api"] == "1"
+    assert sorted(_json(raw)["error"]) == ["code", "message"]
 
 
 def test_api_keys_are_stored_only_as_hashes(tmp_path):

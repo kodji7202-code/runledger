@@ -7,7 +7,89 @@ change behavior, so read the entry before you upgrade.
 
 ## [Unreleased]
 
+### Fixed
+
+- Team stats and Insights count model aliases sharing a friendly label once per receipt,
+  keeping additive tokens and costs and preserving partly priced lower bounds.
+
+## [1.0.0] - 2026-11-26
+
+RunLedger 1.0.0 is the first stable release. It promotes the validated `1.0.0rc2` feature set to a stable release: local-first receipts, deterministic risk and quality scoring, guard hooks, checkpoint rollback, the GitHub Action, and the optional self-hosted team server.
+
+### Highlights
+
+- Receipts record every run across Claude Code, Codex CLI, Factory Droid, Aider and the open native format, with conformance fixtures and dependency-free JSON validation.
+- The guard checks risky commands before execution, with configurable unknown-tool policy, deterministic adversarial parser coverage, and opt-in AI review that never changes the rule-based score.
+- Checkpoints and rollback make agent edits recoverable while documenting Git filter fidelity limits.
+- The GitHub Action publishes sticky pull-request receipts with configurable risk thresholds.
+- The optional FastAPI team server adds dashboard review, approvals, budgets, audit, retention, SSO/SCIM foundations, backup verification, schema versioning, API versioning and operational runbooks.
+- Release artifacts are validated in clean installs; PyPI, Docker, SBOMs, keyless signing and provenance are part of the release pipeline.
+
+### Notes
+
+This stable release includes every change from [1.0.0rc1] and [1.0.0rc2]. Read those sections below for the complete technical changelog.
+
+## [1.0.0rc2] - 2026-11-25
+
+### Fixed
+
+- `runledger backup --verify` removes the temporary SQLite `.tmp-shm`/`.tmp-wal` sidecars that
+  read-only verification can recreate, so verified backups no longer leave files outside retention cleanup.
+- Status lines written to pipes and redirects use UTF-8 unless `PYTHONIOENCODING` explicitly
+  requests another encoding, so Windows Git Bash no longer shows middle-dot separators as `�`.
+- The dashboard accepts zero budgets, matching the API contract, and its webhook help now names the
+  `RUNLEDGER_ALLOW_LOOPBACK_WEBHOOKS=1` opt-in required for local HTTP endpoints.
+
+## [1.0.0rc1] - 2026-11-25
+
+### Fixed
+
+- Small unauthenticated or unauthorized API POSTs reliably return their JSON 401/403 response on
+  Windows: the server briefly drains only the small declared body before closing, instead of letting
+  unread input reset the connection before the client reads the error. Stalled unauthenticated bodies
+  count toward the existing per-address failure limit, so they cannot hold request workers indefinitely.
+- `runledger rollback` with nothing to restore prints `Nothing to restore (already matches <id>).`
+  and exits 0, as `--path` already did. It no longer asks for confirmation, prints `Restored`, or
+  creates a safety checkpoint of an unchanged tree. When only kept ignored files differ, it names
+  them instead of claiming an exact match.
+- Team statistics, Insights, and receipt exports exclude future-dated runs from their reporting windows.
+- `list --limit` counts displayed sessions, so invalid, unreadable, or vanished sessions
+  no longer consume limit slots.
+- The HTML receipt fits phone screens (375px and up) instead of scrolling sideways and hiding the
+  Tokens and Cost columns: on screens up to 600px wide, step rows put the model, tokens and cost on
+  a line under the step, and the quality score and AI review tables move their notes under each row.
+- `runledger stats --until YYYY-MM-DD` includes sessions and guard events in the final
+  fractional second of the day, while still excluding the next day's midnight.
+- Team server request logging handles oversized URLs rejected before parsing, returning HTTP 414
+  instead of dropping the connection with an internal error.
+- Team receipt ingest rejects numbers outside the finite float range and JSON strings with
+  lone Unicode surrogates with HTTP 400 instead of an internal server error.
+
 ### Added
+
+- Receipt conformance release gate: `tools/check_conformance.py` runs a deterministic fixture
+  matrix for Claude Code, Codex CLI, Factory Droid, Aider, the native format and guard receipts;
+  [docs/conformance.md](docs/conformance.md) documents the matrix and the external real-session corpus.
+- Deterministic adversarial parser and guard fuzz corpora: malformed shell, PowerShell, heredoc,
+  Unicode/NUL and nested-operator input must keep the synchronous guard path crash-free and preserve
+  its decision contract.
+- Explicit team-database schema versioning through SQLite `user_version`. Existing databases are
+  stamped after the legacy additive upgrades converge; a database written by a newer schema version
+  is rejected before any migration touches it, with instructions to upgrade or restore the backup.
+- `runledger backup --verify` reopens the finished copy read-only, runs SQLite `integrity_check`,
+  and checks the core RunLedger tables before retention. `deploy/backup.sh` verifies scheduled copies.
+- Every team-server response carries `X-RunLedger-API: 1`; the HTTP API now has an explicit
+  additive-change and deprecation contract. The test suite includes a concurrent mixed read/write
+  load check and an opt-in `RUNLEDGER_SOAK` soak harness, with an operations runbook for monitoring,
+  restore drills, load testing and upgrade rehearsal.
+- Release validation now smoke-tests the built wheel in clean base and `[server]` virtual
+  environments: CLI version/receipt/validation, accidental FastAPI absence from the zero-dependency
+  install, and a real `/health` response. `docs/release.md` defines the 1.0/RC checklist.
+- Development quality gates: a `dev` extra, Ruff Pyflakes lint, strict mypy on fully typed leaf
+  modules, and coverage measurement with a 70% floor in CI.
+- `DELETE /api/runs/{id}` lets a team administrator erase one stored run and its revisions;
+  the erase operation remains visible as a `run.delete` audit event.
+- `runledger validate` checks JSON receipts against the packaged schema without extra dependencies.
 
 - Dashboard OIDC sign-in for Okta, Entra ID and Google Workspace using standard-library
   Authorization Code + PKCE and RS256 verification. Person-bound, keyless sessions use live
@@ -52,21 +134,6 @@ change behavior, so read the entry before you upgrade.
 
 ### Fixed
 
-- Team statistics, Insights, and receipt exports exclude future-dated runs from their reporting windows.
-- `list --limit` counts displayed sessions, so invalid, unreadable, or vanished sessions
-  no longer consume limit slots.
-- The HTML receipt fits phone screens (375px and up) instead of scrolling sideways and hiding the
-  Tokens and Cost columns: on screens up to 600px wide, step rows put the model, tokens and cost on
-  a line under the step, and the quality score and AI review tables move their notes under each row.
-- `runledger stats --until YYYY-MM-DD` includes sessions and guard events in the final
-  fractional second of the day, while still excluding the next day's midnight.
-- Team stats and Insights count model aliases sharing a friendly label once per receipt,
-  keeping additive tokens and costs and preserving partly priced lower bounds.
-- Team server request logging handles oversized URLs rejected before parsing, returning HTTP 414
-  instead of dropping the connection with an internal error.
-- Team receipt ingest rejects numbers outside the finite float range and JSON strings with
-  lone Unicode surrogates with HTTP 400 instead of an internal server error.
-
 - **An out-of-range `runledger stats --since` is a usage error (`runledger.stats`):** a relative
   window too large for the calendar (`--since 99999999999d`) made `parse_since()` raise
   `OverflowError`, so the command printed a traceback and exited 1. It now prints the usual
@@ -74,6 +141,11 @@ change behavior, so read the entry before you upgrade.
 
 ### Changed
 
+- **The team server runs on FastAPI and uvicorn (`runledger.server`):** the HTTP edge, explicit
+  route dispatch and TLS transport now use a maintained ASGI framework instead of
+  `http.server`, while keeping the existing API, dashboard, security headers, authentication,
+  SCIM and request-limit behavior. The CLI remains dependency-free; server deployments install
+  the new optional `server` extra, as the Docker image already does.
 - `runledger doctor` wraps human-readable output to the terminal width with hanging
   indents, keeping URLs, paths and command tokens intact.
 
@@ -1648,7 +1720,10 @@ First working prototype (MVP).
   override them.
 - No runtime dependencies; Python 3.9 and later.
 
-[Unreleased]: https://github.com/kodji7202-code/runledger/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/kodji7202-code/runledger/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/kodji7202-code/runledger/compare/v1.0.0rc2...v1.0.0
+[1.0.0rc2]: https://github.com/kodji7202-code/runledger/compare/v1.0.0rc1...v1.0.0rc2
+[1.0.0rc1]: https://github.com/kodji7202-code/runledger/compare/v0.7.0...v1.0.0rc1
 [0.7.0]: https://github.com/kodji7202-code/runledger/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/kodji7202-code/runledger/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/kodji7202-code/runledger/compare/v0.5.2...v0.6.0

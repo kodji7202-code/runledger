@@ -6,7 +6,8 @@ this release.
 
 ## 1. Install
 
-RunLedger needs Python 3.9 or later and has no runtime dependencies.
+RunLedger needs Python 3.9 or later. The CLI has no runtime dependencies; only the optional team
+server installs its web framework dependencies.
 
 ```bash
 pip install runledger-ai            # from PyPI
@@ -192,9 +193,11 @@ See [rollback.md](rollback.md) for manual use, Droid hooks, Codex, pruning and s
 ## 7. A self-hosted team server
 
 The team server collects receipts that developers push, stores them in one SQLite file, and serves
-a shared dashboard.
+a shared dashboard. On the machine that runs it, install the optional server dependencies first
+(`pip install '.[server]'` from a clone):
 
 ```bash
+pip install 'runledger-ai[server]'
 runledger team create myteam --db runledger.db     # prints the team's API key once
 runledger serve --db runledger.db                  # listens on http://127.0.0.1:8787
 ```
