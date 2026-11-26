@@ -7,6 +7,23 @@ change behavior, so read the entry before you upgrade.
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-11-26
+
+RunLedger 1.0.0 is the first stable release. It promotes the validated `1.0.0rc2` feature set to a stable release: local-first receipts, deterministic risk and quality scoring, guard hooks, checkpoint rollback, the GitHub Action, and the optional self-hosted team server.
+
+### Highlights
+
+- Receipts record every run across Claude Code, Codex CLI, Factory Droid, Aider and the open native format, with conformance fixtures and dependency-free JSON validation.
+- The guard checks risky commands before execution, with configurable unknown-tool policy, deterministic adversarial parser coverage, and opt-in AI review that never changes the rule-based score.
+- Checkpoints and rollback make agent edits recoverable while documenting Git filter fidelity limits.
+- The GitHub Action publishes sticky pull-request receipts with configurable risk thresholds.
+- The optional FastAPI team server adds dashboard review, approvals, budgets, audit, retention, SSO/SCIM foundations, backup verification, schema versioning, API versioning and operational runbooks.
+- Release artifacts are validated in clean installs; PyPI, Docker, SBOMs, keyless signing and provenance are part of the release pipeline.
+
+### Notes
+
+This stable release includes every change from [1.0.0rc1] and [1.0.0rc2]. Read those sections below for the complete technical changelog.
+
 ## [1.0.0rc2] - 2026-11-25
 
 ### Fixed
@@ -1698,7 +1715,8 @@ First working prototype (MVP).
   override them.
 - No runtime dependencies; Python 3.9 and later.
 
-[Unreleased]: https://github.com/kodji7202-code/runledger/compare/v1.0.0rc2...HEAD
+[Unreleased]: https://github.com/kodji7202-code/runledger/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/kodji7202-code/runledger/compare/v1.0.0rc2...v1.0.0
 [1.0.0rc2]: https://github.com/kodji7202-code/runledger/compare/v1.0.0rc1...v1.0.0rc2
 [1.0.0rc1]: https://github.com/kodji7202-code/runledger/compare/v0.7.0...v1.0.0rc1
 [0.7.0]: https://github.com/kodji7202-code/runledger/compare/v0.6.1...v0.7.0
