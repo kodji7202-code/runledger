@@ -85,7 +85,6 @@ jobs:
             ${{ steps.meta.outputs.name }}:${{ steps.meta.outputs.version }}
             ${{ steps.meta.outputs.release == 'true' && format('{0}:{1}', steps.meta.outputs.name, github.ref_name) || 'runledger:supply-chain' }}
           build-args: |
-            PYTHON_BASE_IMAGE=public.ecr.aws/docker/library/python:3.12-slim
             RUNLEDGER_VERSION=${{ steps.meta.outputs.version }}
             RUNLEDGER_REVISION=${{ github.sha }}
       - name: Smoke-test unpublished image
