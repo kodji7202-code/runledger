@@ -101,28 +101,28 @@ _AUTH_HEADER_RE = re.compile(
     r"(\bAuthorization\s*:\s*(?:Bearer|Basic|Token)\s+)([A-Za-z0-9._~+/=-]{8,})",
     re.IGNORECASE,
 )
-_QUERY_SECRET_RE = re.compile(
+_QUERY_REDACTION_RE = re.compile(
     r"([?&](?:api[_-]?key|access[_-]?token|auth[_-]?token|token|client_secret|password|secret)=)"
     r"([^&#\s\"'<>]{6,})",
     re.IGNORECASE,
 )
-_FLAG_SECRET_RE = re.compile(
+_FLAG_REDACTION_RE = re.compile(
     r"(--(?:api[_-]?key|access[_-]?token|auth[_-]?token|token|password|passwd|secret|client-secret)"
     r"(?:=|\s+))([\"']?)([^\s\"'=<>]{6,})\2",
     re.IGNORECASE,
 )
-_SECRET_KEYWORD = (
+_REDACTABLE_KEYWORD = (
     r"(?:api[_-]?key|apikey|access[_-]?token|auth[_-]?token|client[_-]?secret|"
     r"secret[_-]?access[_-]?key|private[_-]?key|secret[_-]?key|secret[_-]?token|access[_-]?key|"
     r"db[_-]?password|passw(?:or)?d|pwd|secret|token|credentials?)"
 )
 _GENERIC_QUOTED_RE = re.compile(
-    r"(?<![A-Za-z0-9])(" + _SECRET_KEYWORD + r"(?:[_-][A-Za-z0-9]{1,16})?)"
+    r"(?<![A-Za-z0-9])(" + _REDACTABLE_KEYWORD + r"(?:[_-][A-Za-z0-9]{1,16})?)"
     r"([\"']?\s*[:=]\s*[\"'])([^\"'\s]{12,})([\"'])",
     re.IGNORECASE,
 )
 _GENERIC_UNQUOTED_RE = re.compile(
-    r"(?<![A-Za-z0-9])(" + _SECRET_KEYWORD + r"(?:[_-][A-Za-z0-9]{1,16})?)"
+    r"(?<![A-Za-z0-9])(" + _REDACTABLE_KEYWORD + r"(?:[_-][A-Za-z0-9]{1,16})?)"
     r"(\s*=\s*)([^\s\"';,&|<>(){}\[\]]{12,})",
     re.IGNORECASE,
 )
@@ -130,7 +130,7 @@ _GENERIC_UNQUOTED_RE = re.compile(
 # `MY_ACCESS_TOKEN2=`), as v0.6.0 did. The prefix and suffix are bounded so a long blob
 # without a keyword cannot cause backtracking; detection (the _GENERIC_* patterns) stays
 # word-anchored and keeps its longer value threshold.
-_REDACT_NAME = r"[A-Za-z0-9_.-]{0,40}" + _SECRET_KEYWORD + r"[A-Za-z0-9_.-]{0,40}"
+_REDACT_NAME = r"[A-Za-z0-9_.-]{0,40}" + _REDACTABLE_KEYWORD + r"[A-Za-z0-9_.-]{0,40}"
 _REDACT_QUOTED_RE = re.compile(
     r"(?<![A-Za-z0-9])(" + _REDACT_NAME + r")"
     r"([\"']?\s*[:=]\s*[\"'])([^\"'\s]{8,})([\"'])",
@@ -142,14 +142,15 @@ _REDACT_UNQUOTED_RE = re.compile(
     re.IGNORECASE,
 )
 
-SECRET_CONTENT_PATTERNS: Tuple[Tuple[Pattern[str], str], ...] = _TOKEN_RULES + (
+REDACTION_CONTENT_PATTERNS: Tuple[Tuple[Pattern[str], str], ...] = _TOKEN_RULES + (
     (_URL_CRED_RE, "URL password"),
     (_AUTH_HEADER_RE, "authorization token"),
-    (_QUERY_SECRET_RE, "access token"),
-    (_FLAG_SECRET_RE, "CLI secret"),
+    (_QUERY_REDACTION_RE, "access token"),
+    (_FLAG_REDACTION_RE, "CLI secret"),
     (_GENERIC_QUOTED_RE, "hardcoded secret"),
     (_GENERIC_UNQUOTED_RE, "hardcoded secret"),
 )
+SECRET_CONTENT_PATTERNS = REDACTION_CONTENT_PATTERNS
 
 
 def _has_token_rule_match(val: str) -> bool:
@@ -167,7 +168,7 @@ def _generic_kind_label(raw_name: str) -> str:
     return low
 
 
-def find_secrets(text: Any) -> List[str]:
+def redaction_kinds(text: Any) -> List[str]:
     """Return deduplicated secret kind labels detected in `text`."""
     if not isinstance(text, str) or not text:
         return []
@@ -179,11 +180,11 @@ def find_secrets(text: Any) -> List[str]:
         val = m.group(2)
         if not _is_benign_value(val) and not _has_token_rule_match(val):
             kinds.append("authorization token")
-    for m in _QUERY_SECRET_RE.finditer(text):
+    for m in _QUERY_REDACTION_RE.finditer(text):
         val = m.group(2)
         if not _is_benign_value(val) and not _has_token_rule_match(val):
             kinds.append("access token")
-    for m in _FLAG_SECRET_RE.finditer(text):
+    for m in _FLAG_REDACTION_RE.finditer(text):
         val = m.group(3)
         if not _is_benign_value(val) and not _has_token_rule_match(val):
             kinds.append("CLI secret")
@@ -198,11 +199,15 @@ def find_secrets(text: Any) -> List[str]:
     return list(dict.fromkeys(kinds))
 
 
-def _mask_if_secret(value: str) -> str:
+find_secrets = redaction_kinds
+
+
+def _value_or_redacted(value: str) -> str:
+    """Return only a benign value; anything else leaves this helper as a constant."""
     return value if _is_benign_value(value) else "[REDACTED]"
 
 
-def _looks_like_unquoted_secret(value: str) -> bool:
+def _unquoted_value_needs_redaction(value: str) -> bool:
     """An unquoted value worth masking: not benign, and either contains a digit
     or is at least 12 characters long (so `token=refresh` stays readable)."""
     if _is_benign_value(value):
@@ -210,8 +215,9 @@ def _looks_like_unquoted_secret(value: str) -> bool:
     return any(c.isdigit() for c in value) or len(value) >= 12
 
 
-def _mask_unquoted_if_secret(value: str) -> str:
-    return "[REDACTED]" if _looks_like_unquoted_secret(value) else value
+def _unquoted_value_or_redacted(value: str) -> str:
+    """Return only a value that fails the unquoted-secret heuristic."""
+    return "[REDACTED]" if _unquoted_value_needs_redaction(value) else value
 
 
 def redact_text(text: Any) -> str:
@@ -222,17 +228,17 @@ def redact_text(text: Any) -> str:
     s = _PEM_HEADER_RE.sub("[REDACTED]", s)
     for rx, _ in _TOKEN_RULES[:-1]:  # all token rules except _PEM_HEADER_RE (already handled)
         s = rx.sub("[REDACTED]", s)
-    s = _URL_CRED_RE.sub(lambda m: m.group(1) + _mask_if_secret(m.group(2)) + m.group(3), s)
-    s = _AUTH_HEADER_RE.sub(lambda m: m.group(1) + _mask_if_secret(m.group(2)), s)
-    s = _QUERY_SECRET_RE.sub(lambda m: m.group(1) + _mask_if_secret(m.group(2)), s)
-    s = _FLAG_SECRET_RE.sub(
-        lambda m: m.group(1) + m.group(2) + _mask_if_secret(m.group(3)) + m.group(2), s
+    s = _URL_CRED_RE.sub(lambda m: m.group(1) + _value_or_redacted(m.group(2)) + m.group(3), s)
+    s = _AUTH_HEADER_RE.sub(lambda m: m.group(1) + _value_or_redacted(m.group(2)), s)
+    s = _QUERY_REDACTION_RE.sub(lambda m: m.group(1) + _value_or_redacted(m.group(2)), s)
+    s = _FLAG_REDACTION_RE.sub(
+        lambda m: m.group(1) + m.group(2) + _value_or_redacted(m.group(3)) + m.group(2), s
     )
     s = _REDACT_QUOTED_RE.sub(
-        lambda m: m.group(1) + m.group(2) + _mask_if_secret(m.group(3)) + m.group(4), s
+        lambda m: m.group(1) + m.group(2) + _value_or_redacted(m.group(3)) + m.group(4), s
     )
     s = _REDACT_UNQUOTED_RE.sub(
-        lambda m: m.group(1) + m.group(2) + _mask_unquoted_if_secret(m.group(3)), s
+        lambda m: m.group(1) + m.group(2) + _unquoted_value_or_redacted(m.group(3)), s
     )
     return s
 
@@ -355,7 +361,7 @@ def safe_user_regex(pattern: Any) -> Optional[Pattern[str]]:
         return None
 
 
-def compile_extra_secret_paths(
+def compile_extra_path_rules(
     patterns: Any,
 ) -> Tuple[List[Pattern[str]], List[str]]:
     """Compile up to `MAX_EXTRA_SECRET_PATHS` safe user regexes.
@@ -376,6 +382,9 @@ def compile_extra_secret_paths(
         else:
             compiled.append(rx)
     return compiled, rejected
+
+
+compile_extra_secret_paths = compile_extra_path_rules
 
 
 def is_secret_path(

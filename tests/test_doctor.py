@@ -844,14 +844,35 @@ def test_the_api_key_never_appears_in_any_output(tmp_path, monkeypatch, capsys):
     captured = capsys.readouterr()
     text = captured.out + captured.err
     assert secret not in text and other not in text
-    assert "set (env OTHER_KEY)" in text
+    assert "key set" in text
+    assert "OTHER_KEY" not in text
 
     assert cli_main(["doctor", "--project", str(proj), "--offline", "--no-selftest",
                      "--json", "--verbose"]) in (0, 1)
     captured = capsys.readouterr()
     payload = captured.out + captured.err
     assert secret not in payload and other not in payload
-    assert "set (env OTHER_KEY)" in payload
+    assert "key set" in payload
+    assert "OTHER_KEY" not in payload
+
+
+def test_approval_server_urls_are_redacted_in_detail_and_verbose_output(tmp_path, monkeypatch):
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    password = "url-pass-9f3a"  # synthetic
+    query_token = "tok123456789"  # synthetic
+    monkeypatch.setenv(
+        "RUNLEDGER_SERVER",
+        f"http://user:{password}@192.0.2.10:8080/?token={query_token}",
+    )
+
+    report = checks(proj, offline=True)
+    check = one(report, "approval")
+    rendered = doctor.render_text(report, verbose=True)
+    shown = check.detail + "\n" + rendered
+    assert password not in shown
+    assert query_token not in shown
+    assert "[REDACTED]" in rendered
 
 
 # ---------------------------------------------------------------- VAL-DOCTOR-010

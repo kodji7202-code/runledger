@@ -87,7 +87,7 @@ class Risk:
     step: int
 
 
-_FALLBACK_SECRET_PATTERNS = [
+_FALLBACK_REDACTION_PATTERNS = [
     r"(^|/)\.env(\.[\w-]+)?$", r"(^|/)\.envrc$", r"id_(rsa|ed25519|ecdsa|dsa)(_[\w-]+)?$",
     r"\.(pem|key|p8|p12|pfx|jks|keystore|kdbx|keychain)$", r"\.tfstate(\.backup)?$", r"\.tfvars$",
     r"(^|/)\.(npmrc|pypirc|netrc|pgpass|htpasswd|vault-token|dockercfg|git-credentials)$",
@@ -101,11 +101,11 @@ _FALLBACK_PUBLIC_PATH_RE = re.compile(
     r"|\.tfvars\.(?:example|sample|template)$)",
     re.I,
 )
-SECRET_PATTERNS = (
+REDACTION_PATTERNS = (
     [rx.pattern for rx in secrets.SECRET_PATH_PATTERNS]
-    if secrets is not None else list(_FALLBACK_SECRET_PATTERNS)
+    if secrets is not None else list(_FALLBACK_REDACTION_PATTERNS)
 )
-_SECRET_RE = re.compile("|".join(SECRET_PATTERNS), re.I)
+_REDACTION_RE = re.compile("|".join(REDACTION_PATTERNS), re.I)
 _ENV_EXAMPLE_RE = (
     secrets._PUBLIC_OR_TEMPLATE_PATH_RE
     if secrets is not None else _FALLBACK_PUBLIC_PATH_RE
@@ -313,7 +313,7 @@ _PERL_CODE_RE = re.compile(r"^-[A-Za-z]*[eE]$")
 _REGEX_TEXT_RE = re.compile(r"\||^\^|\.\*|\(\?|\[\^")
 
 # Hardcoded secrets in written content. Only the kind is reported, never the value.
-_CONTENT_SECRET_RULES = [
+_CONTENT_REDACTION_RULES = [
     (re.compile(r"(?<![A-Za-z0-9])sk-ant-[A-Za-z0-9_-]{20,}"), "Anthropic API key"),
     (re.compile(r"(?<![A-Za-z0-9])sk-(?:proj-)?[A-Za-z0-9]{20,}"), "OpenAI API key"),
     (re.compile(r"(?<![A-Za-z0-9])AKIA[0-9A-Z]{16}(?![A-Za-z0-9])"), "AWS access key"),
@@ -321,7 +321,7 @@ _CONTENT_SECRET_RULES = [
     (re.compile(r"(?<![A-Za-z0-9])xox[baprs]-[A-Za-z0-9-]{10,}"), "Slack token"),
     (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"), "private key"),
 ]
-_GENERIC_SECRET_RE = re.compile(
+_GENERIC_REDACTION_RE = re.compile(
     r"(api[_-]?key|secret|token|password)[\"']?\s*[:=]\s*[\"']([^\"'\s]{12,})[\"']", re.I)
 
 PATH_KEYS = ("file_path", "path", "notebook_path")
@@ -505,14 +505,14 @@ def _is_secret(path: str, extra: Optional[List["re.Pattern"]] = None) -> bool:
     norm = path.replace("\\", "/")
     if _ENV_EXAMPLE_RE.search(norm):
         return False
-    if _SECRET_RE.search(norm):
+    if _REDACTION_RE.search(norm):
         return True
     return bool(extra and any(rx.search(norm[:1024]) for rx in extra))
 
 
 def _user_regexes(patterns: Any) -> List["re.Pattern"]:
     if secrets is not None:
-        compiled, _ = secrets.compile_extra_secret_paths(patterns)
+        compiled, _ = secrets.compile_extra_path_rules(patterns)
         return compiled
     return []
 
@@ -527,14 +527,14 @@ def _written_texts(step: Step) -> List[str]:
     return texts
 
 
-def _hardcoded_secret_kinds(text: str) -> List[str]:
+def _redaction_kind_labels(text: str) -> List[str]:
     """Kinds of hardcoded secret found in `text`. Returns kind names only."""
     if secrets is not None:
-        return secrets.find_secrets(text)
+        return secrets.redaction_kinds(text)
     if not isinstance(text, str) or not text:
         return []
-    kinds = [kind for rx, kind in _CONTENT_SECRET_RULES if rx.search(text)]
-    for m in _GENERIC_SECRET_RE.finditer(text):
+    kinds = [kind for rx, kind in _CONTENT_REDACTION_RULES if rx.search(text)]
+    for m in _GENERIC_REDACTION_RE.finditer(text):
         kinds.append(m.group(1).lower().replace("_", " ").replace("-", " "))
     return list(dict.fromkeys(kinds))
 
@@ -1537,7 +1537,7 @@ def assess_step(step: Step, cwd: Optional[str], policy: Optional[Dict[str, Any]]
     if tool in WRITE_TOOLS:
         name = _basename(paths[0]) if paths else "a file"
         for text in _written_texts(step):
-            for kind in _hardcoded_secret_kinds(text):
+            for kind in _redaction_kind_labels(text):
                 risks.append(Risk("high", "secret_in_content", f"Wrote a hardcoded {kind} into {name}", step.index))
 
     if tool in SHELL_TOOLS:

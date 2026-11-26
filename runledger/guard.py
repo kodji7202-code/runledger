@@ -149,7 +149,7 @@ DEFAULT_ASK = ["severity:high"]
 _LEVELS = ("high", "medium", "low")
 REDACTED = "[REDACTED]"
 
-_FALLBACK_SECRET_RES = [
+_FALLBACK_REDACTION_RES = [
     re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{12,}"),
     re.compile(r"(?<![A-Za-z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Za-z0-9])"),
     re.compile(r"(?<![A-Za-z0-9])(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{22,})"),
@@ -170,12 +170,12 @@ _FALLBACK_GENERIC_RE = re.compile(
     r"(api[_-]?key|secret|token|password)[\"']?\s*[:=]\s*[\"']([^\"'\s]{8,})[\"']", re.I)
 
 # Unquoted values, masked last. Only the named group "v" is replaced.
-_SECRET_NAME = (r"(?:api[_-]?key|apikey|secret|token|passw(?:or)?d|credentials?"
+_REDACTABLE_NAME = (r"(?:api[_-]?key|apikey|secret|token|passw(?:or)?d|credentials?"
                 r"|private[_-]?key|access[_-]?key)")
-_VALUE_SECRET_RES = [
+_VALUE_REDACTION_RES = [
     # TOKEN=abc123, export DB_PASSWORD=**** ?access_token=..., --password=...
     # The name parts are bounded so a long blob without "=" cannot cause quadratic backtracking.
-    re.compile(r"(?i)(?<![A-Za-z0-9])[A-Za-z0-9_.-]{0,40}" + _SECRET_NAME
+    re.compile(r"(?i)(?<![A-Za-z0-9])[A-Za-z0-9_.-]{0,40}" + _REDACTABLE_NAME
                + r"[A-Za-z0-9_.-]{0,40}\s*=\s*(?P<v>[^\s\"'&;|,)}\]]{6,})"),
     # --token abc123, --password hunter2
     re.compile(r"(?i)(?<![A-Za-z0-9-])--?(?:api[-_]?key|(?:access[-_]|auth[-_])?token|passw(?:or)?d"
@@ -210,7 +210,7 @@ def _mask_value(m: "re.Match") -> str:
     return whole[:a] + REDACTED + whole[b:]
 
 
-def _looks_secret(value: str) -> bool:
+def _needs_redaction(value: str) -> bool:
     """An unquoted value worth masking: not a placeholder or a variable name, and either
     containing a digit or at least 12 characters long (so `token=refresh` stays readable)."""
     if value.startswith(_PLACEHOLDER_START) or value.isdigit():
@@ -222,20 +222,20 @@ def _looks_secret(value: str) -> bool:
 
 def _mask_named(m: "re.Match") -> str:
     value = m.group("v")
-    if not _looks_secret(value):
+    if not _needs_redaction(value):
         return m.group(0)
     whole = m.group(0)
     a, b = m.start("v") - m.start(0), m.end("v") - m.start(0)
     return whole[:a] + REDACTED + whole[b:]
 
 
-def _secret_patterns() -> List["re.Pattern"]:
+def _redaction_patterns() -> List["re.Pattern"]:
     """Patterns from secrets.py / risk.py when they are there, plus the fallbacks above."""
     try:
-        from_secrets = [rx for rx, _kind in getattr(_secrets, "SECRET_CONTENT_PATTERNS", []) if hasattr(rx, "sub")]
+        shared_patterns = [rx for rx, _kind in getattr(_secrets, "REDACTION_CONTENT_PATTERNS", []) if hasattr(rx, "sub")]
     except (TypeError, ValueError):
-        from_secrets = []
-    return from_secrets + _FALLBACK_SECRET_RES
+        shared_patterns = []
+    return shared_patterns + _FALLBACK_REDACTION_RES
 
 
 def redact(text: Any) -> str:
@@ -247,9 +247,9 @@ def redact(text: Any) -> str:
             return redact_text(s)
         for rx in [_FALLBACK_GENERIC_RE]:
             s = rx.sub(_mask_value, s)
-        for rx in _secret_patterns():
+        for rx in _redaction_patterns():
             s = rx.sub(REDACTED, s)
-        for rx in _VALUE_SECRET_RES:
+        for rx in _VALUE_REDACTION_RES:
             s = rx.sub(_mask_named, s)
         return s
     except Exception:
@@ -323,7 +323,7 @@ def read_policy(cwd: str, *, _resolved: bool = False) -> Dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def trusted_approval_settings(user: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
+def approval_settings(user: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
     """The approval server and the name of the variable that holds the key. Only the
     environment (RUNLEDGER_SERVER) and the user's file are trusted. The project file is
     never read for these: a cloned repository must not be able to send the key to its
@@ -333,8 +333,13 @@ def trusted_approval_settings(user: Optional[Dict[str, Any]] = None) -> Dict[str
     server = (os.environ.get(SERVER_ENV) or "").strip()
     if not server and isinstance(user.get("server"), str):
         server = user["server"].strip()
-    key_env = user["api_key_env"].strip() if isinstance(user.get("api_key_env"), str) else ""
-    return {"server": server.rstrip("/"), "api_key_env": key_env or KEY_ENV_DEFAULT}
+    env_name = user["api_key_env"].strip() if isinstance(user.get("api_key_env"), str) else ""
+    return {"server": server.rstrip("/"), "env_name": env_name or KEY_ENV_DEFAULT}
+
+
+def _approval_env_label(env_name: str) -> str:
+    """A display label for the variable name; a custom name itself is not echoed."""
+    return KEY_ENV_DEFAULT if env_name == KEY_ENV_DEFAULT else "custom variable (name hidden)"
 
 
 def _project_key_warnings(project: Dict[str, Any]) -> List[str]:
@@ -453,7 +458,7 @@ def _unknown_tool_of(section: Dict[str, Any]) -> Optional[str]:
     return value if isinstance(value, str) and value in _UNKNOWN_TOOL_RANK else None
 
 
-def _effective_guard(project: Dict[str, Any], user: Dict[str, Any], trusted: Dict[str, str]) -> Tuple[Dict[str, Any], List[str]]:
+def _effective_guard(project: Dict[str, Any], user: Dict[str, Any], approval: Dict[str, str]) -> Tuple[Dict[str, Any], List[str]]:
     """The guard settings in force, and the warnings for project settings that were ignored."""
     p = _section(project, "guard")
     u = _section(user, "guard")
@@ -527,7 +532,7 @@ def _effective_guard(project: Dict[str, Any], user: Dict[str, Any], trusted: Dic
         "project_ask": project_ask,
         "codex_ask": codex_ask,
         "unknown_tool": unknown_tool,
-        "approval": {"server": trusted["server"], "api_key_env": trusted["api_key_env"],
+        "approval": {"server": approval["server"], "env_name": approval["env_name"],
                      "timeout_s": timeout, "on_timeout": on_timeout},
     }
     return cfg, warnings
@@ -876,7 +881,7 @@ def decide(event: dict, policy: Optional[dict] = None, approver: Optional[Approv
     cwd = project_root(event)
     project = policy if isinstance(policy, dict) else read_policy(cwd, _resolved=True)
     user = load_user_config()
-    cfg, warnings = _effective_guard(project, user, trusted_approval_settings(user))
+    cfg, warnings = _effective_guard(project, user, approval_settings(user))
     warnings = _project_key_warnings(project) + warnings
 
     tool, tool_input, steps = normalize_event(event, agent)
@@ -1048,10 +1053,10 @@ def http_approver(request: Dict[str, Any], approval: Dict[str, Any]) -> str:
     server = str(approval.get("server") or "").rstrip("/")
     if not server.lower().startswith(("http://", "https://")):
         raise ApprovalError("approval server must be an http:// or https:// URL")
-    env_name = approval.get("api_key_env") or KEY_ENV_DEFAULT
+    env_name = approval.get("env_name") or KEY_ENV_DEFAULT
     key = os.environ.get(env_name, "")
     if not key:
-        raise ApprovalError(f"environment variable {env_name} is not set")
+        raise ApprovalError(f"environment variable {_approval_env_label(env_name)} is not set")
     timeout_s = float(approval.get("timeout_s") or TIMEOUT_DEFAULT_S)
     deadline = time.monotonic() + timeout_s
 
@@ -1190,7 +1195,7 @@ def _on_error(event: Any, policy: Dict[str, Any], exc: BaseException,
         if not policy:
             policy = read_policy(cwd)
         user = load_user_config()
-        cfg, _ = _effective_guard(policy, user, trusted_approval_settings(user))
+        cfg, _ = _effective_guard(policy, user, approval_settings(user))
     except Exception:
         return None  # cannot even read the settings: fail open
     msg = clean(f"{type(exc).__name__}: {exc}", 200)
@@ -1270,7 +1275,8 @@ def cmd_test(event_json: str, agent: Optional[str] = None) -> int:
     except Exception as exc:
         print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
-    print(json.dumps({"decision": decision, "hook_output": hook_output(decision, resolved)}, indent=2))
+    shown = json.dumps({"decision": decision, "hook_output": hook_output(decision, resolved)}, indent=2)
+    print(redact(shown))
     return 0
 
 

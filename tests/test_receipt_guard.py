@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from runledger.cli import build, main
+from runledger.cli import _write_stdout, build, main
 from runledger.guard import _summary
 from runledger.guard_receipt import _MAX_LINE, load_guard_decisions
 from runledger.parser import parse_session
@@ -252,6 +252,30 @@ def test_guard_text_is_redacted_and_escaped_in_receipts(session):
     run.guard[0]["reason"] = secret
     redact_run(run, [])
     assert secret not in run.guard[0]["reason"]
+
+
+def test_stdout_output_is_redacted(monkeypatch):
+    stream = io.StringIO()
+    monkeypatch.setattr("sys.stdout", stream)
+    secret = "sk-ant-api03-" + "y" * 30  # synthetic
+    _write_stdout(f"token={secret}\n")
+    assert secret not in stream.getvalue()
+    assert "token=[REDACTED]" in stream.getvalue()
+
+
+def test_receipt_file_output_is_redacted(session, tmp_path, capsys):
+    path, log = session
+    secret = "sk-ant-api03-" + "x" * 30  # synthetic
+    log.write_text(json.dumps({
+        "session_id": "guard-session", "tool": "Bash", "decision": "deny",
+        "summary": f"echo token={secret}", "reason": f"echo token={secret}", "codes": ["command"],
+    }), encoding="utf-8")
+    target = tmp_path / "receipt.json"
+    assert main(["receipt", str(path), "--format", "json", "-o", str(target)]) == 0
+    capsys.readouterr()
+    written = target.read_text(encoding="utf-8")
+    assert secret not in written
+    assert "[REDACTED]" in written
 
 
 # ---------------------------------------------------------------- native agents
