@@ -9,6 +9,8 @@ change behavior, so read the entry before you upgrade.
 
 ### Fixed
 
+- Team stats and Insights count model aliases sharing a friendly label once per receipt,
+  keeping additive tokens and costs and preserving partly priced lower bounds.
 - `runledger stats` includes sessions started inside the selected window even when copied or
   restored transcripts have older file modification times, without fully parsing old sessions.
 
