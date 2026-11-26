@@ -95,14 +95,15 @@ _PEM_BLOCK_RE = re.compile(
 _PEM_HEADER_RE = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")
 
 _URL_CRED_RE = re.compile(
-    r"(\b[A-Za-z][A-Za-z0-9+.-]{0,20}://[^/\s:@\"']{1,128}:)(?!\$\{?)([^@\s/\"']{4,256})(@)"
+    r"(\b[A-Za-z][A-Za-z0-9+.-]{0,20}://[^/\s:@\"']{1,128}:)(?!\$\{?)([^@\s/\"']{1,256})(@)"
 )
 _AUTH_HEADER_RE = re.compile(
     r"(\bAuthorization\s*:\s*(?:Bearer|Basic|Token)\s+)([A-Za-z0-9._~+/=-]{8,})",
     re.IGNORECASE,
 )
 _QUERY_REDACTION_RE = re.compile(
-    r"([?&](?:api[_-]?key|access[_-]?token|auth[_-]?token|token|client_secret|password|secret)=)"
+    r"([?&](?:api[_-]?key|access[_-]?token|auth[_-]?token|token|client_secret|password|secret"
+    r"|key|sig|signature|x-amz-signature)=)"
     r"([^&#\s\"'<>]{6,})",
     re.IGNORECASE,
 )

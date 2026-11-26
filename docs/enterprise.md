@@ -537,7 +537,7 @@ Cookie and header flags:
   configured, the header counts only from those addresses.
 - `--trusted-proxy CIDR` (repeatable; also `RUNLEDGER_TRUSTED_PROXIES`, comma-separated): *this release.*
   The addresses or ranges of your reverse proxies, for example `10.0.0.0/8` or `203.0.113.5`. The server
-  prints `Trusting X-Forwarded-For from: ...` when it starts, and a bad entry stops it before the database
+  prints `Trusting X-Forwarded-For from the configured proxy networks` when it starts, and a bad entry stops it before the database
   is opened. From a trusted address, the client is the right-most `X-Forwarded-For` address that is not
   itself trusted, so a client cannot choose its own address by adding entries on the left. From any other
   address the header is ignored. The address is used for the failed-sign-in limit and in the audit log.

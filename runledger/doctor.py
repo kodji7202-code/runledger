@@ -3,7 +3,7 @@
 The report is read-only: it never writes a hook file, a config file, a `.runledger` folder or a
 Git ref, and the only network request it may make is an unauthenticated `GET <server>/health`
 for the approval check (skipped with `--offline`). No secret is ever printed: the approval key
-is reported as `set (env RUNLEDGER_API_KEY)` or `not set`.
+is reported as `key set (RUNLEDGER_API_KEY)` or `key RUNLEDGER_API_KEY not set`.
 
 Checks (design section 3.2): `install`, `guard.hooks` (per agent and scope), `guard.note`
 (Codex trust, Droid restart), `guard.selftest`, `config`, `approval`, `log`, `rollback`,
@@ -863,7 +863,9 @@ def _approval_check(user: Dict[str, Any], offline: bool) -> Check:
     server = approval["server"]
     shown_server = _guard.redact(server)
     env_name = approval["env_name"]
-    key_text = "key set" if os.environ.get(env_name, "").strip() else "key not set"
+    env_label = _guard._approval_env_label(env_name)
+    key_text = (f"key set ({env_label})" if os.environ.get(env_name, "").strip()
+                else f"key {env_label} not set")
     if not server:
         return Check("approval", INFO, "approval server",
                      f"no approval server configured; {key_text} (the guard decides locally)")

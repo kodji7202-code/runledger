@@ -84,10 +84,9 @@ from .userconfig import user_config_path as user_config_path
 
 try:
     from . import secrets as _secrets
-    from .secrets import find_secrets, is_secret_path, redact_text, safe_user_regex
+    from .secrets import is_secret_path, redact_text, safe_user_regex
 except Exception:  # pragma: no cover - standalone fallback when runledger.secrets is unavailable
     _secrets = None  # type: ignore[assignment]
-    find_secrets = None  # type: ignore[assignment]
     is_secret_path = None  # type: ignore[assignment]
     redact_text = None  # type: ignore[assignment]
     safe_user_regex = None  # type: ignore[assignment]
