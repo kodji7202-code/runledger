@@ -662,7 +662,7 @@ runledger guard status
 ```
 
 It is read-only: no hook file, config, log, checkpoint ref or `.runledger` folder is written, and
-no secret is ever printed (the approval key shows as `set (env RUNLEDGER_API_KEY)` or `not set`).
+no secret is ever printed (the approval key shows as `key set (RUNLEDGER_API_KEY)` or `key RUNLEDGER_API_KEY not set`).
 [docs/doctor.md](doctor.md) lists every check, its statuses, the `--json` schema and the
 troubleshooting steps.
 

@@ -146,11 +146,12 @@ def _one_line(exc: BaseException) -> str:
 def _write_stdout(text: str) -> None:
     """Receipts are UTF-8 documents, whatever the console encoding (cp1252 on Windows)."""
     buffer = getattr(sys.stdout, "buffer", None)
+    safe_text = redact(text)
     if buffer is None:
-        sys.stdout.write(text)
+        sys.stdout.write(safe_text)
         return
     sys.stdout.flush()
-    buffer.write(text.encode("utf-8"))
+    buffer.write(safe_text.encode("utf-8"))
     buffer.flush()
 
 
@@ -549,7 +550,7 @@ def cmd_receipt(args) -> int:
                 print("warning: --open is ignored when writing to stdout (-o -)", file=sys.stderr)
     else:
         try:
-            target.write_text(out, encoding="utf-8")
+            target.write_text(redact(out), encoding="utf-8")
         except OSError as exc:
             print(f"error: cannot write {target}: {exc.strerror or _one_line(exc)}", file=sys.stderr)
             return 1
@@ -605,8 +606,7 @@ def cmd_serve(args) -> int:
     scheme = "https" if server.tls_context is not None else "http"
     print(f"RunLedger team server on {scheme}://{host}:{port}  (database: {args.db})")
     if server.trusted_proxies:
-        shown = ", ".join(str(net) for net in server.trusted_proxies)
-        print(f"Trusting X-Forwarded-For from: {shown}")
+        print("Trusting X-Forwarded-For from the configured proxy networks")
     if host not in _LOOPBACK and server.tls_context is None:
         print("Warning: listening on a network address. Put it behind HTTPS before sharing it.", file=sys.stderr)
     if server.retention_days:

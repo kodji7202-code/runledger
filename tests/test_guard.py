@@ -466,6 +466,16 @@ def test_missing_api_key_falls_back_to_a_local_ask(tmp_path, monkeypatch):
     assert "RUNLEDGER_API_KEY" in d["reason"]
 
 
+def test_missing_custom_api_key_hides_the_variable_name(tmp_path, monkeypatch, isolated_settings):
+    write_user_config(isolated_settings, {"api_key_env": "OTHER_KEY"})
+    monkeypatch.setenv("RUNLEDGER_SERVER", "http://127.0.0.1:9")
+    monkeypatch.delenv("OTHER_KEY", raising=False)
+    d = guard.decide(bash_event(tmp_path, "sudo apt-get update"), {})
+    assert d["decision"] == "ask" and d["approval"] == "unavailable"
+    assert "custom variable (name hidden)" in d["reason"]
+    assert "OTHER_KEY" not in d["reason"]
+
+
 # ---------------------------------------------------------------- log and redaction
 
 def _last_log(cwd):
@@ -1276,6 +1286,17 @@ def test_cli_guard_test_prints_the_decision_and_writes_no_log(tmp_path, capsys):
     assert out["decision"]["decision"] == "deny"
     assert out["hook_output"]["hookSpecificOutput"]["permissionDecision"] == "deny"
     assert not (tmp_path / ".runledger").exists()
+
+
+def test_cli_guard_test_redacts_a_secret_in_the_command(tmp_path, capsys):
+    secret = "sk-ant-api03-" + "z" * 30  # synthetic
+    event = bash_event(tmp_path, f"echo token={secret}")
+    rc = cli_main(["guard", "test", json.dumps(event)])
+    printed = capsys.readouterr().out
+    assert rc == 0
+    assert secret not in printed
+    assert "[REDACTED]" in printed
+    assert json.loads(printed)["decision"]["tool"] == "Bash"
 
 
 def test_cli_guard_test_rejects_bad_json(capsys):

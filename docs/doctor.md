@@ -30,7 +30,7 @@ never writes into your project, your home folder or Git. No `.bak` file, no `.ru
 `guard.log` row, no config file, no checkpoint ref, no session cache. Its only network request is
 the optional `GET <server>/health` of the
 approval check, and that request is skipped by `--offline`. Secrets are never printed: the
-approval check reports the key variable as `set (env RUNLEDGER_API_KEY)` or `not set`, never its
+approval check reports the key variable as `key set (RUNLEDGER_API_KEY)` or `key RUNLEDGER_API_KEY not set`, never its
 value, in the text report, in `--json`, in `--verbose` and on stderr.
 
 ## Exit codes

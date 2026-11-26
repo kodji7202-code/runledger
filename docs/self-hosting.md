@@ -132,7 +132,7 @@ environment:
 
 The equivalent flag is `--trusted-proxy 172.20.0.0/16` in the server command (the `CMD` in the
 `Dockerfile`, or a `command:` in the compose file). Apply the change with `docker compose up -d`; the
-server prints `Trusting X-Forwarded-For from: 172.20.0.0/16` when it starts.
+server prints `Trusting X-Forwarded-For from the configured proxy networks` when it starts.
 
 Only the Caddy container and the server are on this network. With a trusted proxy named, the server
 takes the client address from `X-Forwarded-For`, and it honours `X-Forwarded-Proto` (set by Caddy)

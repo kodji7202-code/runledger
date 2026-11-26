@@ -3,7 +3,7 @@
 The report is read-only: it never writes a hook file, a config file, a `.runledger` folder or a
 Git ref, and the only network request it may make is an unauthenticated `GET <server>/health`
 for the approval check (skipped with `--offline`). No secret is ever printed: the approval key
-is reported as `set (env RUNLEDGER_API_KEY)` or `not set`.
+is reported as `key set (RUNLEDGER_API_KEY)` or `key RUNLEDGER_API_KEY not set`.
 
 Checks (design section 3.2): `install`, `guard.hooks` (per agent and scope), `guard.note`
 (Codex trust, Droid restart), `guard.selftest`, `config`, `approval`, `log`, `rollback`,
@@ -571,9 +571,9 @@ def _selftest_env(folder: Path, user: Optional[Dict[str, Any]] = None) -> Dict[s
     """The environment the hook runs in: a temp HOME, no approval server, no key, no project
     directory variable, so the run cannot reach the real config or pollute the project."""
     env = dict(os.environ)
-    key_env = _guard.trusted_approval_settings(user or {}).get("api_key_env") or ""
+    env_name = _guard.approval_settings(user or {}).get("env_name") or ""
     for name in ("RUNLEDGER_SERVER", "RUNLEDGER_API_KEY", "RUNLEDGER_CONFIG", "RUNLEDGER_PUSH_SAFE",
-                 key_env, *_guard.PROJECT_DIR_ENV_VARS):
+                 env_name, *_guard.PROJECT_DIR_ENV_VARS):
         if name:
             env.pop(name, None)
     home = folder / "home"
@@ -757,7 +757,7 @@ def _config_entry(kind: str, path: Path, known: Sequence[str], data: Dict[str, A
 def _ignored_project_keys(project: Dict[str, Any], user: Dict[str, Any]) -> List[str]:
     """The project settings the guard ignores, each as the sentence the guard would log."""
     texts: List[str] = []
-    _, warnings = _guard._effective_guard(project, user, {"server": "", "api_key_env": ""})
+    _, warnings = _guard._effective_guard(project, user, {"server": "", "env_name": ""})
     texts.extend(warnings)
     texts.extend(_guard._project_key_warnings(project))
     user_overrides = _guard._valid_overrides(user.get("severity_overrides"))
@@ -859,22 +859,24 @@ def _bad_mcp_verbs(value: Any) -> int:
 def _approval_check(user: Dict[str, Any], offline: bool) -> Check:
     """The server and the key name come from the environment or the user's file only,
     and the key's value is never read into the report."""
-    trusted = _guard.trusted_approval_settings(user)
-    server = trusted["server"]
-    key_env = trusted["api_key_env"]
-    key_text = (f"key set (env {key_env})" if os.environ.get(key_env, "").strip()
-                else f"key {key_env} not set")
+    approval = _guard.approval_settings(user)
+    server = approval["server"]
+    shown_server = _guard.redact(server)
+    env_name = approval["env_name"]
+    env_label = _guard._approval_env_label(env_name)
+    key_text = (f"key set ({env_label})" if os.environ.get(env_name, "").strip()
+                else f"key {env_label} not set")
     if not server:
         return Check("approval", INFO, "approval server",
                      f"no approval server configured; {key_text} (the guard decides locally)")
     issues: List[str] = []
     scheme, host = _url_parts(server)
     if scheme == "http" and host not in ("127.0.0.1", "localhost", "::1"):
-        issues.append(f"the server {server} uses cleartext http outside the loopback interface: "
+        issues.append(f"the server {shown_server} uses cleartext http outside the loopback interface: "
                       f"use https, or the approval key would travel unencrypted")
     if offline:
         return Check("approval", WARN if issues else INFO, "approval server",
-                     f"server {server} "
+                     f"server {shown_server} "
                      f"({'; '.join(issues) if issues else 'not contacted (--offline)'}); {key_text}",
                      fix=("Use https for the approval server, or keep it on the loopback "
                           "interface." if issues else ""))
@@ -882,8 +884,8 @@ def _approval_check(user: Dict[str, Any], offline: bool) -> Check:
         ok, detail = _health_get(server)
         if ok:
             return Check("approval", OK, "approval server",
-                         f"server {server} reachable (/health {detail}); {key_text}")
-        issues.append(f"the server {server} is unreachable ({detail})")
+                         f"server {shown_server} reachable (/health {detail}); {key_text}")
+        issues.append(f"the server {shown_server} is unreachable ({detail})")
     return Check("approval", WARN, "approval server",
                  f"{'; '.join(issues)}; the guard then follows on_timeout; {key_text}",
                  fix=(f"Start the approval server or check {_guard.SERVER_ENV}: while it is "
@@ -1164,7 +1166,7 @@ def _no_session_cache():
 
 def _mode_check(user: Dict[str, Any], project_policy: Dict[str, Any]) -> Check:
     cfg, _ = _guard._effective_guard(project_policy, user,
-                                     _guard.trusted_approval_settings(user))
+                                     _guard.approval_settings(user))
     return Check("guard.mode", INFO, "guard mode",
                  f"mode {cfg['mode']}; fail_closed {'on' if cfg['fail_closed'] else 'off'}")
 
@@ -1227,11 +1229,14 @@ def check_extra(report: Report, check: Check) -> List[str]:
 
 def _file_extras(check: Check, report: Report) -> List[str]:
     if check.id == "approval":
-        trusted = _guard.trusted_approval_settings(_guard.load_user_config())
-        return [f"server from the environment or the user file: "
-                f"{trusted['server'] or 'not configured'}",
-                f"health url: {(trusted['server'] or '<none>').rstrip('/')}/health",
-                f"key variable: {trusted['api_key_env']} (only set/not set is shown)"]
+        approval = _guard.approval_settings(_guard.load_user_config())
+        server = approval["server"]
+        shown_server = _guard.redact(server) if server else "not configured"
+        health_url = _guard.redact(server.rstrip("/") + "/health") if server else "<none>/health"
+        env_label = _guard._approval_env_label(approval["env_name"])
+        return [f"server from the environment or the user file: {shown_server}",
+                f"health url: {health_url}",
+                f"key variable: {env_label}; only set/not set is shown"]
     if check.id == "log":
         return [f"log file: {Path(report.project) / _guard.LOG_DIR / _guard.LOG_FILE}",
                 "the log's rows are counted, never printed"]
@@ -1256,7 +1261,7 @@ def _emit(text: str) -> None:
             reconfigure(errors="replace")
         except (ValueError, OSError):
             pass
-    stream.write(text)
+    stream.write(_guard.redact(text))
     stream.flush()
 
 
